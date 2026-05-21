@@ -14,6 +14,7 @@ use crate::rendering::projection::{
 use crate::simulation::construction::{DamMap, StructureLabel, Wall, WallMap, WallMaterial};
 use crate::simulation::faction::{FactionCenter, StorageTileMap};
 use crate::simulation::items::GroundItem;
+use crate::simulation::perf::{BackgroundWorkDiagnostics, PerfWorkBudget};
 use crate::simulation::plants::{
     spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
 };
@@ -47,6 +48,18 @@ pub const REGION_LOAD_RADIUS: i32 = 6;
 #[derive(Resource, Default)]
 pub struct ChunkRetention {
     pub pinned: AHashSet<ChunkCoord>,
+}
+
+#[derive(Resource, Default)]
+pub struct PendingChunkStreams {
+    pub data_loads: AHashSet<ChunkCoord>,
+    pub sprite_loads: AHashSet<ChunkCoord>,
+    pub unloads: AHashSet<ChunkCoord>,
+}
+
+#[derive(Resource, Default)]
+pub struct PendingTileRefreshes {
+    pub tiles: AHashSet<(i32, i32)>,
 }
 
 /// Emitted when `chunk_streaming_system` first inserts a chunk into
@@ -104,6 +117,13 @@ pub struct StreamPlantParams<'w> {
     pub plant_map: ResMut<'w, PlantMap>,
     pub plant_sprite_index: ResMut<'w, PlantSpriteIndex>,
     pub seed_reservation: Res<'w, crate::simulation::seed_reservation::SeedReservation>,
+}
+
+#[derive(SystemParam)]
+pub struct StreamBudgetParams<'w> {
+    pub pending: ResMut<'w, PendingChunkStreams>,
+    pub budget: Res<'w, PerfWorkBudget>,
+    pub perf: ResMut<'w, BackgroundWorkDiagnostics>,
 }
 
 /// Rebuild `SimulationFocus` from camera + every settled region's mega-chunk
@@ -214,6 +234,46 @@ fn chunk_coord_from_world(x: f32, y: f32) -> ChunkCoord {
         tx.div_euclid(CHUNK_SIZE as i32),
         ty.div_euclid(CHUNK_SIZE as i32),
     )
+}
+
+fn drain_sorted_chunks(set: &mut AHashSet<ChunkCoord>, limit: usize) -> Vec<ChunkCoord> {
+    let mut coords: Vec<ChunkCoord> = set.iter().copied().collect();
+    coords.sort_by_key(|c| (c.0, c.1));
+    let take = coords.len().min(limit);
+    let mut out = Vec::with_capacity(take);
+    for coord in coords.into_iter().take(take) {
+        set.remove(&coord);
+        out.push(coord);
+    }
+    out
+}
+
+fn drain_prioritized_chunks(
+    set: &mut AHashSet<ChunkCoord>,
+    priority: &AHashSet<ChunkCoord>,
+    limit: usize,
+) -> Vec<ChunkCoord> {
+    let mut coords: Vec<ChunkCoord> = set.iter().copied().collect();
+    coords.sort_by_key(|c| (!priority.contains(c), c.0, c.1));
+    let take = coords.len().min(limit);
+    let mut out = Vec::with_capacity(take);
+    for coord in coords.into_iter().take(take) {
+        set.remove(&coord);
+        out.push(coord);
+    }
+    out
+}
+
+fn drain_sorted_tiles(set: &mut AHashSet<(i32, i32)>, limit: usize) -> Vec<(i32, i32)> {
+    let mut tiles: Vec<(i32, i32)> = set.iter().copied().collect();
+    tiles.sort_unstable();
+    let take = tiles.len().min(limit);
+    let mut out = Vec::with_capacity(take);
+    for tile in tiles.into_iter().take(take) {
+        set.remove(&tile);
+        out.push(tile);
+    }
+    out
 }
 
 const PLANT_HASH_SEED: u32 = 42;
@@ -894,6 +954,7 @@ pub fn chunk_streaming_system(
     retention: Res<ChunkRetention>,
     mut stream_events: ChunkStreamEvents,
     focus_view: StreamFocusParams,
+    mut perf_params: StreamBudgetParams,
 ) {
     let now = Instant::now();
     let focus = &focus_view.focus;
@@ -918,8 +979,9 @@ pub fn chunk_streaming_system(
         .collect();
 
     // --- Load chunks within union of focus discs ---
-    // `seen` prevents duplicate work when discs overlap.
-    let mut seen: AHashSet<ChunkCoord> = AHashSet::default();
+    // Desired sets prevent duplicate queue entries when focus discs overlap.
+    let mut desired_data: AHashSet<ChunkCoord> = AHashSet::default();
+    let mut desired_sprites: AHashSet<ChunkCoord> = AHashSet::default();
     for &(pcx, pcy, radius, is_camera) in &focus_centres {
         for dy in -radius..=radius {
             for dx in -radius..=radius {
@@ -929,60 +991,105 @@ pub fn chunk_streaming_system(
                     continue;
                 }
                 let coord = ChunkCoord(cx, cy);
-                if !seen.insert(coord) {
-                    // Already processed by a prior focus; if either focus is
-                    // the camera we still need to spawn sprites — so re-run
-                    // sprite check below regardless.
-                }
-                let (gx, gy) = Globe::cell_for_chunk(cx, cy);
-
-                // 1. Ensure the chunk data exists in ChunkMap.
+                desired_data.insert(coord);
                 if !chunk_map.0.contains_key(&coord) {
-                    if globe.cell(gx, gy).is_none() {
-                        continue;
-                    }
-                    let chunk = generate_chunk_from_globe(coord, &globe, &gen);
-                    chunk_map.0.insert(coord, chunk);
-                    stream_events.loaded.send(ChunkLoadedEvent { coord });
-
-                    if let Some(gc) = globe.cell_mut(gx, gy) {
-                        gc.explored = true;
-                    }
+                    perf_params.pending.data_loads.insert(coord);
                 }
-
-                // 2. Sprites only spawn for the camera focus.
-                if is_camera && !sprite_index.by_chunk.contains_key(&coord) {
-                    spawn_chunk_sprites(
-                        &mut commands,
-                        &tile_materials,
-                        &fog_tile_materials,
-                        &fog_map,
-                        &mut sprite_index,
-                        &mut wall_map,
-                        &chunk_map,
-                        &gen,
-                        &globe,
-                        coord,
-                        camera_view_z.0,
-                        map_view_mode,
-                        &map_projection,
-                    );
-
-                    spawn_chunk_plants(
-                        &mut commands,
-                        &mut plant_params.plant_map,
-                        &mut plant_params.plant_sprite_index,
-                        &chunk_map,
-                        &gen,
-                        &globe,
-                        &plant_params.seed_reservation,
-                        coord,
-                    );
-
-                    spawn_chunk_loose_rocks(&mut commands, &chunk_map, coord);
+                if is_camera {
+                    desired_sprites.insert(coord);
+                    if !sprite_index.by_chunk.contains_key(&coord) {
+                        perf_params.pending.sprite_loads.insert(coord);
+                    }
                 }
             }
         }
+    }
+
+    perf_params
+        .pending
+        .data_loads
+        .retain(|coord| desired_data.contains(coord));
+    perf_params
+        .pending
+        .sprite_loads
+        .retain(|coord| desired_sprites.contains(coord));
+    perf_params
+        .pending
+        .unloads
+        .retain(|coord| !desired_data.contains(coord) && !retention.pinned.contains(coord));
+
+    let mut data_loaded = 0u32;
+    let data_batch = drain_prioritized_chunks(
+        &mut perf_params.pending.data_loads,
+        &desired_sprites,
+        perf_params.budget.chunk_data_loads_per_tick,
+    );
+    for coord in data_batch {
+        if chunk_map.0.contains_key(&coord) || !desired_data.contains(&coord) {
+            continue;
+        }
+        let (gx, gy) = Globe::cell_for_chunk(coord.0, coord.1);
+        if globe.cell(gx, gy).is_none() {
+            continue;
+        }
+        let chunk = generate_chunk_from_globe(coord, &globe, &gen);
+        chunk_map.0.insert(coord, chunk);
+        stream_events.loaded.send(ChunkLoadedEvent { coord });
+        if let Some(gc) = globe.cell_mut(gx, gy) {
+            gc.explored = true;
+        }
+        data_loaded = data_loaded.saturating_add(1);
+    }
+
+    for &coord in &desired_sprites {
+        if chunk_map.0.contains_key(&coord) && !sprite_index.by_chunk.contains_key(&coord) {
+            perf_params.pending.sprite_loads.insert(coord);
+        }
+    }
+
+    let mut sprite_loaded = 0u32;
+    let sprite_batch = drain_sorted_chunks(
+        &mut perf_params.pending.sprite_loads,
+        perf_params.budget.chunk_sprite_loads_per_tick,
+    );
+    for coord in sprite_batch {
+        if !desired_sprites.contains(&coord) || sprite_index.by_chunk.contains_key(&coord) {
+            continue;
+        }
+        if !chunk_map.0.contains_key(&coord) {
+            perf_params.pending.sprite_loads.insert(coord);
+            continue;
+        }
+
+        spawn_chunk_sprites(
+            &mut commands,
+            &tile_materials,
+            &fog_tile_materials,
+            &fog_map,
+            &mut sprite_index,
+            &mut wall_map,
+            &chunk_map,
+            &gen,
+            &globe,
+            coord,
+            camera_view_z.0,
+            map_view_mode,
+            &map_projection,
+        );
+
+        spawn_chunk_plants(
+            &mut commands,
+            &mut plant_params.plant_map,
+            &mut plant_params.plant_sprite_index,
+            &chunk_map,
+            &gen,
+            &globe,
+            &plant_params.seed_reservation,
+            coord,
+        );
+
+        spawn_chunk_loose_rocks(&mut commands, &chunk_map, coord);
+        sprite_loaded = sprite_loaded.saturating_add(1);
     }
 
     // --- Unload chunks beyond UNLOAD_RADIUS of every focus ---
@@ -1010,7 +1117,23 @@ pub fn chunk_streaming_system(
         .collect();
 
     for coord in to_unload {
-        chunk_map.0.remove(&coord);
+        perf_params.pending.unloads.insert(coord);
+        perf_params.pending.data_loads.remove(&coord);
+        perf_params.pending.sprite_loads.remove(&coord);
+    }
+
+    let mut unloaded = 0u32;
+    let unload_batch = drain_sorted_chunks(
+        &mut perf_params.pending.unloads,
+        perf_params.budget.chunk_unloads_per_tick,
+    );
+    for coord in unload_batch {
+        if retention.pinned.contains(&coord) || desired_data.contains(&coord) {
+            continue;
+        }
+        if chunk_map.0.remove(&coord).is_none() {
+            continue;
+        }
         stream_events.unloaded.send(ChunkUnloadedEvent { coord });
 
         let x0 = (coord.0 * CHUNK_SIZE as i32) as i32;
@@ -1040,7 +1163,21 @@ pub fn chunk_streaming_system(
                 commands.entity(e).despawn_recursive();
             }
         }
+        unloaded = unloaded.saturating_add(1);
     }
+
+    perf_params.perf.chunk_loads_applied_last_tick = data_loaded;
+    perf_params.perf.chunk_sprite_loads_applied_last_tick = sprite_loaded;
+    perf_params.perf.chunk_unloads_applied_last_tick = unloaded;
+    perf_params.perf.pending_chunk_loads =
+        perf_params.pending.data_loads.len().min(u32::MAX as usize) as u32;
+    perf_params.perf.pending_chunk_sprite_loads = perf_params
+        .pending
+        .sprite_loads
+        .len()
+        .min(u32::MAX as usize) as u32;
+    perf_params.perf.pending_chunk_unloads =
+        perf_params.pending.unloads.len().min(u32::MAX as usize) as u32;
 
     if !*has_run {
         info!(
@@ -1055,6 +1192,7 @@ pub fn chunk_streaming_system(
 pub fn refresh_changed_tiles_system(
     mut commands: Commands,
     mut events: EventReader<TileChangedEvent>,
+    mut pending: ResMut<PendingTileRefreshes>,
     mut sprite_index: ResMut<TileSpriteIndex>,
     mut wall_map: ResMut<WallMap>,
     chunk_map: Res<ChunkMap>,
@@ -1064,10 +1202,17 @@ pub fn refresh_changed_tiles_system(
     gen: Res<WorldGen>,
     globe: Res<Globe>,
     camera_view_z: Res<CameraViewZ>,
+    budget: Res<PerfWorkBudget>,
+    mut perf: ResMut<BackgroundWorkDiagnostics>,
 ) {
     for ev in events.read() {
-        let tx = ev.tx;
-        let ty = ev.ty;
+        pending.tiles.insert((ev.tx, ev.ty));
+    }
+
+    let tiles = drain_sorted_tiles(&mut pending.tiles, budget.tile_refreshes_per_tick);
+    perf.tile_refreshes_applied_last_tick = tiles.len().min(u32::MAX as usize) as u32;
+
+    for (tx, ty) in tiles {
         let coord = ChunkCoord(
             (tx as i32).div_euclid(CHUNK_SIZE as i32),
             (ty as i32).div_euclid(CHUNK_SIZE as i32),
@@ -1186,6 +1331,8 @@ pub fn refresh_changed_tiles_system(
             }
         }
     }
+
+    perf.pending_tile_refreshes = pending.tiles.len().min(u32::MAX as usize) as u32;
 }
 
 /// Update: when CameraViewZ changes, update all TileSprite materials and visibility
@@ -1248,5 +1395,51 @@ pub fn update_tile_z_view_system(
             now.elapsed()
         );
         *has_run = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_queue_drain_is_sorted_and_budgeted() {
+        let mut set = AHashSet::default();
+        set.insert(ChunkCoord(5, 0));
+        set.insert(ChunkCoord(1, 0));
+        set.insert(ChunkCoord(3, 0));
+
+        let batch = drain_sorted_chunks(&mut set, 2);
+        assert_eq!(batch, vec![ChunkCoord(1, 0), ChunkCoord(3, 0)]);
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&ChunkCoord(5, 0)));
+    }
+
+    #[test]
+    fn chunk_queue_drain_prioritizes_camera_needed_data() {
+        let mut set = AHashSet::default();
+        set.insert(ChunkCoord(0, 0));
+        set.insert(ChunkCoord(10, 0));
+        set.insert(ChunkCoord(2, 0));
+        let mut priority = AHashSet::default();
+        priority.insert(ChunkCoord(10, 0));
+
+        let batch = drain_prioritized_chunks(&mut set, &priority, 2);
+        assert_eq!(batch, vec![ChunkCoord(10, 0), ChunkCoord(0, 0)]);
+        assert!(set.contains(&ChunkCoord(2, 0)));
+    }
+
+    #[test]
+    fn tile_refresh_queue_dedupes_and_drains_in_order() {
+        let mut set = AHashSet::default();
+        set.insert((4, 2));
+        set.insert((1, 2));
+        set.insert((4, 2));
+        set.insert((3, 9));
+
+        let batch = drain_sorted_tiles(&mut set, 2);
+        assert_eq!(batch, vec![(1, 2), (3, 9)]);
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&(4, 2)));
     }
 }

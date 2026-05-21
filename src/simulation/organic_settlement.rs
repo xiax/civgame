@@ -20,7 +20,9 @@ use crate::simulation::construction::{
     StructureIndex, TableMap, WallMap, WallMaterial, WallSelection, WellMap, WorkbenchMap,
     MAX_BLUEPRINTS_SAFETY_CAP,
 };
-use crate::simulation::faction::{FactionData, FactionMember, FactionRegistry, SOLO};
+use crate::simulation::faction::{
+    FactionCulture, FactionData, FactionMember, FactionRegistry, FactionTechs, SOLO,
+};
 use crate::simulation::land::{tile_buildable_by, Plot, PlotIndex, TenureHolder, TileEdge};
 use crate::simulation::schedule::SimClock;
 use crate::simulation::settlement::{
@@ -28,7 +30,7 @@ use crate::simulation::settlement::{
     Zone, ZoneKind,
 };
 use crate::simulation::technology::{
-    current_era, Era, BRIDGE_BUILDING, CITY_STATE_ORG, CROP_CULTIVATION, DAM_BUILDING,
+    current_era, Era, TechId, BRIDGE_BUILDING, CITY_STATE_ORG, CROP_CULTIVATION, DAM_BUILDING,
     FLINT_KNAPPING, GRANARY, LONG_DIST_TRADE, MONUMENTAL_BUILDING, PERM_SETTLEMENT,
     PROFESSIONAL_ARMY, SACRED_RITUAL, WELL_DIGGING,
 };
@@ -451,10 +453,247 @@ pub struct OrganicStructureMaps<'w> {
     pub structure_index: Res<'w, StructureIndex>,
 }
 
-/// Shared per-settlement survey body. Called by `survey_task::survey_cursor_system`
-/// (one settlement per tick, paced so each settlement re-surveys at the
-/// legacy `SURVEY_INTERVAL = 120` ticks cadence) and by
-/// `kickoff_initial_survey_system` once at `OnEnter(GameState::Playing)` so
+/// Send-able structure-map view captured on the main thread before a
+/// settlement survey runs. The survey only needs tile occupancy/anchor keys,
+/// never the live entities behind those maps.
+#[derive(Clone, Default)]
+pub struct SurveyStructureSnapshot {
+    pub beds: AHashSet<(i32, i32)>,
+    pub walls: AHashSet<(i32, i32)>,
+    pub campfires: AHashSet<(i32, i32)>,
+    pub doors: AHashSet<(i32, i32)>,
+    pub workbenches: AHashSet<(i32, i32)>,
+    pub looms: AHashSet<(i32, i32)>,
+    pub tables: AHashSet<(i32, i32)>,
+    pub granaries: AHashSet<(i32, i32)>,
+    pub shrines: AHashSet<(i32, i32)>,
+    pub markets: AHashSet<(i32, i32)>,
+    pub barracks: AHashSet<(i32, i32)>,
+    pub monuments: AHashSet<(i32, i32)>,
+    pub wells: AHashSet<(i32, i32)>,
+    pub structures: AHashSet<(i32, i32)>,
+}
+
+impl SurveyStructureSnapshot {
+    /// Capture all tiles within the settlement survey window. This keeps the
+    /// async task input small while preserving every map lookup the survey
+    /// actually performs.
+    pub fn capture(maps: &OrganicStructureMaps, centre: (i32, i32)) -> Self {
+        let half = crate::simulation::survey_task::SURVEY_WINDOW;
+        let in_window = |(x, y): &(i32, i32)| -> bool {
+            (x - centre.0).abs() <= half && (y - centre.1).abs() <= half
+        };
+        let pick = |m: &AHashMap<(i32, i32), Entity>| -> AHashSet<(i32, i32)> {
+            m.keys().filter(|t| in_window(t)).copied().collect()
+        };
+        Self {
+            beds: pick(&maps.bed_map.0),
+            walls: pick(&maps.wall_map.0),
+            campfires: pick(&maps.campfire_map.0),
+            doors: maps
+                .door_map
+                .0
+                .keys()
+                .filter(|t| in_window(t))
+                .copied()
+                .collect(),
+            workbenches: pick(&maps.workbench_map.0),
+            looms: pick(&maps.loom_map.0),
+            tables: pick(&maps.table_map.0),
+            granaries: pick(&maps.granary_map.0),
+            shrines: pick(&maps.shrine_map.0),
+            markets: pick(&maps.market_map.0),
+            barracks: pick(&maps.barracks_map.0),
+            monuments: pick(&maps.monument_map.0),
+            wells: pick(&maps.well_map.0),
+            structures: maps
+                .structure_index
+                .0
+                .keys()
+                .filter(|t| in_window(t))
+                .copied()
+                .collect(),
+        }
+    }
+}
+
+trait SurveyFactionView {
+    fn home_tile(&self) -> (i32, i32);
+    fn member_count(&self) -> u32;
+    fn techs(&self) -> FactionTechs;
+    fn buildable_techs(&self) -> FactionTechs;
+    fn culture(&self) -> &FactionCulture;
+    fn seed_total(&self) -> u32;
+
+    #[inline]
+    fn community_has(&self, tech: TechId) -> bool {
+        self.buildable_techs().has(tech)
+    }
+}
+
+impl SurveyFactionView for FactionData {
+    fn home_tile(&self) -> (i32, i32) {
+        self.home_tile
+    }
+
+    fn member_count(&self) -> u32 {
+        self.member_count
+    }
+
+    fn techs(&self) -> FactionTechs {
+        self.techs
+    }
+
+    fn buildable_techs(&self) -> FactionTechs {
+        self.buildable_techs
+    }
+
+    fn culture(&self) -> &FactionCulture {
+        &self.culture
+    }
+
+    fn seed_total(&self) -> u32 {
+        self.storage.seed_total()
+    }
+}
+
+#[derive(Clone)]
+pub struct SurveyFactionSnapshot {
+    pub home_tile: (i32, i32),
+    pub member_count: u32,
+    pub techs: FactionTechs,
+    pub buildable_techs: FactionTechs,
+    pub culture: FactionCulture,
+    pub seed_total: u32,
+}
+
+impl SurveyFactionSnapshot {
+    pub fn from_faction(faction: &FactionData) -> Self {
+        Self {
+            home_tile: faction.home_tile,
+            member_count: faction.member_count,
+            techs: faction.techs,
+            buildable_techs: faction.buildable_techs,
+            culture: faction.culture.clone(),
+            seed_total: faction.storage.seed_total(),
+        }
+    }
+}
+
+impl SurveyFactionView for SurveyFactionSnapshot {
+    fn home_tile(&self) -> (i32, i32) {
+        self.home_tile
+    }
+
+    fn member_count(&self) -> u32 {
+        self.member_count
+    }
+
+    fn techs(&self) -> FactionTechs {
+        self.techs
+    }
+
+    fn buildable_techs(&self) -> FactionTechs {
+        self.buildable_techs
+    }
+
+    fn culture(&self) -> &FactionCulture {
+        &self.culture
+    }
+
+    fn seed_total(&self) -> u32 {
+        self.seed_total
+    }
+}
+
+pub struct SettlementSurveyInput {
+    pub settlement: Settlement,
+    pub faction: SurveyFactionSnapshot,
+    pub tick: u64,
+    pub prior_brain: Option<SettlementBrain>,
+    pub chunk_map: ChunkMap,
+    pub maps: SurveyStructureSnapshot,
+    pub member_offsets: Vec<(i32, i32)>,
+    pub snapshot_chunks: usize,
+}
+
+pub struct SettlementSurveyDiff {
+    pub settlement_id: SettlementId,
+    pub owner_faction: u32,
+    pub faction_home_tile: (i32, i32),
+    pub peak_population: u32,
+    pub tick: u64,
+    pub brain: SettlementBrain,
+    pub road_pushes: Vec<(u32, (i32, i32), (i32, i32))>,
+    pub snapshot_chunks: usize,
+}
+
+pub fn compute_settlement_survey(input: SettlementSurveyInput) -> SettlementSurveyDiff {
+    compute_settlement_survey_core(
+        &input.settlement,
+        &input.faction,
+        input.tick,
+        input.prior_brain,
+        &input.chunk_map,
+        &input.maps,
+        &input.member_offsets,
+        input.snapshot_chunks,
+    )
+}
+
+fn compute_settlement_survey_core<F: SurveyFactionView>(
+    settlement: &Settlement,
+    faction: &F,
+    tick: u64,
+    prior_brain: Option<SettlementBrain>,
+    chunk_map: &ChunkMap,
+    maps: &SurveyStructureSnapshot,
+    member_offsets: &[(i32, i32)],
+    snapshot_chunks: usize,
+) -> SettlementSurveyDiff {
+    let seed = organic_seed(settlement, faction);
+    let mut brain = prior_brain
+        .unwrap_or_else(|| SettlementBrain::new(settlement.id, settlement.owner_faction, seed));
+
+    brain.owner_faction = settlement.owner_faction;
+    brain.seed = seed;
+    brain.phase = phase_for(faction, settlement.peak_population);
+    brain.last_survey_tick = tick;
+    decay_traffic(&mut brain.traffic_heat);
+    accumulate_traffic_offsets(&mut brain, faction.home_tile(), member_offsets);
+    brain.anchors = collect_anchors(faction, settlement, chunk_map, maps);
+    brain.districts = build_districts(faction, settlement, &brain);
+    brain.road_segments = build_road_network(faction, &brain, chunk_map, member_offsets);
+    brain.road_tiles = road_tiles_for_segments(&brain.road_segments);
+    brain.frontier = build_frontier(faction, &brain, chunk_map, maps);
+    brain.parcels = build_parcels(faction, settlement, &brain, chunk_map);
+    brain.layout_hash = layout_hash(faction, &brain);
+
+    let road_pushes = desire_path_push(
+        &mut brain,
+        faction.home_tile(),
+        settlement.owner_faction,
+        tick,
+        chunk_map,
+    )
+    .into_iter()
+    .collect();
+
+    SettlementSurveyDiff {
+        settlement_id: settlement.id,
+        owner_faction: settlement.owner_faction,
+        faction_home_tile: faction.home_tile(),
+        peak_population: settlement.peak_population,
+        tick,
+        brain,
+        road_pushes,
+        snapshot_chunks,
+    }
+}
+
+/// Shared synchronous survey apply body. The async scheduler uses
+/// `compute_settlement_survey`; this path is retained for
+/// `kickoff_initial_survey_system` at `OnEnter(GameState::Playing)` so
 /// `SettlementBrain` exists *before* `seed_starting_buildings_system` picks
 /// house anchors. Same effect either way — fold a fresh brain (or update
 /// the existing one) into `SettlementBrains`, recompute road segments /
@@ -462,10 +701,7 @@ pub struct OrganicStructureMaps<'w> {
 /// extensions.
 ///
 /// Caller is expected to have already filtered out SOLO / non-settled
-/// factions. Pure-function refactor (snapshot-based input → output) is
-/// deferred — see `plans/evaluate-this-plan-please-eager-dolphin.md` Step
-/// 2 ("Background survey infrastructure"); this helper is the bridge that
-/// keeps both call sites converging on a single survey body.
+/// factions.
 #[allow(clippy::too_many_arguments)]
 pub fn survey_one_settlement(
     settlement: &Settlement,
@@ -477,36 +713,23 @@ pub fn survey_one_settlement(
     maps: &OrganicStructureMaps,
     member_q: &Query<(&FactionMember, &Transform)>,
 ) {
-    let seed = organic_seed(settlement, faction);
-    let brain = brains
-        .0
-        .entry(settlement.id)
-        .or_insert_with(|| SettlementBrain::new(settlement.id, settlement.owner_faction, seed));
-
-    brain.owner_faction = settlement.owner_faction;
-    brain.seed = seed;
-    brain.phase = phase_for(faction, settlement.peak_population);
-    brain.last_survey_tick = tick;
-    decay_traffic(&mut brain.traffic_heat);
-    accumulate_traffic(brain, faction.home_tile, settlement.owner_faction, member_q);
-    brain.anchors = collect_anchors(faction, settlement, chunk_map, maps);
-    brain.districts = build_districts(faction, settlement, brain);
     let member_offsets =
         collect_member_offsets(faction.home_tile, settlement.owner_faction, member_q);
-    brain.road_segments = build_road_network(faction, brain, chunk_map, &member_offsets);
-    brain.road_tiles = road_tiles_for_segments(&brain.road_segments);
-    brain.frontier = build_frontier(faction, brain, chunk_map, maps);
-    brain.parcels = build_parcels(faction, settlement, brain, chunk_map);
-    brain.layout_hash = layout_hash(faction, brain);
-
-    maybe_queue_desire_path(
-        brain,
-        faction.home_tile,
-        settlement.owner_faction,
+    let structure_snapshot = SurveyStructureSnapshot::capture(maps, faction.home_tile);
+    let diff = compute_settlement_survey_core(
+        settlement,
+        faction,
         tick,
+        brains.0.get(&settlement.id).cloned(),
         chunk_map,
-        road_queue,
+        &structure_snapshot,
+        &member_offsets,
+        chunk_map.0.len(),
     );
+    for road_push in &diff.road_pushes {
+        road_queue.0.push(*road_push);
+    }
+    brains.0.insert(diff.settlement_id, diff.brain);
 }
 
 /// Initial-survey pass run once at `OnEnter(GameState::Playing)` so the
@@ -806,15 +1029,16 @@ pub fn compat_plan_from_brain(
     }
 }
 
-fn organic_seed(settlement: &Settlement, faction: &FactionData) -> u64 {
+fn organic_seed<F: SurveyFactionView>(settlement: &Settlement, faction: &F) -> u64 {
     (settlement.id.0 as u64)
-        ^ ((faction.culture.seed as u64) << 16)
-        ^ ((faction.home_tile.0 as u32 as u64) << 32)
-        ^ ((faction.home_tile.1 as u32 as u64) << 1)
+        ^ ((faction.culture().seed as u64) << 16)
+        ^ ((faction.home_tile().0 as u32 as u64) << 32)
+        ^ ((faction.home_tile().1 as u32 as u64) << 1)
 }
 
-fn phase_for(faction: &FactionData, peak_population: u32) -> SettlementPhase {
-    let era = current_era(&faction.techs);
+fn phase_for<F: SurveyFactionView>(faction: &F, peak_population: u32) -> SettlementPhase {
+    let techs = faction.techs();
+    let era = current_era(&techs);
     if !faction.community_has(PERM_SETTLEMENT) {
         SettlementPhase::Camp
     } else if peak_population < 12 {
@@ -866,18 +1090,14 @@ fn collect_member_offsets(
     out
 }
 
-fn accumulate_traffic(
+fn accumulate_traffic_offsets(
     brain: &mut SettlementBrain,
     home: (i32, i32),
-    faction_id: u32,
-    member_q: &Query<(&FactionMember, &Transform)>,
+    member_offsets: &[(i32, i32)],
 ) {
     let radius = survey_radius(brain.phase) + 10;
-    for (member, transform) in member_q.iter() {
-        if member.faction_id != faction_id {
-            continue;
-        }
-        let tile = world_to_tile(transform.translation.truncate());
+    for &(dx, dy) in member_offsets {
+        let tile = (home.0 + dx, home.1 + dy);
         if cheb(tile, home) > radius {
             continue;
         }
@@ -886,13 +1106,13 @@ fn accumulate_traffic(
     }
 }
 
-fn collect_anchors(
-    faction: &FactionData,
+fn collect_anchors<F: SurveyFactionView>(
+    faction: &F,
     settlement: &Settlement,
     chunk_map: &ChunkMap,
-    maps: &OrganicStructureMaps,
+    maps: &SurveyStructureSnapshot,
 ) -> Vec<SettlementAnchor> {
-    let home = faction.home_tile;
+    let home = faction.home_tile();
     let radius = survey_radius(phase_for(faction, settlement.peak_population));
     let mut anchors = vec![SettlementAnchor {
         kind: SettlementAnchorKind::CivicCore,
@@ -900,49 +1120,49 @@ fn collect_anchors(
         weight: 1.0,
     }];
 
-    add_map_anchors(
+    add_set_anchors(
         &mut anchors,
-        &maps.campfire_map.0,
+        &maps.campfires,
         home,
         32,
         SettlementAnchorKind::Hearth,
         1.0,
     );
-    add_map_anchors(
+    add_set_anchors(
         &mut anchors,
-        &maps.granary_map.0,
+        &maps.granaries,
         home,
         36,
         SettlementAnchorKind::Storehouse,
         0.9,
     );
-    add_map_anchors(
+    add_set_anchors(
         &mut anchors,
-        &maps.shrine_map.0,
+        &maps.shrines,
         home,
         36,
         SettlementAnchorKind::Shrine,
         0.75,
     );
-    add_map_anchors(
+    add_set_anchors(
         &mut anchors,
-        &maps.workbench_map.0,
+        &maps.workbenches,
         home,
         36,
         SettlementAnchorKind::Workshop,
         0.7,
     );
-    add_map_anchors(
+    add_set_anchors(
         &mut anchors,
-        &maps.loom_map.0,
+        &maps.looms,
         home,
         36,
         SettlementAnchorKind::Workshop,
         0.65,
     );
-    add_map_anchors(
+    add_set_anchors(
         &mut anchors,
-        &maps.market_map.0,
+        &maps.markets,
         home,
         42,
         SettlementAnchorKind::Market,
@@ -951,15 +1171,15 @@ fn collect_anchors(
     // Built wells are first-class water anchors — orient road / parcel
     // planning around them so the village's water source lands on the
     // street network.
-    add_map_anchors(
+    add_set_anchors(
         &mut anchors,
-        &maps.well_map.0,
+        &maps.wells,
         home,
         42,
         SettlementAnchorKind::WaterAccess,
         0.9,
     );
-    add_door_gate_anchors(&mut anchors, &maps.door_map.0, home, 42);
+    add_door_gate_anchors(&mut anchors, &maps.doors, home, 42);
 
     if let Some((tile, fresh)) = nearest_water_access(chunk_map, home, radius + 10) {
         anchors.push(SettlementAnchor {
@@ -993,15 +1213,15 @@ fn collect_anchors(
     anchors
 }
 
-fn add_map_anchors(
+fn add_set_anchors(
     anchors: &mut Vec<SettlementAnchor>,
-    map: &AHashMap<(i32, i32), Entity>,
+    tiles: &AHashSet<(i32, i32)>,
     home: (i32, i32),
     radius: i32,
     kind: SettlementAnchorKind,
     weight: f32,
 ) {
-    for &tile in map.keys() {
+    for &tile in tiles {
         if cheb(tile, home) <= radius {
             anchors.push(SettlementAnchor { kind, tile, weight });
         }
@@ -1010,11 +1230,11 @@ fn add_map_anchors(
 
 fn add_door_gate_anchors(
     anchors: &mut Vec<SettlementAnchor>,
-    map: &AHashMap<(i32, i32), crate::simulation::construction::DoorEntry>,
+    tiles: &AHashSet<(i32, i32)>,
     home: (i32, i32),
     radius: i32,
 ) {
-    for &tile in map.keys() {
+    for &tile in tiles {
         if cheb(tile, home) <= radius && cheb(tile, home) >= 8 {
             anchors.push(SettlementAnchor {
                 kind: SettlementAnchorKind::Gate,
@@ -1025,12 +1245,12 @@ fn add_door_gate_anchors(
     }
 }
 
-fn build_districts(
-    faction: &FactionData,
+fn build_districts<F: SurveyFactionView>(
+    faction: &F,
     settlement: &Settlement,
     brain: &SettlementBrain,
 ) -> Vec<DistrictInfluence> {
-    let home = faction.home_tile;
+    let home = faction.home_tile();
     let phase = brain.phase;
     let mut districts = Vec::new();
     districts.push(DistrictInfluence {
@@ -1091,7 +1311,7 @@ fn build_districts(
                     kind: DistrictKind::Sacred,
                     centre: anchor.tile,
                     radius: 6,
-                    weight: 0.6 + (faction.culture.ceremonial as f32 / 255.0) * 0.35,
+                    weight: 0.6 + (faction.culture().ceremonial as f32 / 255.0) * 0.35,
                 });
             }
             SettlementAnchorKind::Market | SettlementAnchorKind::Gate => {
@@ -1099,7 +1319,7 @@ fn build_districts(
                     kind: DistrictKind::Market,
                     centre: anchor.tile,
                     radius: 7,
-                    weight: 0.6 + (faction.culture.mercantile as f32 / 255.0) * 0.35,
+                    weight: 0.6 + (faction.culture().mercantile as f32 / 255.0) * 0.35,
                 });
             }
             SettlementAnchorKind::CivicCore => {}
@@ -1114,7 +1334,7 @@ fn build_districts(
             kind: DistrictKind::Defense,
             centre: home,
             radius: (survey_radius(phase) / 2).clamp(8, 18) as u8,
-            weight: 0.45 + (faction.culture.defensive as f32 / 255.0) * 0.55,
+            weight: 0.45 + (faction.culture().defensive as f32 / 255.0) * 0.55,
         });
     }
 
@@ -1197,13 +1417,13 @@ fn classify_axis(dx: i32, dy: i32) -> SpokeAxis {
 /// 2. Toward the dominant external anchor (gate, market spur, distant high-weight anchor).
 /// 3. Largest eigen-direction of member-cluster offsets from home.
 /// 4. Cardinal E-W fallback.
-pub fn primary_axis(
-    faction: &FactionData,
+fn primary_axis<F: SurveyFactionView>(
+    faction: &F,
     brain: &SettlementBrain,
     chunk_map: &ChunkMap,
     member_offsets: &[(i32, i32)],
 ) -> SpokeAxis {
-    let home = faction.home_tile;
+    let home = faction.home_tile();
 
     // 1. River — already classified by river_context.
     if let Some(river_axis) =
@@ -1276,8 +1496,8 @@ fn line_through(centre: (i32, i32), axis: SpokeAxis, half_extent: i32) -> Street
     }
 }
 
-fn build_road_network(
-    faction: &FactionData,
+fn build_road_network<F: SurveyFactionView>(
+    faction: &F,
     brain: &SettlementBrain,
     chunk_map: &ChunkMap,
     member_offsets: &[(i32, i32)],
@@ -1289,7 +1509,7 @@ fn build_road_network(
         return Vec::new();
     }
 
-    let home = faction.home_tile;
+    let home = faction.home_tile();
     let radius = road_network_radius(brain.phase);
     if radius <= 0 {
         return Vec::new();
@@ -1325,7 +1545,7 @@ fn build_road_network(
             //   (b) a WaterAccess / Field / Market anchor projects off the
             //       spine axis by > 6 tiles — there is a real off-axis
             //       destination people walk toward.
-            let dense = faction.member_count >= 16;
+            let dense = faction.member_count() >= 16;
             // Strongest off-axis anchor (by |perp projection|).
             let mut best_off_axis: Option<(f32, i32, (i32, i32))> = None;
             for anchor in &brain.anchors {
@@ -1609,13 +1829,13 @@ fn bresenham_tiles(from: (i32, i32), to: (i32, i32)) -> Vec<(i32, i32)> {
     out
 }
 
-fn build_frontier(
-    faction: &FactionData,
+fn build_frontier<F: SurveyFactionView>(
+    faction: &F,
     brain: &SettlementBrain,
     chunk_map: &ChunkMap,
-    maps: &OrganicStructureMaps,
+    maps: &SurveyStructureSnapshot,
 ) -> Vec<(i32, i32)> {
-    let home = faction.home_tile;
+    let home = faction.home_tile();
     let radius = survey_radius(brain.phase);
     let road_centred = faction.community_has(PERM_SETTLEMENT) && !brain.road_tiles.is_empty();
     let mut scored: Vec<(f32, i32, i32)> = Vec::new();
@@ -1658,8 +1878,8 @@ fn build_frontier(
         .collect()
 }
 
-fn build_parcels(
-    faction: &FactionData,
+fn build_parcels<F: SurveyFactionView>(
+    faction: &F,
     settlement: &Settlement,
     brain: &SettlementBrain,
     chunk_map: &ChunkMap,
@@ -1704,8 +1924,8 @@ fn build_parcels(
 /// the residence; side edges are tried as fallbacks when the rear is
 /// blocked. Gated on the same passability / reachability / footprint
 /// constraints as the belt.
-fn append_kitchen_gardens(
-    faction: &FactionData,
+fn append_kitchen_gardens<F: SurveyFactionView>(
+    faction: &F,
     settlement: &Settlement,
     brain: &SettlementBrain,
     chunk_map: &ChunkMap,
@@ -1756,7 +1976,7 @@ fn append_kitchen_gardens(
         }
     }
 
-    let home = faction.home_tile;
+    let home = faction.home_tile();
     let mut next_id = parcels
         .iter()
         .map(|p| p.id)
@@ -1870,8 +2090,8 @@ fn kitchen_rect_for_edge(parcel: TileRect, back: TileEdge, size: u16) -> TileRec
 
 /// Frontier-first parcel allocation. Used for camps and nomadic factions
 /// that don't run the road sweep. Identical to the historical algorithm.
-fn build_parcels_frontier_driven(
-    faction: &FactionData,
+fn build_parcels_frontier_driven<F: SurveyFactionView>(
+    faction: &F,
     settlement: &Settlement,
     brain: &SettlementBrain,
     chunk_map: &ChunkMap,
@@ -1931,8 +2151,8 @@ fn build_parcels_frontier_driven(
 /// rects. Every resulting parcel has a guaranteed `frontage_edge` +
 /// `access_tile` because the rect's edge is by construction adjacent to a
 /// road tile.
-fn build_parcels_road_driven(
-    faction: &FactionData,
+fn build_parcels_road_driven<F: SurveyFactionView>(
+    faction: &F,
     settlement: &Settlement,
     brain: &SettlementBrain,
     chunk_map: &ChunkMap,
@@ -1947,7 +2167,7 @@ fn build_parcels_road_driven(
         return Vec::new();
     }
 
-    let home = faction.home_tile;
+    let home = faction.home_tile();
     let mut road_tiles: Vec<(i32, i32)> = brain.road_tiles.iter().copied().collect();
     road_tiles.sort_by_key(|t| (cheb(*t, home), t.0, t.1));
 
@@ -2076,8 +2296,8 @@ fn build_parcels_road_driven(
 /// with a `tile_hash` final tiebreak, no ahash-iteration dependence. `occupied`
 /// is the non-ag road-driven parcel set; `start_id` continues the parcel id
 /// sequence; `budget` is the remaining `MAX_PARCELS` headroom.
-fn build_ag_belt(
-    faction: &FactionData,
+fn build_ag_belt<F: SurveyFactionView>(
+    faction: &F,
     settlement: &Settlement,
     brain: &SettlementBrain,
     chunk_map: &ChunkMap,
@@ -2101,7 +2321,7 @@ fn build_ag_belt(
     if ag_target == 0 {
         return Vec::new();
     }
-    let home = faction.home_tile;
+    let home = faction.home_tile();
 
     // Built-up footprint: non-ag parcels + Civic/Residential/Crafting
     // district discs, each inflated by `BELT_CLEARANCE` so fields keep a
@@ -3170,10 +3390,10 @@ fn parcel_for_tile(brain: &SettlementBrain, tile: (i32, i32)) -> Option<&Parcel>
 
 fn tile_open_for_frontier(
     chunk_map: &ChunkMap,
-    maps: &OrganicStructureMaps,
+    maps: &SurveyStructureSnapshot,
     tile: (i32, i32),
 ) -> bool {
-    if maps.structure_index.0.contains_key(&tile) {
+    if maps.structures.contains(&tile) {
         return false;
     }
     let Some(kind) = chunk_map.tile_kind_at(tile.0, tile.1) else {
@@ -3182,8 +3402,8 @@ fn tile_open_for_frontier(
     kind.is_passable() && kind != TileKind::Wall && !kind.is_water_like()
 }
 
-fn frontier_score(
-    faction: &FactionData,
+fn frontier_score<F: SurveyFactionView>(
+    faction: &F,
     brain: &SettlementBrain,
     chunk_map: &ChunkMap,
     tile: (i32, i32),
@@ -3197,8 +3417,8 @@ fn frontier_score(
     };
     let slope_penalty = local_slope(chunk_map, tile) as f32 * 0.25;
     let heat = brain.traffic_heat.get(&tile).copied().unwrap_or(0) as f32 / 255.0;
-    let centre_d = cheb(tile, faction.home_tile) as f32;
-    let density_pull = faction.culture.density as f32 / 255.0;
+    let centre_d = cheb(tile, faction.home_tile()) as f32;
+    let density_pull = faction.culture().density as f32 / 255.0;
     let spacing = if centre_d < 4.0 {
         -2.0
     } else {
@@ -3207,8 +3427,8 @@ fn frontier_score(
     1.0 + fertility * 2.0 + water * 1.5 + heat * 2.0 + spacing - slope_penalty
 }
 
-fn parcel_suitability(
-    faction: &FactionData,
+fn parcel_suitability<F: SurveyFactionView>(
+    faction: &F,
     settlement: &Settlement,
     brain: &SettlementBrain,
     chunk_map: &ChunkMap,
@@ -3221,12 +3441,12 @@ fn parcel_suitability(
     } else {
         0.0
     };
-    let home_d = cheb(tile, faction.home_tile) as f32;
+    let home = faction.home_tile();
+    let home_d = cheb(tile, home) as f32;
     let heat = brain.traffic_heat.get(&tile).copied().unwrap_or(0) as f32 / 255.0;
     // Terrain elevation delta (solid ground, not water surface).
-    let high = (chunk_map.ground_z_at(tile.0, tile.1)
-        - chunk_map.ground_z_at(faction.home_tile.0, faction.home_tile.1))
-    .max(0) as f32;
+    let high = (chunk_map.ground_z_at(tile.0, tile.1) - chunk_map.ground_z_at(home.0, home.1))
+        .max(0) as f32;
     let mut s = ParcelSuitability {
         residential: 0.65 + water_bonus * 0.25 + (1.0 / (1.0 + home_d * 0.08)) * 0.5,
         agricultural: fertility * 1.4 + water_bonus * 0.5,
@@ -3236,9 +3456,9 @@ fn parcel_suitability(
         storage: 0.45 + fertility * 0.25 + (1.0 / (1.0 + home_d * 0.07)) * 0.5,
         sacred: 0.35
             + high * 0.06
-            + (faction.culture.ceremonial as f32 / 255.0) * 0.35
+            + (faction.culture().ceremonial as f32 / 255.0) * 0.35
             + (1.0 / (1.0 + home_d * 0.05)) * 0.2,
-        market: 0.3 + heat * 0.9 + (faction.culture.mercantile as f32 / 255.0) * 0.3,
+        market: 0.3 + heat * 0.9 + (faction.culture().mercantile as f32 / 255.0) * 0.3,
     };
     if settlement.peak_population < 10 {
         s.market *= 0.25;
@@ -3282,14 +3502,18 @@ fn current_ag_tile_count(brain: &SettlementBrain) -> u32 {
         .sum()
 }
 
-fn parcel_targets(
-    faction: &FactionData,
+fn parcel_targets<F: SurveyFactionView>(
+    faction: &F,
     settlement: &Settlement,
     phase: SettlementPhase,
     current_ag_tiles: u32,
 ) -> AHashMap<DistrictKind, usize> {
-    let members = faction.member_count.max(settlement.peak_population).max(1) as usize;
-    let era = current_era(&faction.techs);
+    let members = faction
+        .member_count()
+        .max(settlement.peak_population)
+        .max(1) as usize;
+    let techs = faction.techs();
+    let era = current_era(&techs);
     let mut targets = AHashMap::default();
 
     targets.insert(DistrictKind::Civic, 1);
@@ -3302,7 +3526,7 @@ fn parcel_targets(
         // which is plantable Cropland in the new mosaic).
         let food_tiles = ((members as u32) * 16) / 4; // 16 grain/person/year, 4 grain/tile/year
         let labor_tiles = (((members as u32) * 60) / 100).saturating_mul(24);
-        let grain_seed_stock = faction.storage.seed_total();
+        let grain_seed_stock = faction.seed_total();
         // Don't let the seed budget shrink below tiles already in production
         // — each grain harvest yields its seed cofactor, so an active field
         // is self-sustaining once it ran its first cycle. The 32-tile floor
@@ -3322,7 +3546,7 @@ fn parcel_targets(
         targets.insert(DistrictKind::Sacred, 2);
     }
     if faction.community_has(LONG_DIST_TRADE) {
-        let market_target = if faction.culture.mercantile > 180 {
+        let market_target = if faction.culture().mercantile > 180 {
             2
         } else {
             1
@@ -3476,16 +3700,15 @@ fn distance_to_road_network(
     best
 }
 
-fn maybe_queue_desire_path(
+fn desire_path_push(
     brain: &mut SettlementBrain,
     home: (i32, i32),
     faction_id: u32,
     tick: u64,
     chunk_map: &ChunkMap,
-    road_queue: &mut RoadCarveQueue,
-) {
+) -> Option<(u32, (i32, i32), (i32, i32))> {
     if tick.saturating_sub(brain.last_path_carve_tick) < DESIRE_PATH_INTERVAL {
-        return;
+        return None;
     }
     let Some((&tile, &_heat)) = brain
         .traffic_heat
@@ -3493,10 +3716,10 @@ fn maybe_queue_desire_path(
         .filter(|(tile, heat)| **heat >= 80 && cheb(**tile, home) >= 6)
         .max_by_key(|(_, heat)| **heat)
     else {
-        return;
+        return None;
     };
     if road_near(chunk_map, tile, 3) {
-        return;
+        return None;
     }
     // Never run a desire path through a farm field. The carve chokepoint
     // (`road_carve_system`) would skip the tilled tiles anyway, but dropping
@@ -3507,10 +3730,10 @@ fn maybe_queue_desire_path(
         .filter(|p| p.district_hint == Some(DistrictKind::Agricultural))
         .any(|p| p.rect().contains(tile.0, tile.1))
     {
-        return;
+        return None;
     }
-    road_queue.0.push((faction_id, tile, home));
     brain.last_path_carve_tick = tick;
+    Some((faction_id, tile, home))
 }
 
 fn road_near(chunk_map: &ChunkMap, tile: (i32, i32), radius: i32) -> bool {
@@ -3738,9 +3961,9 @@ fn organic_street_spine(faction: &FactionData, brain: &SettlementBrain) -> Stree
     }
 }
 
-fn layout_hash(faction: &FactionData, brain: &SettlementBrain) -> u64 {
+fn layout_hash<F: SurveyFactionView>(faction: &F, brain: &SettlementBrain) -> u64 {
     let phase = brain.phase as u64;
-    let pop_bucket = (faction.member_count / 5) as u64;
+    let pop_bucket = (faction.member_count() / 5) as u64;
     let road_hash = brain
         .road_segments
         .iter()
@@ -3750,8 +3973,8 @@ fn layout_hash(faction: &FactionData, brain: &SettlementBrain) -> u64 {
         ^ (pop_bucket << 48)
         ^ ((brain.parcels.len() as u64).min(255) << 40)
         ^ road_hash.rotate_left(7)
-        ^ ((faction.culture.density as u64) << 24)
-        ^ ((faction.culture.defensive as u64) << 16)
+        ^ ((faction.culture().density as u64) << 24)
+        ^ ((faction.culture().defensive as u64) << 16)
 }
 
 fn segment_hash(seg: StreetSegment) -> u64 {
@@ -4345,8 +4568,8 @@ mod tests {
     /// are pure on `(faction, brain, chunk_map, member_offsets)`. Calling
     /// them twice with the same inputs must produce identical outputs —
     /// this is the determinism guarantee that lets the OnEnter kickoff
-    /// survey and the FixedUpdate runtime survey share the same body and
-    /// converge on the same brain.
+    /// survey and the FixedUpdate async survey compute converge on the
+    /// same brain.
     #[test]
     fn survey_subfunctions_are_deterministic() {
         let mut faction = dummy_faction((0, 0), 16);

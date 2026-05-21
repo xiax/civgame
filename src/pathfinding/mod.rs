@@ -24,6 +24,7 @@ impl Plugin for PathfindingPlugin {
             .insert_resource(chunk_graph::GraphDirty::default())
             .insert_resource(chunk_graph::GraphRebuildTask::default())
             .insert_resource(connectivity::ChunkConnectivity::default())
+            .insert_resource(connectivity::ConnectivityRebuildTask::default())
             .insert_resource(chunk_router::ChunkRouter::default())
             .insert_resource(hotspots::HotspotFlowFields::default())
             .insert_resource(pool::AStarPool::default())
@@ -31,6 +32,8 @@ impl Plugin for PathfindingPlugin {
             .insert_resource(path_request::PathDebugFlags::default())
             .insert_resource(path_request::FailureLog::default())
             .insert_resource(worker::PathfindingDiagnostics::default())
+            .init_resource::<crate::simulation::perf::PerfWorkBudget>()
+            .init_resource::<crate::simulation::perf::BackgroundWorkDiagnostics>()
             .add_event::<path_request::PathReady>()
             .add_event::<path_request::PathFailed>()
             // Sync full rebuild fires when ChunkMap first gets populated.
@@ -46,7 +49,14 @@ impl Plugin for PathfindingPlugin {
                         .after(chunk_graph::startup_initial_build_system),
                 ),
             )
-            .add_systems(PreUpdate, chunk_graph::poll_rebuild_task_system)
+            .add_systems(
+                PreUpdate,
+                (
+                    chunk_graph::poll_rebuild_task_system,
+                    connectivity::poll_connectivity_rebuild_task_system
+                        .after(chunk_graph::poll_rebuild_task_system),
+                ),
+            )
             // Path drain lives on FixedUpdate so its budget scales with
             // sim speed (more `Time<Virtual>` ticks per real second at
             // higher speeds). Runs before `SimulationSet::Sequential` so
@@ -65,7 +75,7 @@ impl Plugin for PathfindingPlugin {
                         .after(invalidate_pathing_on_tile_change_system),
                     chunk_graph::spawn_rebuild_task_system
                         .after(chunk_graph::enqueue_graph_dirty_system),
-                    connectivity::rebuild_connectivity_system
+                    connectivity::spawn_connectivity_rebuild_task_system
                         .run_if(connectivity_needs_rebuild)
                         .after(chunk_graph::spawn_rebuild_task_system),
                     hotspots::rebuild_dirty_hotspots_system
@@ -93,13 +103,15 @@ fn connectivity_needs_rebuild(
 fn invalidate_pathing_on_tile_change_system(
     mut events: EventReader<TileChangedEvent>,
     mut hotspots: ResMut<hotspots::HotspotFlowFields>,
+    mut perf: ResMut<crate::simulation::perf::BackgroundWorkDiagnostics>,
 ) {
+    let mut chunks: ahash::AHashSet<ChunkCoord> = ahash::AHashSet::new();
     for ev in events.read() {
         let coord = ChunkCoord(
             (ev.tx as i32).div_euclid(CHUNK_SIZE as i32),
             (ev.ty as i32).div_euclid(CHUNK_SIZE as i32),
         );
-        hotspots.invalidate_chunk(coord);
+        chunks.insert(coord);
         for (dx, dy) in &[
             (-1, -1),
             (-1, 0),
@@ -110,7 +122,11 @@ fn invalidate_pathing_on_tile_change_system(
             (1, 0),
             (1, 1),
         ] {
-            hotspots.invalidate_chunk(ChunkCoord(coord.0 + dx, coord.1 + dy));
+            chunks.insert(ChunkCoord(coord.0 + dx, coord.1 + dy));
         }
+    }
+    perf.tile_change_chunks_last_tick = chunks.len().min(u32::MAX as usize) as u32;
+    for coord in chunks {
+        hotspots.invalidate_chunk(coord);
     }
 }

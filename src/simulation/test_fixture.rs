@@ -7385,6 +7385,7 @@ mod smoke {
                     faction_id: sim.player_faction_id,
                     shaft_tile: tile,
                     bottom_z: 0,
+                    surf_z: 0,
                 },
                 Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
                 GlobalTransform::default(),

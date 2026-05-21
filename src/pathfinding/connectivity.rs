@@ -15,8 +15,11 @@
 
 use ahash::AHashMap;
 use bevy::prelude::*;
+use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
+use std::time::Instant;
 
-use crate::pathfinding::chunk_graph::{ChunkGraph, ComponentId};
+use crate::pathfinding::chunk_graph::{ChunkComponents, ChunkEdge, ChunkGraph, ComponentId};
+use crate::simulation::perf::{micros_u32, BackgroundWorkDiagnostics};
 use crate::world::chunk::{ChunkCoord, CHUNK_SIZE};
 
 /// Coarse z-band used by debug visualisations to slice the world for
@@ -54,6 +57,25 @@ pub struct ChunkConnectivity {
     overlay_entries: Vec<(ChunkCoord, ZBand, u32)>,
     pub generation: u32,
 }
+
+struct ConnectivityGraphSnapshot {
+    edges: AHashMap<ChunkCoord, Vec<ChunkEdge>>,
+    components: AHashMap<ChunkCoord, ChunkComponents>,
+    generation: u32,
+}
+
+struct ConnectivityRebuildResult {
+    cc_at_z: AHashMap<(ChunkCoord, i8), Vec<u32>>,
+    cc_by_component: AHashMap<(ChunkCoord, ComponentId), u32>,
+    cc_total_nodes: usize,
+    cc_distinct: usize,
+    overlay_entries: Vec<(ChunkCoord, ZBand, u32)>,
+    generation: u32,
+    elapsed: std::time::Duration,
+}
+
+#[derive(Resource, Default)]
+pub struct ConnectivityRebuildTask(Option<Task<ConnectivityRebuildResult>>);
 
 impl ChunkConnectivity {
     pub fn is_reachable(&self, from: (ChunkCoord, i8), to: (ChunkCoord, i8)) -> bool {
@@ -131,6 +153,9 @@ impl ChunkConnectivity {
         to: (i32, i32, i8),
     ) -> bool {
         if from == to {
+            return true;
+        }
+        if self.generation != graph.generation {
             return true;
         }
         let csz = CHUNK_SIZE as i32;
@@ -286,6 +311,88 @@ pub fn populate_connectivity_from_graph(graph: &ChunkGraph, conn: &mut ChunkConn
 
 pub fn rebuild_connectivity_system(graph: Res<ChunkGraph>, mut conn: ResMut<ChunkConnectivity>) {
     populate_connectivity_from_graph(&graph, &mut conn);
+}
+
+pub fn spawn_connectivity_rebuild_task_system(
+    graph: Res<ChunkGraph>,
+    conn: Res<ChunkConnectivity>,
+    mut task: ResMut<ConnectivityRebuildTask>,
+    mut perf: ResMut<BackgroundWorkDiagnostics>,
+) {
+    perf.connectivity_in_flight = task.0.is_some();
+    perf.connectivity_generation = conn.generation;
+    if task.0.is_some() || graph.generation == conn.generation {
+        return;
+    }
+
+    let snapshot = ConnectivityGraphSnapshot {
+        edges: graph.edges.clone(),
+        components: graph.components.clone(),
+        generation: graph.generation,
+    };
+    let pool = AsyncComputeTaskPool::get();
+    task.0 = Some(pool.spawn(async move { rebuild_connectivity_offthread(snapshot) }));
+    perf.connectivity_in_flight = true;
+}
+
+pub fn poll_connectivity_rebuild_task_system(
+    graph: Res<ChunkGraph>,
+    mut conn: ResMut<ChunkConnectivity>,
+    mut task: ResMut<ConnectivityRebuildTask>,
+    mut perf: ResMut<BackgroundWorkDiagnostics>,
+) {
+    let Some(t) = task.0.as_mut() else {
+        perf.connectivity_in_flight = false;
+        perf.connectivity_generation = conn.generation;
+        return;
+    };
+    let Some(result) = block_on(future::poll_once(t)) else {
+        perf.connectivity_in_flight = true;
+        perf.connectivity_generation = conn.generation;
+        return;
+    };
+    task.0 = None;
+    perf.connectivity_in_flight = false;
+
+    if result.generation != graph.generation {
+        perf.connectivity_dropped_stale = perf.connectivity_dropped_stale.saturating_add(1);
+        perf.connectivity_compute_us = micros_u32(result.elapsed);
+        perf.connectivity_generation = conn.generation;
+        return;
+    }
+
+    let apply_started = Instant::now();
+    conn.cc_at_z = result.cc_at_z;
+    conn.cc_by_component = result.cc_by_component;
+    conn.cc_total_nodes = result.cc_total_nodes;
+    conn.cc_distinct = result.cc_distinct;
+    conn.overlay_entries = result.overlay_entries;
+    conn.generation = result.generation;
+    perf.connectivity_compute_us = micros_u32(result.elapsed);
+    perf.connectivity_apply_us = micros_u32(apply_started.elapsed());
+    perf.connectivity_generation = conn.generation;
+}
+
+fn rebuild_connectivity_offthread(
+    snapshot: ConnectivityGraphSnapshot,
+) -> ConnectivityRebuildResult {
+    let started = Instant::now();
+    let graph = ChunkGraph {
+        edges: snapshot.edges,
+        components: snapshot.components,
+        generation: snapshot.generation,
+    };
+    let mut conn = ChunkConnectivity::default();
+    populate_connectivity_from_graph(&graph, &mut conn);
+    ConnectivityRebuildResult {
+        cc_at_z: conn.cc_at_z,
+        cc_by_component: conn.cc_by_component,
+        cc_total_nodes: conn.cc_total_nodes,
+        cc_distinct: conn.cc_distinct,
+        overlay_entries: conn.overlay_entries,
+        generation: snapshot.generation,
+        elapsed: started.elapsed(),
+    }
 }
 
 #[cfg(test)]

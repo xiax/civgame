@@ -57,8 +57,12 @@ impl Plugin for WorldPlugin {
             .insert_resource(spatial::SpatialIndex::default())
             .insert_resource(seasons::Calendar::default())
             .insert_resource(chunk_streaming::ChunkRetention::default())
+            .insert_resource(chunk_streaming::PendingChunkStreams::default())
+            .insert_resource(chunk_streaming::PendingTileRefreshes::default())
             .insert_resource(water_runtime::RuntimeWater::default())
             .insert_resource(water_runtime::WaterSim::default())
+            .init_resource::<crate::simulation::perf::PerfWorkBudget>()
+            .init_resource::<crate::simulation::perf::BackgroundWorkDiagnostics>()
             .add_event::<chunk_streaming::TileChangedEvent>()
             .add_event::<chunk_streaming::TileCarvedEvent>()
             .add_event::<chunk_streaming::ChunkLoadedEvent>()
@@ -84,7 +88,15 @@ impl Plugin for WorldPlugin {
             // `TileChangedEvent`s it emits.
             .add_systems(
                 FixedUpdate,
-                water_runtime::restamp_runtime_water_on_chunk_load
+                (
+                    // Re-carve dug well stepwell geometry (shaft + helix) lost
+                    // when a footprint chunk regenerated, then re-apply the
+                    // `RuntimeWater` columns + Bridge/Dam tiles. Chained so the
+                    // water restamp stamps onto the just-re-carved shaft.
+                    crate::simulation::well::restamp_wells_on_chunk_load,
+                    water_runtime::restamp_runtime_water_on_chunk_load,
+                )
+                    .chain()
                     .after(chunk_streaming::chunk_streaming_system)
                     .run_if(in_state(crate::GameState::Playing)),
             )

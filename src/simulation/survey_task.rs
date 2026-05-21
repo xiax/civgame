@@ -1,48 +1,28 @@
 //! Background-survey infrastructure for `SettlementBrain`.
 //!
-//! ## Status
-//!
-//! **Shipped:** snapshot types (`ChunkSnapshot`, `MapsSnapshot`,
-//! `FactionSnapshot`, `MemberOffsets`) and a *cursor-paced* survey driver
-//! (`survey_cursor_system`) that processes **one settlement per tick** at
-//! the same `SURVEY_INTERVAL = 120` cadence. The legacy
-//! `settlement_survey_system` swept *every* settlement on a single tick;
-//! that produced visible tick-CPU spikes once 5+ settlements were live.
-//! Cursor pacing flattens the spike to constant per-tick cost.
-//!
-//! **Deferred:** wiring the snapshot types through `run_survey` as a pure
-//! function spawned on `AsyncComputeTaskPool`. That requires refactoring
-//! ~15 helpers in `organic_settlement.rs` (`collect_anchors`,
-//! `build_districts`, `build_road_network`, `build_parcels`,
-//! `build_frontier`, `accumulate_traffic`, `maybe_queue_desire_path`, plus
-//! their downstream callees) to accept `&ChunkSnapshot` / `&MapsSnapshot`
-//! instead of `&ChunkMap` / `&OrganicStructureMaps`. The snapshot types
-//! below are the public API surface that refactor will target — once
-//! every helper takes them, swap `survey_cursor_system`'s body for a
-//! `AsyncComputeTaskPool::spawn(async move { run_survey(input) })` plus a
-//! `survey_completion_system` polling loop. See module footnote for the
-//! exact migration steps.
-//!
-//! Why deliver pacing now: the actual user-visible goal is "survey latency
-//! invisible in tick CPU." Cursor pacing achieves that with a 50-line
-//! change. The async architecture is a bigger refactor that lets multiple
-//! settlements survey in parallel — a strict win, but not on the critical
-//! path for the original "spike-free game start" complaint.
+//! Surveys now run as a declarative async pipeline: the main thread captures
+//! a bounded terrain/structure/member/faction snapshot, `AsyncComputeTaskPool`
+//! computes a `SettlementBrain` + road-queue pushes, and the main thread
+//! validates and applies at most `PerfWorkBudget::settlement_plan_applies_per_tick`
+//! ready results per tick.
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use bevy::prelude::*;
+use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
-use crate::simulation::archetype::FactionCapabilities;
 use crate::simulation::construction::RoadCarveQueue;
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
 use crate::simulation::organic_settlement::{
-    survey_one_settlement, OrganicStructureMaps, SettlementBrain, SettlementBrains,
-    SettlementParcelIndex,
+    compute_settlement_survey, OrganicStructureMaps, SettlementBrains, SettlementParcelIndex,
+    SettlementSurveyDiff, SettlementSurveyInput, SurveyFactionSnapshot, SurveyStructureSnapshot,
 };
+use crate::simulation::perf::{micros_u32, BackgroundWorkDiagnostics, PerfWorkBudget};
 use crate::simulation::schedule::SimClock;
 use crate::simulation::settlement::{Settlement, SettlementId};
-use crate::world::chunk::ChunkMap;
-use crate::world::tile::TileKind;
+use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
+use crate::world::terrain::world_to_tile;
 
 /// Half-side of the survey window (chebyshev tiles around the settlement
 /// home tile). Must be ≥ `road_network_radius(Urban) ≈ 24` plus a healthy
@@ -50,179 +30,32 @@ use crate::world::tile::TileKind;
 /// snapshot builders below.
 pub const SURVEY_WINDOW: i32 = 64;
 
-/// Cadence for survey passes. One settlement is processed per *cursor
-/// tick*; the cursor advances every tick the simulation runs, so a faction
-/// with N settled villages re-surveys each one every `N * 1` ticks. With
-/// the typical 1–4 settled factions × 1 settlement each, this is
-/// indistinguishable from the legacy 120-tick cadence.
+/// Chunk-map clone radius for async survey compute. Parcel belt allocation
+/// can look farther than the anchor/structure window when a large built-up
+/// footprint pushes fields outward, so the terrain snapshot is wider than
+/// `SURVEY_WINDOW` while still bounded.
+pub const SURVEY_TERRAIN_WINDOW: i32 = 192;
+
+/// Cadence for survey passes. The scheduler advances one settlement every
+/// `(ASYNC_SURVEY_INTERVAL / eligible_settlements).max(1)` ticks so each
+/// eligible settlement is attempted about once per legacy 120-tick window.
 pub const ASYNC_SURVEY_INTERVAL: u64 = 120;
 
-/// Read-only window over `ChunkMap` covering tiles within `SURVEY_WINDOW` of
-/// a settlement. Only stores the four fields the survey helpers consume —
-/// keeps the snapshot cheap to build and small enough to ship through a
-/// task without taxing memory pressure.
-///
-/// Public API surface for the future async survey: helpers will be
-/// refactored to take `&ChunkSnapshot` instead of `&ChunkMap` so
-/// `run_survey` can run off-thread on `AsyncComputeTaskPool`.
-pub struct ChunkSnapshot {
-    /// Sparse map keyed by world tile. Tiles outside the window simply
-    /// return `None` from accessors, matching ChunkMap's "chunk not loaded"
-    /// behaviour for unmapped tiles.
-    pub tiles: AHashMap<(i32, i32), CompactTileView>,
-}
+/// Snapshot of all structure-map tiles within the survey window. Kept under
+/// the historical name here; the concrete type lives with the organic survey
+/// code that consumes it.
+pub type MapsSnapshot = SurveyStructureSnapshot;
 
-#[derive(Clone, Copy)]
-pub struct CompactTileView {
-    pub kind: TileKind,
-    pub fertility: u8,
-    pub river_distance: u8,
-    pub surface_z: i8,
-}
-
-impl ChunkSnapshot {
-    /// Snapshot a square window of `2*SURVEY_WINDOW+1` tiles centred on
-    /// `centre`. Uses ChunkMap's per-tile accessors so unloaded chunks are
-    /// silently skipped (tiles in unloaded chunks just don't appear in the
-    /// snapshot).
-    pub fn capture(chunk_map: &ChunkMap, centre: (i32, i32)) -> Self {
-        let half = SURVEY_WINDOW;
-        let mut tiles = AHashMap::with_capacity(((2 * half + 1) * (2 * half + 1)) as usize);
-        for dy in -half..=half {
-            for dx in -half..=half {
-                let tx = centre.0 + dx;
-                let ty = centre.1 + dy;
-                let Some(kind) = chunk_map.tile_kind_at(tx, ty) else {
-                    continue;
-                };
-                let fertility = chunk_map.tile_fertility_at(tx, ty).unwrap_or(0);
-                let river_distance = chunk_map.river_distance_at(tx, ty);
-                let surface_z = chunk_map.surface_z_at(tx, ty) as i8;
-                tiles.insert(
-                    (tx, ty),
-                    CompactTileView {
-                        kind,
-                        fertility,
-                        river_distance,
-                        surface_z,
-                    },
-                );
-            }
-        }
-        Self { tiles }
-    }
-
-    pub fn tile_kind_at(&self, tx: i32, ty: i32) -> Option<TileKind> {
-        self.tiles.get(&(tx, ty)).map(|v| v.kind)
-    }
-
-    pub fn tile_fertility_at(&self, tx: i32, ty: i32) -> Option<u8> {
-        self.tiles.get(&(tx, ty)).map(|v| v.fertility)
-    }
-
-    pub fn river_distance_at(&self, tx: i32, ty: i32) -> u8 {
-        self.tiles
-            .get(&(tx, ty))
-            .map(|v| v.river_distance)
-            .unwrap_or(u8::MAX)
-    }
-
-    pub fn surface_z_at(&self, tx: i32, ty: i32) -> i32 {
-        self.tiles
-            .get(&(tx, ty))
-            .map(|v| v.surface_z as i32)
-            .unwrap_or(crate::world::chunk::Z_MIN - 1)
-    }
-}
-
-/// Snapshot of all structure-map tiles within the survey window. Each map
-/// becomes an `AHashSet<(i32, i32)>` because the survey helpers only ever
-/// call `.contains_key` / `.keys()` on the original maps — they never look
-/// up entities. This keeps the snapshot small and Send-able.
-pub struct MapsSnapshot {
-    pub beds: AHashSet<(i32, i32)>,
-    pub walls: AHashSet<(i32, i32)>,
-    pub campfires: AHashSet<(i32, i32)>,
-    pub doors: AHashSet<(i32, i32)>,
-    pub workbenches: AHashSet<(i32, i32)>,
-    pub looms: AHashSet<(i32, i32)>,
-    pub tables: AHashSet<(i32, i32)>,
-    pub granaries: AHashSet<(i32, i32)>,
-    pub shrines: AHashSet<(i32, i32)>,
-    pub markets: AHashSet<(i32, i32)>,
-    pub barracks: AHashSet<(i32, i32)>,
-    pub monuments: AHashSet<(i32, i32)>,
-    pub structures: AHashSet<(i32, i32)>,
-}
-
-impl MapsSnapshot {
-    /// Capture all tiles within `SURVEY_WINDOW` chebyshev of `centre` from
-    /// each underlying structure map.
-    pub fn capture(maps: &OrganicStructureMaps, centre: (i32, i32)) -> Self {
-        let half = SURVEY_WINDOW;
-        let in_window = |(x, y): &(i32, i32)| -> bool {
-            (x - centre.0).abs() <= half && (y - centre.1).abs() <= half
-        };
-        let pick = |m: &AHashMap<(i32, i32), Entity>| -> AHashSet<(i32, i32)> {
-            m.keys().filter(|t| in_window(t)).copied().collect()
-        };
-        Self {
-            beds: pick(&maps.bed_map.0),
-            walls: pick(&maps.wall_map.0),
-            campfires: pick(&maps.campfire_map.0),
-            doors: maps
-                .door_map
-                .0
-                .keys()
-                .filter(|t| in_window(t))
-                .copied()
-                .collect(),
-            workbenches: pick(&maps.workbench_map.0),
-            looms: pick(&maps.loom_map.0),
-            tables: pick(&maps.table_map.0),
-            granaries: pick(&maps.granary_map.0),
-            shrines: pick(&maps.shrine_map.0),
-            markets: pick(&maps.market_map.0),
-            barracks: pick(&maps.barracks_map.0),
-            monuments: pick(&maps.monument_map.0),
-            structures: maps
-                .structure_index
-                .0
-                .keys()
-                .filter(|t| in_window(t))
-                .copied()
-                .collect(),
-        }
-    }
-}
-
-/// Subset of `FactionData` the survey helpers actually read. Cloned at
-/// scheduler time so the future doesn't borrow the live registry. (Used by
-/// the future async survey; the cursor-paced driver below still reads the
-/// live registry directly.)
-#[derive(Clone)]
-pub struct FactionSnapshot {
-    pub id: u32,
-    pub home_tile: (i32, i32),
-    pub member_count: u32,
-    pub caps: FactionCapabilities,
-    /// Settlement peak population — drives phase scaling.
-    pub peak_population: u32,
-}
-
-/// Per-member tile offset relative to `faction.home_tile`. Captured from
-/// the live transform query at scheduler time so the future can compute
-/// traffic heat / member-offset principal-axis without reading the world.
+/// Per-member tile offset relative to `faction.home_tile`, captured before
+/// the task starts so background survey compute never borrows the ECS world.
 #[derive(Clone)]
 pub struct MemberOffsets {
     pub offsets: Vec<(i32, i32)>,
 }
 
-/// Cursor index into the settlement set. The cursor system processes one
-/// settlement per tick, walking through all loaded settlements over time
-/// and resetting each cycle. This caps per-tick survey cost at one
-/// settlement's worth of work — flat tick CPU instead of the legacy
-/// burst-every-120-ticks pattern.
+/// Cursor index into the settlement set. The scheduler snapshots one
+/// settlement per fire, walking through loaded settlements over time and
+/// resetting each cycle.
 #[derive(Resource, Default)]
 pub struct SurveyCursor {
     /// Index into the sorted `Vec<SettlementId>` we walk each cycle.
@@ -234,39 +67,33 @@ pub struct SurveyCursor {
     pub last_advance_tick: u64,
 }
 
-/// Per-faction in-flight survey marker. Reserved for the future async
-/// implementation — not currently spawned by anything.
-#[derive(Component)]
-pub struct PendingSurvey {
-    pub settlement_id: SettlementId,
+pub struct SettlementSurveyTaskResult {
+    pub diff: SettlementSurveyDiff,
+    pub elapsed: Duration,
 }
 
-/// Tracks which settlements have an in-flight async survey so the
-/// scheduler doesn't double-spawn while a task is still running. Reserved
-/// for the future async implementation.
+/// Async task state for settlement surveys. Tasks compute declarative diffs
+/// off-thread; the main thread later validates and applies a small number of
+/// ready results per tick.
 #[derive(Resource, Default)]
-pub struct InFlightSurveys(pub AHashSet<SettlementId>);
+pub struct SettlementSurveyTaskState {
+    pub tasks: AHashMap<SettlementId, Task<SettlementSurveyTaskResult>>,
+    pub ready: VecDeque<SettlementSurveyTaskResult>,
+}
 
-/// Cursor-paced survey driver. Processes **one settlement per tick** at
-/// `ASYNC_SURVEY_INTERVAL` cadence, calling the same `survey_one_settlement`
-/// body the legacy synchronous path used. Replaces
-/// `settlement_survey_system` (which swept every settlement on a single
-/// tick) so per-tick CPU cost is constant regardless of how many
-/// settlements are loaded.
-///
-/// Settlement order is stable (sorted by `SettlementId`) so the cursor
-/// resumes at the same place across pauses / saves.
-pub fn survey_cursor_system(
+/// Cursor-paced async survey scheduler. It snapshots one eligible settlement
+/// at a time and hands the pure survey compute to `AsyncComputeTaskPool`.
+pub fn schedule_survey_tasks_system(
     clock: Res<SimClock>,
     mut cursor: ResMut<SurveyCursor>,
-    mut brains: ResMut<SettlementBrains>,
-    mut parcel_index: ResMut<SettlementParcelIndex>,
-    mut road_queue: ResMut<RoadCarveQueue>,
+    mut state: ResMut<SettlementSurveyTaskState>,
+    brains: Res<SettlementBrains>,
     settlements: Query<&Settlement>,
     registry: Res<FactionRegistry>,
     chunk_map: Res<ChunkMap>,
     maps: OrganicStructureMaps,
     member_q: Query<(&FactionMember, &Transform)>,
+    mut perf: ResMut<BackgroundWorkDiagnostics>,
 ) {
     // Snapshot eligible settlements in stable order.
     let mut eligible: Vec<&Settlement> = settlements
@@ -305,39 +132,173 @@ pub fn survey_cursor_system(
     let settlement = eligible[cursor.next_index];
     cursor.next_index = (cursor.next_index + 1) % eligible.len();
 
+    if state.tasks.contains_key(&settlement.id)
+        || state
+            .ready
+            .iter()
+            .any(|ready| ready.diff.settlement_id == settlement.id)
+    {
+        update_survey_diagnostics(&state, &mut perf);
+        return;
+    }
+
     let Some(faction) = registry.factions.get(&settlement.owner_faction) else {
         return;
     };
-    survey_one_settlement(
-        settlement,
-        faction,
-        clock.tick,
-        &mut brains,
-        &mut road_queue,
-        &chunk_map,
-        &maps,
-        &member_q,
-    );
-    parcel_index.rebuild(&brains);
+    let terrain_snapshot = clone_chunk_window(&chunk_map, faction.home_tile);
+    let snapshot_chunks = terrain_snapshot.0.len();
+    let input = SettlementSurveyInput {
+        settlement: settlement.clone(),
+        faction: SurveyFactionSnapshot::from_faction(faction),
+        tick: clock.tick,
+        prior_brain: brains.0.get(&settlement.id).cloned(),
+        chunk_map: terrain_snapshot,
+        maps: MapsSnapshot::capture(&maps, faction.home_tile),
+        member_offsets: snapshot_member_offsets(
+            faction.home_tile,
+            settlement.owner_faction,
+            &member_q,
+        )
+        .offsets,
+        snapshot_chunks,
+    };
+    let pool = AsyncComputeTaskPool::get();
+    let task = pool.spawn(async move {
+        let started = Instant::now();
+        let diff = compute_settlement_survey(input);
+        SettlementSurveyTaskResult {
+            diff,
+            elapsed: started.elapsed(),
+        }
+    });
+    state.tasks.insert(settlement.id, task);
+    perf.settlement_survey_snapshot_chunks = snapshot_chunks.min(u32::MAX as usize) as u32;
+    update_survey_diagnostics(&state, &mut perf);
 }
 
-/// Helper: build a `FactionSnapshot` from live faction state at scheduler
-/// time. Reserved for the future async implementation.
-pub fn snapshot_faction(
+pub fn poll_survey_tasks_system(
+    mut state: ResMut<SettlementSurveyTaskState>,
+    mut perf: ResMut<BackgroundWorkDiagnostics>,
+) {
+    let ids: Vec<SettlementId> = state.tasks.keys().copied().collect();
+    let mut completed = Vec::new();
+    for id in ids {
+        let Some(task) = state.tasks.get_mut(&id) else {
+            continue;
+        };
+        if let Some(result) = block_on(future::poll_once(task)) {
+            completed.push((id, result));
+        }
+    }
+
+    for (id, result) in completed {
+        state.tasks.remove(&id);
+        perf.settlement_survey_compute_us = micros_u32(result.elapsed);
+        perf.settlement_survey_snapshot_chunks =
+            result.diff.snapshot_chunks.min(u32::MAX as usize) as u32;
+        state.ready.push_back(result);
+    }
+    update_survey_diagnostics(&state, &mut perf);
+}
+
+pub fn apply_survey_results_system(
+    mut state: ResMut<SettlementSurveyTaskState>,
+    mut brains: ResMut<SettlementBrains>,
+    mut parcel_index: ResMut<SettlementParcelIndex>,
+    mut road_queue: ResMut<RoadCarveQueue>,
+    settlements: Query<&Settlement>,
+    registry: Res<FactionRegistry>,
+    budget: Res<PerfWorkBudget>,
+    mut perf: ResMut<BackgroundWorkDiagnostics>,
+) {
+    let started = Instant::now();
+    let mut applied = 0u32;
+    let max_results = budget.settlement_plan_applies_per_tick.max(1);
+
+    for _ in 0..max_results {
+        let Some(result) = state.ready.pop_front() else {
+            break;
+        };
+        if !survey_result_is_current(&result.diff, &settlements, &registry) {
+            perf.settlement_survey_dropped_stale =
+                perf.settlement_survey_dropped_stale.saturating_add(1);
+            continue;
+        }
+        for road_push in &result.diff.road_pushes {
+            road_queue.0.push(*road_push);
+        }
+        brains
+            .0
+            .insert(result.diff.settlement_id, result.diff.brain);
+        applied = applied.saturating_add(1);
+    }
+
+    if applied > 0 {
+        parcel_index.rebuild(&brains);
+    }
+    perf.settlement_surveys_applied_last_tick = applied;
+    perf.settlement_survey_apply_us = micros_u32(started.elapsed());
+    update_survey_diagnostics(&state, &mut perf);
+}
+
+fn update_survey_diagnostics(
+    state: &SettlementSurveyTaskState,
+    perf: &mut BackgroundWorkDiagnostics,
+) {
+    perf.settlement_survey_in_flight = !state.tasks.is_empty();
+    perf.settlement_planner_backlog =
+        (state.tasks.len() + state.ready.len()).min(u32::MAX as usize) as u32;
+}
+
+fn survey_result_is_current(
+    diff: &SettlementSurveyDiff,
+    settlements: &Query<&Settlement>,
+    registry: &FactionRegistry,
+) -> bool {
+    let Some(settlement) = settlements
+        .iter()
+        .find(|settlement| settlement.id == diff.settlement_id)
+    else {
+        return false;
+    };
+    let Some(faction) = registry.factions.get(&diff.owner_faction) else {
+        return false;
+    };
+    survey_result_matches_live(diff, settlement, faction)
+}
+
+fn survey_result_matches_live(
+    diff: &SettlementSurveyDiff,
     settlement: &Settlement,
     faction: &crate::simulation::faction::FactionData,
-) -> FactionSnapshot {
-    FactionSnapshot {
-        id: settlement.owner_faction,
-        home_tile: faction.home_tile,
-        member_count: faction.member_count,
-        caps: faction.caps.clone(),
-        peak_population: settlement.peak_population,
+) -> bool {
+    if settlement.owner_faction != diff.owner_faction
+        || settlement.peak_population != diff.peak_population
+    {
+        return false;
     }
+    diff.owner_faction != SOLO
+        && faction.home_tile == diff.faction_home_tile
+        && faction.caps.settlement.is_full_settlement()
+}
+
+pub fn clone_chunk_window(chunk_map: &ChunkMap, centre: (i32, i32)) -> ChunkMap {
+    let centre_coord = ChunkCoord(
+        centre.0.div_euclid(CHUNK_SIZE as i32),
+        centre.1.div_euclid(CHUNK_SIZE as i32),
+    );
+    let radius_chunks =
+        (SURVEY_TERRAIN_WINDOW + CHUNK_SIZE as i32 - 1).div_euclid(CHUNK_SIZE as i32);
+    let mut out = ChunkMap::default();
+    for (&coord, chunk) in &chunk_map.0 {
+        if coord.chebyshev_dist(centre_coord) <= radius_chunks {
+            out.0.insert(coord, chunk.clone());
+        }
+    }
+    out
 }
 
 /// Helper: capture per-member tile offsets from a live transform query.
-/// Reserved for the future async implementation.
 pub fn snapshot_member_offsets(
     home: (i32, i32),
     owner_faction: u32,
@@ -349,29 +310,17 @@ pub fn snapshot_member_offsets(
         if m.faction_id != owner_faction {
             continue;
         }
-        let tx = (t.translation.x / crate::world::terrain::TILE_SIZE).round() as i32;
-        let ty = (t.translation.y / crate::world::terrain::TILE_SIZE).round() as i32;
+        let (tx, ty) = world_to_tile(t.translation.truncate());
         offsets.push((tx - hx, ty - hy));
     }
     MemberOffsets { offsets }
 }
 
-#[allow(dead_code)]
-fn _placeholder_for_run_survey(
-    _chunk: &ChunkSnapshot,
-    _maps: &MapsSnapshot,
-    _faction: &FactionSnapshot,
-    _members: &MemberOffsets,
-    _prior_brain: Option<&SettlementBrain>,
-) {
-    // Intentionally empty: the future async pipeline lands here once the
-    // organic_settlement helpers take snapshot types. Keeps the snapshot
-    // types Send/Sync-correct against the public API.
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::economy::market::SettlementMarket;
+    use crate::simulation::organic_settlement::SettlementBrain;
 
     #[test]
     fn cursor_pacing_spreads_one_settlement_per_advance() {
@@ -396,73 +345,65 @@ mod tests {
     }
 
     #[test]
-    fn chunk_snapshot_returns_none_outside_window() {
-        // Empty snapshot → every probe returns the unloaded sentinel.
-        let snap = ChunkSnapshot {
-            tiles: AHashMap::new(),
-        };
-        assert!(snap.tile_kind_at(0, 0).is_none());
-        assert!(snap.tile_fertility_at(0, 0).is_none());
-        assert_eq!(snap.river_distance_at(0, 0), u8::MAX);
-        assert_eq!(snap.surface_z_at(0, 0), crate::world::chunk::Z_MIN - 1);
+    fn clone_chunk_window_empty_map_stays_empty() {
+        let map = ChunkMap::default();
+        let snap = clone_chunk_window(&map, (0, 0));
+        assert!(snap.0.is_empty());
     }
 
     #[test]
-    fn chunk_snapshot_returns_stored_values() {
-        let mut tiles = AHashMap::new();
-        tiles.insert(
-            (3, 4),
-            CompactTileView {
-                kind: TileKind::Grass,
-                fertility: 200,
-                river_distance: 5,
-                surface_z: 7,
-            },
-        );
-        let snap = ChunkSnapshot { tiles };
-        assert_eq!(snap.tile_kind_at(3, 4), Some(TileKind::Grass));
-        assert_eq!(snap.tile_fertility_at(3, 4), Some(200));
-        assert_eq!(snap.river_distance_at(3, 4), 5);
-        assert_eq!(snap.surface_z_at(3, 4), 7);
-        // Adjacent tile not stored: returns sentinel.
-        assert!(snap.tile_kind_at(3, 5).is_none());
+    fn stale_survey_result_rejected_when_peak_population_changed() {
+        let mut registry = FactionRegistry::default();
+        let faction_id = registry.create_faction((4, 5));
+        let faction = registry.factions.get(&faction_id).unwrap();
+        let settlement = Settlement {
+            id: SettlementId(7),
+            owner_faction: faction_id,
+            market_tile: (4, 5),
+            founding_tick: 0,
+            name: "test".to_string(),
+            treasury: 0.0,
+            market: SettlementMarket::default(),
+            peak_population: 12,
+        };
+        let diff = SettlementSurveyDiff {
+            settlement_id: settlement.id,
+            owner_faction: faction_id,
+            faction_home_tile: faction.home_tile,
+            peak_population: 11,
+            tick: 1,
+            brain: SettlementBrain::new(settlement.id, faction_id, 123),
+            road_pushes: Vec::new(),
+            snapshot_chunks: 0,
+        };
+        assert!(!survey_result_matches_live(&diff, &settlement, faction));
+    }
+
+    #[test]
+    fn current_survey_result_is_accepted() {
+        let mut registry = FactionRegistry::default();
+        let faction_id = registry.create_faction((4, 5));
+        let faction = registry.factions.get(&faction_id).unwrap();
+        let settlement = Settlement {
+            id: SettlementId(7),
+            owner_faction: faction_id,
+            market_tile: (4, 5),
+            founding_tick: 0,
+            name: "test".to_string(),
+            treasury: 0.0,
+            market: SettlementMarket::default(),
+            peak_population: 12,
+        };
+        let diff = SettlementSurveyDiff {
+            settlement_id: settlement.id,
+            owner_faction: faction_id,
+            faction_home_tile: faction.home_tile,
+            peak_population: settlement.peak_population,
+            tick: 1,
+            brain: SettlementBrain::new(settlement.id, faction_id, 123),
+            road_pushes: Vec::new(),
+            snapshot_chunks: 0,
+        };
+        assert!(survey_result_matches_live(&diff, &settlement, faction));
     }
 }
-
-// ── Migration plan for the full async pipeline (deferred) ────────────────
-//
-// To finish the async refactor:
-//
-// 1. Refactor each survey helper in `organic_settlement.rs` to take
-//    `&ChunkSnapshot` instead of `&ChunkMap` and `&MapsSnapshot` instead
-//    of `&OrganicStructureMaps`. Helpers to migrate:
-//      collect_anchors / build_districts / accumulate_traffic /
-//      collect_member_offsets / build_road_network / build_frontier /
-//      build_parcels / maybe_queue_desire_path / layout_hash
-//    and every helper they recursively call (e.g. `is_clear_for_anchor`,
-//    `score_water`, `find_unfilled_civic_zone_tile`, `next_clear_tile`).
-//
-// 2. Replace `survey_one_settlement` body with snapshot-driven calls and
-//    return a pure `SurveyOutput { brain, road_queue_pushes }`.
-//
-// 3. Wrap the body in `run_survey(input: SurveyInput) -> SurveyOutput`
-//    in this module; the function must be `Send + 'static`.
-//
-// 4. Add a `survey_scheduler_system` that builds snapshots and spawns
-//    `AsyncComputeTaskPool::get().spawn(async move { run_survey(input) })`,
-//    inserting `PendingSurvey { task, settlement_id }` markers and
-//    pushing into `InFlightSurveys`.
-//
-// 5. Add a `survey_completion_system` that polls `Task<SurveyOutput>`
-//    via `block_on(future::poll_once(&mut task))`, applies the result
-//    to `SettlementBrains`, drains `road_queue_pushes` into
-//    `RoadCarveQueue`, despawns the marker, and clears `InFlightSurveys`.
-//
-// 6. Replace `survey_cursor_system` registration in `simulation/mod.rs`
-//    with the scheduler+completion pair. Delete `survey_cursor_system`
-//    and `SurveyCursor`.
-//
-// 7. Update `kickoff_initial_survey_system` to call `run_survey`
-//    synchronously (no spawn) so the OnEnter pass produces brains before
-//    `seed_starting_buildings_system` reads them — same as the cursor
-//    path today.

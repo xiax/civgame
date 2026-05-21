@@ -157,5 +157,9 @@ X - Farming doesn't need the technology to be adopted by the faction, if either 
 
 Fix gap in survive goal for hunger and drink when no tasks under the goal meet requirements
 
+Not making a tile cropland when seeding because its fertility doesn't meet some arbitrary requirement doesn't make sense from a realism perspective. Why would people just leave some land in the middle of their farm empty?
+
+Import new animal sprites
+
 
 

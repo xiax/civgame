@@ -140,6 +140,11 @@ pub struct Well {
     pub shaft_tile: (i32, i32),
     /// Z of the carved shaft sump (one below the water table).
     pub bottom_z: i8,
+    /// Z of the original ground surface at the shaft tile. With `bottom_z`
+    /// this is the durable truth for the dug stepwell geometry — read by
+    /// `well::restamp_wells_on_chunk_load` to re-carve the shaft + helix
+    /// after a footprint chunk streams back in.
+    pub surf_z: i8,
 }
 
 /// Constructed timber span. The tile slot is mutated to `TileKind::Bridge`
@@ -6778,6 +6783,7 @@ pub fn construction_system(
                                 faction_id: bp.faction_id,
                                 shaft_tile: tile,
                                 bottom_z: bp.target_z,
+                                surf_z: bp.target_z,
                             },
                             StructureLabel(BuildSiteKind::Well.label()),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
@@ -7969,7 +7975,11 @@ fn spawn_seeded_structure_at_tile(
             // Seed wells are pre-existing infrastructure — skip the multi-phase
             // worker pipeline and stamp a finished, water-bearing well: charge
             // the physical `RuntimeWater` column so the well is drinkable from
-            // tick 0. The descent shaft is not carved (a seed simplification).
+            // tick 0. The visible stepwell shaft + helix are carved by the
+            // OnEnter `well::carve_seeded_wells_system` pass (it has the
+            // `WorldGen`/`Globe` the carve primitive needs); depth here stays a
+            // fixed shallow `surf - 3` seed simplification rather than an
+            // aquifer-derived `well_spec_at` resolve.
             let surf = _chunk_map.surface_z_at(tile.0, tile.1).clamp(-16, 15) as i8;
             let bottom_z = (surf as i32 - 3).clamp(-16, 15) as i8;
             maps.runtime_water.set(
@@ -7988,6 +7998,7 @@ fn spawn_seeded_structure_at_tile(
                         faction_id,
                         shaft_tile: tile,
                         bottom_z,
+                        surf_z: surf,
                     },
                     StructureLabel(BuildSiteKind::Well.label()),
                     Transform::from_xyz(world_pos.x, world_pos.y, 0.35),

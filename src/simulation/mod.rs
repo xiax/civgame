@@ -50,6 +50,7 @@ pub mod opportunistic;
 pub mod opportunity;
 pub mod organic_settlement;
 pub mod pack_deploy;
+pub mod perf;
 pub mod person;
 pub mod placement_reachability;
 pub mod plants;
@@ -173,10 +174,14 @@ impl Plugin for SimulationPlugin {
             .insert_resource(nomad::PendingCampOps::default())
             .insert_resource(SimClock::default())
             .insert_resource(survey_task::SurveyCursor::default())
-            .insert_resource(survey_task::InFlightSurveys::default())
+            .insert_resource(survey_task::SettlementSurveyTaskState::default())
             .insert_resource(speed::GameSpeed::default())
             .insert_resource(speed::SimTimingDiagnostics::default())
             .insert_resource(speed::TickTimer::default())
+            .insert_resource(perf::PerfWorkBudget::default())
+            .insert_resource(perf::BackgroundWorkDiagnostics::default())
+            .insert_resource(world_sim::WorldSimCursor::default())
+            .insert_resource(world_sim::WorldSimTaskState::default())
             .insert_resource(goals::ForceGoalReevaluate::default())
             .insert_resource({
                 // Phase 6: scorer registry, pre-populated with the
@@ -361,6 +366,14 @@ impl Plugin for SimulationPlugin {
                     // farming can start on tick 1 instead of waiting for the
                     // organic carve pipeline.
                     farm::seed_starting_farms_system
+                        .after(construction::seed_starting_buildings_system)
+                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    // Seed wells are stamped as finished `Well` entities; carve
+                    // their visible stepwell shaft + helix and project the
+                    // charged water column so they look (and read) as dug from
+                    // tick 0. Runs once here — runtime wells are carved by the
+                    // worker excavation pipeline instead.
+                    well::carve_seeded_wells_system
                         .after(construction::seed_starting_buildings_system)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                     // Seasonal-farming jellyfish: backfill any pre-stamped
@@ -1170,11 +1183,17 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (
-                    survey_task::survey_cursor_system
+                    survey_task::poll_survey_tasks_system
                         .after(settlement::auto_found_default_settlements_system)
+                        .before(survey_task::apply_survey_results_system),
+                    survey_task::apply_survey_results_system
+                        .after(survey_task::poll_survey_tasks_system)
+                        .before(survey_task::schedule_survey_tasks_system),
+                    survey_task::schedule_survey_tasks_system
+                        .after(survey_task::apply_survey_results_system)
                         .before(settlement::settlement_planner_system),
                     organic_settlement::settlement_pressure_system
-                        .after(survey_task::survey_cursor_system)
+                        .after(survey_task::apply_survey_results_system)
                         .before(organic_settlement::settlement_morphology_system),
                     organic_settlement::settlement_morphology_system
                         .after(organic_settlement::settlement_pressure_system)
@@ -1183,10 +1202,10 @@ impl Plugin for SimulationPlugin {
                         .after(organic_settlement::settlement_morphology_system)
                         .before(construction::chief_directive_system),
                     organic_settlement::bridge_intent_emitter_system
-                        .after(survey_task::survey_cursor_system)
+                        .after(survey_task::apply_survey_results_system)
                         .before(construction::chief_directive_system),
                     organic_settlement::dam_intent_emitter_system
-                        .after(survey_task::survey_cursor_system)
+                        .after(survey_task::apply_survey_results_system)
                         .before(construction::chief_directive_system),
                 )
                     .in_set(SimulationSet::Economy),
@@ -1195,10 +1214,10 @@ impl Plugin for SimulationPlugin {
                 FixedUpdate,
                 (
                     settlement::settlement_planner_system
-                        .after(survey_task::survey_cursor_system)
+                        .after(survey_task::apply_survey_results_system)
                         .before(construction::chief_directive_system),
                     settlement::auto_found_default_settlements_system
-                        .before(survey_task::survey_cursor_system)
+                        .before(survey_task::schedule_survey_tasks_system)
                         .before(settlement::settlement_planner_system),
                     construction::building_upgrade_system
                         .after(settlement::settlement_planner_system)

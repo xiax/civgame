@@ -23,10 +23,10 @@
 //! See `plans/dynamic-wells.md` (superseded) and the mossy-snuggling-puddle
 //! plan for the full design.
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use bevy::prelude::*;
 
-use crate::world::chunk::{ChunkMap, CHUNK_HEIGHT, Z_MIN};
+use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_HEIGHT, CHUNK_SIZE, Z_MIN};
 use crate::world::globe::Globe;
 use crate::world::terrain::GLOBE_H_TO_Z;
 
@@ -154,6 +154,29 @@ pub fn excavation_targets(spec: &WellSpec, center: (i32, i32)) -> Vec<((i32, i32
     out
 }
 
+/// Every tile of the 5×5 stepwell footprint (centre + inner helix + outer
+/// lining ring). Used by placement validation to reject a well whose footprint
+/// would overlap an existing structure.
+pub fn well_footprint(center: (i32, i32)) -> Vec<(i32, i32)> {
+    let mut tiles = Vec::with_capacity(25);
+    for dy in -2..=2i32 {
+        for dx in -2..=2i32 {
+            tiles.push((center.0 + dx, center.1 + dy));
+        }
+    }
+    tiles
+}
+
+/// Reconstruct the excavation [`WellSpec`] from a finished [`Well`]. `Well`
+/// stores `surf_z` + `bottom_z`; the helix length is exactly their difference.
+pub fn well_spec_of(well: &Well) -> WellSpec {
+    WellSpec {
+        surf_z: well.surf_z,
+        bottom_z: well.bottom_z,
+        depth: well.surf_z as i32 - well.bottom_z as i32,
+    }
+}
+
 /// Construction phase of an in-progress well.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WellPhase {
@@ -230,13 +253,15 @@ pub struct WellSiteMap(pub AHashMap<(i32, i32), Entity>);
 // Staged construction
 // ---------------------------------------------------------------------------
 
+use crate::simulation::carve::carve_tile;
 use crate::simulation::construction::{
-    best_wall_material, Blueprint, BlueprintAuthor, BlueprintMap, BuildSiteKind, StructureLabel,
-    Well, WellMap,
+    best_wall_material, Blueprint, BlueprintAuthor, BlueprintMap, BuildSiteKind, StructureIndex,
+    StructureLabel, Well, WellMap,
 };
 use crate::simulation::faction::{FactionRegistry, FactionTechs};
 use crate::simulation::terraform::{TerraformMap, TerraformSite};
-use crate::world::terrain::tile_to_world;
+use crate::world::chunk_streaming::{ChunkLoadedEvent, TileChangedEvent};
+use crate::world::terrain::{tile_to_world, WorldGen};
 use crate::world::water_runtime::{RuntimeWater, RuntimeWaterCell, AQUIFER_SEEP_RATE};
 
 /// Spawn a staged `WellSite` and its excavation `TerraformSite`s. Used by every
@@ -301,6 +326,8 @@ pub fn convert_well_blueprint_system(
     mut bp_map: ResMut<BlueprintMap>,
     mut well_site_map: ResMut<WellSiteMap>,
     mut terraform_map: ResMut<TerraformMap>,
+    structure_index: Res<StructureIndex>,
+    well_map: Res<WellMap>,
     blueprints: Query<(Entity, &Blueprint)>,
 ) {
     for (entity, bp) in blueprints.iter() {
@@ -326,6 +353,24 @@ pub fn convert_well_blueprint_system(
                 commands.entity(entity).despawn();
             }
             WellResult::Ok(spec) => {
+                // Footprint validation — the 5×5 stepwell must not overlap an
+                // existing structure, blueprint, or another well. Manual and
+                // organic placement only check the centre tile, so a well sited
+                // one or two tiles from a hut would carve its helix through the
+                // wall. Reject (despawn the blueprint) exactly like `TooDeep`.
+                let footprint_clear = well_footprint(center).into_iter().all(|t| {
+                    !structure_index.0.contains_key(&t)
+                        && !well_map.0.contains_key(&t)
+                        && !well_site_map.0.contains_key(&t)
+                        && bp_map.0.get(&t).map_or(true, |&e| e == entity)
+                });
+                if !footprint_clear {
+                    if bp_map.0.get(&center) == Some(&entity) {
+                        bp_map.0.remove(&center);
+                    }
+                    commands.entity(entity).despawn();
+                    continue;
+                }
                 let author = bp
                     .posted_by
                     .map(|e| BlueprintAuthor::new(e, bp.design_techs));
@@ -449,6 +494,7 @@ pub fn well_site_progression_system(
                             faction_id: site.faction_id,
                             shaft_tile: site.center,
                             bottom_z: site.bottom_z,
+                            surf_z: site.surf_z,
                         },
                         StructureLabel(BuildSiteKind::Well.label()),
                         Transform::from_xyz(wp.x, wp.y, 0.35),
@@ -461,6 +507,171 @@ pub fn well_site_progression_system(
                 well_site_map.0.remove(&site.center);
                 commands.entity(entity).despawn();
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Carved-geometry persistence
+// ---------------------------------------------------------------------------
+
+/// Re-carve one footprint tile down to `target_z`, one Z per `carve_tile`
+/// call — exactly mirroring `terraform_system`'s stepwise descent. Idempotent:
+/// a tile already at (or below) target is a no-op, and an unloaded chunk
+/// reads `surface_z_at < Z_MIN` so the loop never runs. The guard bounds the
+/// worst case to the hand-dug depth cap plus headroom.
+fn recarve_tile_to(
+    chunk_map: &mut ChunkMap,
+    gen: &WorldGen,
+    globe: &Globe,
+    tile: (i32, i32),
+    target_z: i8,
+    tile_changed: &mut EventWriter<TileChangedEvent>,
+) {
+    let mut guard = 0;
+    while chunk_map.surface_z_at(tile.0, tile.1) > target_z as i32 {
+        let surf = chunk_map.surface_z_at(tile.0, tile.1);
+        carve_tile(
+            chunk_map,
+            gen,
+            globe,
+            tile.0,
+            tile.1,
+            surf - 1,
+            tile_changed,
+        );
+        guard += 1;
+        if guard > MAX_HAND_DUG_WELL_DEPTH_Z + 4 {
+            break;
+        }
+    }
+}
+
+/// Re-open a well's stepwell geometry on the live `ChunkMap`: the centre
+/// water-shaft column and the descending helix of carved floors. Shared by
+/// the seed-time carve pass and the chunk-reload restamp.
+pub fn carve_well_geometry(
+    chunk_map: &mut ChunkMap,
+    gen: &WorldGen,
+    globe: &Globe,
+    center: (i32, i32),
+    spec: WellSpec,
+    tile_changed: &mut EventWriter<TileChangedEvent>,
+) {
+    for (tile, target_z) in excavation_targets(&spec, center) {
+        recarve_tile_to(chunk_map, gen, globe, tile, target_z, tile_changed);
+    }
+}
+
+/// OnEnter(Playing), after `seed_starting_buildings_system`. Seed wells are
+/// stamped as finished `Well` entities (skipping the worker excavation
+/// pipeline), so their visible stepwell shaft was never dug. Carve it now and
+/// project the charged `RuntimeWater` column onto the freshly-opened centre
+/// tile, so a seeded well looks dug — and reads as drinkable blue water —
+/// from tick 0 rather than appearing as a flat tile.
+pub fn carve_seeded_wells_system(
+    mut chunk_map: ResMut<ChunkMap>,
+    gen: Res<WorldGen>,
+    globe: Res<Globe>,
+    runtime_water: Res<RuntimeWater>,
+    wells: Query<&Well>,
+    mut tile_changed: EventWriter<TileChangedEvent>,
+) {
+    for well in wells.iter() {
+        carve_well_geometry(
+            &mut chunk_map,
+            &gen,
+            &globe,
+            well.shaft_tile,
+            well_spec_of(well),
+            &mut tile_changed,
+        );
+        if let Some(cell) = runtime_water.cells.get(&well.shaft_tile) {
+            if chunk_map.apply_water_column(
+                well.shaft_tile.0,
+                well.shaft_tile.1,
+                cell.ground_z,
+                cell.depth,
+                cell.reservoir_id,
+            ) {
+                tile_changed.send(TileChangedEvent {
+                    tx: well.shaft_tile.0,
+                    ty: well.shaft_tile.1,
+                });
+            }
+        }
+    }
+}
+
+/// FixedUpdate, after `chunk_streaming_system`, before
+/// `restamp_runtime_water_on_chunk_load`. Carved Air/floor tiles are chunk
+/// deltas not re-applied on regen — only `WallMap`/`DamMap` entities and
+/// `RuntimeWater` columns survive. A well whose 5×5 footprint straddles a
+/// chunk boundary would lose the navigable helix on the off-chunk portion
+/// when that chunk unloads and streams back. `Well` (`surf_z` + `bottom_z`)
+/// and an in-progress `WellSite` are the durable truth: on every
+/// `ChunkLoadedEvent` re-carve any well geometry intersecting a loaded chunk.
+/// The lining `Wall` entities survive streaming on their own; the water
+/// column is re-applied by `restamp_runtime_water_on_chunk_load` (chained
+/// after this so it stamps water onto the just-re-carved shaft).
+pub fn restamp_wells_on_chunk_load(
+    mut events: EventReader<ChunkLoadedEvent>,
+    mut chunk_map: ResMut<ChunkMap>,
+    gen: Res<WorldGen>,
+    globe: Res<Globe>,
+    terraform_map: Res<TerraformMap>,
+    wells: Query<&Well>,
+    well_sites: Query<&WellSite>,
+    mut tile_changed: EventWriter<TileChangedEvent>,
+) {
+    let loaded: AHashSet<ChunkCoord> = events.read().map(|e| e.coord).collect();
+    if loaded.is_empty() {
+        return;
+    }
+    let in_loaded = |tile: (i32, i32)| {
+        loaded.contains(&ChunkCoord(
+            tile.0.div_euclid(CHUNK_SIZE as i32),
+            tile.1.div_euclid(CHUNK_SIZE as i32),
+        ))
+    };
+
+    // Finished wells — re-carve the whole footprint if any tile reloaded.
+    for well in wells.iter() {
+        let spec = well_spec_of(well);
+        let targets = excavation_targets(&spec, well.shaft_tile);
+        if !targets.iter().any(|(t, _)| in_loaded(*t)) {
+            continue;
+        }
+        for (tile, target_z) in targets {
+            recarve_tile_to(
+                &mut chunk_map,
+                &gen,
+                &globe,
+                tile,
+                target_z,
+                &mut tile_changed,
+            );
+        }
+    }
+
+    // In-progress sites — re-carve only excavation tiles that have already
+    // completed (drained from `TerraformMap`). A tile a worker is still
+    // digging keeps its live `surface_z` progress and must not be jumped
+    // ahead to its final target.
+    for site in well_sites.iter() {
+        let spec = site.spec();
+        for (tile, target_z) in excavation_targets(&spec, site.center) {
+            if !in_loaded(tile) || terraform_map.0.contains_key(&tile) {
+                continue;
+            }
+            recarve_tile_to(
+                &mut chunk_map,
+                &gen,
+                &globe,
+                tile,
+                target_z,
+                &mut tile_changed,
+            );
         }
     }
 }
@@ -492,6 +703,36 @@ mod tests {
             well_spec_from(10, (10 - MAX_HAND_DUG_WELL_DEPTH_Z + WELL_SUMP_Z) as f32),
             WellResult::Ok(_)
         ));
+    }
+
+    #[test]
+    fn well_footprint_is_the_full_5x5() {
+        let fp = well_footprint((3, 7));
+        assert_eq!(fp.len(), 25);
+        // Centre, every inner-ring tile, every outer-ring tile are members.
+        assert!(fp.contains(&(3, 7)));
+        for t in inner_ring((3, 7)) {
+            assert!(fp.contains(&t), "inner-ring tile {t:?} missing");
+        }
+        for t in outer_ring((3, 7)) {
+            assert!(fp.contains(&t), "outer-ring tile {t:?} missing");
+        }
+    }
+
+    #[test]
+    fn well_spec_of_round_trips_geometry() {
+        let well = Well {
+            faction_id: 1,
+            shaft_tile: (0, 0),
+            bottom_z: 4,
+            surf_z: 10,
+        };
+        let spec = well_spec_of(&well);
+        assert_eq!(spec.surf_z, 10);
+        assert_eq!(spec.bottom_z, 4);
+        assert_eq!(spec.depth, 6);
+        // Helix length matches the depth — same invariant `well_spec_from` holds.
+        assert_eq!(excavation_targets(&spec, (0, 0)).len(), 1 + 6);
     }
 
     #[test]

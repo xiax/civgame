@@ -2,6 +2,7 @@ use ahash::{AHashMap, AHashSet};
 use bevy::prelude::*;
 
 use crate::pathfinding::flow_field::{build_flow_field, FlowField};
+use crate::simulation::perf::{BackgroundWorkDiagnostics, PerfWorkBudget};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 
 /// What the hotspot is for. Used by producers to tag their registrations
@@ -31,6 +32,26 @@ pub struct HotspotKey {
 
 pub struct HotspotEntry {
     pub field: FlowField,
+}
+
+fn hotspot_kind_rank(kind: HotspotKind) -> u8 {
+    match kind {
+        HotspotKind::FactionCenter => 0,
+        HotspotKind::Storage => 1,
+        HotspotKind::RallyPoint => 2,
+    }
+}
+
+fn take_hotspot_batch(dirty: &mut AHashSet<HotspotKey>, limit: usize) -> Vec<HotspotKey> {
+    let mut keys: Vec<HotspotKey> = dirty.iter().copied().collect();
+    keys.sort_by_key(|k| (k.tile.0, k.tile.1, k.tile.2, hotspot_kind_rank(k.kind)));
+    let take = keys.len().min(limit.max(1));
+    let mut batch = Vec::with_capacity(take);
+    for key in keys.into_iter().take(take) {
+        dirty.remove(&key);
+        batch.push(key);
+    }
+    batch
 }
 
 /// Registry of "many agents converge here" tiles plus their precomputed
@@ -141,11 +162,15 @@ impl HotspotFlowFields {
 pub fn rebuild_dirty_hotspots_system(
     chunk_map: Res<ChunkMap>,
     mut fields: ResMut<HotspotFlowFields>,
+    budget: Res<PerfWorkBudget>,
+    mut perf: ResMut<BackgroundWorkDiagnostics>,
 ) {
+    perf.hotspot_rebuilt_last_tick = 0;
+    perf.hotspot_dirty = fields.dirty.len().min(u32::MAX as usize) as u32;
     if fields.dirty.is_empty() {
         return;
     }
-    let dirty: Vec<HotspotKey> = fields.dirty.drain().collect();
+    let dirty = take_hotspot_batch(&mut fields.dirty, budget.hotspot_rebuilds_per_tick);
     let csz = CHUNK_SIZE as i32;
     let mut requeue: Vec<HotspotKey> = Vec::new();
     let mut built: Vec<(HotspotKey, FlowField)> = Vec::new();
@@ -163,6 +188,7 @@ pub fn rebuild_dirty_hotspots_system(
         let field = build_flow_field(&chunk_map, chunk, goal_local, gz, &|_| 0u16);
         built.push((key, field));
     }
+    let built_count = built.len();
     for (key, field) in built {
         fields.entries.insert(key, HotspotEntry { field });
     }
@@ -170,6 +196,8 @@ pub fn rebuild_dirty_hotspots_system(
         fields.dirty.insert(key);
     }
     fields.field_count = fields.entries.len() as u32;
+    perf.hotspot_rebuilt_last_tick = built_count.min(u32::MAX as usize) as u32;
+    perf.hotspot_dirty = fields.dirty.len().min(u32::MAX as usize) as u32;
 }
 
 #[cfg(test)]

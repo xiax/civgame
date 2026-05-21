@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use crate::pathfinding::tile_cost::{tile_step_cost, IMPASSABLE};
+use crate::simulation::perf::{micros_u32, BackgroundWorkDiagnostics, PerfWorkBudget};
 use crate::world::chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_SIZE, Z_MIN};
 use crate::world::chunk_streaming::{ChunkLoadedEvent, ChunkUnloadedEvent, TileChangedEvent};
 
@@ -270,6 +271,18 @@ fn coord_for_tile(tx: i32, ty: i32) -> ChunkCoord {
     ChunkCoord(tx.div_euclid(csz), ty.div_euclid(csz))
 }
 
+pub fn take_classify_batch(dirty: &mut AHashSet<ChunkCoord>, limit: usize) -> AHashSet<ChunkCoord> {
+    let mut coords: Vec<ChunkCoord> = dirty.iter().copied().collect();
+    coords.sort_by_key(|c| (c.0, c.1));
+    let take = coords.len().min(limit.max(1));
+    let mut batch = AHashSet::with_capacity(take);
+    for coord in coords.into_iter().take(take) {
+        dirty.remove(&coord);
+        batch.insert(coord);
+    }
+    batch
+}
+
 /// Drains all three event readers into the `GraphDirty` accumulator. Only
 /// chunks whose own tile state changed (or that just loaded) go into
 /// `classify`; their cardinal neighbours are derived at task-spawn time.
@@ -302,7 +315,11 @@ pub fn spawn_rebuild_task_system(
     graph: Res<ChunkGraph>,
     mut dirty: ResMut<GraphDirty>,
     mut task: ResMut<GraphRebuildTask>,
+    budget: Res<PerfWorkBudget>,
+    mut perf: ResMut<BackgroundWorkDiagnostics>,
 ) {
+    perf.graph_dirty_classify = dirty.classify.len().min(u32::MAX as usize) as u32;
+    perf.graph_dirty_unloaded = dirty.unloaded.len().min(u32::MAX as usize) as u32;
     if task.0.is_some() {
         return;
     }
@@ -312,13 +329,21 @@ pub fn spawn_rebuild_task_system(
 
     // Drop classify entries for chunks that have since been unloaded.
     dirty.classify.retain(|c| chunk_map.0.contains_key(c));
+    let classify_dirty =
+        take_classify_batch(&mut dirty.classify, budget.graph_classify_chunks_per_task);
+    let unloaded = std::mem::take(&mut dirty.unloaded);
+    perf.graph_dirty_classify = dirty.classify.len().min(u32::MAX as usize) as u32;
+    perf.graph_dirty_unloaded = 0;
+    if classify_dirty.is_empty() && unloaded.is_empty() {
+        return;
+    }
 
     // Edge-dirty = classify ∪ cardinals_of(classify ∪ unloaded), restricted
     // to currently-loaded chunks. These need their edges re-emitted so they
     // reflect the latest IDs of classify-dirty neighbours and drop edges to
     // unloaded ones.
     let mut edge_dirty: AHashSet<ChunkCoord> = AHashSet::new();
-    for &c in &dirty.classify {
+    for &c in &classify_dirty {
         edge_dirty.insert(c);
         for nb in cardinal_neighbors(c) {
             if chunk_map.0.contains_key(&nb) {
@@ -326,7 +351,7 @@ pub fn spawn_rebuild_task_system(
             }
         }
     }
-    for &c in &dirty.unloaded {
+    for &c in &unloaded {
         for nb in cardinal_neighbors(c) {
             if chunk_map.0.contains_key(&nb) {
                 edge_dirty.insert(nb);
@@ -355,7 +380,7 @@ pub fn spawn_rebuild_task_system(
         }
         // Live components for everything in the snapshot that we won't
         // re-classify. Edges from edge-dirty chunks reference these IDs.
-        if !dirty.classify.contains(coord) {
+        if !classify_dirty.contains(coord) {
             if let Some(cc) = graph.components.get(coord) {
                 live_components.insert(*coord, cc.clone());
             }
@@ -364,10 +389,10 @@ pub fn spawn_rebuild_task_system(
 
     let snapshot = RebuildSnapshot {
         chunks: snap_map,
-        classify_dirty: std::mem::take(&mut dirty.classify),
+        classify_dirty,
         edge_dirty,
         live_components,
-        unloaded: std::mem::take(&mut dirty.unloaded),
+        unloaded,
     };
 
     let pool = AsyncComputeTaskPool::get();
@@ -376,7 +401,11 @@ pub fn spawn_rebuild_task_system(
 
 /// Polls the in-flight task; when ready, merges the result into `ChunkGraph`
 /// and clears the task slot so the next tick can spawn a new one.
-pub fn poll_rebuild_task_system(mut task: ResMut<GraphRebuildTask>, mut graph: ResMut<ChunkGraph>) {
+pub fn poll_rebuild_task_system(
+    mut task: ResMut<GraphRebuildTask>,
+    mut graph: ResMut<ChunkGraph>,
+    mut perf: ResMut<BackgroundWorkDiagnostics>,
+) {
     let Some(t) = task.0.as_mut() else {
         return;
     };
@@ -385,6 +414,7 @@ pub fn poll_rebuild_task_system(mut task: ResMut<GraphRebuildTask>, mut graph: R
     };
     task.0 = None;
 
+    let apply_started = Instant::now();
     for coord in &result.unloaded {
         graph.components.remove(coord);
         graph.edges.remove(coord);
@@ -396,6 +426,11 @@ pub fn poll_rebuild_task_system(mut task: ResMut<GraphRebuildTask>, mut graph: R
         graph.edges.insert(coord, edges);
     }
     graph.generation = graph.generation.wrapping_add(1);
+    perf.graph_last_classify = result.classify_count.min(u32::MAX as usize) as u32;
+    perf.graph_last_edge_chunks = result.edge_chunks.min(u32::MAX as usize) as u32;
+    perf.graph_last_edges = result.edge_count.min(u32::MAX as usize) as u32;
+    perf.graph_compute_us = micros_u32(result.elapsed);
+    perf.graph_apply_us = micros_u32(apply_started.elapsed());
 
     info!(
         "ChunkGraph rebuilt async: classify={} edge_chunks={} edges={} elapsed={:?}",
@@ -636,6 +671,28 @@ mod tests {
         let surface_kind = Box::new([[TileKind::Grass; CHUNK_SIZE]; CHUNK_SIZE]);
         let surface_fertility = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
         Chunk::new(surface_z, surface_kind, surface_fertility)
+    }
+
+    #[test]
+    fn graph_dirty_batch_splits_and_leaves_backlog() {
+        let mut dirty = AHashSet::default();
+        for x in (0..20).rev() {
+            dirty.insert(ChunkCoord(x, 0));
+        }
+
+        let first = take_classify_batch(&mut dirty, 16);
+        assert_eq!(first.len(), 16);
+        assert_eq!(dirty.len(), 4);
+        for x in 0..16 {
+            assert!(first.contains(&ChunkCoord(x, 0)));
+        }
+
+        let second = take_classify_batch(&mut dirty, 16);
+        assert_eq!(second.len(), 4);
+        assert!(dirty.is_empty());
+        for x in 16..20 {
+            assert!(second.contains(&ChunkCoord(x, 0)));
+        }
     }
 
     #[test]

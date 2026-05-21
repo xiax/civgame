@@ -12,6 +12,7 @@ use crate::rendering::path_debug::PathDebugOverlay;
 use crate::simulation::construction::RitualState;
 use crate::simulation::faction::{FactionRegistry, PlayerFaction};
 use crate::simulation::needs::Needs;
+use crate::simulation::perf::BackgroundWorkDiagnostics;
 use crate::simulation::person::Person;
 use crate::simulation::settlement::{SettlementPlans, ZoneOverlayToggle};
 use crate::simulation::skills::{Skills, SKILL_COUNT};
@@ -85,6 +86,7 @@ pub struct PathPanelParams<'w> {
     pub connectivity: Res<'w, ChunkConnectivity>,
     pub timing: Res<'w, crate::simulation::speed::SimTimingDiagnostics>,
     pub game_speed: Res<'w, crate::simulation::speed::GameSpeed>,
+    pub bg: Res<'w, BackgroundWorkDiagnostics>,
 }
 
 #[derive(SystemParam)]
@@ -648,6 +650,30 @@ pub fn debug_panel_system(
                     );
                     ui.label(
                         egui::RichText::new(format!(
+                            "Graph dirty: {} classify / {} unload  •  last {} chunks, {} edge chunks, {} edges",
+                            path.bg.graph_dirty_classify,
+                            path.bg.graph_dirty_unloaded,
+                            path.bg.graph_last_classify,
+                            path.bg.graph_last_edge_chunks,
+                            path.bg.graph_last_edges,
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Graph async/apply: {:.2}/{:.2} ms  •  Connectivity async/apply: {:.2}/{:.2} ms{}",
+                            path.bg.graph_compute_us as f32 / 1000.0,
+                            path.bg.graph_apply_us as f32 / 1000.0,
+                            path.bg.connectivity_compute_us as f32 / 1000.0,
+                            path.bg.connectivity_apply_us as f32 / 1000.0,
+                            if path.bg.connectivity_in_flight { "  •  in flight" } else { "" },
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
                             "Flow-field hits: {}/tick  •  {} total",
                             path.diag.flow_field_hits_per_tick,
                             path.diag.flow_field_hits_total,
@@ -709,6 +735,99 @@ pub fn debug_panel_system(
                             path.failure_log.clear();
                         }
                     });
+                });
+
+                ui.add_space(4.0);
+
+                // ── Background Work ──────────────────────────────────────────
+                egui::CollapsingHeader::new(
+                    egui::RichText::new("Background Work")
+                        .strong()
+                        .color(egui::Color32::from_rgb(180, 220, 255)),
+                )
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Chunk queues: data {} (+{})  •  sprites {} (+{})  •  unload {} (-{})",
+                            path.bg.pending_chunk_loads,
+                            path.bg.chunk_loads_applied_last_tick,
+                            path.bg.pending_chunk_sprite_loads,
+                            path.bg.chunk_sprite_loads_applied_last_tick,
+                            path.bg.pending_chunk_unloads,
+                            path.bg.chunk_unloads_applied_last_tick,
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Tile refresh: pending {}  •  applied {}",
+                            path.bg.pending_tile_refreshes,
+                            path.bg.tile_refreshes_applied_last_tick,
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Hotspots: dirty {}  •  rebuilt {}  •  invalidated chunks {}",
+                            path.bg.hotspot_dirty,
+                            path.bg.hotspot_rebuilt_last_tick,
+                            path.bg.tile_change_chunks_last_tick,
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "World sim: cursor {}  •  snapshot {}  •  pending deltas {}  •  applied {}{}",
+                            path.bg.world_sim_cursor,
+                            path.bg.world_sim_snapshot_cells,
+                            path.bg.world_sim_pending_results,
+                            path.bg.world_sim_deltas_applied_last_tick,
+                            if path.bg.world_sim_in_flight { "  •  in flight" } else { "" },
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "World sim async/apply: {:.2}/{:.2} ms  •  stale drops: connectivity {} / world {}",
+                            path.bg.world_sim_compute_us as f32 / 1000.0,
+                            path.bg.world_sim_apply_us as f32 / 1000.0,
+                            path.bg.connectivity_dropped_stale,
+                            path.bg.world_sim_dropped_stale,
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Planner backlog: factions {}  •  settlement surveys {}{}",
+                            path.bg.faction_planner_backlog,
+                            path.bg.settlement_planner_backlog,
+                            if path.bg.settlement_survey_in_flight {
+                                "  •  in flight"
+                            } else {
+                                ""
+                            },
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Settlement survey: chunks {}  •  applied {}  •  async/apply {:.2}/{:.2} ms  •  stale drops {}",
+                            path.bg.settlement_survey_snapshot_chunks,
+                            path.bg.settlement_surveys_applied_last_tick,
+                            path.bg.settlement_survey_compute_us as f32 / 1000.0,
+                            path.bg.settlement_survey_apply_us as f32 / 1000.0,
+                            path.bg.settlement_survey_dropped_stale,
+                        ))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                    );
                 });
 
                 ui.add_space(4.0);

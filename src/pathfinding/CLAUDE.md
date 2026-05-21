@@ -13,8 +13,8 @@ Graph node = **`(ChunkCoord, ComponentId)`** — `ComponentId` is a chunk-local 
 ### Rebuild pipeline
 
 - **Startup** (after `terrain::spawn_world_system`): `startup_initial_build_system` runs a synchronous full rebuild of the pre-generated 32×32 spawn area — one-time main-thread cost.
-- **Runtime**: events drive an **async incremental** pipeline. `enqueue_graph_dirty_system` (PostUpdate) drains `TileChangedEvent` / `ChunkLoadedEvent` / `ChunkUnloadedEvent` into `GraphDirty { chunks, unloaded }`. `spawn_rebuild_task_system` snapshots `dirty ∪ cardinal_neighbors(dirty)` into a fresh `ChunkMap` (Chunk: Clone) and hands it to `AsyncComputeTaskPool`. `poll_rebuild_task_system` (PreUpdate) merges the result into `ChunkGraph`. One task in flight at a time; fresh events accumulate for the next task.
-- **Connectivity** rebuilds only when the graph is *settled* (`task.is_none() && dirty empty && graph.generation != conn.generation`) via the `connectivity_needs_rebuild` run condition — avoids spamming union-find during steady-state activity.
+- **Runtime**: events drive an **async incremental** pipeline. `enqueue_graph_dirty_system` (PostUpdate) drains `TileChangedEvent` / `ChunkLoadedEvent` / `ChunkUnloadedEvent` into `GraphDirty { classify, unloaded }`. `spawn_rebuild_task_system` snapshots at most `PerfWorkBudget.graph_classify_chunks_per_task` classify chunks (default 16) plus all pending unloads, then hands the snapshot to `AsyncComputeTaskPool`. Remaining classify work stays queued for later ticks. `poll_rebuild_task_system` (PreUpdate) merges the result into `ChunkGraph` and records compute/apply timings in `BackgroundWorkDiagnostics`.
+- **Connectivity** is now its own async snapshot/poll/apply pipeline. `spawn_connectivity_rebuild_task_system` clones the graph summary for `AsyncComputeTaskPool`; `poll_connectivity_rebuild_task_system` applies only if the result generation still matches the live graph, otherwise it increments the stale-drop diagnostic. `tile_reachable` treats stale connectivity as temporarily unknown/reachable so producers avoid hard false failures while the async snapshot catches up.
 - **Tests** that populate `ChunkMap` directly call `rebuild_chunk_graph_sync` (`TestSim::flat_world`) since they bypass chunk streaming.
 - `ChunkGraph::generation` bump invalidates every cached router tree.
 
@@ -35,7 +35,7 @@ Z-mismatch penalty is gone — components are exact, no "wrong z" choice to pena
 
 ## Connectivity (`connectivity.rs`)
 
-`ChunkConnectivity` is a self-contained reachability snapshot built by `rebuild_connectivity_system`, gated on `connectivity_needs_rebuild` (graph settled + generation mismatch). Three reachability APIs at different precision levels:
+`ChunkConnectivity` is a self-contained reachability snapshot built at startup by `rebuild_connectivity_system` and at runtime by the async connectivity task. Three reachability APIs at different precision levels:
 
 - **`tile_reachable(graph, from_3d, to_3d) -> bool`** — *exact* tile-to-tile reachability. Resolves each endpoint's `ComponentId` via `ChunkGraph::component_for_tile` and tests equality of inter-chunk CC ids. **Authoritative gameplay-routing API.** Storage picks, vision pickers, adjacency fallback, migration commit, player pitch-camp all gate on this. Costs one `ChunkGraph` borrow at the call site.
 - **`component_reachable(from_node, to_node) -> bool`** — same precision but caller has already resolved nodes. Used by the path worker.
@@ -62,7 +62,7 @@ Largest `chunk_route.len()` per tick surfaces as `chunk_route_len_max_last_tick`
 
 ## Hotspot flow fields (`hotspots.rs`)
 
-Pre-built per-chunk flow fields for popular destinations (faction centres, storage, rally points, doors, tunnel mouths). Fast-path used when goal is in start chunk; cross-chunk routing always goes through the router. **Flow fields are reserved for hotspots — per-agent local nav is A*.**
+Pre-built per-chunk flow fields for popular destinations (faction centres, storage, rally points, doors, tunnel mouths). Fast-path used when goal is in start chunk; cross-chunk routing always goes through the router. Dirty fields rebuild through a small per-tick budget (`PerfWorkBudget.hotspot_rebuilds_per_tick`) so tile-change bursts do not drain every field in one PostUpdate. **Flow fields are reserved for hotspots — per-agent local nav is A*.**
 
 ## Conventions
 

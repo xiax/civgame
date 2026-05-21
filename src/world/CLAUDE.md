@@ -45,7 +45,11 @@ solely on the reload restamp).
 `refresh_changed_tiles_system`) re-applies `RuntimeWater` columns **and re-stamps `Bridge`/`Dam`
 tiles from `BridgeMap`/`DamMap`** on each `ChunkLoadedEvent` (shared `stamp` closure) — this is what
 keeps a bridged/dammed cell from reverting to River on reload (the structural-delta-not-reapplied
-gap). Re-stamp uses `set_tile` (same path as finalize).
+gap). Re-stamp uses `set_tile` (same path as finalize). `simulation::well::restamp_wells_on_chunk_load`
+is **chained before** it (same FixedUpdate batch): carved well shaft/helix tiles are likewise
+chunk deltas lost on regen, so a dug stepwell footprint straddling a chunk boundary would lose its
+navigable helix — the restamp re-carves any `Well`/`WellSite` geometry on a freshly-loaded chunk,
+then the water restamp stamps the column onto the re-carved shaft.
 
 **Dam (`construction.rs` + `tile.rs`).** `TileKind::Dam=25` (26 variants) — passable + road-speed
 (crest carries a road) but **not** water-like/fresh/drinkable (water blocked; the deliberate
@@ -153,4 +157,6 @@ unchanged (rides `TileChangedEvent`).
 ## Streaming schedule
 
 - **`chunk_streaming_system` runs on `FixedUpdate` (20 Hz)**, not `Update`. The per-frame variant burned cycles on the full-map unload filter even when the camera was stationary. One fixed-tick (≤50 ms) load lag is imperceptible. `update_chunk_retention_system`, `update_simulation_focus_system`, and `fog::fog_update_system` move with it; gizmos and `update_tile_z_view_system` stay on `Update`.
+- **Streaming is queued and budgeted.** `PendingChunkStreams` stores data loads, sprite loads, and unloads. Each FixedUpdate computes desired data/sprite sets, enqueues missing work, drains data chunks first (`PerfWorkBudget.chunk_data_loads_per_tick`, default 24), camera sprites second (default 8), and unload despawns last (default 32). Region-focus chunks load data only; camera-focus chunks enqueue sprite work once data exists.
+- **Tile refreshes are deduped and capped.** `refresh_changed_tiles_system` collects `TileChangedEvent`s into `PendingTileRefreshes` and refreshes at most `PerfWorkBudget.tile_refreshes_per_tick` unique tiles (default 512). This prevents road/farm/building bursts from despawning/spawning the same sprite multiple times in one frame.
 - **`update_tile_z_view_system`** carries a `Local<Option<i32>>` last-applied-z guard — Bevy's `is_changed()` fires false-positives (first-tick re-fire, same-value `set_changed()` writes), and the system iterates the full loaded-sprite set on every fire.
