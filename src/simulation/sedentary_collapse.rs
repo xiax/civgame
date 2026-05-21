@@ -132,8 +132,7 @@ pub fn sedentary_collapse_system(
 
         // Shelter loss — fewer faction-owned beds than half the members.
         let bed_count = usable_beds(fid, home, &bed_map, &beds, &members);
-        let needed_beds =
-            ((member_count as f32 * COLLAPSE_MIN_BED_COVERAGE).ceil() as u32).max(1);
+        let needed_beds = ((member_count as f32 * COLLAPSE_MIN_BED_COVERAGE).ceil() as u32).max(1);
         let shelter_loss = bed_count < needed_beds;
 
         // Combined-failure trigger: a food deficit ALONE is survivable;

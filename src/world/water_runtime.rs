@@ -360,24 +360,24 @@ pub fn spawn_water_sim_task_system(
         // Bed + current depth: RuntimeWater is truth; else the loaded chunk;
         // else skip (unloaded → closed wall, acceptable: a player-built dam
         // and its neighbourhood are loaded).
-        let (bed, depth, orig_kind, loaded) =
-            if let Some(rc) = runtime_water.cells.get(&t) {
-                let k = chunk_map
-                    .tile_kind_at(t.0, t.1)
-                    .unwrap_or(TileKind::Water);
-                (rc.ground_z as f32, rc.depth, k, true)
-            } else if let Some(k) = chunk_map.tile_kind_at(t.0, t.1) {
-                let g = chunk_map.ground_z_at(t.0, t.1);
-                (g as f32, chunk_map.water_depth_at(t.0, t.1), k, g >= Z_MIN)
-            } else {
-                (0.0, 0.0, TileKind::Air, false)
-            };
+        let (bed, depth, orig_kind, loaded) = if let Some(rc) = runtime_water.cells.get(&t) {
+            let k = chunk_map.tile_kind_at(t.0, t.1).unwrap_or(TileKind::Water);
+            (rc.ground_z as f32, rc.depth, k, true)
+        } else if let Some(k) = chunk_map.tile_kind_at(t.0, t.1) {
+            let g = chunk_map.ground_z_at(t.0, t.1);
+            (g as f32, chunk_map.water_depth_at(t.0, t.1), k, g >= Z_MIN)
+        } else {
+            (0.0, 0.0, TileKind::Air, false)
+        };
         if !loaded {
             continue;
         }
 
         let is_watercourse = depth > 0.0
-            || matches!(orig_kind, TileKind::Water | TileKind::River | TileKind::Marsh);
+            || matches!(
+                orig_kind,
+                TileKind::Water | TileKind::River | TileKind::Marsh
+            );
 
         // Ocean / large standing water → fixed-level sink/source.
         let pinned_ocean = globe
@@ -403,10 +403,11 @@ pub fn spawn_water_sim_task_system(
         // actually pools it.
         if let Some(&(discharge, lvl)) = inlet.get(&t) {
             let surf = z_clampf(lvl * GLOBE_H_TO_Z).max(bed + depth);
-            let rate =
-                INLET_BASE_RATE * (1.0 + (discharge / 256.0).min(2.0)) * season_full;
-            grid.cells
-                .insert(t, WaterCell::free(bed, (surf - bed).max(0.0)).with_source(rate));
+            let rate = INLET_BASE_RATE * (1.0 + (discharge / 256.0).min(2.0)) * season_full;
+            grid.cells.insert(
+                t,
+                WaterCell::free(bed, (surf - bed).max(0.0)).with_source(rate),
+            );
             continue;
         }
 

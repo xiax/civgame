@@ -1858,9 +1858,7 @@ pub fn spawn_blueprint_sprites(
             // ships. FeedTrough/HitchingPost are tiny so the table sprite
             // reads better.
             BuildSiteKind::Pen | BuildSiteKind::Stable => textures.wall_palisade_ascii.clone(),
-            BuildSiteKind::FeedTrough | BuildSiteKind::HitchingPost => {
-                textures.table_ascii.clone()
-            }
+            BuildSiteKind::FeedTrough | BuildSiteKind::HitchingPost => textures.table_ascii.clone(),
         };
 
         let mut ghost_sprite = Sprite::from_image(ghost_img);

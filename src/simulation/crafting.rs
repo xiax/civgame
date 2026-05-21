@@ -1115,26 +1115,14 @@ mod tests {
 
         // Cart parts (recipes 15-18): each resolves to its catalog resource.
         assert_eq!(recipes[15].name, "Cart Wheel (Wood)");
-        assert_eq!(
-            recipes[15].output_resource,
-            core_ids::cart_wheel_wood()
-        );
+        assert_eq!(recipes[15].output_resource, core_ids::cart_wheel_wood());
         assert_eq!(recipes[16].name, "Cart Wheel (Iron-Rimmed)");
-        assert_eq!(
-            recipes[16].output_resource,
-            core_ids::cart_wheel_ironrim()
-        );
+        assert_eq!(recipes[16].output_resource, core_ids::cart_wheel_ironrim());
         assert_eq!(recipes[16].inputs.len(), 3);
         assert_eq!(recipes[17].name, "Cart Frame (Small)");
-        assert_eq!(
-            recipes[17].output_resource,
-            core_ids::cart_frame_small()
-        );
+        assert_eq!(recipes[17].output_resource, core_ids::cart_frame_small());
         assert_eq!(recipes[18].name, "Cart Frame (Medium)");
-        assert_eq!(
-            recipes[18].output_resource,
-            core_ids::cart_frame_medium()
-        );
+        assert_eq!(recipes[18].output_resource, core_ids::cart_frame_medium());
         assert_eq!(
             recipes[18].tech_gate,
             Some(crate::simulation::technology::OX_CART)

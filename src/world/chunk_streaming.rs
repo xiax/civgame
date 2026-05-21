@@ -12,7 +12,6 @@ use crate::rendering::projection::{
     skirt_sprite, ElevationSkirt, MapProjection, MapViewMode, ProjectedAnchor, ProjectionState,
 };
 use crate::simulation::construction::{DamMap, StructureLabel, Wall, WallMap, WallMaterial};
-use crate::world::water_runtime::RuntimeWater;
 use crate::simulation::faction::{FactionCenter, StorageTileMap};
 use crate::simulation::items::GroundItem;
 use crate::simulation::plants::{
@@ -24,6 +23,7 @@ use crate::world::terrain::{
     generate_chunk_from_globe, tile_at_3d, tile_to_world, WorldGen, TILE_SIZE,
 };
 use crate::world::tile::{OreKind, TileKind};
+use crate::world::water_runtime::RuntimeWater;
 
 pub const LOAD_RADIUS: i32 = 12;
 pub const UNLOAD_RADIUS: i32 = 16;

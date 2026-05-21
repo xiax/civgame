@@ -531,8 +531,7 @@ pub fn generate_chunk_from_globe(coord: ChunkCoord, globe: &Globe, gen: &WorldGe
         for lx in 0..CHUNK_SIZE {
             let global_tx = chunk_tx0 + lx as i32;
             let global_ty = chunk_ty0 + ly as i32;
-            let sample =
-                biome_mod::surface_biome_sample_at_tile(globe, global_tx, global_ty);
+            let sample = biome_mod::surface_biome_sample_at_tile(globe, global_tx, global_ty);
             let v = surface_v(global_tx, global_ty, gen, globe);
             let z = (Z_MIN as f32 + v * CHUNK_HEIGHT as f32).round() as i32;
             let z = z.clamp(Z_MIN, Z_MAX);
@@ -698,8 +697,7 @@ pub fn generate_chunk_from_globe(coord: ChunkCoord, globe: &Globe, gen: &WorldGe
                 // Ocean handled by biome bands; Spring/Dam are runtime.
                 ReservoirKind::Ocean | ReservoirKind::Spring | ReservoirKind::Dam => continue,
             };
-            let water_surf =
-                ((res.spill_level * GLOBE_H_TO_Z).round() as i32).clamp(Z_MIN, Z_MAX);
+            let water_surf = ((res.spill_level * GLOBE_H_TO_Z).round() as i32).clamp(Z_MIN, Z_MAX);
             let bed = globe
                 .hydro_cell_at(tx, ty)
                 .map(|hc| ((hc.raw_height * GLOBE_H_TO_Z).round() as i32).clamp(Z_MIN, Z_MAX))
@@ -727,10 +725,7 @@ pub fn generate_chunk_from_globe(coord: ChunkCoord, globe: &Globe, gen: &WorldGe
     for ly in 0..CHUNK_SIZE {
         for lx in 0..CHUNK_SIZE {
             let kind = surface_kind[ly][lx];
-            if matches!(
-                kind,
-                TileKind::River | TileKind::Water | TileKind::Marsh
-            ) {
+            if matches!(kind, TileKind::River | TileKind::Water | TileKind::Marsh) {
                 continue;
             }
             let tx = chunk_tx0 + lx as i32;
@@ -1128,10 +1123,8 @@ mod tests {
                         let bed = c.surface_ground_z[ly][lx] as i32;
                         let depth = c.surface_water_depth[ly][lx];
                         let rid = c.surface_reservoir_id[ly][lx];
-                        let wet = matches!(
-                            k,
-                            TileKind::River | TileKind::Water | TileKind::Marsh
-                        ) && depth > 0.0;
+                        let wet = matches!(k, TileKind::River | TileKind::Water | TileKind::Marsh)
+                            && depth > 0.0;
                         if wet {
                             wet_seen += 1;
                             assert!(bed <= surf, "wet bed {bed} above surface {surf}");
@@ -1255,10 +1248,7 @@ mod tests {
             for ly in 0..CHUNK_SIZE {
                 for lx in 0..CHUNK_SIZE {
                     let k = c.surface_kind[ly][lx];
-                    if matches!(
-                        k,
-                        TileKind::River | TileKind::Water | TileKind::Marsh
-                    ) {
+                    if matches!(k, TileKind::River | TileKind::Water | TileKind::Marsh) {
                         continue;
                     }
                     let tx = cx * CHUNK_SIZE as i32 + lx as i32;
@@ -1269,8 +1259,7 @@ mod tests {
                     let (elev_u, _, _) = g.sample_climate(tx, ty);
                     let macro_f = (elev_u / 255.0).clamp(0.0, 1.0);
                     let cell_surface_z = Z_MIN as f32 + macro_f * CHUNK_HEIGHT as f32;
-                    let aquifer_depth_z =
-                        (h.filled_height - h.aquifer_level) * GLOBE_H_TO_Z;
+                    let aquifer_depth_z = (h.filled_height - h.aquifer_level) * GLOBE_H_TO_Z;
                     let table_z = cell_surface_z - aquifer_depth_z;
                     let bed_z = c.surface_ground_z[ly][lx] as f32;
                     assert!(
@@ -1317,10 +1306,7 @@ mod tests {
                             }
                         }
                         // Skip non-land for the distribution stats.
-                        if matches!(
-                            k,
-                            TileKind::River | TileKind::Water | TileKind::Marsh
-                        ) {
+                        if matches!(k, TileKind::River | TileKind::Water | TileKind::Marsh) {
                             continue;
                         }
                         let tx = cx * CHUNK_SIZE as i32 + lx as i32;
@@ -1330,12 +1316,10 @@ mod tests {
                         };
                         let (elev_u, _, _) = g.sample_climate(tx, ty);
                         let macro_f = (elev_u / 255.0).clamp(0.0, 1.0);
-                        let cell_surface_z =
-                            Z_MIN as f32 + macro_f * CHUNK_HEIGHT as f32;
+                        let cell_surface_z = Z_MIN as f32 + macro_f * CHUNK_HEIGHT as f32;
                         let bed_z = c.surface_z[ly][lx] as f32;
                         let jitter = bed_z - cell_surface_z;
-                        let depth =
-                            (h.filled_height - h.aquifer_level) * GLOBE_H_TO_Z;
+                        let depth = (h.filled_height - h.aquifer_level) * GLOBE_H_TO_Z;
                         min_jitter_z = min_jitter_z.min(jitter);
                         max_jitter_z = max_jitter_z.max(jitter);
                         min_depth_z = min_depth_z.min(depth);
@@ -1397,11 +1381,7 @@ mod tests {
         let mut found = 0u32;
         for dy in 0..GLOBE_CELL_CHUNKS {
             for dx in 0..GLOBE_CELL_CHUNKS {
-                let c = generate_chunk_from_globe(
-                    ChunkCoord(chunk.0 + dx, chunk.1 + dy),
-                    &g,
-                    &gen,
-                );
+                let c = generate_chunk_from_globe(ChunkCoord(chunk.0 + dx, chunk.1 + dy), &g, &gen);
                 for ly in 0..CHUNK_SIZE {
                     for lx in 0..CHUNK_SIZE {
                         if c.surface_kind[ly][lx] == TileKind::Marsh

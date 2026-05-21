@@ -175,7 +175,9 @@ fn handle_switch_archetype(
             .resource::<crate::economy::resource_catalog::ResourceCatalog>()
             .clone();
         let archetype_registry = world.resource::<FactionArchetypeRegistry>().clone();
-        let now = world.resource::<crate::simulation::schedule::SimClock>().tick as u32;
+        let now = world
+            .resource::<crate::simulation::schedule::SimClock>()
+            .tick as u32;
         let mut registry = world.resource_mut::<FactionRegistry>();
         let Some(faction) = registry.factions.get_mut(&faction_id) else {
             return;

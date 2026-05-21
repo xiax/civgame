@@ -436,10 +436,7 @@ pub fn well_site_progression_system(
                 site.phase = WellPhase::Lining;
             }
             WellPhase::Lining => {
-                let done = site
-                    .lining_tiles
-                    .iter()
-                    .all(|t| !bp_map.0.contains_key(t));
+                let done = site.lining_tiles.iter().all(|t| !bp_map.0.contains_key(t));
                 if done {
                     site.phase = WellPhase::Capping;
                 }
@@ -546,10 +543,18 @@ mod tests {
         // Tick 1: Excavating → Lining (water charged, walls spawned).
         app.update();
         assert!(
-            app.world().resource::<RuntimeWater>().cells.contains_key(&center),
+            app.world()
+                .resource::<RuntimeWater>()
+                .cells
+                .contains_key(&center),
             "shaft water column charged on excavation completion"
         );
-        let lining = app.world().get::<WellSite>(site).unwrap().lining_tiles.len();
+        let lining = app
+            .world()
+            .get::<WellSite>(site)
+            .unwrap()
+            .lining_tiles
+            .len();
         assert!(lining > 0, "lining walls spawned");
         assert_eq!(
             app.world().get::<WellSite>(site).unwrap().phase,
@@ -583,7 +588,7 @@ mod tests {
         // centre + 6 ring tiles
         assert_eq!(targets.len(), 7);
         assert_eq!(targets[0], ((0, 0), 4)); // centre → bottom_z
-        // ring tile k → surf_z - k
+                                             // ring tile k → surf_z - k
         for k in 1..=6i32 {
             assert_eq!(targets[k as usize].1, (10 - k) as i8);
         }

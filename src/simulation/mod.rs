@@ -8,6 +8,7 @@ pub mod building_template;
 pub mod camp;
 pub mod capital;
 pub mod carry;
+pub mod cart;
 pub mod carve;
 pub mod civic_milestones;
 pub mod clear_obstacle;
@@ -18,7 +19,6 @@ pub mod corpse;
 pub mod crafting;
 pub mod dig;
 pub mod doormat;
-pub mod cart;
 pub mod draftwork;
 pub mod drink;
 pub mod faction;
@@ -610,8 +610,7 @@ impl Plugin for SimulationPlugin {
             // dispatcher so a `Preparing` raider equips rather than marches.
             .add_systems(
                 FixedUpdate,
-                (raid::raid_prep_dispatch_system
-                    .before(htn::htn_combat_faction_dispatch_system),)
+                (raid::raid_prep_dispatch_system.before(htn::htn_combat_faction_dispatch_system),)
                     .in_set(SimulationSet::ParallelB),
             )
             .add_systems(
@@ -834,8 +833,7 @@ impl Plugin for SimulationPlugin {
                     // Seasonal-farming jellyfish: PrepareField direct
                     // dispatcher — routes Prepare-phase Farm claimants to
                     // the nearest unprepared plot tile.
-                    htn::htn_prepare_field_dispatch_system
-                        .after(htn::htn_play_dispatch_system),
+                    htn::htn_prepare_field_dispatch_system.after(htn::htn_play_dispatch_system),
                 )
                     .in_set(SimulationSet::ParallelB),
             )
@@ -853,8 +851,7 @@ impl Plugin for SimulationPlugin {
                         construction::construction_system
                             .after(gather::gather_system)
                             .after(terraform::footprint_completion_system),
-                        well::well_site_progression_system
-                            .after(construction::construction_system),
+                        well::well_site_progression_system.after(construction::construction_system),
                     ),
                     construction::deconstruct_system.after(construction::construction_system),
                     construction::road_carve_system.after(construction::construction_system),
@@ -1118,8 +1115,10 @@ impl Plugin for SimulationPlugin {
                 // Runs before the hand-haul dispatcher so a bulky Haul claim
                 // is routed through a cart when one is available; the
                 // hand-haul dispatcher then skips the now-busy worker.
-                (cart::htn_cart_haul_dispatch_system
-                    .before(htn::htn_acquire_good_dispatch_system),)
+                (
+                    cart::htn_cart_haul_dispatch_system
+                        .before(htn::htn_acquire_good_dispatch_system),
+                )
                     .in_set(SimulationSet::ParallelB),
             )
             .add_systems(

@@ -485,11 +485,9 @@ mod tests {
             .with_tree_from(&graph, origin, |tree| tree.dist.get(&origin).copied())
             .flatten();
         assert_eq!(self_d, Some(0));
-        let missing = router.with_tree_from(
-            &graph,
-            (ChunkCoord(9, 9), ComponentId(0)),
-            |tree| tree.dist.len(),
-        );
+        let missing = router.with_tree_from(&graph, (ChunkCoord(9, 9), ComponentId(0)), |tree| {
+            tree.dist.len()
+        });
         assert_eq!(missing, None, "origin chunk not in graph ⇒ None");
     }
 

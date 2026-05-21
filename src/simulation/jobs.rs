@@ -2910,7 +2910,10 @@ pub fn chief_job_posting_system(
             && faction.member_count > 0
         {
             let phase = crate::simulation::farm::farm_season_phase(&calendar);
-            if !matches!(phase, crate::simulation::farm::FarmSeasonPhase::WinterDormant) {
+            if !matches!(
+                phase,
+                crate::simulation::farm::FarmSeasonPhase::WinterDormant
+            ) {
                 let grain_seed_stock = faction.storage.seed_total();
                 // Map of plots already covered by an open posting of a
                 // particular phase, so we don't double-post.
@@ -2923,10 +2926,7 @@ pub fn chief_job_posting_system(
                     if !matches!(p.kind, JobKind::Farm) {
                         continue;
                     }
-                    if let JobProgress::FieldWork {
-                        phase, plot_id, ..
-                    } = p.progress
-                    {
+                    if let JobProgress::FieldWork { phase, plot_id, .. } = p.progress {
                         if let Some(pid) = plot_id {
                             posted_by_phase.insert((pid, phase), ());
                         }
@@ -2968,18 +2968,14 @@ pub fn chief_job_posting_system(
                             let is_cropland =
                                 matches!(kind_opt, Some(crate::world::tile::TileKind::Cropland));
                             let nutrients = state.map(|s| s.nutrients).unwrap_or(0);
-                            let exhausted = nutrients
-                                < crate::simulation::farm::EXHAUSTED_FLOOR;
+                            let exhausted = nutrients < crate::simulation::farm::EXHAUSTED_FLOOR;
                             if !is_cropland || exhausted {
                                 unprepared += 1;
                             }
                             if is_cropland
-                                && nutrients
-                                    >= crate::simulation::farm::MIN_PLANTABLE_NUTRIENTS
+                                && nutrients >= crate::simulation::farm::MIN_PLANTABLE_NUTRIENTS
                             {
-                                if let Some(pent) =
-                                    farm_params.plant_map.0.get(&(tx, ty))
-                                {
+                                if let Some(pent) = farm_params.plant_map.0.get(&(tx, ty)) {
                                     if let Ok(pl) = farm_params.plant_q.get(*pent) {
                                         if matches!(
                                             pl.kind,
@@ -2998,12 +2994,9 @@ pub fn chief_job_posting_system(
                             // plantable threshold (eg. tile yield dropped
                             // mid-season).
                             if is_cropland
-                                && nutrients
-                                    < crate::simulation::farm::MIN_PLANTABLE_NUTRIENTS
+                                && nutrients < crate::simulation::farm::MIN_PLANTABLE_NUTRIENTS
                             {
-                                if let Some(pent) =
-                                    farm_params.plant_map.0.get(&(tx, ty))
-                                {
+                                if let Some(pent) = farm_params.plant_map.0.get(&(tx, ty)) {
                                     if let Ok(pl) = farm_params.plant_q.get(*pent) {
                                         if matches!(
                                             pl.kind,
@@ -3044,9 +3037,7 @@ pub fn chief_job_posting_system(
                             settlement_id: None,
                         });
                     };
-                    let caretaker = farm_params
-                        .assignments
-                        .assigned_farmer(*pid);
+                    let caretaker = farm_params.assignments.assigned_farmer(*pid);
 
                     match phase {
                         crate::simulation::farm::FarmSeasonPhase::SpringPrepPlant => {
@@ -3744,9 +3735,7 @@ fn posting_target_workers(p: &JobPosting) -> u32 {
         // Seasonal Farm postings: scale with target tile/plant count so
         // Spring prep (256-tile plot) gets up to 12 workers but a 1-tile
         // caretaker run stays at 3.
-        (JobKind::Farm, JobProgress::FieldWork { target, .. }) => {
-            ((*target / 8).max(3)).min(12)
-        }
+        (JobKind::Farm, JobProgress::FieldWork { target, .. }) => ((*target / 8).max(3)).min(12),
         (JobKind::Farm, _) => 3,
         (JobKind::Craft, _) => 1,
         // Plow is a single-farmer single-animal job — one worker pulls the
@@ -4048,10 +4037,9 @@ fn posting_target_tile(p: &JobPosting) -> Option<(i32, i32)> {
         )),
         JobProgress::Crafting { .. } => None,
         JobProgress::Building { .. } => None,
-        JobProgress::Plow { area, .. } => Some((
-            (area.min.0 + area.max.0) / 2,
-            (area.min.1 + area.max.1) / 2,
-        )),
+        JobProgress::Plow { area, .. } => {
+            Some(((area.min.0 + area.max.0) / 2, (area.min.1 + area.max.1) / 2))
+        }
     }
 }
 
@@ -4508,9 +4496,7 @@ fn same_target(a: &JobProgress, b: &JobProgress) -> bool {
                 ..
             },
         ) => bx == by && rx == ry,
-        (JobProgress::Plow { plot_id: px, .. }, JobProgress::Plow { plot_id: py, .. }) => {
-            px == py
-        }
+        (JobProgress::Plow { plot_id: px, .. }, JobProgress::Plow { plot_id: py, .. }) => px == py,
         _ => false,
     }
 }

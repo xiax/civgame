@@ -41,8 +41,8 @@ use crate::world::biome::water_kind_at;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::globe::Globe;
 use crate::world::terrain::TILE_SIZE;
-use crate::world::water_runtime::RuntimeWater;
 use crate::world::tile::TileKind;
+use crate::world::water_runtime::RuntimeWater;
 
 /// Game-ticks an agent stays in `Working` before the drink completes.
 /// Short — drinking a sip is faster than eating a meal.
@@ -132,8 +132,7 @@ pub fn perform_drink(
             // Draw the physical column down by one sip. The cell is left in
             // place (depth clamped at 0) so its seep source keeps recharging.
             if let Some(cell) = runtime_water.cells.get_mut(&tile) {
-                cell.depth =
-                    (cell.depth - crate::simulation::well::WELL_SIP_DRAWDOWN_Z).max(0.0);
+                cell.depth = (cell.depth - crate::simulation::well::WELL_SIP_DRAWDOWN_Z).max(0.0);
             }
             // Well water is treated as clean; `SanitationMap` may still
             // mark it contaminated, handled by the caller.
@@ -422,12 +421,10 @@ pub fn htn_drink_dispatch_system(
                 DRINK_TILE_SCAN_RADIUS
             };
 
-            let local_well =
-                nearest_well_tile(&well_map, &runtime_water, (cur_tx, cur_ty), scan).map(|tile| {
-                    DrinkCandidate {
-                        source: DrinkSource::Well { tile },
-                        target_tile: tile,
-                    }
+            let local_well = nearest_well_tile(&well_map, &runtime_water, (cur_tx, cur_ty), scan)
+                .map(|tile| DrinkCandidate {
+                    source: DrinkSource::Well { tile },
+                    target_tile: tile,
                 });
             let local_water =
                 nearest_fresh_drinkable_tile(&chunk_map, &globe, (cur_tx, cur_ty), scan).map(

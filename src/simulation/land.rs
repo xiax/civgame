@@ -22,10 +22,10 @@ use crate::world::chunk::{ChunkMap, Z_MIN};
 #[allow(unused_imports)]
 use crate::world::chunk_streaming::TileChangedEvent;
 use crate::world::globe::Globe;
-#[allow(unused_imports)]
-use crate::world::tile::{TileData, TileKind};
 use crate::world::seasons::TICKS_PER_DAY;
 use crate::world::terrain::{tile_at_3d, WorldGen};
+#[allow(unused_imports)]
+use crate::world::tile::{TileData, TileKind};
 
 pub type PlotId = u32;
 
@@ -1122,48 +1122,47 @@ pub fn household_land_acquisition_system(
     // acquisition path AND the Residential→child-Ag claim path (the latter
     // used to be silently skipped, leaving the household with no storage
     // tile to plant from / deposit into).
-    let ensure_household_storage =
-        |commands: &mut Commands,
-         plot_q: &Query<&mut Plot>,
-         households_with_storage: &mut AHashSet<u32>,
-         household_id: u32,
-         source_pid: PlotId| {
-            if households_with_storage.contains(&household_id) {
-                return;
-            }
-            let mut storage_tile: Option<(i32, i32)> = None;
-            for (&_other_pid, &ent) in plot_index.by_id.iter() {
-                if let Ok(other) = plot_q.get(ent) {
-                    if matches!(other.holder, TenureHolder::Household { faction_id }
+    let ensure_household_storage = |commands: &mut Commands,
+                                    plot_q: &Query<&mut Plot>,
+                                    households_with_storage: &mut AHashSet<u32>,
+                                    household_id: u32,
+                                    source_pid: PlotId| {
+        if households_with_storage.contains(&household_id) {
+            return;
+        }
+        let mut storage_tile: Option<(i32, i32)> = None;
+        for (&_other_pid, &ent) in plot_index.by_id.iter() {
+            if let Ok(other) = plot_q.get(ent) {
+                if matches!(other.holder, TenureHolder::Household { faction_id }
                         if faction_id == household_id)
-                        && other.zone_kind == ZoneKind::Residential
-                    {
-                        storage_tile = other.access_tile.or(Some(other.rect.center()));
-                        break;
-                    }
+                    && other.zone_kind == ZoneKind::Residential
+                {
+                    storage_tile = other.access_tile.or(Some(other.rect.center()));
+                    break;
                 }
             }
-            if storage_tile.is_none() {
-                if let Some(&ent) = plot_index.by_id.get(&source_pid) {
-                    if let Ok(plot) = plot_q.get(ent) {
-                        storage_tile = plot.access_tile.or(Some(plot.rect.center()));
-                    }
+        }
+        if storage_tile.is_none() {
+            if let Some(&ent) = plot_index.by_id.get(&source_pid) {
+                if let Ok(plot) = plot_q.get(ent) {
+                    storage_tile = plot.access_tile.or(Some(plot.rect.center()));
                 }
             }
-            if let Some((sx, sy)) = storage_tile {
-                let world_pos = crate::world::terrain::tile_to_world(sx, sy);
-                commands.spawn((
-                    crate::simulation::faction::FactionStorageTile {
-                        faction_id: household_id,
-                    },
-                    Transform::from_xyz(world_pos.x, world_pos.y, 0.5),
-                    GlobalTransform::default(),
-                    Visibility::Hidden,
-                    InheritedVisibility::default(),
-                ));
-                households_with_storage.insert(household_id);
-            }
-        };
+        }
+        if let Some((sx, sy)) = storage_tile {
+            let world_pos = crate::world::terrain::tile_to_world(sx, sy);
+            commands.spawn((
+                crate::simulation::faction::FactionStorageTile {
+                    faction_id: household_id,
+                },
+                Transform::from_xyz(world_pos.x, world_pos.y, 0.5),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ));
+            households_with_storage.insert(household_id);
+        }
+    };
 
     // Are there any Farmer-headed households at all? If not, fall back to any
     // household with treasury for agricultural acquisitions — bootstrapping a

@@ -226,14 +226,9 @@ pub fn rect_reachable_from_home(
         (max.0, max.1),
     ];
     let home3 = resolve3(chunk_map, home);
-    probes.iter().any(|&p| {
-        path_exists(
-            chunk_map,
-            home3,
-            resolve3(chunk_map, p),
-            ReachOpts::seed(),
-        )
-    })
+    probes
+        .iter()
+        .any(|&p| path_exists(chunk_map, home3, resolve3(chunk_map, p), ReachOpts::seed()))
 }
 
 /// Validate a planned walled house *as it will exist once built*: the door's

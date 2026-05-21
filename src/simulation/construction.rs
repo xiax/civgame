@@ -3070,20 +3070,17 @@ fn find_palisade_site(
     let mut max_x = i32::MIN;
     let mut min_y = i32::MAX;
     let mut max_y = i32::MIN;
-    let mut consider = |pos: (i32, i32),
-                        min_x: &mut i32,
-                        max_x: &mut i32,
-                        min_y: &mut i32,
-                        max_y: &mut i32| {
-        let (bx, by) = pos;
-        if (bx - hx).abs() > search || (by - hy).abs() > search {
-            return;
-        }
-        *min_x = (*min_x).min(bx);
-        *max_x = (*max_x).max(bx);
-        *min_y = (*min_y).min(by);
-        *max_y = (*max_y).max(by);
-    };
+    let mut consider =
+        |pos: (i32, i32), min_x: &mut i32, max_x: &mut i32, min_y: &mut i32, max_y: &mut i32| {
+            let (bx, by) = pos;
+            if (bx - hx).abs() > search || (by - hy).abs() > search {
+                return;
+            }
+            *min_x = (*min_x).min(bx);
+            *max_x = (*max_x).max(bx);
+            *min_y = (*min_y).min(by);
+            *max_y = (*max_y).max(by);
+        };
     for &pos in maps.bed_map.0.keys() {
         consider(pos, &mut min_x, &mut max_x, &mut min_y, &mut max_y);
     }
@@ -3113,40 +3110,39 @@ fn find_palisade_site(
     // crosses the edge; the 3-tile gateway centres on that crossing.
     // Fallback to `hx`/`hy` when no road meets that edge.
     let gateway_half = 1i32; // half-width: gateway spans 3 tiles
-    let crossing_on_edge =
-        |fixed_y: Option<i32>, fixed_x: Option<i32>, default: i32| -> i32 {
-            let Some(brain) = brain else { return default };
-            // Walk every planned road tile; the one whose row/column matches
-            // the requested edge and lies inside the rect wins. Take the
-            // tile closest (chebyshev) to the original cardinal centre.
-            let mut best: Option<(i32, i32)> = None;
-            for &tile in brain.road_tiles.iter() {
-                if let Some(yy) = fixed_y {
-                    if tile.1 != yy {
-                        continue;
-                    }
-                    if tile.0 < min_x || tile.0 > max_x {
-                        continue;
-                    }
-                    let d = (tile.0 - default).abs();
-                    if best.map_or(true, |(bd, _)| d < bd) {
-                        best = Some((d, tile.0));
-                    }
-                } else if let Some(xx) = fixed_x {
-                    if tile.0 != xx {
-                        continue;
-                    }
-                    if tile.1 < min_y || tile.1 > max_y {
-                        continue;
-                    }
-                    let d = (tile.1 - default).abs();
-                    if best.map_or(true, |(bd, _)| d < bd) {
-                        best = Some((d, tile.1));
-                    }
+    let crossing_on_edge = |fixed_y: Option<i32>, fixed_x: Option<i32>, default: i32| -> i32 {
+        let Some(brain) = brain else { return default };
+        // Walk every planned road tile; the one whose row/column matches
+        // the requested edge and lies inside the rect wins. Take the
+        // tile closest (chebyshev) to the original cardinal centre.
+        let mut best: Option<(i32, i32)> = None;
+        for &tile in brain.road_tiles.iter() {
+            if let Some(yy) = fixed_y {
+                if tile.1 != yy {
+                    continue;
+                }
+                if tile.0 < min_x || tile.0 > max_x {
+                    continue;
+                }
+                let d = (tile.0 - default).abs();
+                if best.map_or(true, |(bd, _)| d < bd) {
+                    best = Some((d, tile.0));
+                }
+            } else if let Some(xx) = fixed_x {
+                if tile.0 != xx {
+                    continue;
+                }
+                if tile.1 < min_y || tile.1 > max_y {
+                    continue;
+                }
+                let d = (tile.1 - default).abs();
+                if best.map_or(true, |(bd, _)| d < bd) {
+                    best = Some((d, tile.1));
                 }
             }
-            best.map(|(_, v)| v).unwrap_or(default)
-        };
+        }
+        best.map(|(_, v)| v).unwrap_or(default)
+    };
     let gate_x_north = crossing_on_edge(Some(min_y), None, hx);
     let gate_x_south = crossing_on_edge(Some(max_y), None, hx);
     let gate_y_west = crossing_on_edge(None, Some(min_x), hy);
@@ -6488,12 +6484,7 @@ pub fn construction_system(
                         .settlement_map
                         .first_for_faction(bp.faction_id)
                         .and_then(|sid| maps.brains.0.get(&sid));
-                    match find_door_connector_target(
-                        &chunk_map,
-                        brain_ref,
-                        doormat_tile,
-                        12,
-                    ) {
+                    match find_door_connector_target(&chunk_map, brain_ref, doormat_tile, 12) {
                         DoorConnectorTarget::None => {}
                         DoorConnectorTarget::Road(target) => {
                             road_carve_queue
@@ -6849,10 +6840,7 @@ pub fn construction_system(
                     .id(),
                 BuildSiteKind::HitchingPost => commands
                     .spawn((
-                        crate::simulation::husbandry::HitchingPost::new(
-                            bp.faction_id,
-                            tile,
-                        ),
+                        crate::simulation::husbandry::HitchingPost::new(bp.faction_id, tile),
                         StructureLabel(BuildSiteKind::HitchingPost.label()),
                         Transform::from_xyz(world_pos.x, world_pos.y, 0.2),
                         GlobalTransform::default(),
@@ -7507,38 +7495,36 @@ pub fn deconstruct_system(
         // dropped at the now-impassable water cell would be unrecoverable).
         // Dam additionally clears its `RuntimeWater` crest barrier so the
         // impounded water drains on the next Phase 5 solve.
-        let water_anchored_refund_tile: Option<(i32, i32)> = if matches!(
-            kind,
-            BuildSiteKind::Bridge | BuildSiteKind::Dam
-        ) {
-            let restore = match kind {
-                BuildSiteKind::Bridge => bridge_query
-                    .get(target_entity)
-                    .map(|b| b.restore_tile)
-                    .unwrap_or(TileKind::River),
-                BuildSiteKind::Dam => {
-                    maps.runtime_water.clear_dam(tile);
-                    dam_query
+        let water_anchored_refund_tile: Option<(i32, i32)> =
+            if matches!(kind, BuildSiteKind::Bridge | BuildSiteKind::Dam) {
+                let restore = match kind {
+                    BuildSiteKind::Bridge => bridge_query
                         .get(target_entity)
-                        .map(|d| d.restore_tile)
-                        .unwrap_or(TileKind::River)
-                }
-                _ => unreachable!(),
+                        .map(|b| b.restore_tile)
+                        .unwrap_or(TileKind::River),
+                    BuildSiteKind::Dam => {
+                        maps.runtime_water.clear_dam(tile);
+                        dam_query
+                            .get(target_entity)
+                            .map(|d| d.restore_tile)
+                            .unwrap_or(TileKind::River)
+                    }
+                    _ => unreachable!(),
+                };
+                let surf_z = chunk_map.surface_z_at(tile.0 as i32, tile.1 as i32);
+                chunk_map.set_tile(
+                    tile.0 as i32,
+                    tile.1 as i32,
+                    surf_z as i32,
+                    TileData {
+                        kind: restore,
+                        ..Default::default()
+                    },
+                );
+                nearest_passable_bank(&chunk_map, (tile.0 as i32, tile.1 as i32))
+            } else {
+                None
             };
-            let surf_z = chunk_map.surface_z_at(tile.0 as i32, tile.1 as i32);
-            chunk_map.set_tile(
-                tile.0 as i32,
-                tile.1 as i32,
-                surf_z as i32,
-                TileData {
-                    kind: restore,
-                    ..Default::default()
-                },
-            );
-            nearest_passable_bank(&chunk_map, (tile.0 as i32, tile.1 as i32))
-        } else {
-            None
-        };
 
         // Furniture removal can change tile passability/speed; tell pathing
         // caches to invalidate. (The Wall arm above already emits one — a
@@ -8591,11 +8577,7 @@ fn splitmix64(mut x: u64) -> u64 {
 }
 
 pub fn yard_tile_role(culture_seed: u64, tile: (i32, i32)) -> YardTileRole {
-    let mix = splitmix64(
-        culture_seed
-            ^ ((tile.0 as u32 as u64) << 32)
-            ^ (tile.1 as u32 as u64),
-    );
+    let mix = splitmix64(culture_seed ^ ((tile.0 as u32 as u64) << 32) ^ (tile.1 as u32 as u64));
     let roll = (mix as f32 / u64::MAX as f32).clamp(0.0, 1.0);
     if roll < 0.55 {
         YardTileRole::CroplandRich
@@ -8701,8 +8683,7 @@ fn seed_farmstead_yard(
                             ore: cur.ore,
                         },
                     );
-                    tile_changed
-                        .send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
+                    tile_changed.send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
                 }
                 YardTileRole::CroplandFallow => {
                     chunk_map.set_tile(
@@ -8717,8 +8698,7 @@ fn seed_farmstead_yard(
                             ore: cur.ore,
                         },
                     );
-                    tile_changed
-                        .send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
+                    tile_changed.send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
                 }
                 YardTileRole::LoamYard => {
                     // Only convert if not already a stone/wall/water tile.
@@ -9614,10 +9594,7 @@ mod tests {
             (3, 4)
         );
         assert_eq!(
-            yard_dimensions(
-                Era::BronzeAge,
-                &BuildIntent::Hut(WallMaterial::Mudbrick),
-            ),
+            yard_dimensions(Era::BronzeAge, &BuildIntent::Hut(WallMaterial::Mudbrick),),
             (4, 5)
         );
         // Longhouse yards bigger than Hut at every era.

@@ -162,26 +162,23 @@ pub fn assign_preferred_home_system(
         let _ = members_q.get(e);
         // Find best housing — chebyshev distance.
         let mut best: Option<(Entity, i32)> = None;
-        let mut consider = |home_e: Entity,
-                            home_owner: u32,
-                            home_tile: (i32, i32),
-                            cap: u8,
-                            mask: u8| {
-            if home_owner != owner {
-                return;
-            }
-            if mask & species_bit == 0 {
-                return;
-            }
-            let used = housed_count.get(&home_e).copied().unwrap_or(0);
-            if used >= cap {
-                return;
-            }
-            let d = (pos.0 - home_tile.0).abs().max((pos.1 - home_tile.1).abs());
-            if best.map_or(true, |(_, bd)| d < bd) {
-                best = Some((home_e, d));
-            }
-        };
+        let mut consider =
+            |home_e: Entity, home_owner: u32, home_tile: (i32, i32), cap: u8, mask: u8| {
+                if home_owner != owner {
+                    return;
+                }
+                if mask & species_bit == 0 {
+                    return;
+                }
+                let used = housed_count.get(&home_e).copied().unwrap_or(0);
+                if used >= cap {
+                    return;
+                }
+                let d = (pos.0 - home_tile.0).abs().max((pos.1 - home_tile.1).abs());
+                if best.map_or(true, |(_, bd)| d < bd) {
+                    best = Some((home_e, d));
+                }
+            };
         for (pe, pen) in pen_q.iter() {
             consider(pe, pen.faction_id, pen.tile, pen.capacity, pen.species_mask);
         }
@@ -276,8 +273,7 @@ pub fn husbandry_intent_emitter_system(
                     };
                     if matches!(
                         k,
-                        crate::world::tile::TileKind::Grass
-                            | crate::world::tile::TileKind::Scrub
+                        crate::world::tile::TileKind::Grass | crate::world::tile::TileKind::Scrub
                     ) && bp_map.0.get(&t).is_none()
                     {
                         placement = Some(t);
@@ -364,10 +360,7 @@ pub fn on_pen_add(
     let Some(pen) = world.get::<Pen>(entity).copied() else {
         return;
     };
-    world
-        .resource_mut::<PenMap>()
-        .0
-        .insert(pen.tile, entity);
+    world.resource_mut::<PenMap>().0.insert(pen.tile, entity);
 }
 
 pub fn on_pen_remove(

@@ -176,7 +176,10 @@ mod tests {
         let r = ChunkRouter::default();
         let est = DetourEstimator::new(&r, &g);
         // (10,31) → (20,20), both chunk(0,0) component 0.
-        assert_eq!(est.tiles((10, 31), 0, (20, 20), 0), chebyshev((10, 31), (20, 20)));
+        assert_eq!(
+            est.tiles((10, 31), 0, (20, 20), 0),
+            chebyshev((10, 31), (20, 20))
+        );
     }
 
     #[test]

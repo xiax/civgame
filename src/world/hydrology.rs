@@ -452,7 +452,11 @@ fn cluster_neighbours(i: usize, out: &mut [usize; 4]) -> usize {
 /// if very shallow), one with no lower escape is `Endorheic` (evaporative →
 /// brackish). Returns the reservoir table and a per-cell `reservoir_id`
 /// (`u32::MAX` = dry / open drainage).
-pub fn classify_reservoirs(raw: &[f32], filled: &[f32], dirs: &[u32]) -> (Vec<Reservoir>, Vec<u32>) {
+pub fn classify_reservoirs(
+    raw: &[f32],
+    filled: &[f32],
+    dirs: &[u32],
+) -> (Vec<Reservoir>, Vec<u32>) {
     let n = W * H;
     debug_assert_eq!(raw.len(), n);
     debug_assert_eq!(filled.len(), n);

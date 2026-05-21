@@ -56,7 +56,9 @@ use crate::simulation::plants::{
 };
 use crate::simulation::production::total_edible;
 use crate::simulation::schedule::SimClock;
-use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
+use crate::simulation::tasks::{
+    assign_task_with_routing, dispatch_autonomous_task_with_routing, TaskKind,
+};
 use crate::simulation::technology::TechId;
 use crate::simulation::typed_task::{ActionQueue, Task};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
@@ -4554,10 +4556,8 @@ pub fn htn_acquire_good_dispatch_system(
                         (t.0, t.1, tz),
                     )
                 };
-                let detour_est = crate::pathfinding::detour::DetourEstimator::new(
-                    &chunk_router,
-                    &chunk_graph,
-                );
+                let detour_est =
+                    crate::pathfinding::detour::DetourEstimator::new(&chunk_router, &chunk_graph);
                 let detour_dist = |t: (i32, i32)| -> i32 {
                     let tz = chunk_map.nearest_standable_z(t.0, t.1, ai.current_z as i32) as i8;
                     detour_est.tiles((cur_tx, cur_ty), ai.current_z, t, tz)
@@ -7078,9 +7078,10 @@ pub fn htn_plant_from_storage_dispatch_system(
     }
 }
 
-/// Seasonal-farming jellyfish: direct dispatch for `Task::PrepareField`.
-/// Mirrors `bureaucrat_admin_dispatch_system`'s "no HTN registry" pattern.
-/// Activates for any non-Drafted, idle, non-Dormant agent holding a
+/// Seasonal-farming direct dispatch for `Task::PrepareField`.
+/// Uses `dispatch_autonomous_task_with_routing` so routing, typed-task
+/// dispatch, and stale-reset lifecycle metadata stay in one path. Activates
+/// for any non-Drafted, idle, non-Dormant agent holding a
 /// `JobClaim::Farm` whose backing posting carries
 /// `JobProgress::FieldWork { phase: Prepare, area, .. }`. Picks the nearest
 /// unprepared tile in `area` (via
@@ -7167,12 +7168,17 @@ pub fn htn_prepare_field_dispatch_system(
         ) else {
             continue;
         };
-        let dispatched = assign_task_with_routing(
+        let dispatched = dispatch_autonomous_task_with_routing(
             &mut ai,
+            &mut aq,
             (cur_tx, cur_ty),
             cur_chunk,
             tile,
             TaskKind::PrepareField,
+            Task::PrepareField { tile },
+            AgentGoal::Farm,
+            Some(claim.job_id),
+            true,
             None,
             &chunk_graph,
             &chunk_router,
@@ -7182,7 +7188,6 @@ pub fn htn_prepare_field_dispatch_system(
         if !dispatched {
             continue;
         }
-        aq.dispatch(Task::PrepareField { tile });
     }
 }
 

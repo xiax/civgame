@@ -565,11 +565,7 @@ fn spawn_herd_members(
         let entity = match species {
             WildHerdSpecies::Horse => commands
                 .spawn((
-                    (
-                        Horse,
-                        WildHerdMember { herd_id },
-                        HerdMember { cluster_id },
-                    ),
+                    (Horse, WildHerdMember { herd_id }, HerdMember { cluster_id }),
                     Transform::from_xyz(pos.x, pos.y, 1.0),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -588,11 +584,7 @@ fn spawn_herd_members(
                 .id(),
             WildHerdSpecies::Cow => commands
                 .spawn((
-                    (
-                        Cow,
-                        WildHerdMember { herd_id },
-                        HerdMember { cluster_id },
-                    ),
+                    (Cow, WildHerdMember { herd_id }, HerdMember { cluster_id }),
                     Transform::from_xyz(pos.x, pos.y, 1.0),
                     GlobalTransform::default(),
                     Visibility::Visible,

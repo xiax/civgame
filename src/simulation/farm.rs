@@ -509,11 +509,7 @@ pub fn seed_starting_farms_system(
                 .min_by_key(|r| {
                     let cx = r.x0 + r.w as i32 / 2;
                     let cy = r.y0 + r.h as i32 / 2;
-                    (
-                        (cx - home.0).abs().max((cy - home.1).abs()),
-                        r.x0,
-                        r.y0,
-                    )
+                    ((cx - home.0).abs().max((cy - home.1).abs()), r.x0, r.y0)
                 })
         });
 
@@ -561,7 +557,8 @@ pub fn seed_starting_farms_system(
         let storage_tile = storage_tiles
             .iter()
             .find_map(|(storage, transform)| {
-                (storage.faction_id == fid).then_some(world_to_tile(transform.translation.truncate()))
+                (storage.faction_id == fid)
+                    .then_some(world_to_tile(transform.translation.truncate()))
             })
             .unwrap_or(home);
         crate::simulation::items::spawn_or_merge_ground_item(
@@ -606,11 +603,13 @@ pub fn backfill_field_tile_index_system(
 /// Farm posting's `JobProgress::FieldWork.completed`, grants Farming XP, and
 /// bumps `FieldTileIndex[tile].nutrients` to at least `EXHAUSTED_FLOOR`.
 pub fn prepare_field_task_system(
+    mut commands: Commands,
     clock: Res<SimClock>,
     mut chunk_map: ResMut<crate::world::chunk::ChunkMap>,
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
     mut field_tiles: ResMut<FieldTileIndex>,
     mut board: ResMut<crate::simulation::jobs::JobBoard>,
+    mut completed_events: EventWriter<crate::simulation::jobs::JobCompletedEvent>,
     mut workers: Query<
         (
             Entity,
@@ -624,7 +623,7 @@ pub fn prepare_field_task_system(
         With<crate::simulation::person::Person>,
     >,
 ) {
-    use crate::simulation::jobs::{JobKind, JobProgress};
+    use crate::simulation::jobs::{record_progress, JobKind};
     use crate::simulation::person::AiState;
     use crate::simulation::skills::SkillKind;
     use crate::simulation::tasks::TaskKind;
@@ -676,11 +675,14 @@ pub fn prepare_field_task_system(
         // Credit the claimed posting's Prepare phase.
         if let Some(claim) = claim_opt {
             if matches!(claim.kind, JobKind::Farm) {
-                if let Some(posting) = board.get_mut(claim.job_id) {
-                    if let JobProgress::FieldWork { completed, .. } = &mut posting.progress {
-                        *completed = completed.saturating_add(1);
-                    }
-                }
+                record_progress(
+                    &mut commands,
+                    &mut board,
+                    &mut completed_events,
+                    claim,
+                    JobKind::Farm,
+                    1,
+                );
             }
         }
         skills.gain_xp(SkillKind::Farming, SKILL_XP_PER_PREP_TILE);
@@ -836,7 +838,10 @@ mod tests {
         for _ in 0..4 {
             nut = nut.saturating_add(FALLOW_NUTRIENTS_PER_SEASON).min(cap);
         }
-        assert_eq!(nut, 110, "nutrients hit the fertility ceiling, not 50+60=110+");
+        assert_eq!(
+            nut, 110,
+            "nutrients hit the fertility ceiling, not 50+60=110+"
+        );
     }
 
     #[test]

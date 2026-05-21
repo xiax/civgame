@@ -387,8 +387,7 @@ pub fn faction_decision_system(
                     .get(&target)
                     .map(|t| t.member_count.max(1) as f32)
                     .unwrap_or(0.0);
-                let target_drained =
-                    target_food <= target_members * RAID_RIVAL_RESERVE_PER_MEMBER;
+                let target_drained = target_food <= target_members * RAID_RIVAL_RESERVE_PER_MEMBER;
                 let recovered = food >= members * RAID_CANCEL_FOOD_PER_MEMBER;
                 let living = living_party_count(&registry, id, &alive);
                 let timed_out = now.saturating_sub(since_tick) >= RAID_ENGAGED_TIMEOUT_TICKS;
@@ -434,11 +433,7 @@ fn raid_target_viable(registry: &FactionRegistry, attacker: u32, target: u32) ->
     chebyshev(a.home_tile, t.home_tile) <= RAID_MAX_TRAVEL_TILES
 }
 
-fn living_party_count(
-    registry: &FactionRegistry,
-    faction: u32,
-    alive: &AHashSet<Entity>,
-) -> usize {
+fn living_party_count(registry: &FactionRegistry, faction: u32, alive: &AHashSet<Entity>) -> usize {
     registry
         .factions
         .get(&faction)
@@ -563,18 +558,8 @@ pub fn raid_prep_dispatch_system(
     )>,
 ) {
     let weapon_id = crate::economy::core_ids::weapon();
-    for (
-        entity,
-        mut ai,
-        mut aq,
-        goal,
-        agent,
-        carrier,
-        equipment,
-        transform,
-        member,
-        lod,
-    ) in query.iter_mut()
+    for (entity, mut ai, mut aq, goal, agent, carrier, equipment, transform, member, lod) in
+        query.iter_mut()
     {
         if *lod == LodLevel::Dormant || *goal != AgentGoal::Raid {
             continue;
@@ -595,12 +580,7 @@ pub fn raid_prep_dispatch_system(
         if agent_is_armed(equipment, carrier, Some(agent)) {
             continue;
         }
-        let stock = faction
-            .storage
-            .totals
-            .get(&weapon_id)
-            .copied()
-            .unwrap_or(0);
+        let stock = faction.storage.totals.get(&weapon_id).copied().unwrap_or(0);
         if stock == 0 {
             continue;
         }
@@ -627,7 +607,8 @@ pub fn raid_prep_dispatch_system(
                     }
                 }
             }
-            let effective = tile_stock.saturating_sub(storage_reservations.get((tx, ty), weapon_id));
+            let effective =
+                tile_stock.saturating_sub(storage_reservations.get((tx, ty), weapon_id));
             if effective == 0 {
                 continue;
             }
@@ -744,8 +725,7 @@ pub fn raid_execution_system(
             .unwrap_or(0.0);
         let cooldown_ok = now.saturating_sub(ai.last_raid_steal_tick) >= RAID_STEAL_COOLDOWN_TICKS
             || ai.last_raid_steal_tick == 0;
-        let reserve_ok =
-            target_food - 1.0 >= target_members * RAID_RIVAL_RESERVE_PER_MEMBER;
+        let reserve_ok = target_food - 1.0 >= target_members * RAID_RIVAL_RESERVE_PER_MEMBER;
         if target_food >= 1.0 && cooldown_ok && reserve_ok {
             food_steals.push((member.faction_id, raid_target_faction));
             agent.add_resource(crate::economy::core_ids::fruit(), 1);

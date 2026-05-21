@@ -1376,7 +1376,8 @@ fn build_road_network(
                 let dy = t.1 - home.1;
                 let perp_proj = dx * px + dy * py;
                 // "On spine" = perpendicular projection within 2 tiles.
-                perp_proj.abs() <= 2 && spine_axis as u8 != SpokeAxis::EW as u8 || perp_proj.abs() <= 2
+                perp_proj.abs() <= 2 && spine_axis as u8 != SpokeAxis::EW as u8
+                    || perp_proj.abs() <= 2
             };
             let mut scored: Vec<(f32, (i32, i32))> = Vec::new();
             for anchor in &brain.anchors {
@@ -1878,7 +1879,12 @@ fn build_parcels_frontier_driven(
     let mut parcels = Vec::new();
     let mut occupied: Vec<TileRect> = Vec::new();
     let mut counts: AHashMap<DistrictKind, usize> = AHashMap::default();
-    let targets = parcel_targets(faction, settlement, brain.phase, current_ag_tile_count(brain));
+    let targets = parcel_targets(
+        faction,
+        settlement,
+        brain.phase,
+        current_ag_tile_count(brain),
+    );
     let road_centred = faction.community_has(PERM_SETTLEMENT) && !brain.road_tiles.is_empty();
     let mut next_id = 0u32;
     for &tile in &brain.frontier {
@@ -1931,7 +1937,12 @@ fn build_parcels_road_driven(
     brain: &SettlementBrain,
     chunk_map: &ChunkMap,
 ) -> Vec<Parcel> {
-    let targets = parcel_targets(faction, settlement, brain.phase, current_ag_tile_count(brain));
+    let targets = parcel_targets(
+        faction,
+        settlement,
+        brain.phase,
+        current_ag_tile_count(brain),
+    );
     if targets.is_empty() {
         return Vec::new();
     }
@@ -2080,7 +2091,12 @@ fn build_ag_belt(
     if budget == 0 {
         return Vec::new();
     }
-    let targets = parcel_targets(faction, settlement, brain.phase, current_ag_tile_count(brain));
+    let targets = parcel_targets(
+        faction,
+        settlement,
+        brain.phase,
+        current_ag_tile_count(brain),
+    );
     let ag_target = *targets.get(&DistrictKind::Agricultural).unwrap_or(&0);
     if ag_target == 0 {
         return Vec::new();
@@ -2206,8 +2222,8 @@ fn build_ag_belt(
             let reach = (scan - fp_extent).max(bw as i32) as f32;
             let dist_penalty = 0.5 * (near_edge_dist / reach).min(1.0);
             let base_score = suitability.agricultural + road_bonus - dist_penalty;
-            let tile_hash = ((c.0 as i64).wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64)
-                ^ c.1 as i64) as u64;
+            let tile_hash =
+                ((c.0 as i64).wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64) ^ c.1 as i64) as u64;
             cands.push(AgCand {
                 rect,
                 access_tile,
@@ -2267,9 +2283,7 @@ fn build_ag_belt(
             let better = best.is_none()
                 || adj > best_key.0
                 || (adj == best_key.0 && c.base_score > best_key.1)
-                || (adj == best_key.0
-                    && c.base_score == best_key.1
-                    && c.tile_hash < best_key.2);
+                || (adj == best_key.0 && c.base_score == best_key.1 && c.tile_hash < best_key.2);
             if better {
                 best = Some(i);
                 best_key = (adj, c.base_score, c.tile_hash);
@@ -4318,7 +4332,11 @@ mod tests {
             .iter()
             .filter(|z| z.kind == ZoneKind::Agricultural)
             .collect();
-        assert_eq!(ag.len(), 1, "the single belt parcel → one Agricultural zone");
+        assert_eq!(
+            ag.len(),
+            1,
+            "the single belt parcel → one Agricultural zone"
+        );
         assert_eq!(ag[0].rect, belt, "ag zone uses the belt rect, not home");
     }
 
@@ -4405,9 +4423,9 @@ mod tests {
         // The strongest anchor (Market at weight 3.0) must show up as one
         // endpoint (modulo ±1 jitter).
         let target = (8, 12);
-        let hit = secondaries.iter().any(|s| {
-            (s.end.0 - target.0).abs() <= 1 && (s.end.1 - target.1).abs() <= 1
-        });
+        let hit = secondaries
+            .iter()
+            .any(|s| (s.end.0 - target.0).abs() <= 1 && (s.end.1 - target.1).abs() <= 1);
         assert!(
             hit,
             "expected strongest anchor (Market @ {:?}) among secondary endpoints; got {:?}",
@@ -4802,13 +4820,7 @@ pub fn dam_intent_emitter_system(
             continue;
         }
         let cz = chunk_map.surface_z_at(tile.0, tile.1) as i8;
-        let mut bp = Blueprint::new(
-            settlement.owner_faction,
-            None,
-            BuildSiteKind::Dam,
-            tile,
-            cz,
-        );
+        let mut bp = Blueprint::new(settlement.owner_faction, None, BuildSiteKind::Dam, tile, cz);
         bp.work_stand =
             crate::simulation::construction::work_stand_for_bridge(&chunk_map, tile, &bp_map);
         if bp.work_stand.is_none() {

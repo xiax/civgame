@@ -157,7 +157,10 @@ pub fn herd_cohesion_field_system(
     let entry = registry.by_id.get_mut(&cid).unwrap();
     let (cx, cy) = entry.center_tile;
     let cz = entry.center_z;
-    let chunk = ChunkCoord(cx.div_euclid(CHUNK_SIZE as i32), cy.div_euclid(CHUNK_SIZE as i32));
+    let chunk = ChunkCoord(
+        cx.div_euclid(CHUNK_SIZE as i32),
+        cy.div_euclid(CHUNK_SIZE as i32),
+    );
     let local_x = cx.rem_euclid(CHUNK_SIZE as i32) as u8;
     let local_y = cy.rem_euclid(CHUNK_SIZE as i32) as u8;
     let field = build_flow_field(&chunk_map, chunk, (local_x, local_y), cz, &|_| 0u16);
@@ -397,4 +400,3 @@ pub fn try_replan_via_flow_field(
 pub fn build(app: &mut App) {
     app.init_resource::<HerdClusterRegistry>();
 }
-

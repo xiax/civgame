@@ -30,9 +30,9 @@ use crate::simulation::jobs::{JobBoard, JobClaim};
 use crate::simulation::lod::LodLevel;
 use crate::simulation::needs::Needs;
 use crate::simulation::person::{Drafted, PersonAI, Profession};
-use crate::simulation::social_contact::SecondarySocial;
 use crate::simulation::schedule::SimClock;
 use crate::simulation::skills::Skills;
+use crate::simulation::social_contact::SecondarySocial;
 use crate::simulation::typed_task::{ActionQueue, Task};
 use crate::world::seasons::Calendar;
 

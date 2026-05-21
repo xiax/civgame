@@ -30,6 +30,7 @@
 use bevy::prelude::Component;
 
 use crate::economy::resource_catalog::ResourceId;
+use crate::simulation::goals::AgentGoal;
 use crate::simulation::items::EquipmentSlot;
 use crate::simulation::memory::MemoryKind;
 use crate::simulation::person::{AiState, PersonAI};
@@ -552,6 +553,21 @@ pub const UNEMPLOYED_TASK_KIND: u16 = u16::MAX;
 /// rather than spilling to a heap-backed Vec.
 pub const ACTION_QUEUE_CAP: usize = 4;
 
+/// Lifecycle metadata for autonomous dispatchers that install a concrete
+/// task directly instead of going through an HTN `MethodId`.
+///
+/// The metadata lives beside `current`, so normal `finish_task` / `advance` /
+/// `cancel` paths clear it with the task it describes. This keeps direct
+/// job-driven dispatchers from needing a second, hand-maintained preserve-arm
+/// in `goal_dispatch_system`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutonomousTaskLifecycle {
+    pub owner_goal: AgentGoal,
+    pub task_kind: TaskKind,
+    pub job_id: Option<u32>,
+    pub preserve_across_goal_dispatch: bool,
+}
+
 /// Per-agent typed-task slot. Phase 4a introduced the component (`current`
 /// only); Phase 4b-i adds the `queued` prefetch ring.
 ///
@@ -576,6 +592,7 @@ pub struct ActionQueue {
     pub current: Task,
     queued: [Task; ACTION_QUEUE_CAP],
     queued_len: u8,
+    autonomous_lifecycle: Option<AutonomousTaskLifecycle>,
 }
 
 impl Default for ActionQueue {
@@ -590,6 +607,7 @@ impl ActionQueue {
             current: Task::Idle,
             queued: [Task::Idle; ACTION_QUEUE_CAP],
             queued_len: 0,
+            autonomous_lifecycle: None,
         }
     }
 
@@ -618,6 +636,18 @@ impl ActionQueue {
 
     pub fn queued_is_full(&self) -> bool {
         self.queued_len as usize >= ACTION_QUEUE_CAP
+    }
+
+    /// Metadata for the currently-running autonomous direct-dispatch task, if
+    /// one owns `current`.
+    pub fn autonomous_lifecycle(&self) -> Option<AutonomousTaskLifecycle> {
+        self.autonomous_lifecycle
+    }
+
+    /// Stamp lifecycle metadata for the currently-running task. Callers should
+    /// only use this immediately after a dispatch promoted into `current`.
+    pub fn set_autonomous_lifecycle(&mut self, lifecycle: AutonomousTaskLifecycle) {
+        self.autonomous_lifecycle = Some(lifecycle);
     }
 
     /// Read the next prefetched task without consuming it. Returns `None` if
@@ -718,6 +748,7 @@ impl ActionQueue {
     /// Use `cancel()` instead when the entire plan chain is being aborted
     /// (player order, draft, goal flip, target despawn).
     pub fn advance(&mut self) {
+        self.autonomous_lifecycle = None;
         self.current = self.pop_next();
     }
 
@@ -736,6 +767,7 @@ impl ActionQueue {
     /// plain `current = Task::Idle` so the prefetched queue can advance into
     /// `current` on the next tick.
     pub fn cancel(&mut self) {
+        self.autonomous_lifecycle = None;
         self.current = Task::Idle;
         self.clear_queued();
     }
@@ -1250,9 +1282,7 @@ impl Task {
     /// Convenience accessor for the Plow variant. Returns
     /// `(plot_entity, animal)` where `animal` is `Some(e)` for ox-drawn
     /// plowing and `None` for human-drawn.
-    pub fn as_plow(
-        &self,
-    ) -> Option<(bevy::prelude::Entity, Option<bevy::prelude::Entity>)> {
+    pub fn as_plow(&self) -> Option<(bevy::prelude::Entity, Option<bevy::prelude::Entity>)> {
         match *self {
             Task::Plow {
                 plot_entity,
@@ -1344,9 +1374,16 @@ mod tests {
         aq.current = dig(1);
         aq.enqueue(dig(2));
         aq.enqueue(dig(3));
+        aq.set_autonomous_lifecycle(AutonomousTaskLifecycle {
+            owner_goal: AgentGoal::Farm,
+            task_kind: TaskKind::Dig,
+            job_id: Some(7),
+            preserve_across_goal_dispatch: true,
+        });
         aq.cancel();
         assert_eq!(aq.current, Task::Idle);
         assert!(aq.queued_is_empty());
+        assert_eq!(aq.autonomous_lifecycle(), None);
     }
 
     #[test]
@@ -1384,9 +1421,16 @@ mod tests {
         aq.current = dig(1);
         assert!(aq.enqueue(dig(2)));
         assert!(aq.enqueue(dig(3)));
+        aq.set_autonomous_lifecycle(AutonomousTaskLifecycle {
+            owner_goal: AgentGoal::Farm,
+            task_kind: TaskKind::Dig,
+            job_id: Some(7),
+            preserve_across_goal_dispatch: true,
+        });
         aq.advance();
         assert_eq!(aq.current, dig(2));
         assert_eq!(aq.queued_len(), 1);
+        assert_eq!(aq.autonomous_lifecycle(), None);
         aq.advance();
         assert_eq!(aq.current, dig(3));
         assert!(aq.queued_is_empty());

@@ -283,7 +283,10 @@ mod tests {
         assert!((g.total_free_volume() - v0).abs() < 1e-3, "volume drift");
         let a = g.cells[&(0, 0)].depth;
         let b = g.cells[&(1, 0)].depth;
-        assert!((a - 2.0).abs() < 0.05 && (b - 2.0).abs() < 0.05, "a={a} b={b}");
+        assert!(
+            (a - 2.0).abs() < 0.05 && (b - 2.0).abs() < 0.05,
+            "a={a} b={b}"
+        );
     }
 
     #[test]
@@ -395,6 +398,9 @@ mod tests {
         for k in [(0, 0), (1, 0), (2, 0)] {
             assert!(g.cells[&k].depth >= 0.0, "negative depth at {k:?}");
         }
-        assert!((g.total_free_volume() - 1.0).abs() < 1e-3, "volume not conserved");
+        assert!(
+            (g.total_free_volume() - 1.0).abs() < 1e-3,
+            "volume not conserved"
+        );
     }
 }

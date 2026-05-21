@@ -4854,7 +4854,6 @@ mod smoke {
 
     #[test]
     fn seed_starting_farms_spawns_physical_grain_seed_at_storage() {
-        use bevy::ecs::system::RunSystemOnce;
         use crate::economy::core_ids;
         use crate::simulation::farm::seed_starting_farms_system;
         use crate::simulation::land::{Plot, PlotIndex, TenureHolder};
@@ -4862,6 +4861,7 @@ mod smoke {
             DistrictKind, Parcel, ParcelShape, ParcelSuitability, SettlementBrain, SettlementBrains,
         };
         use crate::simulation::settlement::{SettlementMap, TileRect, ZoneKind};
+        use bevy::ecs::system::RunSystemOnce;
 
         let mut sim = TestSim::new(0xF00D_FA12);
         sim.flat_world(2, 0, TileKind::Grass);
@@ -4894,7 +4894,10 @@ mod smoke {
                 district_hint: Some(DistrictKind::Agricultural),
                 suitability: ParcelSuitability::default(),
             });
-            world.resource_mut::<SettlementBrains>().0.insert(sid, brain);
+            world
+                .resource_mut::<SettlementBrains>()
+                .0
+                .insert(sid, brain);
         }
 
         sim.app
@@ -4925,14 +4928,12 @@ mod smoke {
         let grain_seed = core_ids::grain_seed();
         let seed_qty: u32 = {
             let world = sim.app.world_mut();
-            let mut q =
-                world.query::<(&crate::simulation::items::GroundItem, &Transform)>();
+            let mut q = world.query::<(&crate::simulation::items::GroundItem, &Transform)>();
             q.iter(world)
                 .filter(|(item, transform)| {
                     item.item.resource_id == grain_seed
-                        && crate::world::terrain::world_to_tile(
-                            transform.translation.truncate(),
-                        ) == storage_tile
+                        && crate::world::terrain::world_to_tile(transform.translation.truncate())
+                            == storage_tile
                 })
                 .map(|(item, _)| item.qty)
                 .sum()
@@ -5047,13 +5048,13 @@ mod smoke {
     /// pre-loaded from `TileData.fertility`). Founders pay Spring 1 to till.
     #[test]
     fn seed_belt_does_not_stamp_cropland_and_seeds_field_tile_index() {
-        use bevy::ecs::system::RunSystemOnce;
-        use crate::simulation::farm::{FieldTileIndex, seed_starting_farms_system};
+        use crate::simulation::farm::{seed_starting_farms_system, FieldTileIndex};
         use crate::simulation::land::{PlotIndex, TenureHolder};
         use crate::simulation::organic_settlement::{
             DistrictKind, Parcel, ParcelShape, ParcelSuitability, SettlementBrain, SettlementBrains,
         };
         use crate::simulation::settlement::{SettlementMap, TileRect};
+        use bevy::ecs::system::RunSystemOnce;
 
         let mut sim = TestSim::new(0xCA11_F1E1);
         sim.flat_world(3, 0, TileKind::Grass);
@@ -5078,7 +5079,10 @@ mod smoke {
                 district_hint: Some(DistrictKind::Agricultural),
                 suitability: ParcelSuitability::default(),
             });
-            world.resource_mut::<SettlementBrains>().0.insert(sid, brain);
+            world
+                .resource_mut::<SettlementBrains>()
+                .0
+                .insert(sid, brain);
         }
 
         sim.app
@@ -5267,10 +5271,7 @@ mod smoke {
             world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
             for ty in 40..56 {
                 for tx in 40..56 {
-                    world
-                        .resource_mut::<PlotIndex>()
-                        .ag_tiles
-                        .insert((tx, ty));
+                    world.resource_mut::<PlotIndex>().ag_tiles.insert((tx, ty));
                     world
                         .resource_mut::<FieldTileIndex>()
                         .ensure_entry((tx, ty), pid, 150);
@@ -5301,6 +5302,284 @@ mod smoke {
             prepare_count >= 1,
             "Spring must post at least one FieldWork(Prepare); got {prepare_count}"
         );
+    }
+
+    #[test]
+    fn prepare_field_direct_dispatch_survives_goal_dispatch_lifecycle() {
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::farm::{FarmWorkPhase, FieldTileIndex};
+        use crate::simulation::jobs::{
+            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass, TileAabb,
+        };
+        use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
+        use crate::simulation::settlement::{TileRect, ZoneKind};
+        use crate::simulation::tasks::TaskKind;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(0xF1E1D);
+        sim.flat_world(3, 0, TileKind::Grass);
+        let connectivity_id = sim
+            .app
+            .world_mut()
+            .register_system(crate::pathfinding::connectivity::rebuild_connectivity_system);
+        sim.app.world_mut().run_system(connectivity_id).unwrap();
+        let fid = sim.player_faction_id;
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.add_member(fid);
+        }
+
+        let area = TileAabb {
+            min: (40, 40),
+            max: (40, 40),
+        };
+        let pid = {
+            let world = sim.app.world_mut();
+            let pid = world.resource_mut::<PlotIndex>().alloc_id();
+            let plot_entity = world
+                .spawn(Plot {
+                    id: pid,
+                    settlement_id: 0,
+                    faction_id: fid,
+                    rect: TileRect::new(40, 40, 1, 1),
+                    z: 0,
+                    zone_kind: ZoneKind::Agricultural,
+                    tenure: Tenure::StateOwned,
+                    holder: TenureHolder::State { faction_id: fid },
+                    base_value: 0.0,
+                    last_valued_tick: 0,
+                    missed_payments: 0,
+                    frontage_edge: None,
+                    access_tile: None,
+                    parent_plot: None,
+                    plowed_year: None,
+                })
+                .id();
+            world
+                .resource_mut::<PlotIndex>()
+                .by_id
+                .insert(pid, plot_entity);
+            world
+                .resource_mut::<PlotIndex>()
+                .by_tile
+                .insert((40, 40), pid);
+            world.resource_mut::<PlotIndex>().ag_tiles.insert((40, 40));
+            world
+                .resource_mut::<FieldTileIndex>()
+                .ensure_entry((40, 40), pid, 150);
+            pid
+        };
+
+        let worker = sim.spawn_person(fid, (0, 0), |b| {
+            b.goal(AgentGoal::Farm);
+            b.profession(Profession::Farmer);
+        });
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            board.faction_postings_mut(fid).push(JobPosting {
+                id,
+                faction_id: fid,
+                kind: JobKind::Farm,
+                progress: JobProgress::FieldWork {
+                    phase: FarmWorkPhase::Prepare,
+                    completed: 0,
+                    target: 1,
+                    area,
+                    plot_id: Some(pid),
+                    assigned_farmer: None,
+                },
+                claimants: vec![worker],
+                priority: 200,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            });
+            id
+        };
+        sim.app.world_mut().entity_mut(worker).insert(JobClaim {
+            job_id,
+            faction_id: fid,
+            kind: JobKind::Farm,
+            posted_tick: 0,
+            fail_count: 0,
+        });
+
+        let dispatch_id = sim
+            .app
+            .world_mut()
+            .register_system(crate::simulation::htn::htn_prepare_field_dispatch_system);
+        sim.app.world_mut().run_system(dispatch_id).unwrap();
+
+        {
+            let aq = sim.app.world().get::<ActionQueue>(worker).unwrap();
+            assert_eq!(aq.current, Task::PrepareField { tile: (40, 40) });
+            let lifecycle = aq
+                .autonomous_lifecycle()
+                .expect("PrepareField dispatch must stamp lifecycle metadata");
+            assert_eq!(lifecycle.owner_goal, AgentGoal::Farm);
+            assert_eq!(lifecycle.task_kind, TaskKind::PrepareField);
+            assert_eq!(lifecycle.job_id, Some(job_id));
+            assert!(lifecycle.preserve_across_goal_dispatch);
+        }
+
+        let reset_id = sim
+            .app
+            .world_mut()
+            .register_system(crate::simulation::tasks::goal_dispatch_system);
+        sim.app.world_mut().run_system(reset_id).unwrap();
+        {
+            let aq = sim.app.world().get::<ActionQueue>(worker).unwrap();
+            assert_eq!(
+                aq.current,
+                Task::PrepareField { tile: (40, 40) },
+                "Farm-owned PrepareField must survive stale-task reset"
+            );
+        }
+
+        *sim.app.world_mut().get_mut::<AgentGoal>(worker).unwrap() = AgentGoal::GatherFood;
+        sim.app.world_mut().run_system(reset_id).unwrap();
+        {
+            let aq = sim.app.world().get::<ActionQueue>(worker).unwrap();
+            assert_eq!(aq.current, Task::Idle);
+            assert_eq!(aq.autonomous_lifecycle(), None);
+            assert_eq!(person_ai(&sim.app, worker).state, AiState::Idle);
+        }
+    }
+
+    #[test]
+    fn prepare_field_completion_uses_job_board_progress_and_releases_claim() {
+        use crate::simulation::farm::{
+            FarmWorkPhase, FieldTileIndex, EXHAUSTED_FLOOR, FIELD_PREP_WORK_TICKS,
+        };
+        use crate::simulation::jobs::{
+            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass, TileAabb,
+        };
+        use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
+        use crate::simulation::settlement::{TileRect, ZoneKind};
+        use crate::simulation::typed_task::{ActionQueue, Task};
+        use crate::world::tile::TileKind;
+
+        let mut sim = TestSim::new(0xF1E1E);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        let tile = (1, 0);
+        let area = TileAabb {
+            min: tile,
+            max: tile,
+        };
+        let pid = {
+            let world = sim.app.world_mut();
+            let pid = world.resource_mut::<PlotIndex>().alloc_id();
+            let plot_entity = world
+                .spawn(Plot {
+                    id: pid,
+                    settlement_id: 0,
+                    faction_id: fid,
+                    rect: TileRect::new(tile.0, tile.1, 1, 1),
+                    z: 0,
+                    zone_kind: ZoneKind::Agricultural,
+                    tenure: Tenure::StateOwned,
+                    holder: TenureHolder::State { faction_id: fid },
+                    base_value: 0.0,
+                    last_valued_tick: 0,
+                    missed_payments: 0,
+                    frontage_edge: None,
+                    access_tile: None,
+                    parent_plot: None,
+                    plowed_year: None,
+                })
+                .id();
+            world
+                .resource_mut::<PlotIndex>()
+                .by_id
+                .insert(pid, plot_entity);
+            world.resource_mut::<PlotIndex>().by_tile.insert(tile, pid);
+            world.resource_mut::<PlotIndex>().ag_tiles.insert(tile);
+            world
+                .resource_mut::<FieldTileIndex>()
+                .ensure_entry(tile, pid, 5);
+            pid
+        };
+
+        let worker = sim.spawn_person(fid, (0, 0), |b| {
+            b.goal(AgentGoal::Farm);
+            b.profession(Profession::Farmer);
+        });
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            board.faction_postings_mut(fid).push(JobPosting {
+                id,
+                faction_id: fid,
+                kind: JobKind::Farm,
+                progress: JobProgress::FieldWork {
+                    phase: FarmWorkPhase::Prepare,
+                    completed: 0,
+                    target: 1,
+                    area,
+                    plot_id: Some(pid),
+                    assigned_farmer: None,
+                },
+                claimants: vec![worker],
+                priority: 200,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            });
+            id
+        };
+        {
+            let world = sim.app.world_mut();
+            world.entity_mut(worker).insert(JobClaim {
+                job_id,
+                faction_id: fid,
+                kind: JobKind::Farm,
+                posted_tick: 0,
+                fail_count: 0,
+            });
+            let mut ai = world.get_mut::<PersonAI>(worker).unwrap();
+            ai.state = AiState::Working;
+            ai.work_progress = FIELD_PREP_WORK_TICKS as u8;
+            let mut aq = world.get_mut::<ActionQueue>(worker).unwrap();
+            aq.current = Task::PrepareField { tile };
+        }
+
+        let executor_id = sim
+            .app
+            .world_mut()
+            .register_system(crate::simulation::farm::prepare_field_task_system);
+        sim.app.world_mut().run_system(executor_id).unwrap();
+
+        let kind = sim
+            .app
+            .world()
+            .resource::<ChunkMap>()
+            .tile_kind_at(tile.0, tile.1);
+        assert_eq!(kind, Some(TileKind::Cropland));
+        let field = sim.app.world().resource::<FieldTileIndex>();
+        assert!(
+            field.by_tile.get(&tile).unwrap().nutrients >= EXHAUSTED_FLOOR,
+            "PrepareField must bump exhausted nutrients to the floor"
+        );
+        let board = sim.app.world().resource::<JobBoard>();
+        assert!(
+            board.faction_postings(fid).iter().all(|p| p.id != job_id),
+            "completed FieldWork posting must be removed"
+        );
+        assert!(
+            sim.app.world().get::<JobClaim>(worker).is_none(),
+            "worker JobClaim released on prepare completion"
+        );
+        let aq = sim.app.world().get::<ActionQueue>(worker).unwrap();
+        assert_eq!(aq.current, Task::Idle);
+        assert_eq!(aq.autonomous_lifecycle(), None);
     }
 
     /// Draftwork v2: with `ARD_PLOW` Aware + an `ard_plow` implement in
@@ -5374,10 +5653,7 @@ mod smoke {
             world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
             for ty in 40..56 {
                 for tx in 40..56 {
-                    world
-                        .resource_mut::<PlotIndex>()
-                        .ag_tiles
-                        .insert((tx, ty));
+                    world.resource_mut::<PlotIndex>().ag_tiles.insert((tx, ty));
                     world
                         .resource_mut::<FieldTileIndex>()
                         .ensure_entry((tx, ty), pid, 150);
@@ -5481,10 +5757,7 @@ mod smoke {
             world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
             for ty in 40..56 {
                 for tx in 40..56 {
-                    world
-                        .resource_mut::<PlotIndex>()
-                        .ag_tiles
-                        .insert((tx, ty));
+                    world.resource_mut::<PlotIndex>().ag_tiles.insert((tx, ty));
                     world
                         .resource_mut::<FieldTileIndex>()
                         .ensure_entry((tx, ty), pid, 150);
@@ -5525,8 +5798,7 @@ mod smoke {
         use crate::simulation::draftwork::PLOW_WORK_TICKS_PER_TILE;
         use crate::simulation::faction::FactionRegistry;
         use crate::simulation::jobs::{
-            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass,
-            TileAabb,
+            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass, TileAabb,
         };
         use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
         use crate::simulation::person::{AiState, PersonAI};
@@ -5572,10 +5844,7 @@ mod smoke {
             world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
             for ty in 40..42 {
                 for tx in 40..42 {
-                    world
-                        .resource_mut::<PlotIndex>()
-                        .ag_tiles
-                        .insert((tx, ty));
+                    world.resource_mut::<PlotIndex>().ag_tiles.insert((tx, ty));
                 }
             }
             pid
@@ -5600,9 +5869,7 @@ mod smoke {
         let animal = sim
             .app
             .world_mut()
-            .spawn((Tamed {
-                owner_faction: fid,
-            },))
+            .spawn((Tamed { owner_faction: fid },))
             .id();
 
         // Post the Plow job to the board.
@@ -5653,11 +5920,14 @@ mod smoke {
                 expires_tick: u32::MAX,
             },
         ));
-        sim.app.world_mut().entity_mut(animal).insert(AnimalWorkClaim {
-            worker,
-            use_kind: AnimalUse::Plow,
-            expires_tick: u32::MAX,
-        });
+        sim.app
+            .world_mut()
+            .entity_mut(animal)
+            .insert(AnimalWorkClaim {
+                worker,
+                use_kind: AnimalUse::Plow,
+                expires_tick: u32::MAX,
+            });
 
         // Drive the executor directly via register_system so we bypass
         // any goal-update / dispatcher / preserve-arm interference and
@@ -5680,10 +5950,7 @@ mod smoke {
             }
             sim.app.world_mut().run_system(executor_id).unwrap();
             let board = sim.app.world().resource::<JobBoard>();
-            let post = board
-                .faction_postings(fid)
-                .iter()
-                .find(|p| p.id == job_id);
+            let post = board.faction_postings(fid).iter().find(|p| p.id == job_id);
             if let Some(p) = post {
                 if let JobProgress::Plow { plowed_tiles, .. } = p.progress {
                     assert!(
@@ -5773,15 +6040,12 @@ mod smoke {
             let f = registry.factions.get_mut(&fid).unwrap();
             f.techs.unlock(ANIMAL_HUSBANDRY);
         }
-        sim.app
-            .world_mut()
-            .spawn(HitchingPost::new(fid, (2, 0)));
+        sim.app.world_mut().spawn(HitchingPost::new(fid, (2, 0)));
 
         // Tick so the SpatialIndex registers the storage ground items, then
         // park the clock on a daily boundary and drive the assembly system.
         sim.tick_n(10);
-        sim.app.world_mut().resource_mut::<SimClock>().tick =
-            TICKS_PER_DAY as u64;
+        sim.app.world_mut().resource_mut::<SimClock>().tick = TICKS_PER_DAY as u64;
         let assembly_id = sim
             .app
             .world_mut()
@@ -5805,7 +6069,10 @@ mod smoke {
             .iter(sim.app.world())
             .filter(|c| c.owner_faction == fid)
             .count();
-        assert_eq!(cart_count2, 1, "cart assembly is capped at one cart per faction");
+        assert_eq!(
+            cart_count2, 1,
+            "cart assembly is capped at one cart per faction"
+        );
     }
 
     /// Animal Husbandry v2.1: the cart-haul executor loads bulk material at a
@@ -5817,9 +6084,7 @@ mod smoke {
         use crate::economy::core_ids;
         use crate::simulation::animals::{AnimalUse, AnimalWorkClaim, Tamed};
         use crate::simulation::cart::{Cart, CartInventory, CartSize, CART_PHASE_WORK_TICKS};
-        use crate::simulation::construction::{
-            Blueprint, BuildSiteKind, GoodNeed, WallMaterial,
-        };
+        use crate::simulation::construction::{Blueprint, BuildSiteKind, GoodNeed, WallMaterial};
         use crate::simulation::faction::FactionRegistry;
         use crate::simulation::husbandry::HitchingPost;
         use crate::simulation::jobs::{
@@ -6041,8 +6306,7 @@ mod smoke {
         use crate::simulation::draftwork::PLOW_WORK_TICKS_PER_TILE_HUMAN;
         use crate::simulation::faction::FactionRegistry;
         use crate::simulation::jobs::{
-            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass,
-            TileAabb,
+            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass, TileAabb,
         };
         use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
         use crate::simulation::person::{AiState, PersonAI};
@@ -6086,10 +6350,7 @@ mod smoke {
             world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
             for ty in 40..42 {
                 for tx in 40..42 {
-                    world
-                        .resource_mut::<PlotIndex>()
-                        .ag_tiles
-                        .insert((tx, ty));
+                    world.resource_mut::<PlotIndex>().ag_tiles.insert((tx, ty));
                 }
             }
             pid
@@ -6167,10 +6428,7 @@ mod smoke {
             }
             sim.app.world_mut().run_system(executor_id).unwrap();
             let board = sim.app.world().resource::<JobBoard>();
-            let post = board
-                .faction_postings(fid)
-                .iter()
-                .find(|p| p.id == job_id);
+            let post = board.faction_postings(fid).iter().find(|p| p.id == job_id);
             if let Some(p) = post {
                 if let JobProgress::Plow { plowed_tiles, .. } = p.progress {
                     assert!(
@@ -6223,8 +6481,7 @@ mod smoke {
         };
         use crate::simulation::faction::FactionRegistry;
         use crate::simulation::jobs::{
-            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass,
-            TileAabb,
+            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass, TileAabb,
         };
         use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
         use crate::simulation::person::{AiState, PersonAI};
@@ -6434,10 +6691,7 @@ mod smoke {
             world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
             for ty in 40..56 {
                 for tx in 40..56 {
-                    world
-                        .resource_mut::<PlotIndex>()
-                        .ag_tiles
-                        .insert((tx, ty));
+                    world.resource_mut::<PlotIndex>().ag_tiles.insert((tx, ty));
                     world
                         .resource_mut::<FieldTileIndex>()
                         .ensure_entry((tx, ty), pid, 150);
@@ -6471,7 +6725,7 @@ mod smoke {
     /// `run_system_once`).
     #[test]
     fn fallow_recovery_restores_nutrients_capped_at_fertility() {
-        use crate::simulation::farm::{FieldTileIndex, fallow_recovery_system};
+        use crate::simulation::farm::{fallow_recovery_system, FieldTileIndex};
         use crate::world::seasons::{Calendar, Season};
 
         let mut sim = TestSim::new(0xFA110);
@@ -6513,10 +6767,7 @@ mod smoke {
 
         // Register the system once. Local<Option<Season>> persists across
         // every run_system call against this SystemId.
-        let sys_id = sim
-            .app
-            .world_mut()
-            .register_system(fallow_recovery_system);
+        let sys_id = sim.app.world_mut().register_system(fallow_recovery_system);
 
         // Run 1: Spring primes the Local.
         {
@@ -12941,12 +13192,12 @@ mod baseline_behaviour {
     /// retain fires, so `claimants.is_empty()` would short-circuit the drop.
     #[test]
     fn chief_stockpile_drop_refunds_escrow() {
-        use bevy::ecs::system::RunSystemOnce;
         use crate::economy::agent::EconomicAgent;
         use crate::simulation::jobs::{
             JobBoard, JobEscrow, JobEscrowIndex, JobKind, JobPosting, JobProgress, JobSource,
             PosterClass,
         };
+        use bevy::ecs::system::RunSystemOnce;
 
         let mut sim = TestSim::new(2026_05_19);
         sim.flat_world(2, 0, TileKind::Grass);
@@ -16473,12 +16724,9 @@ mod onenter_era_seeding {
         trigger_onenter(&mut sim);
 
         let world = sim.app.world();
-        let reservation = world
-            .resource::<crate::simulation::seed_reservation::SeedReservation>();
-        let structure_index = world
-            .resource::<crate::simulation::construction::StructureIndex>();
-        let doormat = world
-            .resource::<crate::simulation::doormat::DoormatReservations>();
+        let reservation = world.resource::<crate::simulation::seed_reservation::SeedReservation>();
+        let structure_index = world.resource::<crate::simulation::construction::StructureIndex>();
+        let doormat = world.resource::<crate::simulation::doormat::DoormatReservations>();
 
         assert!(
             !reservation.is_empty(),
@@ -16509,8 +16757,7 @@ mod onenter_era_seeding {
         trigger_onenter(&mut sim);
 
         let world = sim.app.world();
-        let reservation = world
-            .resource::<crate::simulation::seed_reservation::SeedReservation>();
+        let reservation = world.resource::<crate::simulation::seed_reservation::SeedReservation>();
         let plant_map = world.resource::<crate::simulation::plants::PlantMap>();
 
         for &tile in plant_map.0.keys() {
@@ -16616,7 +16863,12 @@ mod onenter_era_seeding {
         trigger_onenter(&mut sim);
 
         let members = player_member_entities(&sim);
-        assert_eq!(members.len(), 2, "expected 2 founders, got {}", members.len());
+        assert_eq!(
+            members.len(),
+            2,
+            "expected 2 founders, got {}",
+            members.len()
+        );
         let h0 = household_id_of(&sim, members[0]);
         let h1 = household_id_of(&sim, members[1]);
         assert!(
@@ -16863,8 +17115,8 @@ mod onenter_era_seeding {
     #[test]
     fn no_founder_on_stamped_structure_tile() {
         use crate::simulation::construction::{BedMap, WallMap};
-        use crate::world::tile::TileKind;
         use crate::world::terrain::TILE_SIZE;
+        use crate::world::tile::TileKind;
 
         let mut sim = fixture_with_flat_world();
         configure_start(&mut sim, Era::Neolithic);
@@ -16882,16 +17134,14 @@ mod onenter_era_seeding {
             .faction_id;
 
         let mut checked = 0u32;
-        let mut q = world
-            .iter_entities()
-            .filter_map(|e| {
-                let fm = e.get::<crate::simulation::faction::FactionMember>()?;
-                if fm.faction_id != player_fid {
-                    return None;
-                }
-                let t = e.get::<Transform>()?;
-                Some((e.id(), t.translation.x, t.translation.y))
-            });
+        let mut q = world.iter_entities().filter_map(|e| {
+            let fm = e.get::<crate::simulation::faction::FactionMember>()?;
+            if fm.faction_id != player_fid {
+                return None;
+            }
+            let t = e.get::<Transform>()?;
+            Some((e.id(), t.translation.x, t.translation.y))
+        });
 
         while let Some((entity, wx, wy)) = q.next() {
             let tx = (wx / TILE_SIZE).floor() as i32;
@@ -17001,10 +17251,7 @@ mod onenter_era_seeding {
     }
 
     /// The raw (always-present) component.
-    fn secondary(
-        app: &App,
-        e: Entity,
-    ) -> crate::simulation::social_contact::SecondarySocial {
+    fn secondary(app: &App, e: Entity) -> crate::simulation::social_contact::SecondarySocial {
         *app.world()
             .get::<crate::simulation::social_contact::SecondarySocial>(e)
             .expect("SecondarySocial is spawned on every Person")
@@ -17029,14 +17276,12 @@ mod onenter_era_seeding {
         let mut sim = TestSim::new(0xA31B);
         sim.flat_world(2, 0, TileKind::Grass);
         sim.seed_faction_food(sim.player_faction_id, 256);
-        let a = sim
-            .spawn_person(sim.player_faction_id, (0, 0), |b| {
-                b.goal(AgentGoal::GatherWood);
-            });
-        let c = sim
-            .spawn_person(sim.player_faction_id, (2, 0), |b| {
-                b.goal(AgentGoal::GatherWood);
-            });
+        let a = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.goal(AgentGoal::GatherWood);
+        });
+        let c = sim.spawn_person(sim.player_faction_id, (2, 0), |b| {
+            b.goal(AgentGoal::GatherWood);
+        });
 
         tick_pinned(
             &mut sim,

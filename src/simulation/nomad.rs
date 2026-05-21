@@ -312,12 +312,10 @@ pub fn nomad_migration_system(world: &mut World) {
                 // Strict AND: stored-food deficit AND weak local knowledge.
                 // Either alone is not enough to uproot the band.
                 let members = faction.member_count.max(1) as f32;
-                let food_deficit =
-                    faction.storage.food_total() < members * NOMAD_TRIGGER_FOOD_DAYS;
+                let food_deficit = faction.storage.food_total() < members * NOMAD_TRIGGER_FOOD_DAYS;
                 let food_score =
                     score_local_food(shared, fid, faction.home_tile, NOMAD_FORAGE_RADIUS);
-                let weak_local =
-                    (food_score as f32) < members * NOMAD_KNOWN_FOOD_TARGET_PER_MEMBER;
+                let weak_local = (food_score as f32) < members * NOMAD_KNOWN_FOOD_TARGET_PER_MEMBER;
                 if !(food_deficit && weak_local) {
                     return None;
                 }
@@ -605,14 +603,11 @@ pub fn nomad_survey_completion_system(world: &mut World) {
                         // ~NOMAD_NO_CANDIDATE_RETRY_DAYS days rather than
                         // waiting a full migration period.
                         faction.pending_migration = None;
-                        faction.migration_phase =
-                            crate::simulation::faction::MigrationPhase::Idle;
+                        faction.migration_phase = crate::simulation::faction::MigrationPhase::Idle;
                         faction.last_phase_change_tick = now;
-                        let retry =
-                            NOMAD_NO_CANDIDATE_RETRY_DAYS.saturating_mul(TICKS_PER_DAY);
-                        faction.last_migration_tick = now
-                            .saturating_add(retry)
-                            .saturating_sub(d.retry_cooldown);
+                        let retry = NOMAD_NO_CANDIDATE_RETRY_DAYS.saturating_mul(TICKS_PER_DAY);
+                        faction.last_migration_tick =
+                            now.saturating_add(retry).saturating_sub(d.retry_cooldown);
                         info!(
                             "Faction {} survey found no acceptable site tick {now}; retry ~{} days",
                             d.fid, NOMAD_NO_CANDIDATE_RETRY_DAYS,
@@ -3870,8 +3865,8 @@ mod tests {
 
     #[test]
     fn score_danger_ignores_prey_clusters() {
-        use crate::simulation::shared_knowledge::{KnowledgeTier, SharedKnowledge};
         use crate::simulation::shared_knowledge::ResourceOwner;
+        use crate::simulation::shared_knowledge::{KnowledgeTier, SharedKnowledge};
         let mut shared = SharedKnowledge::default();
         // A Prey cluster (deer/wolf mix) right on the tile must NOT be
         // treated as danger — deer are good grazing, not a threat.
@@ -3887,8 +3882,8 @@ mod tests {
 
     #[test]
     fn score_danger_penalises_hostile_faction() {
-        use crate::simulation::shared_knowledge::{KnowledgeTier, SharedKnowledge};
         use crate::simulation::shared_knowledge::ResourceOwner;
+        use crate::simulation::shared_knowledge::{KnowledgeTier, SharedKnowledge};
         let mut shared = SharedKnowledge::default();
         shared.report_sighting(
             KnowledgeTier::Faction(1),

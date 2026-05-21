@@ -91,8 +91,7 @@ pub struct ScorerInputs<'w, 's> {
     /// Household membership for the agent. Read once per
     /// `goal_update_system` cycle to decide `private_farm_available`
     /// for the FarmWorkScorer household-availability gate.
-    pub household_q:
-        Query<'w, 's, &'static crate::simulation::reproduction::HouseholdMember>,
+    pub household_q: Query<'w, 's, &'static crate::simulation::reproduction::HouseholdMember>,
     /// All plot components. Walked once per `goal_update_system`
     /// invocation to build the `households_with_ag_plot` snapshot
     /// (cheap — plot count is bounded per settlement).
@@ -663,8 +662,8 @@ pub fn goal_update_system(
                         .unwrap_or(0);
                     match farm_season {
                         crate::simulation::farm::FarmSeasonPhase::SpringPrepPlant => {
-                            let unprepared = !is_cropland
-                                || nut < crate::simulation::farm::EXHAUSTED_FLOOR;
+                            let unprepared =
+                                !is_cropland || nut < crate::simulation::farm::EXHAUSTED_FLOOR;
                             let plantable = is_cropland
                                 && nut >= crate::simulation::farm::MIN_PLANTABLE_NUTRIENTS
                                 && !scorer_inputs.plant_map.0.contains_key(&(tx, ty));
@@ -674,8 +673,8 @@ pub fn goal_update_system(
                             }
                         }
                         crate::simulation::farm::FarmSeasonPhase::SummerMaintenance => {
-                            let unprepared = !is_cropland
-                                || nut < crate::simulation::farm::EXHAUSTED_FLOOR;
+                            let unprepared =
+                                !is_cropland || nut < crate::simulation::farm::EXHAUSTED_FLOOR;
                             if unprepared {
                                 has_work = true;
                                 break 'tiles;

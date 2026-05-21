@@ -412,12 +412,20 @@ pub fn cart_assembly_system(
         };
 
         // Path A: pre-crafted parts in storage (1 frame + 2 wheels).
-        let have_frame =
-            faction_storage_stock(faction_id, frame, &storage_tile_map, &spatial, &ground_items)
-                >= 1;
-        let have_wheels =
-            faction_storage_stock(faction_id, wheels, &storage_tile_map, &spatial, &ground_items)
-                >= 2;
+        let have_frame = faction_storage_stock(
+            faction_id,
+            frame,
+            &storage_tile_map,
+            &spatial,
+            &ground_items,
+        ) >= 1;
+        let have_wheels = faction_storage_stock(
+            faction_id,
+            wheels,
+            &storage_tile_map,
+            &spatial,
+            &ground_items,
+        ) >= 2;
         let assembled = if have_frame && have_wheels {
             consume_faction_storage(
                 &mut commands,
@@ -700,7 +708,9 @@ fn blueprint_remaining_need(bp: &Blueprint, rid: ResourceId) -> u32 {
     for i in 0..bp.deposit_count as usize {
         if bp.deposits[i].resource_id == rid {
             total = total.saturating_add(
-                bp.deposits[i].needed.saturating_sub(bp.deposits[i].deposited) as u32,
+                bp.deposits[i]
+                    .needed
+                    .saturating_sub(bp.deposits[i].deposited) as u32,
             );
         }
     }
@@ -783,8 +793,9 @@ pub fn cart_haul_task_system(
         }
 
         // Snapshot cart capacity + load state; abort if the cart vanished.
-        let Ok((cart_capacity, cart_loaded)) =
-            carts_q.get(cart_e).map(|(c, inv)| (c.capacity_g, !inv.is_empty()))
+        let Ok((cart_capacity, cart_loaded)) = carts_q
+            .get(cart_e)
+            .map(|(c, inv)| (c.capacity_g, !inv.is_empty()))
         else {
             release_animal_work_claim(&mut commands, animal_e);
             commands.entity(worker).remove::<JobClaim>();
@@ -856,11 +867,12 @@ pub fn cart_haul_task_system(
                     if bp.deposits[i].resource_id != rid {
                         continue;
                     }
-                    let still =
-                        bp.deposits[i].needed.saturating_sub(bp.deposits[i].deposited) as u32;
+                    let still = bp.deposits[i]
+                        .needed
+                        .saturating_sub(bp.deposits[i].deposited)
+                        as u32;
                     let take = still.min(remaining).min(u8::MAX as u32);
-                    bp.deposits[i].deposited =
-                        bp.deposits[i].deposited.saturating_add(take as u8);
+                    bp.deposits[i].deposited = bp.deposits[i].deposited.saturating_add(take as u8);
                     remaining -= take;
                     deposited += take;
                 }

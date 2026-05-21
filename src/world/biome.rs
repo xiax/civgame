@@ -299,11 +299,7 @@ impl SurfaceBiomeSample {
 /// transition band → emit a dithered `accent_weight` capped at
 /// `MAX_ACCENT_WEIGHT`. Band width follows the climate gradient magnitude
 /// naturally (gentle gradients widen the ecotone).
-pub fn surface_biome_sample_at_tile(
-    globe: &Globe,
-    tile_x: i32,
-    tile_y: i32,
-) -> SurfaceBiomeSample {
+pub fn surface_biome_sample_at_tile(globe: &Globe, tile_x: i32, tile_y: i32) -> SurfaceBiomeSample {
     let (elev_u, _, _) = globe.sample_climate(tile_x, tile_y);
     let elev_f = elev_u / 255.0;
     if elev_f > MOUNTAIN_ELEV_GATE {
@@ -392,7 +388,10 @@ mod tests {
         // Channel stays fresh regardless of any reservoir sampling.
         let g = crate::world::globe::generate_globe(42);
         assert_eq!(water_kind_at(&g, TileKind::River, 0, 0), WaterKind::Fresh);
-        assert_eq!(water_kind_at(&g, TileKind::Marsh, 12345, -678), WaterKind::Fresh);
+        assert_eq!(
+            water_kind_at(&g, TileKind::Marsh, 12345, -678),
+            WaterKind::Fresh
+        );
         // Non-water tile → neutral Fresh default.
         assert_eq!(water_kind_at(&g, TileKind::Grass, 5, 5), WaterKind::Fresh);
     }
@@ -481,7 +480,11 @@ mod tests {
                 );
                 // Whenever base == accent we expect weight 0 (interior).
                 if s.base == s.accent {
-                    assert_eq!(s.weight_q, 0, "interior tile has weight at ({}, {})", tx, ty);
+                    assert_eq!(
+                        s.weight_q, 0,
+                        "interior tile has weight at ({}, {})",
+                        tx, ty
+                    );
                 }
                 // Ocean/Mountain gates → pure samples (no ecotone).
                 if matches!(s.base, Biome::Ocean | Biome::Mountain) {

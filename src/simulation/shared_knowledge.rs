@@ -409,8 +409,7 @@ impl KnowledgeMap {
                         // pressured-but-closest rep wins over a free-but-far
                         // rep on the same cluster, defeating the cluster
                         // mutex.
-                        let Some(target) = c.pick_least_pressured_rep(dist, &claim_penalty)
-                        else {
+                        let Some(target) = c.pick_least_pressured_rep(dist, &claim_penalty) else {
                             continue;
                         };
                         let score = dist(target) + claim_penalty(target);
@@ -720,14 +719,10 @@ impl<'w> GatherKnowledge<'w> {
         };
         // Detour-aware (river-aware) distance: a target on the far bank
         // of a river costs the walk-around, not the straight line.
-        let est = crate::pathfinding::detour::DetourEstimator::new(
-            &self.chunk_router,
-            &self.chunk_graph,
-        );
-        let z_of = |t: (i32, i32)| {
-            self.chunk_map
-                .nearest_standable_z(t.0, t.1, agent_z as i32) as i8
-        };
+        let est =
+            crate::pathfinding::detour::DetourEstimator::new(&self.chunk_router, &self.chunk_graph);
+        let z_of =
+            |t: (i32, i32)| self.chunk_map.nearest_standable_z(t.0, t.1, agent_z as i32) as i8;
         let dist = est.from(from, agent_z, z_of);
         self.shared
             .nearest_in_tier_set_with_cluster_filter(
@@ -1045,7 +1040,10 @@ mod tests {
             ResourceCluster::new(ClusterId(0), fake_kind(), ResourceOwner::Public, (5, 5), 0);
         c.push_rep((20, 20));
         let zero = |_t: (i32, i32)| 0i32;
-        assert_eq!(c.pick_least_pressured_rep(&cheb((0, 0)), zero), Some((5, 5)));
+        assert_eq!(
+            c.pick_least_pressured_rep(&cheb((0, 0)), zero),
+            Some((5, 5))
+        );
         assert_eq!(c.nearest_target_tile((0, 0)), Some((5, 5)));
     }
 
@@ -1059,7 +1057,10 @@ mod tests {
         c.push_rep((20, 20));
         // Penalty 100 on the close rep — far rep at chebyshev 20 wins on score.
         let pen = |t: (i32, i32)| if t == (5, 5) { 100 } else { 0 };
-        assert_eq!(c.pick_least_pressured_rep(&cheb((0, 0)), pen), Some((20, 20)));
+        assert_eq!(
+            c.pick_least_pressured_rep(&cheb((0, 0)), pen),
+            Some((20, 20))
+        );
     }
 
     /// P4: a saturated cluster (with `cluster_filter` rejecting it) is

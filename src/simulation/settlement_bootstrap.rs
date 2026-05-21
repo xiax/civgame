@@ -215,11 +215,18 @@ pub fn relocate_stranded_members_system(
     seed_reservation: Res<crate::simulation::seed_reservation::SeedReservation>,
     plot_index: Res<crate::simulation::land::PlotIndex>,
     registry: Res<FactionRegistry>,
-    mut members_q: Query<(&FactionMember, &mut Transform, &mut crate::simulation::person::PersonAI), With<Person>>,
+    mut members_q: Query<
+        (
+            &FactionMember,
+            &mut Transform,
+            &mut crate::simulation::person::PersonAI,
+        ),
+        With<Person>,
+    >,
 ) {
-    use ahash::AHashSet;
     use crate::world::terrain::{tile_to_world, TILE_SIZE};
     use crate::world::tile::TileKind;
+    use ahash::AHashSet;
 
     // Cache reachable-from-home pools per faction so we don't re-BFS for
     // each stranded member.
@@ -285,10 +292,15 @@ pub fn relocate_stranded_members_system(
             continue;
         }
         let home = faction.home_tile;
-        let pool = pools_by_faction.entry(member.faction_id).or_insert_with(|| {
-            crate::simulation::placement_reachability::spawn_tiles_from(&chunk_map, home, 256)
-        });
-        let Some(&new_tile) = pool.iter().find(|&&t| !is_conflict(t) && !used.contains(&t)) else {
+        let pool = pools_by_faction
+            .entry(member.faction_id)
+            .or_insert_with(|| {
+                crate::simulation::placement_reachability::spawn_tiles_from(&chunk_map, home, 256)
+            });
+        let Some(&new_tile) = pool
+            .iter()
+            .find(|&&t| !is_conflict(t) && !used.contains(&t))
+        else {
             continue; // no safe tile; leave the member where they are (defensive)
         };
         used.remove(&tile);

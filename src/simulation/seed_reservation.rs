@@ -58,11 +58,7 @@ impl SeedReservation {
 /// the reservation set. Matches the **2-tile-wide** carve in
 /// `road_carve_system` so queued-but-uncarved roads are reserved across
 /// their full footprint, not just the centreline.
-pub fn rasterize_line_into(
-    reservation: &mut SeedReservation,
-    from: (i32, i32),
-    to: (i32, i32),
-) {
+pub fn rasterize_line_into(reservation: &mut SeedReservation, from: (i32, i32), to: (i32, i32)) {
     let mut x0 = from.0;
     let mut y0 = from.1;
     let x1 = to.0;

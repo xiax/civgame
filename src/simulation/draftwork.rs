@@ -469,10 +469,7 @@ fn pick_idle_draft_animal(
         if da.training < TRAINING_THRESHOLD_DRAFT {
             continue;
         }
-        if !matches!(
-            da.species,
-            DomesticSpecies::Cattle | DomesticSpecies::Horse
-        ) {
+        if !matches!(da.species, DomesticSpecies::Cattle | DomesticSpecies::Horse) {
             continue;
         }
         if claim_q.get(e).is_ok() {
@@ -501,7 +498,10 @@ mod tests {
         let bases = [1u32, 3, 4, 5];
         let bonused: Vec<u32> = bases.iter().map(|b| apply_plow_yield_bonus(*b)).collect();
         for (b, p) in bases.iter().zip(bonused.iter()) {
-            assert!(*p >= *b, "plow bonus must not reduce yield (base {b} → {p})");
+            assert!(
+                *p >= *b,
+                "plow bonus must not reduce yield (base {b} → {p})"
+            );
         }
     }
 

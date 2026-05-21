@@ -1001,17 +1001,12 @@ pub fn animal_movement_system(
                 }
             }
             if !planned {
-                let goal_z =
-                    chunk_map.surface_z_at(ai.target_tile.0, ai.target_tile.1) as i8;
+                let goal_z = chunk_map.surface_z_at(ai.target_tile.0, ai.target_tile.1) as i8;
                 let start = (cur_tx, cur_ty, cur_z);
                 let goal = (ai.target_tile.0, ai.target_tile.1, goal_z);
                 let scratch = pool.scratch(2);
                 if crate::simulation::animal_paths::replan_astar(
-                    scratch,
-                    &chunk_map,
-                    &mut ai,
-                    start,
-                    goal,
+                    scratch, &chunk_map, &mut ai, start, goal,
                 ) {
                     planned = true;
                 }
@@ -2620,7 +2615,11 @@ fn pick_seed_animal_tile(
         }
         if matches!(
             k,
-            TileKind::Grass | TileKind::Scrub | TileKind::Cropland | TileKind::Loam | TileKind::Silt
+            TileKind::Grass
+                | TileKind::Scrub
+                | TileKind::Cropland
+                | TileKind::Loam
+                | TileKind::Silt
         ) {
             // Don't trip a borrow-checker warning on the unused clock.
             let _ = &mut *clock;

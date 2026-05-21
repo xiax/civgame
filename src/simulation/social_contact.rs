@@ -260,7 +260,11 @@ pub fn ambient_social_pairing_system(
             tile,
             root_faction: registry.root_faction(fm.faction_id),
             compatible,
-            active_partner: if sec.is_active(now) { sec.partner } else { None },
+            active_partner: if sec.is_active(now) {
+                sec.partner
+            } else {
+                None
+            },
         });
     }
 
@@ -527,7 +531,7 @@ mod tests {
         };
         assert!(live.is_active(49));
         assert!(!live.is_active(50)); // strict
-        // partner None ⇒ never active even with future expiry
+                                      // partner None ⇒ never active even with future expiry
         let no_partner = SecondarySocial {
             partner: None,
             mode: SocialMode::Ambient,

@@ -287,14 +287,8 @@ impl RiverNetwork {
     ///
     /// [`Inlet`]: EdgeCrossingKind::Inlet
     /// [`Outlet`]: EdgeCrossingKind::Outlet
-    pub fn edge_crossings_in_bbox(
-        &self,
-        min: (i32, i32),
-        max: (i32, i32),
-    ) -> Vec<EdgeCrossing> {
-        let inside = |t: (i32, i32)| {
-            t.0 >= min.0 && t.0 <= max.0 && t.1 >= min.1 && t.1 <= max.1
-        };
+    pub fn edge_crossings_in_bbox(&self, min: (i32, i32), max: (i32, i32)) -> Vec<EdgeCrossing> {
+        let inside = |t: (i32, i32)| t.0 >= min.0 && t.0 <= max.0 && t.1 >= min.1 && t.1 <= max.1;
         let mut out = Vec::new();
         for (ei, poly) in self.edge_polylines.iter().enumerate() {
             if poly.len() < 2 {
@@ -319,8 +313,7 @@ impl RiverNetwork {
                     // Level lerps from `from_level` (idx 0) to `to_level`
                     // (idx last) — monotone non-increasing by construction.
                     let frac = cross_idx as f32 / last as f32;
-                    let level =
-                        edge.from_level + (edge.to_level - edge.from_level) * frac;
+                    let level = edge.from_level + (edge.to_level - edge.from_level) * frac;
                     out.push(EdgeCrossing {
                         tile,
                         kind,

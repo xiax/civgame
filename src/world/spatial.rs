@@ -41,7 +41,13 @@ impl IndexedKind {
     pub fn is_mobile_agent(self) -> bool {
         matches!(
             self,
-            Self::Person | Self::Wolf | Self::Deer | Self::Horse | Self::Cow | Self::Pig | Self::Cat
+            Self::Person
+                | Self::Wolf
+                | Self::Deer
+                | Self::Horse
+                | Self::Cow
+                | Self::Pig
+                | Self::Cat
         )
     }
 }

@@ -1,18 +1,18 @@
+use super::goals::AgentGoal;
 use super::goals::Personality;
 use super::items::{spawn_or_merge_ground_item, GroundItem};
 use super::jobs::{
     record_progress, record_progress_filtered, JobBoard, JobClaim, JobCompletedEvent, JobKind,
     RecipeId,
 };
-use super::goals::AgentGoal;
 use super::lod::LodLevel;
 use super::memory::RelationshipMemory;
 use super::needs::Needs;
 use super::person::{AiState, Person, PersonAI, Profession};
 use super::plants::PlantKind;
 use super::schedule::{BucketSlot, SimClock};
-use super::social_contact::{is_social_contact, SecondarySocial};
 use super::skills::{SkillKind, Skills};
+use super::social_contact::{is_social_contact, SecondarySocial};
 use super::tasks::TaskKind;
 use crate::economy::agent::EconomicAgent;
 use crate::economy::resource_catalog::ResourceId;
@@ -1887,8 +1887,7 @@ impl StorageTileMap {
     ) -> Option<(i32, i32)> {
         let _ = from;
         let tiles = self.by_faction.get(&faction_id)?;
-        let est =
-            crate::pathfinding::detour::DetourEstimator::new(chunk_router, chunk_graph);
+        let est = crate::pathfinding::detour::DetourEstimator::new(chunk_router, chunk_graph);
         let pick = |reachable_only: bool| {
             tiles
                 .iter()
@@ -4164,7 +4163,13 @@ mod tests {
         stm.by_faction.insert(7, vec![raised_tile, isolated_tile]);
 
         let picked = stm.nearest_for_faction_reachable(
-            7, (5, 5), agent_tile, &chunk_map, &graph, &router, &conn,
+            7,
+            (5, 5),
+            agent_tile,
+            &chunk_map,
+            &graph,
+            &router,
+            &conn,
         );
         assert_eq!(
             picked,

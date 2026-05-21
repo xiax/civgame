@@ -176,9 +176,7 @@ pub fn production_system(
                                 if let Some(pid) = plot_index.plot_at(tx, ty) {
                                     if let Some(&plot_e) = plot_index.by_id.get(&pid) {
                                         if let Ok(plot) = plot_q.get(plot_e) {
-                                            if plot.plowed_year
-                                                == Some(calendar.year as u16)
-                                            {
+                                            if plot.plowed_year == Some(calendar.year as u16) {
                                                 commands
                                                     .entity(plant_entity)
                                                     .insert(crate::simulation::draftwork::Tilled);
