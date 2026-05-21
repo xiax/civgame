@@ -488,17 +488,19 @@ pub enum Task {
     /// `JobProgress::FieldWork { phase: Prepare, completed, .. }`, grants
     /// Farming XP, and ensures `FieldTileIndex[tile].nutrients >= 30`.
     PrepareField { tile: (i32, i32) },
-    /// Draftwork v2: worker stands inside the named Agricultural plot and
-    /// plows it with the named draft animal (Cattle / Horse). Executor
-    /// (`draftwork::plow_task_system`) accumulates `plot.area() *
-    /// PLOW_WORK_TICKS_PER_TILE`, then stamps `Plot.plowed_year =
-    /// Some(calendar.year)`, releases the `AnimalWorkClaim`, awards Farming
-    /// XP, and `finish_task`. The animal entity rides on the variant for
-    /// chain-integrity inspection and so the executor knows which claim to
-    /// drop. Produced by `draftwork::chief_plow_dispatch_system`.
+    /// Draftwork v2: worker plows one tile of an Agricultural plot, either
+    /// with a draft animal (Cattle / Horse) — `animal: Some(e)` — or
+    /// human-drawn — `animal: None`. Executor `draftwork::plow_task_system`
+    /// accumulates `plow_work_ticks(animal)` ticks per tile (6 with an ox,
+    /// 12 by hand), credits the posting's `plowed_tiles` counter, and on
+    /// the final tile stamps `Plot.plowed_year`, releases the
+    /// `AnimalWorkClaim` (only when `animal.is_some()`), and `finish_task`.
+    /// Produced by `draftwork::htn_plow_dispatch_system`. The animal entity
+    /// rides on the variant for chain-integrity inspection and so the
+    /// executor knows which (if any) claim to drop.
     Plow {
         plot_entity: bevy::prelude::Entity,
-        animal: bevy::prelude::Entity,
+        animal: Option<bevy::prelude::Entity>,
     },
 }
 
@@ -1231,8 +1233,11 @@ impl Task {
     }
 
     /// Convenience accessor for the Plow variant. Returns
-    /// `(plot_entity, animal_entity)`.
-    pub fn as_plow(&self) -> Option<(bevy::prelude::Entity, bevy::prelude::Entity)> {
+    /// `(plot_entity, animal)` where `animal` is `Some(e)` for ox-drawn
+    /// plowing and `None` for human-drawn.
+    pub fn as_plow(
+        &self,
+    ) -> Option<(bevy::prelude::Entity, Option<bevy::prelude::Entity>)> {
         match *self {
             Task::Plow {
                 plot_entity,

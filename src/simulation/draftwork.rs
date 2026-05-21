@@ -71,11 +71,31 @@ use crate::world::terrain::world_to_tile;
 pub const PLOW_YIELD_MULT_NUMER: u32 = 7;
 pub const PLOW_YIELD_MULT_DENOM: u32 = 5;
 
-/// Per-tile work-tick cost of plowing. Each `Task::Plow` dispatch covers
-/// exactly one tile; the dispatcher re-fires for the next tile until the
-/// posting completes. At 20 Hz, 6 ticks ≈ 0.3s per tile — a 16×16 plot
-/// takes ~75 game-seconds.
-pub const PLOW_WORK_TICKS_PER_TILE: u8 = 6;
+/// Per-tile work-tick cost when an ox/horse pulls the plow.
+/// Each `Task::Plow` dispatch covers exactly one tile; the dispatcher
+/// re-fires for the next tile until the posting completes. At 20 Hz,
+/// 6 ticks ≈ 0.3s per tile — a 16×16 plot takes ~75 game-seconds.
+pub const PLOW_WORK_TICKS_PER_TILE_ANIMAL: u8 = 6;
+
+/// Per-tile work-tick cost for human-drawn plowing (no ox available).
+/// 2× the animal-drawn cost — historically peasants without draft animals
+/// yoked themselves to the ard and made slower progress. Same yield bonus;
+/// the difference is throughput.
+pub const PLOW_WORK_TICKS_PER_TILE_HUMAN: u8 = 12;
+
+/// Legacy alias retained for backwards-compat with the original v2.0
+/// constant. Equal to the animal-drawn rate.
+pub const PLOW_WORK_TICKS_PER_TILE: u8 = PLOW_WORK_TICKS_PER_TILE_ANIMAL;
+
+/// Per-tile work-tick cost for the named `Task::Plow.animal` mode.
+#[inline]
+pub fn plow_work_ticks(animal: Option<Entity>) -> u8 {
+    if animal.is_some() {
+        PLOW_WORK_TICKS_PER_TILE_ANIMAL
+    } else {
+        PLOW_WORK_TICKS_PER_TILE_HUMAN
+    }
+}
 
 /// Threshold on `DomesticAnimal.training` above which an animal is eligible
 /// for the `AnimalUse::Plow` claim. Cattle / Horse reach this in ~80 days
@@ -210,12 +230,15 @@ pub fn plow_task_system(
         }
         if !matches!(claim.kind, JobKind::Plow) {
             // Worker has lost its plow claim somehow; drop the chain.
-            release_animal_work_claim(&mut commands, animal);
+            if let Some(a) = animal {
+                release_animal_work_claim(&mut commands, a);
+            }
             aq.cancel_chain(&mut ai);
             continue;
         }
-        // Per-tile work threshold.
-        if (ai.work_progress as u32) < PLOW_WORK_TICKS_PER_TILE as u32 {
+        // Per-tile work threshold (animal: 6, human: 12).
+        let needed = plow_work_ticks(animal) as u32;
+        if (ai.work_progress as u32) < needed {
             continue;
         }
         // One tile done — credit posting progress and check completion.
@@ -238,17 +261,11 @@ pub fn plow_task_system(
 
         if completed {
             // Stamp plot.plowed_year, fire JobCompletedEvent, despawn the
-            // posting, release the animal claim, drop the worker's JobClaim,
-            // finish the chain. Use record_progress_filtered for the
-            // completion accounting so wage payout flows through the
-            // standard escrow path.
+            // posting, release the animal claim (if any), drop the worker's
+            // JobClaim, finish the chain.
             if let Ok(mut plot) = plot_q.get_mut(plot_entity) {
                 plot.plowed_year = Some(calendar.year as u16);
             }
-            // Emit completion via the standard helper. We already bumped the
-            // counter above, so call with increment=0 to drive the completion
-            // detection without double-counting. The helper handles
-            // claimant cleanup + JobCompletedEvent emission.
             record_progress_filtered(
                 &mut commands,
                 &mut board,
@@ -258,17 +275,16 @@ pub fn plow_task_system(
                 None,
                 0,
             );
-            release_animal_work_claim(&mut commands, animal);
-            // Also drop the worker's JobClaim — record_progress_filtered does
-            // this when the posting auto-completes, but the per-claimant
-            // iteration there only fires when `completed >= target` is
-            // triggered by the increment. Belt-and-braces:
+            if let Some(a) = animal {
+                release_animal_work_claim(&mut commands, a);
+            }
             commands.entity(worker).remove::<JobClaim>();
             skills.gain_xp(SkillKind::Farming, 6); // completion bonus
             aq.finish_task(&mut ai);
         } else {
             // Mid-job: drop back to Idle so the next dispatcher pass picks
-            // the next tile. Keep the JobClaim, keep the AnimalWorkClaim.
+            // the next tile. Keep the JobClaim, keep the AnimalWorkClaim
+            // (if any).
             aq.finish_task(&mut ai);
         }
     }
@@ -358,45 +374,35 @@ pub fn htn_plow_dispatch_system(
             worker_tile.0.div_euclid(CHUNK_SIZE as i32),
             worker_tile.1.div_euclid(CHUNK_SIZE as i32),
         );
-        // Pick / re-use animal.
-        let animal = match posted_animal {
+        // Pick / re-use animal. Three branches:
+        //  - posted_animal == Some — validated and reused for the rest of the job
+        //  - posted_animal == None, ox available — commit + stamp + claim
+        //  - posted_animal == None, no ox — fall back to human-drawn (animal = None)
+        //
+        // The third branch leaves `posting.animal` as None so the *next*
+        // dispatch may upgrade if an ox becomes free mid-job. Slower (12 ticks
+        // per tile vs 6) but never blocks.
+        let animal: Option<Entity> = match posted_animal {
             Some(a) => {
                 // Validate the animal still exists with valid Tamed + DomesticAnimal.
                 if animals_q.get(a).is_err() {
-                    // Animal died mid-job — drop the chain so the chief can re-post next pass.
-                    continue;
+                    // Animal died / despawned mid-job — un-stamp from the posting
+                    // and fall through to a fresh search below.
+                    if let Some(p2) = board.get_mut(claim.job_id) {
+                        if let JobProgress::Plow {
+                            animal: ref mut posting_animal,
+                            ..
+                        } = p2.progress
+                        {
+                            *posting_animal = None;
+                        }
+                    }
+                    pick_idle_draft_animal(fm.faction_id, &animals_q, &claim_q)
+                } else {
+                    Some(a)
                 }
-                a
             }
-            None => {
-                // First dispatch — pick an un-claimed trained ox/horse owned
-                // by the same faction.
-                let mut chosen: Option<Entity> = None;
-                for (e, da, tamed) in animals_q.iter() {
-                    if tamed.owner_faction != fm.faction_id {
-                        continue;
-                    }
-                    if da.training < TRAINING_THRESHOLD_DRAFT {
-                        continue;
-                    }
-                    if !matches!(
-                        da.species,
-                        DomesticSpecies::Cattle | DomesticSpecies::Horse
-                    ) {
-                        continue;
-                    }
-                    if claim_q.get(e).is_ok() {
-                        continue;
-                    }
-                    chosen = Some(e);
-                    break;
-                }
-                let Some(a) = chosen else {
-                    // No animal available right now; try next pass.
-                    continue;
-                };
-                a
-            }
+            None => pick_idle_draft_animal(fm.faction_id, &animals_q, &claim_q),
         };
         // Route worker to the tile.
         let routed = assign_task_with_routing(
@@ -422,25 +428,59 @@ pub fn htn_plow_dispatch_system(
             plot_entity,
             animal,
         });
-        // Stamp animal on the posting + insert the work claim only on the
-        // first dispatch.
-        if posted_animal.is_none() {
-            if let Some(p2) = board.get_mut(claim.job_id) {
-                if let JobProgress::Plow {
-                    animal: posting_animal,
-                    ..
-                } = &mut p2.progress
-                {
-                    *posting_animal = Some(animal);
+        // Stamp animal on the posting + insert the work claim ONLY when this
+        // dispatch newly committed to an ox (i.e. we picked one and the
+        // posting wasn't already tracking it). Human-drawn dispatches
+        // (animal == None) leave `posting.animal` as None so the next
+        // dispatcher pass can upgrade if an ox becomes free.
+        if let Some(a) = animal {
+            if posted_animal != Some(a) {
+                if let Some(p2) = board.get_mut(claim.job_id) {
+                    if let JobProgress::Plow {
+                        animal: posting_animal,
+                        ..
+                    } = &mut p2.progress
+                    {
+                        *posting_animal = Some(a);
+                    }
                 }
+                commands.entity(a).insert(AnimalWorkClaim {
+                    worker,
+                    use_kind: AnimalUse::Plow,
+                    expires_tick: now.saturating_add(PLOW_CLAIM_TTL_TICKS),
+                });
             }
-            commands.entity(animal).insert(AnimalWorkClaim {
-                worker,
-                use_kind: AnimalUse::Plow,
-                expires_tick: now.saturating_add(PLOW_CLAIM_TTL_TICKS),
-            });
         }
     }
+}
+
+/// Find one trained, un-claimed Cattle / Horse owned by `faction_id` with
+/// no live `AnimalWorkClaim`. Returns `None` when no eligible draft animal
+/// exists — caller falls back to human-drawn plowing.
+fn pick_idle_draft_animal(
+    faction_id: u32,
+    animals_q: &Query<(Entity, &DomesticAnimal, &Tamed)>,
+    claim_q: &Query<&AnimalWorkClaim>,
+) -> Option<Entity> {
+    for (e, da, tamed) in animals_q.iter() {
+        if tamed.owner_faction != faction_id {
+            continue;
+        }
+        if da.training < TRAINING_THRESHOLD_DRAFT {
+            continue;
+        }
+        if !matches!(
+            da.species,
+            DomesticSpecies::Cattle | DomesticSpecies::Horse
+        ) {
+            continue;
+        }
+        if claim_q.get(e).is_ok() {
+            continue;
+        }
+        return Some(e);
+    }
+    None
 }
 
 #[cfg(test)]

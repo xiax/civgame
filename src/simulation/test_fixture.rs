@@ -5675,7 +5675,7 @@ mod smoke {
                 let mut aq = world.get_mut::<ActionQueue>(worker).unwrap();
                 aq.current = Task::Plow {
                     plot_entity,
-                    animal,
+                    animal: Some(animal),
                 };
             }
             sim.app.world_mut().run_system(executor_id).unwrap();
@@ -5745,6 +5745,343 @@ mod smoke {
         );
         // Suppress unused warning if TaskKind import isn't used elsewhere.
         let _ = TaskKind::Plow;
+    }
+
+    /// Draftwork v2: human-drawn fallback. With NO trained draft animal in
+    /// the faction, the executor still completes the plowing (the dispatcher
+    /// dispatches `Task::Plow { animal: None }`, the executor uses
+    /// `PLOW_WORK_TICKS_PER_TILE_HUMAN = 12` per tile). Plot still gets
+    /// stamped + `Tilled`-bonus path is unlocked.
+    #[test]
+    fn plow_executor_stamps_plowed_year_under_human_drawn_fallback() {
+        use crate::economy::core_ids;
+        use crate::simulation::draftwork::PLOW_WORK_TICKS_PER_TILE_HUMAN;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{
+            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass,
+            TileAabb,
+        };
+        use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
+        use crate::simulation::person::{AiState, PersonAI};
+        use crate::simulation::settlement::{TileRect, ZoneKind};
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(0xD7AFB);
+        sim.flat_world(3, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        sim.spawn_storage_tile(fid, (0, 0));
+        sim.spawn_ground_item((0, 0), core_ids::ard_plow(), 1);
+
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.add_member(fid);
+        }
+
+        let belt_rect = TileRect::new(40, 40, 2, 2); // 4 tiles
+        let pid = {
+            let world = sim.app.world_mut();
+            let pid = world.resource_mut::<PlotIndex>().alloc_id();
+            let ent = world
+                .spawn(Plot {
+                    id: pid,
+                    settlement_id: 0,
+                    faction_id: fid,
+                    rect: belt_rect,
+                    z: 0,
+                    zone_kind: ZoneKind::Agricultural,
+                    tenure: Tenure::StateOwned,
+                    holder: TenureHolder::State { faction_id: fid },
+                    base_value: 0.0,
+                    last_valued_tick: 0,
+                    missed_payments: 0,
+                    frontage_edge: None,
+                    access_tile: None,
+                    parent_plot: None,
+                    plowed_year: None,
+                })
+                .id();
+            world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
+            for ty in 40..42 {
+                for tx in 40..42 {
+                    world
+                        .resource_mut::<PlotIndex>()
+                        .ag_tiles
+                        .insert((tx, ty));
+                }
+            }
+            pid
+        };
+        let plot_entity = *sim
+            .app
+            .world()
+            .resource::<PlotIndex>()
+            .by_id
+            .get(&pid)
+            .unwrap();
+
+        let worker = sim.spawn_person(fid, (0, 0), |b| {
+            b.goal(AgentGoal::Farm);
+            b.profession(crate::simulation::person::Profession::Farmer);
+        });
+        // NO animal spawned — this is the human-drawn case.
+
+        let area = TileAabb {
+            min: (40, 40),
+            max: (41, 41),
+        };
+        let target_tiles = 4u32;
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            board.faction_postings_mut(fid).push(JobPosting {
+                id,
+                faction_id: fid,
+                kind: JobKind::Plow,
+                progress: JobProgress::Plow {
+                    plot_id: pid,
+                    area,
+                    plowed_tiles: 0,
+                    target_tiles,
+                    assigned_worker: Some(worker),
+                    animal: None, // human-drawn — never stamped
+                },
+                claimants: vec![worker],
+                priority: 200,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            });
+            id
+        };
+
+        sim.app.world_mut().entity_mut(worker).insert(JobClaim {
+            job_id,
+            faction_id: fid,
+            kind: JobKind::Plow,
+            posted_tick: 0,
+            fail_count: 0,
+        });
+
+        let executor_id = sim
+            .app
+            .world_mut()
+            .register_system(crate::simulation::draftwork::plow_task_system);
+        for iter in 0..target_tiles {
+            {
+                let world = sim.app.world_mut();
+                let mut ai = world.get_mut::<PersonAI>(worker).unwrap();
+                ai.state = AiState::Working;
+                // Human-drawn requires 12 ticks/tile, not 6.
+                ai.work_progress = PLOW_WORK_TICKS_PER_TILE_HUMAN;
+                let mut aq = world.get_mut::<ActionQueue>(worker).unwrap();
+                aq.current = Task::Plow {
+                    plot_entity,
+                    animal: None,
+                };
+            }
+            sim.app.world_mut().run_system(executor_id).unwrap();
+            let board = sim.app.world().resource::<JobBoard>();
+            let post = board
+                .faction_postings(fid)
+                .iter()
+                .find(|p| p.id == job_id);
+            if let Some(p) = post {
+                if let JobProgress::Plow { plowed_tiles, .. } = p.progress {
+                    assert!(
+                        plowed_tiles >= iter + 1,
+                        "iter {iter}: expected plowed_tiles >= {} but got {plowed_tiles}",
+                        iter + 1
+                    );
+                }
+            } else if iter + 1 < target_tiles {
+                panic!("iter {iter}: posting vanished before completion");
+            }
+        }
+
+        // Plot stamped (human-drawn still unlocks Tilled bonus next planting).
+        let current_year = sim
+            .app
+            .world()
+            .resource::<crate::world::seasons::Calendar>()
+            .year as u16;
+        let plot = sim.app.world().get::<Plot>(plot_entity).unwrap();
+        assert_eq!(
+            plot.plowed_year,
+            Some(current_year),
+            "human-drawn plowing must still stamp Plot.plowed_year"
+        );
+
+        // Posting cleaned up + worker's JobClaim dropped.
+        let board = sim.app.world().resource::<JobBoard>();
+        assert_eq!(
+            board
+                .faction_postings(fid)
+                .iter()
+                .filter(|p| matches!(p.kind, JobKind::Plow))
+                .count(),
+            0
+        );
+        assert!(sim.app.world().get::<JobClaim>(worker).is_none());
+    }
+
+    /// Human-drawn plowing demands strictly more work per tile than
+    /// animal-drawn — at `PLOW_WORK_TICKS_PER_TILE_ANIMAL` work_progress
+    /// (6) and `animal: None`, the executor must NOT credit the tile.
+    /// Catches a regression where the executor reads the threshold from
+    /// the animal-mode constant rather than `plow_work_ticks(animal)`.
+    #[test]
+    fn human_drawn_plowing_requires_higher_work_progress() {
+        use crate::economy::core_ids;
+        use crate::simulation::draftwork::{
+            plow_work_ticks, PLOW_WORK_TICKS_PER_TILE_ANIMAL, PLOW_WORK_TICKS_PER_TILE_HUMAN,
+        };
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{
+            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass,
+            TileAabb,
+        };
+        use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
+        use crate::simulation::person::{AiState, PersonAI};
+        use crate::simulation::settlement::{TileRect, ZoneKind};
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        // Constants pin: human cost strictly > animal cost.
+        assert!(PLOW_WORK_TICKS_PER_TILE_HUMAN > PLOW_WORK_TICKS_PER_TILE_ANIMAL);
+        assert_eq!(plow_work_ticks(None), PLOW_WORK_TICKS_PER_TILE_HUMAN);
+        // Behavioural pin: at animal-cost work_progress, the executor must
+        // NOT credit the tile when animal is None.
+        let mut sim = TestSim::new(0xD7AFC);
+        sim.flat_world(3, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        sim.spawn_storage_tile(fid, (0, 0));
+        sim.spawn_ground_item((0, 0), core_ids::ard_plow(), 1);
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.add_member(fid);
+        }
+        let belt_rect = TileRect::new(40, 40, 1, 1);
+        let pid = {
+            let world = sim.app.world_mut();
+            let pid = world.resource_mut::<PlotIndex>().alloc_id();
+            let ent = world
+                .spawn(Plot {
+                    id: pid,
+                    settlement_id: 0,
+                    faction_id: fid,
+                    rect: belt_rect,
+                    z: 0,
+                    zone_kind: ZoneKind::Agricultural,
+                    tenure: Tenure::StateOwned,
+                    holder: TenureHolder::State { faction_id: fid },
+                    base_value: 0.0,
+                    last_valued_tick: 0,
+                    missed_payments: 0,
+                    frontage_edge: None,
+                    access_tile: None,
+                    parent_plot: None,
+                    plowed_year: None,
+                })
+                .id();
+            world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
+            world.resource_mut::<PlotIndex>().ag_tiles.insert((40, 40));
+            pid
+        };
+        let plot_entity = *sim
+            .app
+            .world()
+            .resource::<PlotIndex>()
+            .by_id
+            .get(&pid)
+            .unwrap();
+        let worker = sim.spawn_person(fid, (0, 0), |b| {
+            b.goal(AgentGoal::Farm);
+            b.profession(crate::simulation::person::Profession::Farmer);
+        });
+        let area = TileAabb {
+            min: (40, 40),
+            max: (40, 40),
+        };
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            board.faction_postings_mut(fid).push(JobPosting {
+                id,
+                faction_id: fid,
+                kind: JobKind::Plow,
+                progress: JobProgress::Plow {
+                    plot_id: pid,
+                    area,
+                    plowed_tiles: 0,
+                    target_tiles: 1,
+                    assigned_worker: Some(worker),
+                    animal: None,
+                },
+                claimants: vec![worker],
+                priority: 200,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            });
+            id
+        };
+        sim.app.world_mut().entity_mut(worker).insert(JobClaim {
+            job_id,
+            faction_id: fid,
+            kind: JobKind::Plow,
+            posted_tick: 0,
+            fail_count: 0,
+        });
+        // Set work_progress to ANIMAL cost (6) — too low for human-drawn.
+        {
+            let world = sim.app.world_mut();
+            let mut ai = world.get_mut::<PersonAI>(worker).unwrap();
+            ai.state = AiState::Working;
+            ai.work_progress = PLOW_WORK_TICKS_PER_TILE_ANIMAL;
+            let mut aq = world.get_mut::<ActionQueue>(worker).unwrap();
+            aq.current = Task::Plow {
+                plot_entity,
+                animal: None,
+            };
+        }
+        let executor_id = sim
+            .app
+            .world_mut()
+            .register_system(crate::simulation::draftwork::plow_task_system);
+        sim.app.world_mut().run_system(executor_id).unwrap();
+        // Tile must NOT be credited at the animal-cost threshold with no animal.
+        let board = sim.app.world().resource::<JobBoard>();
+        let p = board
+            .faction_postings(fid)
+            .iter()
+            .find(|p| p.id == job_id)
+            .unwrap();
+        if let JobProgress::Plow { plowed_tiles, .. } = p.progress {
+            assert_eq!(
+                plowed_tiles, 0,
+                "Human-drawn tile must NOT credit at the animal-cost threshold"
+            );
+        }
+        // Now bump to the human cost and run again — must credit.
+        {
+            let world = sim.app.world_mut();
+            let mut ai = world.get_mut::<PersonAI>(worker).unwrap();
+            ai.state = AiState::Working;
+            ai.work_progress = PLOW_WORK_TICKS_PER_TILE_HUMAN;
+        }
+        sim.app.world_mut().run_system(executor_id).unwrap();
+        let plot = sim.app.world().get::<Plot>(plot_entity).unwrap();
+        let current_year = sim
+            .app
+            .world()
+            .resource::<crate::world::seasons::Calendar>()
+            .year as u16;
+        assert_eq!(plot.plowed_year, Some(current_year));
     }
 
     /// Plot already plowed this year → no duplicate plow posting next Spring
