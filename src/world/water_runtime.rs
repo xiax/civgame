@@ -25,7 +25,7 @@ use crate::world::globe::{EdgeCrossingKind, Globe, Reservoir, ReservoirKind};
 use crate::world::seasons::Calendar;
 use crate::world::terrain::{WorldGen, GLOBE_H_TO_Z};
 use crate::world::tile::{TileData, TileKind};
-use crate::world::water::{CellRole, WaterCell, WaterGrid};
+use crate::world::water::{CellRole, WaterCell, WaterGrid, REST_EPS};
 
 /// One persistent runtime water cell, keyed by world tile in
 /// [`RuntimeWater`]. Survives chunk unload/regeneration. `depth == 0` is
@@ -248,6 +248,43 @@ fn hydro_surface_z(globe: &Globe, t: (i32, i32), bed: f32) -> f32 {
     }
 }
 
+/// Flood-fill the cells each dam genuinely impounds: from every dam, the
+/// connected `region` cells whose solid bed sits below *that dam's* crest —
+/// the exact reservoir + tailwater extent. Cells outside the union are
+/// free-flowing river: hydrology truth, pinned by the classify loop so the
+/// virtual-pipe solver can't pile the injected discharge onto their banks.
+/// `bed_at` returns the solid bed Z (`None` = unloaded ⇒ frontier stops).
+fn dam_impoundment_set(
+    region: &AHashSet<(i32, i32)>,
+    dam_crests: &AHashMap<(i32, i32), f32>,
+    bed_at: impl Fn((i32, i32)) -> Option<f32>,
+) -> AHashSet<(i32, i32)> {
+    const NEIGHBOURS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+    let mut impound: AHashSet<(i32, i32)> = AHashSet::new();
+    for (&dam, &crest) in dam_crests.iter() {
+        let mut visited: AHashSet<(i32, i32)> = AHashSet::new();
+        let mut stack: Vec<(i32, i32)> = NEIGHBOURS
+            .iter()
+            .map(|(dx, dy)| (dam.0 + dx, dam.1 + dy))
+            .collect();
+        while let Some(t) = stack.pop() {
+            if !region.contains(&t) || dam_crests.contains_key(&t) || !visited.insert(t) {
+                continue;
+            }
+            // Terrain at/above the crest dams the water — frontier stops here.
+            match bed_at(t) {
+                Some(bed) if bed < crest => {}
+                _ => continue,
+            }
+            impound.insert(t);
+            for (dx, dy) in NEIGHBOURS {
+                stack.push((t.0 + dx, t.1 + dy));
+            }
+        }
+    }
+    impound
+}
+
 /// PostUpdate. Snapshots the active region (union of `WATER_SIM_RADIUS`
 /// boxes around every dam **and every persisted runtime/seep cell**) into a
 /// [`WaterGrid`] and hands it to `AsyncComputeTaskPool`. River inflow is
@@ -353,6 +390,27 @@ pub fn spawn_water_sim_task_system(
     let season_full = calendar.discharge_multiplier();
     let season_aq = 0.5 + 0.5 * season_full;
 
+    // Solid bed Z of a tile — `RuntimeWater` is truth, else the loaded chunk
+    // (`None` when unloaded). Shared by the dam-impoundment flood-fill and the
+    // classify loop so both read the same floor.
+    let bed_at = |t: (i32, i32)| -> Option<f32> {
+        if let Some(rc) = runtime_water.cells.get(&t) {
+            Some(rc.ground_z as f32)
+        } else {
+            let g = chunk_map.ground_z_at(t.0, t.1);
+            if g >= Z_MIN {
+                Some(g as f32)
+            } else {
+                None
+            }
+        }
+    };
+
+    // Dam-impoundment flood-fill. A free-flowing river is hydrology truth (a
+    // fixed-level boundary, pinned below); a river cell free-evolves ONLY
+    // where a dam genuinely backs water into it.
+    let dam_impoundment = dam_impoundment_set(&region, &grid.dam_crests, &bed_at);
+
     for &t in &region {
         if grid.dam_crests.contains_key(&t) {
             continue; // dam tile is a barrier, not a cell
@@ -389,6 +447,30 @@ pub fn spawn_water_sim_task_system(
             let lvl = hydro_surface_z(&globe, t, bed + depth);
             grid.cells.insert(t, WaterCell::pinned(lvl));
             continue;
+        }
+
+        // A free-flowing river's surface is hydrology truth — a fixed-level
+        // boundary, like the ocean. Free-evolve a river cell ONLY where a
+        // dam's impoundment backs water into it; elsewhere pin it at its
+        // chunk-gen column surface so the virtual-pipe solver can't force an
+        // unnatural surface gradient and pile water onto the banks (the
+        // discharge inlet has no relief valve without a dam weir). `orig_kind
+        // == River` cleanly excludes well shafts / dug pits — they project as
+        // `Water`, never `River` — so well seep is untouched.
+        if orig_kind == TileKind::River && !dam_impoundment.contains(&t) {
+            // Keep a cell Free while it still holds runtime water above its
+            // natural column (a reservoir draining after dam removal) so it
+            // drains through `poll` instead of orphaning a deep runtime cell.
+            let natural_surf = (bed + depth).max(bed);
+            let draining = runtime_water
+                .cells
+                .get(&t)
+                .map(|rc| rc.ground_z as f32 + rc.depth > natural_surf + REST_EPS)
+                .unwrap_or(false);
+            if !draining {
+                grid.cells.insert(t, WaterCell::pinned(natural_surf));
+                continue;
+            }
         }
 
         // River leaves the region here → stable pinned outflow.
@@ -773,6 +855,71 @@ mod tests {
             });
         app.update();
         assert!(drain_changed(&mut app).is_empty());
+    }
+
+    /// A `WATER_SIM_RADIUS`-style box of tiles around the origin.
+    fn box_region(half: i32) -> AHashSet<(i32, i32)> {
+        let mut r = AHashSet::new();
+        for y in -half..=half {
+            for x in -half..=half {
+                r.insert((x, y));
+            }
+        }
+        r
+    }
+
+    #[test]
+    fn no_dam_means_empty_impoundment() {
+        // With no dam, every river tile is left out of the impoundment ⇒ the
+        // classify loop pins it at hydrology truth (no flooding).
+        let region = box_region(5);
+        let crests: AHashMap<(i32, i32), f32> = AHashMap::new();
+        let impound = dam_impoundment_set(&region, &crests, |_| Some(0.0));
+        assert!(impound.is_empty(), "no dam ⇒ nothing free-simulated");
+    }
+
+    #[test]
+    fn dam_impoundment_floods_below_crest_and_stops_at_high_ground() {
+        // A flat channel at bed 0, crest 3. A wall of bed-5 tiles at x=3
+        // dams the fill — cells at x>=3 must be excluded.
+        let region = box_region(6);
+        let mut crests: AHashMap<(i32, i32), f32> = AHashMap::new();
+        crests.insert((0, 0), 3.0);
+        let bed_at = |t: (i32, i32)| -> Option<f32> {
+            if t.0 == 3 {
+                Some(5.0) // ridge at/above crest — frontier stops
+            } else {
+                Some(0.0)
+            }
+        };
+        let impound = dam_impoundment_set(&region, &crests, bed_at);
+
+        assert!(impound.contains(&(1, 0)), "cell below crest is impounded");
+        assert!(impound.contains(&(2, 0)), "connected below-crest cell");
+        assert!(impound.contains(&(-4, 2)), "fill reaches the far low ground");
+        assert!(
+            !impound.contains(&(3, 0)),
+            "ridge at/above crest is not impounded"
+        );
+        assert!(
+            !impound.contains(&(4, 0)),
+            "low ground beyond the ridge is unreachable"
+        );
+        assert!(!impound.contains(&(0, 0)), "the dam tile itself is a barrier");
+    }
+
+    #[test]
+    fn impoundment_is_bounded_by_the_region() {
+        // A below-crest cell outside the active region is never pulled in.
+        let region = box_region(2);
+        let mut crests: AHashMap<(i32, i32), f32> = AHashMap::new();
+        crests.insert((0, 0), 9.0);
+        let impound = dam_impoundment_set(&region, &crests, |_| Some(0.0));
+        assert!(impound.contains(&(2, 0)), "in-region below-crest cell");
+        assert!(
+            !impound.contains(&(3, 0)),
+            "out-of-region cell must not be impounded"
+        );
     }
 
     #[test]

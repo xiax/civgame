@@ -22,7 +22,7 @@ use crate::simulation::technology::{
     FLINT_KNAPPING, GRANARY, HORSE_TAMING, LONG_DIST_TRADE, LOOM_WEAVING, MONUMENTAL_BUILDING,
     PERM_SETTLEMENT, PORTABLE_DWELLINGS, PROFESSIONAL_ARMY, SACRED_RITUAL, TECH_TREE, WELL_DIGGING,
 };
-use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
+use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE, Z_MAX, Z_MIN};
 use crate::world::seasons::{Calendar, Season};
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
 use crate::world::tile::{TileData, TileKind};
@@ -6783,7 +6783,17 @@ pub fn construction_system(
                                 faction_id: bp.faction_id,
                                 shaft_tile: tile,
                                 bottom_z: bp.target_z,
-                                surf_z: bp.target_z,
+                                // `surf_z` is the ground surface, not the
+                                // shaft bottom — `well_spec_of` derives the
+                                // helix length from `surf_z - bottom_z`.
+                                surf_z: {
+                                    let s = chunk_map.surface_z_at(tile.0, tile.1);
+                                    if s >= Z_MIN {
+                                        s.clamp(Z_MIN, Z_MAX) as i8
+                                    } else {
+                                        bp.target_z
+                                    }
+                                },
                             },
                             StructureLabel(BuildSiteKind::Well.label()),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.35),

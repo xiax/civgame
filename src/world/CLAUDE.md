@@ -75,7 +75,14 @@ snapshot→spawn→poll pattern). `spawn` (PostUpdate) snapshots a bounded regio
 runtime cells; self-terminating) — ocean/lake/unloaded → Pinned at hydrology Z; **per-cell flow
 routing** via `RiverNetwork::edge_crossings_in_bbox` places real inlets (inject the edge's
 `discharge`) / outlets (Pinned) at the true channel crossings (replaced the old highest-elevation
-boundary guess); a Free cell whose bed sits below `HydroCell.aquifer_level` seeps upward (springs +
+boundary guess). **A free-flowing `TileKind::River` cell is Pinned at its chunk-gen column surface
+(hydrology truth, like the ocean) — it free-evolves, and its discharge inlet fires, ONLY inside a
+dam's impoundment.** `dam_impoundment_set` BFS-floods from every dam over connected region cells
+whose solid bed sits below that dam's crest (the exact reservoir + tailwater extent); cells outside
+the union stay Pinned. Without this, a well's runtime cell pulls the nearby river into the active
+region and the uncapped discharge inlet — which has no relief valve absent a dam weir — forces an
+unnatural surface gradient and floods the banks. Well shafts project as `Water`, never `River`, so
+their seep is untouched. A Free cell whose bed sits below `HydroCell.aquifer_level` seeps upward (springs +
 pits dug below the table) **capped at the table** — `bed+depth<aquifer_z` only, so groundwater
 never floods rock (snapshot-time gate ⇒ zero `water.rs` change, determinism tests stand); dam
 footing → weir crest = footing + `DAM_RISE_Z=3`. All inflow follows the **snowmelt seasonal
