@@ -21,7 +21,6 @@ use crate::simulation::person::UNEMPLOYED_TASK_KIND;
 use crate::simulation::schedule::SimClock;
 use crate::simulation::shared_knowledge::{KnowledgeTier, SharedKnowledge};
 use crate::simulation::technology::current_era;
-use crate::simulation::wild_herd::WildHerdRegistry;
 use crate::world::chunk::ChunkMap;
 use crate::world::chunk_streaming::TileChangedEvent;
 use crate::world::globe::{Biome, Globe};
@@ -46,6 +45,30 @@ pub struct MigrationOrder {
 /// Tiles within `NOMAD_FORAGE_RADIUS` are "local" — clusters here count
 /// toward the band's at-camp food score.
 pub const NOMAD_FORAGE_RADIUS: i32 = 24;
+
+/// Strict-AND migration trigger thresholds. A band migrates only when its
+/// stored food is below `members × NOMAD_TRIGGER_FOOD_DAYS` *and* its known
+/// local food clusters score below `members × NOMAD_KNOWN_FOOD_TARGET_PER_MEMBER`.
+pub const NOMAD_TRIGGER_FOOD_DAYS: f32 = 3.0;
+pub const NOMAD_KNOWN_FOOD_TARGET_PER_MEMBER: f32 = 1.0;
+/// A survey that produces no candidate scoring at least this high returns
+/// the band to `Idle` rather than committing to a poor site.
+pub const NOMAD_MIN_ACCEPTABLE_SITE_SCORE: f32 = 15.0;
+/// After a no-candidate survey, the band retries this many days later
+/// instead of waiting a full migration period.
+pub const NOMAD_NO_CANDIDATE_RETRY_DAYS: u32 = 2;
+
+/// Minimum-stay cooldown derived from the faction's archetype: a `Mobile`
+/// band must stay `migration_period_min_days`; anything else falls back to
+/// one season.
+pub fn migration_cooldown_ticks(home: crate::simulation::archetype::HomeMobility) -> u32 {
+    match home {
+        crate::simulation::archetype::HomeMobility::Mobile {
+            migration_period_min_days,
+        } => migration_period_min_days.saturating_mul(TICKS_PER_DAY),
+        crate::simulation::archetype::HomeMobility::Anchored => TICKS_PER_SEASON,
+    }
+}
 
 /// Min chebyshev distance from old camp the migration target must satisfy.
 /// Phase D: kept as a soft floor — `pick_migration_target` no longer hard-
@@ -282,13 +305,20 @@ pub fn nomad_migration_system(world: &mut World) {
                 ) {
                     return None;
                 }
-                if now < faction.last_migration_tick.saturating_add(TICKS_PER_SEASON) {
+                let cooldown = migration_cooldown_ticks(faction.caps.home);
+                if now < faction.last_migration_tick.saturating_add(cooldown) {
                     return None;
                 }
+                // Strict AND: stored-food deficit AND weak local knowledge.
+                // Either alone is not enough to uproot the band.
+                let members = faction.member_count.max(1) as f32;
+                let food_deficit =
+                    faction.storage.food_total() < members * NOMAD_TRIGGER_FOOD_DAYS;
                 let food_score =
                     score_local_food(shared, fid, faction.home_tile, NOMAD_FORAGE_RADIUS);
-                let threshold: u16 = (faction.member_count.max(1) as u16).saturating_mul(3);
-                if food_score >= threshold {
+                let weak_local =
+                    (food_score as f32) < members * NOMAD_KNOWN_FOOD_TARGET_PER_MEMBER;
+                if !(food_deficit && weak_local) {
                     return None;
                 }
                 Some(Trigger {
@@ -444,7 +474,12 @@ pub fn nomad_survey_completion_system(world: &mut World) {
     struct Done {
         fid: u32,
         home: (i32, i32),
-        target: (i32, i32),
+        /// `Some` only when a candidate cleared `NOMAD_MIN_ACCEPTABLE_SITE_SCORE`.
+        /// `None` → no acceptable site; the band returns to `Idle` with a
+        /// short retry delay instead of committing to a poor camp.
+        target: Option<(i32, i32)>,
+        /// Retry cooldown anchor when `target` is `None`.
+        retry_cooldown: u32,
         scouts: Vec<Entity>,
         candidates: Vec<crate::simulation::faction::CampSiteCandidate>,
     }
@@ -453,7 +488,6 @@ pub fn nomad_survey_completion_system(world: &mut World) {
     let done: Vec<Done> = {
         let registry = world.resource::<FactionRegistry>();
         let shared = world.resource::<SharedKnowledge>();
-        let wild_herds = world.resource::<WildHerdRegistry>();
         let chunk_map = world.resource::<ChunkMap>();
         let globe = world.resource::<Globe>();
         let calendar = world.resource::<Calendar>();
@@ -474,7 +508,6 @@ pub fn nomad_survey_completion_system(world: &mut World) {
                 }
                 let candidates = pick_migration_candidates(
                     shared,
-                    wild_herds,
                     chunk_map,
                     globe,
                     calendar.season,
@@ -487,14 +520,17 @@ pub fn nomad_survey_completion_system(world: &mut World) {
                     faction.migration_intent,
                     crate::simulation::faction::MAX_CANDIDATE_SITES,
                 );
+                // Only commit to a candidate that clears the acceptable-site
+                // bar. A weak best candidate → no migration; retry shortly.
                 let target = candidates
                     .first()
-                    .map(|c| c.anchor)
-                    .unwrap_or_else(|| fallback_direction(fid, faction.home_tile, now));
+                    .filter(|c| c.score >= NOMAD_MIN_ACCEPTABLE_SITE_SCORE)
+                    .map(|c| c.anchor);
                 Some(Done {
                     fid,
                     home: faction.home_tile,
                     target,
+                    retry_cooldown: migration_cooldown_ticks(faction.caps.home),
                     scouts: scouts.clone(),
                     candidates,
                 })
@@ -550,17 +586,39 @@ pub fn nomad_survey_completion_system(world: &mut World) {
                         faction.candidate_sites.pop_front();
                     }
                 }
-                faction.pending_migration = Some(d.target);
-                faction.migration_phase =
-                    crate::simulation::faction::MigrationPhase::PendingCommit {
-                        target: d.target,
-                        chosen_tick: now,
-                    };
-                faction.last_phase_change_tick = now;
-                info!(
-                    "Faction {} survey complete ({:?} -> {:?}) tick {now}",
-                    d.fid, d.home, d.target,
-                );
+                match d.target {
+                    Some(target) => {
+                        faction.pending_migration = Some(target);
+                        faction.migration_phase =
+                            crate::simulation::faction::MigrationPhase::PendingCommit {
+                                target,
+                                chosen_tick: now,
+                            };
+                        faction.last_phase_change_tick = now;
+                        info!(
+                            "Faction {} survey complete ({:?} -> {:?}) tick {now}",
+                            d.fid, d.home, target,
+                        );
+                    }
+                    None => {
+                        // No acceptable site — return to Idle and retry in
+                        // ~NOMAD_NO_CANDIDATE_RETRY_DAYS days rather than
+                        // waiting a full migration period.
+                        faction.pending_migration = None;
+                        faction.migration_phase =
+                            crate::simulation::faction::MigrationPhase::Idle;
+                        faction.last_phase_change_tick = now;
+                        let retry =
+                            NOMAD_NO_CANDIDATE_RETRY_DAYS.saturating_mul(TICKS_PER_DAY);
+                        faction.last_migration_tick = now
+                            .saturating_add(retry)
+                            .saturating_sub(d.retry_cooldown);
+                        info!(
+                            "Faction {} survey found no acceptable site tick {now}; retry ~{} days",
+                            d.fid, NOMAD_NO_CANDIDATE_RETRY_DAYS,
+                        );
+                    }
+                }
             }
         }
     }
@@ -2108,7 +2166,6 @@ pub fn manual_scout_completion_system(world: &mut World) {
     let folded: Vec<(u32, Vec<CampSiteCandidate>)> = {
         let registry = world.resource::<FactionRegistry>();
         let shared = world.resource::<SharedKnowledge>();
-        let wild_herds = world.resource::<WildHerdRegistry>();
         let chunk_map = world.resource::<ChunkMap>();
         let globe = world.resource::<Globe>();
         let calendar = world.resource::<Calendar>();
@@ -2120,7 +2177,6 @@ pub fn manual_scout_completion_system(world: &mut World) {
             // Score local clusters within ±SCOUT_LOCAL_RADIUS of arrival anchor.
             let cands = pick_migration_candidates(
                 shared,
-                wild_herds,
                 chunk_map,
                 globe,
                 calendar.season,
@@ -2818,7 +2874,6 @@ pub struct MigrationScore {
 #[allow(clippy::too_many_arguments)]
 pub fn pick_migration_target(
     shared: &SharedKnowledge,
-    wild_herds: &WildHerdRegistry,
     chunk_map: &ChunkMap,
     globe: &Globe,
     season: Season,
@@ -2832,7 +2887,6 @@ pub fn pick_migration_target(
 ) -> Option<(i32, i32)> {
     pick_migration_candidates(
         shared,
-        wild_herds,
         chunk_map,
         globe,
         season,
@@ -2857,7 +2911,6 @@ pub fn pick_migration_target(
 #[allow(clippy::too_many_arguments)]
 pub fn pick_migration_candidates(
     shared: &SharedKnowledge,
-    wild_herds: &WildHerdRegistry,
     chunk_map: &ChunkMap,
     globe: &Globe,
     season: Season,
@@ -2871,6 +2924,7 @@ pub fn pick_migration_candidates(
     k: usize,
 ) -> Vec<crate::simulation::faction::CampSiteCandidate> {
     use crate::simulation::faction::{CampSiteCandidate, CandidateReason};
+    use crate::world::tile::TileKind;
     let w = intent.weights();
     let mut scored: Vec<(CampSiteCandidate, i32)> = Vec::new();
 
@@ -2878,6 +2932,17 @@ pub fn pick_migration_candidates(
         let d = chebyshev(tile, home);
         if d < min_d || d > max_d {
             return;
+        }
+        // Early reject: never propose an impassable / unsettleable centre
+        // tile — these would only fail at the `migration_target_ready`
+        // commit gate after wasting a survey window.
+        if let Some(tk) = chunk_map.tile_kind_at(tile.0, tile.1) {
+            if matches!(
+                tk,
+                TileKind::Water | TileKind::River | TileKind::Wall | TileKind::Ore
+            ) {
+                return;
+            }
         }
         let water = score_water(chunk_map, tile, WATER_PROBE_RADIUS);
         let biome_season = score_biome_season(globe, tile, season);
@@ -2931,17 +2996,20 @@ pub fn pick_migration_candidates(
         ));
     };
 
+    // Knowledge-gated: only clusters the faction has actually scouted into
+    // its faction-tier `SharedKnowledge` produce candidates — no omniscient
+    // `WildHerdRegistry` scan.
     if let Some(map) = shared.map(KnowledgeTier::Faction(fid)) {
         for c in map.clusters.values() {
-            if !matches!(c.kind, MemoryKind::AnyEdible) {
-                continue;
+            match c.kind {
+                MemoryKind::AnyEdible => consider(c.center, c.estimated_count as i32, 0),
+                MemoryKind::HerdSighting => {
+                    let herd_score = (c.estimated_count as i32 / 2).max(20);
+                    consider(c.center, 0, herd_score);
+                }
+                _ => {}
             }
-            consider(c.center, c.estimated_count as i32, 0);
         }
-    }
-    for herd in wild_herds.herds.values() {
-        let herd_score = (herd.aggregate_count as i32 / 2).max(20);
-        consider(herd.leader_tile, 0, herd_score);
     }
 
     scored.sort_by(|a, b| b.1.cmp(&a.1));
@@ -3001,17 +3069,22 @@ pub fn score_biome_season(globe: &Globe, tile: (i32, i32), season: Season) -> i3
     base + seasonal
 }
 
-/// Penalises tiles near sighted predator/prey clusters (proxy for "wolves
-/// hunt this area"). −15 per `MemoryKind::Prey` cluster centre within
-/// `PREDATOR_PROBE_RADIUS`. A wolf-pack-rich tile thus pulls 15..45 below
-/// a quiet alternative — enough to flip equal-food candidates.
+/// Penalises tiles near sighted hostile war parties. −15 per
+/// `MemoryKind::HostileFactionSighting` cluster centre within
+/// `PREDATOR_PROBE_RADIUS`.
+///
+/// **Do not** reinstate a `MemoryKind::Prey` arm here: `Prey` mixes
+/// predators and game (deer), so it was never a real danger signal — a
+/// deer-rich meadow is *good* grazing, not a threat. Wild-herd opportunity
+/// is now scored separately via `MemoryKind::HerdSighting` in
+/// `pick_migration_candidates`.
 pub fn score_danger(shared: &SharedKnowledge, fid: u32, tile: (i32, i32)) -> i32 {
     let Some(map) = shared.map(KnowledgeTier::Faction(fid)) else {
         return 0;
     };
     let mut penalty: i32 = 0;
     for c in map.clusters.values() {
-        if !matches!(c.kind, MemoryKind::Prey) {
+        if !matches!(c.kind, MemoryKind::HostileFactionSighting) {
             continue;
         }
         if chebyshev(c.center, tile) <= PREDATOR_PROBE_RADIUS {
@@ -3119,6 +3192,11 @@ pub fn nomad_sedentarize_system(
     }
 }
 
+/// Deterministic compass-direction fallback target. The autonomous survey
+/// path no longer uses this — a no-candidate survey returns to `Idle` and
+/// retries rather than blindly committing. Retained for the debug / manual
+/// `PlayerCommand` migration tooling, which can still force a direction.
+#[allow(dead_code)]
 fn fallback_direction(fid: u32, home: (i32, i32), now: u32) -> (i32, i32) {
     let seed = fid.wrapping_mul(0x9E37_79B9).wrapping_add(now);
     let dir = (seed % 8) as i32;
@@ -3788,5 +3866,52 @@ mod tests {
             .expect("route arrival should keep the final migration marker");
         assert_eq!(marker.tile, (8, 0));
         assert_eq!(marker.route_tile, None);
+    }
+
+    #[test]
+    fn score_danger_ignores_prey_clusters() {
+        use crate::simulation::shared_knowledge::{KnowledgeTier, SharedKnowledge};
+        use crate::simulation::shared_knowledge::ResourceOwner;
+        let mut shared = SharedKnowledge::default();
+        // A Prey cluster (deer/wolf mix) right on the tile must NOT be
+        // treated as danger — deer are good grazing, not a threat.
+        shared.report_sighting(
+            KnowledgeTier::Faction(1),
+            (10, 10),
+            MemoryKind::Prey,
+            ResourceOwner::Public,
+            0,
+        );
+        assert_eq!(score_danger(&shared, 1, (10, 10)), 0);
+    }
+
+    #[test]
+    fn score_danger_penalises_hostile_faction() {
+        use crate::simulation::shared_knowledge::{KnowledgeTier, SharedKnowledge};
+        use crate::simulation::shared_knowledge::ResourceOwner;
+        let mut shared = SharedKnowledge::default();
+        shared.report_sighting(
+            KnowledgeTier::Faction(1),
+            (10, 10),
+            MemoryKind::HostileFactionSighting,
+            ResourceOwner::Public,
+            0,
+        );
+        assert!(score_danger(&shared, 1, (10, 10)) < 0);
+        // Far from the sighting → no penalty.
+        assert_eq!(score_danger(&shared, 1, (500, 500)), 0);
+    }
+
+    #[test]
+    fn migration_cooldown_tracks_capability() {
+        use crate::simulation::archetype::HomeMobility;
+        let fast = migration_cooldown_ticks(HomeMobility::Mobile {
+            migration_period_min_days: 5,
+        });
+        let slow = migration_cooldown_ticks(HomeMobility::Mobile {
+            migration_period_min_days: 30,
+        });
+        assert!(slow > fast);
+        assert_eq!(fast, 5 * TICKS_PER_DAY);
     }
 }

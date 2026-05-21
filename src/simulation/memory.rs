@@ -25,6 +25,16 @@ pub enum MemoryKind {
     AnyEdible,
     Resource(ResourceId),
     Prey,
+    /// A sighted wild herd (Deer / Horse / Cattle). Distinct from `Prey`
+    /// (which mixes predators and game): nomad migration scoring reads
+    /// `HerdSighting` clusters as a *knowledge-gated* "good grazing /
+    /// hunting nearby" signal — a band only migrates toward herds it has
+    /// actually scouted, not every herd on the map.
+    HerdSighting,
+    /// A sighted hostile faction war party. `nomad::score_danger` reads
+    /// these clusters as a real migration deterrent (replaces the former
+    /// misuse of `Prey` as a danger proxy).
+    HostileFactionSighting,
 }
 
 impl MemoryKind {
@@ -341,10 +351,19 @@ pub fn vision_system(
     )>,
     item_query: Query<&crate::simulation::items::GroundItem>,
     prey_query: Query<
-        (Entity, &crate::simulation::combat::Health),
+        (
+            Entity,
+            &crate::simulation::combat::Health,
+            Has<crate::simulation::animals::Wolf>,
+            Has<crate::simulation::animals::Deer>,
+            Has<crate::simulation::animals::Horse>,
+            Has<crate::simulation::animals::Cow>,
+        ),
         Or<(
             With<crate::simulation::animals::Wolf>,
             With<crate::simulation::animals::Deer>,
+            With<crate::simulation::animals::Horse>,
+            With<crate::simulation::animals::Cow>,
         )>,
     >,
     mut shared: ResMut<crate::simulation::shared_knowledge::SharedKnowledge>,
@@ -487,21 +506,44 @@ pub fn vision_system(
                                 owner: ResourceOwner::Public,
                             });
                         }
-                    } else if let Ok((_, health)) = prey_query.get(entity) {
+                    } else if let Ok((_, health, is_wolf, is_deer, is_horse, is_cow)) =
+                        prey_query.get(entity)
+                    {
                         if !health.is_dead() {
-                            shared.report_sighting(
-                                write_tier,
-                                (ntx, nty),
-                                MemoryKind::Prey,
-                                ResourceOwner::Public,
-                                now,
-                            );
-                            current_vision.entries.push(VisionEntry {
-                                kind: MemoryKind::Prey,
-                                tile: (ntx, nty),
-                                entity: Some(entity),
-                                owner: ResourceOwner::Public,
-                            });
+                            // Prey: predators + game (Wolf / Deer) — feeds the
+                            // hunting pipeline.
+                            if is_wolf || is_deer {
+                                shared.report_sighting(
+                                    write_tier,
+                                    (ntx, nty),
+                                    MemoryKind::Prey,
+                                    ResourceOwner::Public,
+                                    now,
+                                );
+                                current_vision.entries.push(VisionEntry {
+                                    kind: MemoryKind::Prey,
+                                    tile: (ntx, nty),
+                                    entity: Some(entity),
+                                    owner: ResourceOwner::Public,
+                                });
+                            }
+                            // Herd sighting: knowledge-gated grazing signal for
+                            // nomad migration scoring (Deer / Horse / Cattle).
+                            if is_deer || is_horse || is_cow {
+                                shared.report_sighting(
+                                    write_tier,
+                                    (ntx, nty),
+                                    MemoryKind::HerdSighting,
+                                    ResourceOwner::Public,
+                                    now,
+                                );
+                                current_vision.entries.push(VisionEntry {
+                                    kind: MemoryKind::HerdSighting,
+                                    tile: (ntx, nty),
+                                    entity: Some(entity),
+                                    owner: ResourceOwner::Public,
+                                });
+                            }
                         }
                     }
                 }
