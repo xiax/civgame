@@ -56,6 +56,10 @@ pub enum MenuAction {
     EncodeTablet(crate::simulation::technology::TechId),
     /// Faction-level: queue a vehicle design for assembly at a Vehicle Yard.
     QueueVehicle(u32),
+    /// Faction-level: a right-click order on a spawned `Vehicle` entity
+    /// (move / load / unload / right / crew / hitch / deconstruct). The
+    /// `VehicleOrderKind` already carries any destination tile.
+    VehicleAct(Entity, crate::simulation::vehicle::VehicleOrderKind),
     /// Pitch the player faction's mobile camp at this tile (only
     /// available when `caps.home.is_mobile()` and `camp_state ==
     /// Packed`). The chief is the dispatched actor; the apply system
@@ -112,9 +116,63 @@ impl MenuAction {
             MenuAction::ReadItem(_) => "Read",
             MenuAction::EncodeTablet(_) => "Encode Tablet",
             MenuAction::QueueVehicle(_) => "Assemble Vehicle",
+            MenuAction::VehicleAct(_, kind) => vehicle_order_label(kind),
             MenuAction::PitchCampHere => "Pitch Camp Here",
         }
     }
+}
+
+/// Display label for one `VehicleOrderKind` right-click action.
+fn vehicle_order_label(kind: crate::simulation::vehicle::VehicleOrderKind) -> &'static str {
+    use crate::simulation::vehicle::VehicleOrderKind as K;
+    match kind {
+        K::MoveTo(_) => "Move Vehicle Here",
+        K::Right => "Right Vehicle",
+        K::Load => "Load Cargo",
+        K::Unload => "Unload Cargo",
+        K::AssignCrew => "Assign Crew",
+        K::Hitch => "Hitch Animals",
+        K::Unhitch => "Unhitch Animals",
+        K::Deconstruct => "Salvage Vehicle",
+    }
+}
+
+/// Build the right-click order list for one `Vehicle` entity. `include_move`
+/// adds a "Move Vehicle Here" entry targeting `target_tile` — used when the
+/// vehicle itself is selected and the player clicks a destination.
+fn build_vehicle_ops(
+    vehicle: Entity,
+    target_tile: (i32, i32),
+    include_move: bool,
+    vehicle_q: &Query<&crate::simulation::vehicle::Vehicle>,
+) -> Vec<(MenuAction, String)> {
+    use crate::simulation::vehicle::{VehicleOrderKind as K, VehicleState};
+    let Ok(v) = vehicle_q.get(vehicle) else {
+        return Vec::new();
+    };
+    let mut ops: Vec<(MenuAction, String)> = Vec::new();
+    let mut push = |kind: K| {
+        ops.push((
+            MenuAction::VehicleAct(vehicle, kind),
+            vehicle_order_label(kind).to_string(),
+        ));
+    };
+    if v.state == VehicleState::Overturned {
+        // An overturned vehicle is an inert hulk — only righting / salvage.
+        push(K::Right);
+        push(K::Deconstruct);
+        return ops;
+    }
+    if include_move {
+        push(K::MoveTo(target_tile));
+    }
+    push(K::Load);
+    push(K::Unload);
+    push(K::AssignCrew);
+    push(K::Hitch);
+    push(K::Unhitch);
+    push(K::Deconstruct);
+    ops
 }
 
 /// An entity found on the right-clicked tile that is displayed in Section 2.
@@ -152,6 +210,9 @@ pub struct ContextMenuState {
     /// Stock vehicle designs offered when the target tile holds a
     /// player-faction `VehicleYard`. `(action, display name)`.
     pub vehicle_options: Vec<(MenuAction, String)>,
+    /// Right-click orders for a player-faction `Vehicle` — either the
+    /// selected vehicle, or one parked on the target tile. `(action, label)`.
+    pub vehicle_ops: Vec<(MenuAction, String)>,
 }
 
 impl ContextMenuState {
@@ -159,6 +220,7 @@ impl ContextMenuState {
         self.tile_entities.clear();
         self.tile_items.clear();
         self.vehicle_options.clear();
+        self.vehicle_ops.clear();
     }
 }
 
@@ -243,6 +305,7 @@ pub struct RoutingResources<'w, 's> {
     // "Assemble Vehicle" submenu.
     pub vehicle_yard_map: Res<'w, crate::simulation::vehicle::VehicleYardMap>,
     pub vehicle_registry: Res<'w, crate::simulation::vehicle::VehicleDesignRegistry>,
+    pub vehicle_occupancy: Res<'w, crate::simulation::vehicle::VehicleOccupancyIndex>,
     #[system_param(ignore)]
     pub _marker: std::marker::PhantomData<&'s ()>,
 }
@@ -261,6 +324,7 @@ pub fn right_click_context_menu_system(
     tile_display: TileDisplayQueries,
     routing: RoutingResources,
     vehicle_yard_q: Query<&crate::simulation::vehicle::VehicleYard>,
+    vehicle_q: Query<&crate::simulation::vehicle::Vehicle>,
     mut menu_state: ResMut<ContextMenuState>,
     mut cmd_events: EventWriter<crate::simulation::player_command::PlayerCommandEvent>,
 ) {
@@ -275,12 +339,18 @@ pub fn right_click_context_menu_system(
         .map(|m| m.faction_id == player_faction.faction_id)
         .unwrap_or(false);
     let is_drafted = member_q.drafted_q.get(sel_entity).is_ok();
-    if !is_player_member {
+    // A selected player-faction vehicle opens a vehicle-only right-click menu.
+    let sel_vehicle: Option<Entity> = vehicle_q
+        .get(sel_entity)
+        .ok()
+        .filter(|v| v.owner_faction == player_faction.faction_id)
+        .map(|_| sel_entity);
+    if !is_player_member && sel_vehicle.is_none() {
         menu_state.open = false;
         return;
     }
     // Drafted units are commanded by `military_right_click_system` instead.
-    if is_drafted {
+    if is_drafted && sel_vehicle.is_none() {
         menu_state.open = false;
         return;
     }
@@ -289,7 +359,20 @@ pub fn right_click_context_menu_system(
     if mouse_buttons.just_pressed(MouseButton::Right) {
         if let Some(pick) = cursor.cursor_pick() {
             {
-                {
+                if let Some(sv) = sel_vehicle {
+                    // Vehicle-only menu: the selected vehicle drives to the
+                    // clicked tile, plus its standing right-click orders.
+                    menu_state.clear_tile_data();
+                    menu_state.vehicle_ops = build_vehicle_ops(sv, pick.tile, true, &vehicle_q);
+                    menu_state.open = true;
+                    menu_state.screen_pos =
+                        egui::pos2(pick.screen_pos.x, pick.screen_pos.y);
+                    menu_state.target_tile = pick.tile;
+                    menu_state.target_z =
+                        chunk_map.surface_z_at(pick.tile.0, pick.tile.1) as i8;
+                    menu_state.actions = Vec::new();
+                    menu_state.build_options = Vec::new();
+                } else {
                     let (tx, ty) = pick.tile;
                     let cursor_pos = pick.screen_pos;
 
@@ -469,6 +552,19 @@ pub fn right_click_context_menu_system(
                         }
                     }
 
+                    // Vehicle system (Phase 5): a player-faction vehicle
+                    // parked on this tile offers its right-click order menu.
+                    if let Some(&veh_e) = routing.vehicle_occupancy.0.get(&pos_tile) {
+                        if vehicle_q
+                            .get(veh_e)
+                            .map(|v| v.owner_faction == player_faction.faction_id)
+                            .unwrap_or(false)
+                        {
+                            menu_state.vehicle_ops =
+                                build_vehicle_ops(veh_e, pos_tile, false, &vehicle_q);
+                        }
+                    }
+
                     menu_state.open = true;
                     menu_state.screen_pos = egui::pos2(cursor_pos.x, cursor_pos.y);
                     menu_state.target_tile = pos_tile;
@@ -495,6 +591,7 @@ pub fn right_click_context_menu_system(
     let actions = menu_state.actions.clone();
     let build_options = menu_state.build_options.clone();
     let vehicle_options = menu_state.vehicle_options.clone();
+    let vehicle_ops = menu_state.vehicle_ops.clone();
     let target_tile = menu_state.target_tile;
     let target_z = menu_state.target_z;
     // Clone enough display data to use in the closure without borrow issues.
@@ -551,6 +648,18 @@ pub fn right_click_context_menu_system(
                     ui.menu_button("Assemble Vehicle \u{25B8}", |ui| {
                         for (act, name) in &vehicle_options {
                             if ui.button(name).clicked() {
+                                chosen = Some(*act);
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                }
+
+                // Section 1c — right-click orders for a vehicle.
+                if !vehicle_ops.is_empty() {
+                    ui.menu_button("Vehicle \u{25B8}", |ui| {
+                        for (act, label) in &vehicle_ops {
+                            if ui.button(label).clicked() {
                                 chosen = Some(*act);
                                 ui.close_menu();
                             }
@@ -626,6 +735,19 @@ pub fn right_click_context_menu_system(
                 actors: Vec::new(),
                 command: crate::simulation::player_command::PlayerCommand::QueueVehicle {
                     design_id,
+                },
+            });
+            menu_state.open = false;
+            return;
+        }
+        // Vehicle orders are faction-level — the vehicle entity is the
+        // subject, so emit with empty `actors`.
+        if let MenuAction::VehicleAct(vehicle, kind) = action {
+            cmd_events.send(crate::simulation::player_command::PlayerCommandEvent {
+                actors: Vec::new(),
+                command: crate::simulation::player_command::PlayerCommand::VehicleOrder {
+                    vehicle,
+                    kind,
                 },
             });
             menu_state.open = false;
@@ -722,6 +844,8 @@ fn menu_action_to_command(
         MenuAction::ReadItem(tech) => PlayerCommand::ReadItem { tech },
         MenuAction::EncodeTablet(tech) => PlayerCommand::EncodeTablet { tech },
         MenuAction::QueueVehicle(design_id) => PlayerCommand::QueueVehicle { design_id },
+        // Handled by a dedicated faction-level branch before this call.
+        MenuAction::VehicleAct(..) => return None,
         MenuAction::PitchCampHere => PlayerCommand::PitchCamp {
             tile: target_tile,
             z: target_z,

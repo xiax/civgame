@@ -6662,6 +6662,170 @@ mod smoke {
         assert!(queued, "the custom design must be enqueued for assembly");
     }
 
+    /// Vehicle system (Phase 5): AI freeform-design proposals. A faction with
+    /// `ANIMAL_HUSBANDRY` + `BRONZE_CASTING` earns one metal-reinforced
+    /// proposal in `VehicleDesignRegistry`, authored by the faction; the pass
+    /// is idempotent (one authored design per faction).
+    #[test]
+    fn vehicle_ai_generates_one_design_proposal_per_faction() {
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::technology::{ANIMAL_HUSBANDRY, BRONZE_CASTING};
+        use crate::simulation::vehicle::{
+            vehicle_ai_design_proposal_system, VehicleDesignRegistry,
+        };
+
+        let mut sim = TestSim::new(0xB20E5);
+        sim.flat_world(10, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let f = registry.factions.get_mut(&fid).unwrap();
+            f.techs.unlock(ANIMAL_HUSBANDRY);
+            f.techs.unlock(BRONZE_CASTING);
+        }
+
+        let sys = sim
+            .app
+            .world_mut()
+            .register_system(vehicle_ai_design_proposal_system);
+        sim.app.world_mut().run_system(sys).unwrap();
+
+        let authored_count = |app: &App| -> usize {
+            app.world()
+                .resource::<VehicleDesignRegistry>()
+                .iter()
+                .filter(|d| d.author_faction == Some(fid))
+                .count()
+        };
+        assert_eq!(
+            authored_count(&sim.app),
+            1,
+            "the faction must earn exactly one proposal"
+        );
+
+        // Idempotent — a second pass must not add another.
+        sim.app.world_mut().run_system(sys).unwrap();
+        assert_eq!(
+            authored_count(&sim.app),
+            1,
+            "proposal generation is one-per-faction"
+        );
+    }
+
+    /// Vehicle system (Phase 5): the right-click `Right` order uprights an
+    /// overturned vehicle (`Overturned` → `Parked`).
+    #[test]
+    fn vehicle_player_command_right_uprights_overturned() {
+        use crate::simulation::vehicle::{
+            PendingVehicleOps, Vehicle, VehicleCrew, VehicleDesignRegistry, VehicleDraft,
+            VehicleInventory, VehicleOrderKind, VehiclePurpose, VehicleState,
+        };
+
+        let mut sim = TestSim::new(0xC0DE1);
+        sim.flat_world(4, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        let design_id = {
+            let reg = sim.app.world().resource::<VehicleDesignRegistry>();
+            reg.by_name("Handcart").unwrap().id
+        };
+        let vehicle = sim
+            .app
+            .world_mut()
+            .spawn((
+                Vehicle {
+                    owner_faction: fid,
+                    design_id,
+                    purpose: VehiclePurpose::Cargo,
+                    heading: 0,
+                    state: VehicleState::Overturned,
+                    anchor_tile: (0, 0),
+                    z: 0,
+                    hauler: None,
+                },
+                VehicleInventory::default(),
+                VehicleCrew::default(),
+                VehicleDraft { hitched: Vec::new(), required_animals: 0 },
+            ))
+            .id();
+
+        sim.app
+            .world_mut()
+            .resource_mut::<PendingVehicleOps>()
+            .ops
+            .push((vehicle, VehicleOrderKind::Right));
+        let sys = sim
+            .app
+            .world_mut()
+            .register_system(crate::simulation::vehicle::vehicle_player_command_system);
+        sim.app.world_mut().run_system(sys).unwrap();
+
+        assert_eq!(
+            sim.app.world().get::<Vehicle>(vehicle).unwrap().state,
+            VehicleState::Parked,
+            "the Right order must upright an overturned vehicle"
+        );
+    }
+
+    /// Vehicle system (Phase 5): the right-click `Deconstruct` order despawns
+    /// the vehicle and refunds part of its design bill onto its tile.
+    #[test]
+    fn vehicle_player_command_deconstruct_refunds_and_despawns() {
+        use crate::simulation::items::GroundItem;
+        use crate::simulation::vehicle::{
+            PendingVehicleOps, Vehicle, VehicleCrew, VehicleDesignRegistry, VehicleDraft,
+            VehicleInventory, VehicleOrderKind, VehiclePurpose, VehicleState,
+        };
+
+        let mut sim = TestSim::new(0xC0DE2);
+        sim.flat_world(4, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        let design_id = {
+            let reg = sim.app.world().resource::<VehicleDesignRegistry>();
+            reg.by_name("Handcart").unwrap().id
+        };
+        let vehicle = sim
+            .app
+            .world_mut()
+            .spawn((
+                Vehicle {
+                    owner_faction: fid,
+                    design_id,
+                    purpose: VehiclePurpose::Cargo,
+                    heading: 0,
+                    state: VehicleState::Parked,
+                    anchor_tile: (1, 1),
+                    z: 0,
+                    hauler: None,
+                },
+                VehicleInventory::default(),
+                VehicleCrew::default(),
+                VehicleDraft { hitched: Vec::new(), required_animals: 0 },
+            ))
+            .id();
+
+        sim.app
+            .world_mut()
+            .resource_mut::<PendingVehicleOps>()
+            .ops
+            .push((vehicle, VehicleOrderKind::Deconstruct));
+        let sys = sim
+            .app
+            .world_mut()
+            .register_system(crate::simulation::vehicle::vehicle_player_command_system);
+        sim.app.world_mut().run_system(sys).unwrap();
+
+        assert!(
+            sim.app.world().get_entity(vehicle).is_err(),
+            "Deconstruct must despawn the vehicle"
+        );
+        let mut items = sim.app.world_mut().query::<&GroundItem>();
+        let refunded: u32 = items.iter(sim.app.world()).map(|gi| gi.qty).sum();
+        assert!(
+            refunded > 0,
+            "Deconstruct must refund part of the design bill as ground items"
+        );
+    }
+
     /// Draftwork v2: human-drawn fallback. With NO trained draft animal in
     /// the faction, the executor still completes the plowing (the dispatcher
     /// dispatches `Task::Plow { animal: None }`, the executor uses

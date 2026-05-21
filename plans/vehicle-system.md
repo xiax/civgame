@@ -319,7 +319,7 @@ Manual acceptance (`cargo run`, never `--sandbox`, Bronze Age start):
   - **Deferred:** the vehicle re-parks in place (no drive-back-to-yard); rollover *recovery* is
     a righting task for a later phase (an overturned vehicle is an inert hulk the dispatcher
     skips).
-- **Phase 5 — partial.** AI provisioning shipped: `vehicle_yard_intent_emitter_system` (drops a
+- **Phase 5 — shipped.** AI provisioning: `vehicle_yard_intent_emitter_system` (drops a
   `VehicleYard` blueprint for a settled `ANIMAL_HUSBANDRY` faction ≥10 members, no yard) +
   `vehicle_ai_queue_system` (enqueues a Handcart once a yard is built) — restores autonomous
   vehicle provisioning for AI factions. Inspector "Vehicle" section shipped (design / state /
@@ -332,10 +332,32 @@ Manual acceptance (`cargo run`, never `--sandbox`, Bronze Age start):
     `PlayerCommand::QueueCustomVehicle { name, grid, purpose, required_animals }` — the UI stays
     event-only; `drain_player_command_events_system` registers the design into
     `VehicleDesignRegistry` (authored by the player faction) and enqueues it.
-  - 950-test suite passes (incl. `vehicle_designer_custom_queue_registers_and_enqueues`).
-  **Still pending in Phase 5:** AI freeform-design proposal generation into
-  `VehicleDesignRegistry`, custom-sprite / multi-Z rendering, and the right-click vehicle menu
-  (move / load / repair / right / crew / hitch / deconstruct). Phases 6-7 pending.
+  - **AI freeform-design proposals shipped** — `vehicle_ai_design_proposal_system` (Economy,
+    weekly) generates one metal-reinforced freeform design per faction that knows
+    `ANIMAL_HUSBANDRY` + `BRONZE_CASTING` (below metalworking an all-wood "freeform" design is
+    identical to a stock template — nothing distinct to propose). The proposal upgrades the
+    tech-best stock cargo/war template's wheels + axles to copper; stored in
+    `VehicleDesignRegistry` with `author_faction`, **not** auto-queued (AI keeps auto-queuing
+    stock templates). The designer's "Saved & proposed designs" `CollapsingHeader` lists every
+    player-faction-authored design with a Load button — proposals + previously-queued customs
+    flow back into the editor.
+  - **Composed / multi-Z rendering shipped** — `entity_sprites::spawn_vehicle_sprites` keys off
+    the design: stock 1-tall designs keep the hand-drawn `entity_cart` sprite; freeform / multi-Z
+    designs render as a composed body (one `VisualChild` colored quad per cell, XY-placed + Z-lifted,
+    `vehicle_cell_color` part palette).
+  - **Right-click vehicle menu shipped** — a "Vehicle ▸" submenu (`ui/orders.rs`) on a player-faction
+    `Vehicle` (or the selected vehicle + a destination click): Move / Load / Unload / Assign Crew /
+    Hitch / Unhitch / Salvage, plus Right for an overturned hulk. Each emits the faction-level
+    `PlayerCommand::VehicleOrder { vehicle, kind: VehicleOrderKind }` → `drain_player_command_events_system`
+    queues onto `PendingVehicleOps` → `vehicle_player_command_system` (Sequential, before
+    `vehicle_movement_system`) applies it directly: `MoveTo` plans a driverless `footprint_astar`
+    route, `Right` flips `Overturned→Parked`, `Load`/`Unload` shuttle cargo to/from the nearest
+    storage tile, `Hitch`/`Unhitch` claim/release draft animals, `Deconstruct` refunds half the
+    design bill and despawns. Repair is intentionally omitted — the per-cell damage model lands
+    with Phase 6 combat.
+  - 953-test suite passes (incl. `vehicle_player_command_right_uprights_overturned`,
+    `vehicle_player_command_deconstruct_refunds_and_despawns`).
+  **Phase 5 — complete.** Phases 6-7 (chariot combat, docs) pending.
 
 ## Assumptions
 

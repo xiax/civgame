@@ -2489,6 +2489,324 @@ pub fn vehicle_ai_queue_system(
     }
 }
 
+/// Cadence of the AI design-proposal pass — weekly.
+const PROPOSAL_CADENCE_TICKS: u64 = 7 * TICKS_PER_DAY as u64;
+
+/// Economy (weekly): generate one freeform *proposal* design per qualifying
+/// faction into `VehicleDesignRegistry`. Proposals are **not** auto-queued —
+/// AI factions keep auto-queuing stock templates via `vehicle_ai_queue_system`;
+/// proposals exist for the player to browse, edit, and queue from the
+/// `vehicle_designer` window. A faction only earns a proposal once it knows
+/// `BRONZE_CASTING` — below that, a "freeform" all-wood design is identical to
+/// a stock template, so there is nothing distinct to propose. The proposal is
+/// a metal-reinforced variant of the tech-best stock cargo/war template
+/// (wheels + axles upgraded to copper). Deterministic and idempotent: one
+/// authored design per faction.
+pub fn vehicle_ai_design_proposal_system(
+    clock: Res<SimClock>,
+    factions: Res<FactionRegistry>,
+    mut designs: ResMut<VehicleDesignRegistry>,
+    data: Res<VehicleData>,
+) {
+    if clock.tick % PROPOSAL_CADENCE_TICKS != 0 {
+        return;
+    }
+    // The strongest metal in the vehicle catalog — `core.ron` ships copper /
+    // iron; copper is the metalworking-era reinforcement.
+    let Some(metal) = core_ids::catalog().id_of("copper") else {
+        return;
+    };
+    // Factions that already own an authored design (proposal or player
+    // custom) — one proposal each.
+    let mut authored: ahash::AHashSet<u32> = ahash::AHashSet::default();
+    for d in designs.iter() {
+        if let Some(f) = d.author_faction {
+            authored.insert(f);
+        }
+    }
+    // Collect first — the registry can't be mutated while a `by_name` borrow
+    // into it is live.
+    let mut proposals: Vec<VehicleDesign> = Vec::new();
+    for (&fid, faction) in factions.factions.iter() {
+        if faction.parent_faction.is_some() || authored.contains(&fid) {
+            continue;
+        }
+        if !faction.techs.has(ANIMAL_HUSBANDRY) || !faction.techs.has(BRONZE_CASTING) {
+            continue;
+        }
+        let base_name = if faction.techs.has(WAR_CHARIOT) {
+            "War Chariot"
+        } else if faction.techs.has(OX_CART) {
+            "Four-Wheel Wagon"
+        } else {
+            "Ox Cart"
+        };
+        let Some(base) = designs.by_name(base_name) else {
+            continue;
+        };
+        let mut grid = base.grid.clone();
+        for (_, cell) in grid.cells.iter_mut() {
+            if matches!(cell.kind, VehiclePartKind::Wheel | VehiclePartKind::Axle) {
+                cell.material = metal;
+                cell.durability = cell_durability(metal, &data);
+            }
+        }
+        let proposal = VehicleDesign {
+            id: VehicleDesignId(0), // reassigned by `insert`
+            name: format!("Reinforced {base_name}"),
+            grid,
+            allowed_purpose: base.allowed_purpose,
+            required_animals: base.required_animals,
+            tech_gates: base.tech_gates.clone(),
+            author_faction: Some(fid),
+            revision: 0,
+        };
+        if validate_design(&proposal, &data).is_ok() {
+            proposals.push(proposal);
+        }
+    }
+    for p in proposals {
+        designs.insert(p);
+    }
+}
+
+// ── Phase 5: player right-click vehicle orders ────────────────────────────
+//
+// The right-click menu (`ui/orders.rs`) emits a faction-level
+// `PlayerCommand::VehicleOrder { vehicle, kind }`; `drain_player_command_events_system`
+// queues it onto `PendingVehicleOps`. `vehicle_player_command_system`
+// (Sequential, before `vehicle_movement_system`) applies it. Each order is a
+// direct effect — no HTN worker task — so a player can micro-manage a vehicle
+// the way Pack/Pitch micro-manages a camp.
+
+/// One queued player vehicle order. `MoveTo` plans a `footprint_astar` route;
+/// the rest are immediate state changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VehicleOrderKind {
+    /// Drive the (idle, upright) vehicle to a destination tile.
+    MoveTo((i32, i32)),
+    /// Right an overturned vehicle (`Overturned` → `Parked`).
+    Right,
+    /// Top the cargo bay up from the nearest faction storage tile.
+    Load,
+    /// Spill the whole cargo bay onto the vehicle's tile.
+    Unload,
+    /// Seat the nearest idle faction member as the driver.
+    AssignCrew,
+    /// Harness idle trained draft animals up to the design's requirement.
+    Hitch,
+    /// Release every hitched draft animal.
+    Unhitch,
+    /// Salvage the vehicle — refund half the design bill, despawn it.
+    Deconstruct,
+}
+
+/// Pending player vehicle orders, drained by `vehicle_player_command_system`.
+#[derive(Resource, Default)]
+pub struct PendingVehicleOps {
+    pub ops: Vec<(Entity, VehicleOrderKind)>,
+}
+
+/// Fraction of the design bill refunded when a vehicle is salvaged.
+const SALVAGE_REFUND_NUM: u32 = 1;
+const SALVAGE_REFUND_DEN: u32 = 2;
+
+/// Sequential (before `vehicle_movement_system`): apply queued player vehicle
+/// orders. Each order acts on one `Vehicle` entity directly.
+#[allow(clippy::too_many_arguments)]
+pub fn vehicle_player_command_system(
+    mut commands: Commands,
+    mut pending: ResMut<PendingVehicleOps>,
+    clock: Res<SimClock>,
+    registry: Res<VehicleDesignRegistry>,
+    data: Res<VehicleData>,
+    chunk_map: Res<ChunkMap>,
+    occupancy: Res<VehicleOccupancyIndex>,
+    storage_tile_map: Res<StorageTileMap>,
+    spatial: Res<SpatialIndex>,
+    mut ground_items: Query<&mut GroundItem>,
+    animals_q: Query<(Entity, &DomesticAnimal, &Tamed), Without<AnimalWorkClaim>>,
+    members_q: Query<(Entity, &FactionMember), (With<Person>, Without<Drafted>, Without<BoardedVehicle>)>,
+    mut vehicles_q: Query<(
+        &mut Vehicle,
+        &mut VehicleInventory,
+        &mut VehicleCrew,
+        &mut VehicleDraft,
+    )>,
+    mut scratch: Local<VehiclePathScratch>,
+) {
+    if pending.ops.is_empty() {
+        return;
+    }
+    let now = clock.tick as u32;
+    let mut claimed_this_pass: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+
+    for (vehicle_e, kind) in std::mem::take(&mut pending.ops) {
+        let Ok((mut v, mut inv, mut crew, mut draft)) = vehicles_q.get_mut(vehicle_e) else {
+            continue; // vehicle despawned before the order applied
+        };
+        let Some(design) = registry.get(v.design_id).cloned() else {
+            continue;
+        };
+        let anchor = v.anchor_tile;
+
+        match kind {
+            VehicleOrderKind::MoveTo(dest) => {
+                // Only an idle, upright vehicle obeys a player move — a
+                // mid-haul vehicle is owned by the cargo executor.
+                if v.hauler.is_some() || v.state == VehicleState::Overturned {
+                    continue;
+                }
+                if let Some(path) = plan_vehicle_route(
+                    &mut scratch,
+                    &design,
+                    &data,
+                    vehicle_e,
+                    anchor,
+                    v.z,
+                    v.heading,
+                    dest,
+                    &chunk_map,
+                    &occupancy,
+                ) {
+                    v.state = VehicleState::Moving;
+                    commands.entity(vehicle_e).insert(VehiclePathFollow {
+                        path,
+                        cursor: ROUTE_CURSOR_START,
+                        tip_torque: 0.0,
+                    });
+                }
+            }
+            VehicleOrderKind::Right => {
+                if v.state == VehicleState::Overturned {
+                    v.state = VehicleState::Parked;
+                    commands.entity(vehicle_e).remove::<VehiclePathFollow>();
+                }
+            }
+            VehicleOrderKind::Load => {
+                let payload_g = design_payload_g(&design, &data);
+                let mut room_g = payload_g.saturating_sub(cargo_weight_g(&inv));
+                if room_g == 0 {
+                    continue;
+                }
+                let Some(src) = storage_tile_map
+                    .by_faction
+                    .get(&v.owner_faction)
+                    .and_then(|tiles| nearest_tile(anchor, tiles))
+                else {
+                    continue;
+                };
+                for gi_e in spatial.get(src.0, src.1).to_vec() {
+                    if room_g == 0 {
+                        break;
+                    }
+                    if let Ok(mut gi) = ground_items.get_mut(gi_e) {
+                        if gi.qty == 0 {
+                            continue;
+                        }
+                        let rid = gi.item.resource_id;
+                        let unit = unit_weight_g(rid);
+                        let take = (room_g / unit).min(gi.qty);
+                        if take == 0 {
+                            continue;
+                        }
+                        gi.qty -= take;
+                        inv.add(rid, take);
+                        room_g = room_g.saturating_sub(take.saturating_mul(unit));
+                        if gi.qty == 0 {
+                            commands.entity(gi_e).despawn_recursive();
+                        }
+                    }
+                }
+            }
+            VehicleOrderKind::Unload => {
+                for (rid, qty) in std::mem::take(&mut inv.items) {
+                    if qty > 0 {
+                        crate::simulation::items::spawn_or_merge_ground_item(
+                            &mut commands,
+                            &spatial,
+                            &mut ground_items,
+                            anchor.0,
+                            anchor.1,
+                            rid,
+                            qty,
+                        );
+                    }
+                }
+            }
+            VehicleOrderKind::AssignCrew => {
+                if crew.driver.is_some() {
+                    continue;
+                }
+                if let Some((person, _)) = members_q
+                    .iter()
+                    .find(|(_, fm)| fm.faction_id == v.owner_faction)
+                {
+                    crew.driver = Some(person);
+                }
+            }
+            VehicleOrderKind::Hitch => {
+                let want = design.required_animals as usize;
+                while draft.hitched.len() < want {
+                    match pick_idle_draft_animal(v.owner_faction, &animals_q, &claimed_this_pass) {
+                        Some(a) => {
+                            claimed_this_pass.insert(a);
+                            draft.hitched.push(a);
+                            commands.entity(a).insert(AnimalWorkClaim {
+                                worker: vehicle_e,
+                                use_kind: AnimalUse::Cart,
+                                expires_tick: now.saturating_add(VEHICLE_CLAIM_TTL_TICKS),
+                            });
+                        }
+                        None => break,
+                    }
+                }
+            }
+            VehicleOrderKind::Unhitch => {
+                for &a in &draft.hitched {
+                    release_animal_work_claim(&mut commands, a);
+                }
+                draft.hitched.clear();
+            }
+            VehicleOrderKind::Deconstruct => {
+                // Refund half the design bill onto the vehicle's tile.
+                for (rid, qty) in design_bill(&design) {
+                    let refund = qty.saturating_mul(SALVAGE_REFUND_NUM) / SALVAGE_REFUND_DEN;
+                    if refund > 0 {
+                        crate::simulation::items::spawn_or_merge_ground_item(
+                            &mut commands,
+                            &spatial,
+                            &mut ground_items,
+                            anchor.0,
+                            anchor.1,
+                            rid,
+                            refund,
+                        );
+                    }
+                }
+                // Spill any carried cargo too.
+                for (rid, qty) in std::mem::take(&mut inv.items) {
+                    if qty > 0 {
+                        crate::simulation::items::spawn_or_merge_ground_item(
+                            &mut commands,
+                            &spatial,
+                            &mut ground_items,
+                            anchor.0,
+                            anchor.1,
+                            rid,
+                            qty,
+                        );
+                    }
+                }
+                for &a in &draft.hitched {
+                    release_animal_work_claim(&mut commands, a);
+                }
+                commands.entity(vehicle_e).despawn_recursive();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

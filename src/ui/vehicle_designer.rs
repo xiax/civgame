@@ -14,10 +14,11 @@ use bevy_egui::{egui, EguiContexts};
 
 use crate::economy::resource_catalog::ResourceId;
 use crate::simulation::player_command::{PlayerCommand, PlayerCommandEvent};
+use crate::simulation::faction::PlayerFaction;
 use crate::simulation::vehicle::{
     cell_durability, derive_stats, design_bill, validate_grid, DesignError, VehicleCell,
-    VehicleData, VehicleDesign, VehicleDesignId, VehicleGrid, VehiclePartKind, VehiclePurpose,
-    GRID_MAX_DEPTH, GRID_MAX_HEIGHT, GRID_MAX_WIDTH,
+    VehicleData, VehicleDesign, VehicleDesignId, VehicleDesignRegistry, VehicleGrid,
+    VehiclePartKind, VehiclePurpose, GRID_MAX_DEPTH, GRID_MAX_HEIGHT, GRID_MAX_WIDTH,
 };
 
 /// The parts the designer can place. The reserved tank/siege kinds
@@ -155,6 +156,8 @@ pub fn vehicle_designer_system(
     mut contexts: EguiContexts,
     mut state: ResMut<VehicleDesignerState>,
     data: Res<VehicleData>,
+    registry: Res<VehicleDesignRegistry>,
+    player_faction: Res<PlayerFaction>,
     mut cmd_events: EventWriter<PlayerCommandEvent>,
 ) {
     if !state.open {
@@ -193,6 +196,42 @@ pub fn vehicle_designer_system(
                 ui.label("Draft animals:");
                 ui.add(egui::DragValue::new(&mut state.required_animals).range(0..=4));
             });
+
+            // ── Saved & AI-proposed designs ─────────────────────────────
+            // Designs authored by the player faction: previously-queued
+            // customs plus the weekly `vehicle_ai_design_proposal_system`
+            // proposals. Loading one re-populates the editor for editing.
+            let fid = player_faction.faction_id;
+            let have_any = registry
+                .iter()
+                .any(|d| d.author_faction == Some(fid));
+            if have_any {
+                egui::CollapsingHeader::new(
+                    egui::RichText::new("Saved & proposed designs").strong(),
+                )
+                .default_open(false)
+                .show(ui, |ui| {
+                    let mut load: Option<VehicleDesign> = None;
+                    for d in registry.iter() {
+                        if d.author_faction != Some(fid) {
+                            continue;
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{}  ({} cells)", d.name, d.grid.cells.len()));
+                            if ui.small_button("Load").clicked() {
+                                load = Some(d.clone());
+                            }
+                        });
+                    }
+                    if let Some(d) = load {
+                        state.name = d.name;
+                        state.grid = d.grid;
+                        state.purpose = d.allowed_purpose;
+                        state.required_animals = d.required_animals;
+                        state.layer = 0;
+                    }
+                });
+            }
 
             ui.separator();
 

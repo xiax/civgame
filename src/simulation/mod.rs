@@ -248,6 +248,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(vehicle::VehicleYardMap::default())
             .insert_resource(vehicle::VehicleAssemblyQueue::default())
             .insert_resource(vehicle::VehicleOccupancyIndex::default())
+            .insert_resource(vehicle::PendingVehicleOps::default())
             .insert_resource(construction::StructureIndex::default())
             .insert_resource(construction::BlueprintMap::default())
             .insert_resource(construction::ConstructionPosterPool::default())
@@ -1156,6 +1157,10 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (
+                    // Phase 5: apply queued player vehicle orders before the
+                    // vehicle steps, so a Move order's route is followed the
+                    // same tick it is issued.
+                    vehicle::vehicle_player_command_system,
                     vehicle::vehicle_cargo_haul_task_system,
                     vehicle::vehicle_movement_system,
                     vehicle::vehicle_rollover_system,
@@ -1172,9 +1177,11 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (
-                    // Phase 5: AI provisioning — yard intent + auto-queue.
+                    // Phase 5: AI provisioning — yard intent + auto-queue +
+                    // freeform design proposals.
                     vehicle::vehicle_yard_intent_emitter_system,
                     vehicle::vehicle_ai_queue_system,
+                    vehicle::vehicle_ai_design_proposal_system,
                     vehicle::vehicle_assembly_system,
                     vehicle::vehicle_haul_recovery_system,
                 )

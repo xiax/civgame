@@ -2,7 +2,9 @@ use crate::economy::resource_catalog::ResourceCatalog;
 use crate::rendering::pixel_art::{AnimalTextures, ArtMode, EntityTextures};
 use crate::rendering::sprite_library::SpriteLibrary;
 use crate::simulation::animals::{Cat, Cow, Deer, Fox, Horse, Pig, Rabbit, Wolf};
-use crate::simulation::vehicle::{Vehicle, VehicleVisual};
+use crate::simulation::vehicle::{
+    Vehicle, VehicleDesignRegistry, VehiclePartKind, VehicleVisual,
+};
 use crate::simulation::construction::{
     Bed, Blueprint, BuildSiteKind, Campfire, Chair, Door, Loom, Table, Wall, WallMaterial, Well,
     Workbench,
@@ -370,32 +372,105 @@ pub fn spawn_chair_sprites(
     }
 }
 
-/// Vehicle system: reactively attach a child sprite to every `Vehicle`.
-/// Vehicles are mobile (they trail a driver), so — like Person / animal
-/// sprites — they deliberately omit `FogPersistent`.
+/// Flat tint for one vehicle cell, keyed by part kind — the freeform
+/// composed-sprite renderer's palette.
+fn vehicle_cell_color(kind: VehiclePartKind) -> Color {
+    match kind {
+        VehiclePartKind::Frame => Color::srgb(0.45, 0.30, 0.16),
+        VehiclePartKind::Deck => Color::srgb(0.62, 0.46, 0.28),
+        VehiclePartKind::Wall => Color::srgb(0.55, 0.55, 0.58),
+        VehiclePartKind::Axle => Color::srgb(0.28, 0.24, 0.22),
+        VehiclePartKind::Wheel => Color::srgb(0.12, 0.10, 0.10),
+        VehiclePartKind::Hitch | VehiclePartKind::Yoke => Color::srgb(0.34, 0.22, 0.12),
+        VehiclePartKind::CargoBay => Color::srgb(0.74, 0.60, 0.36),
+        VehiclePartKind::CrewSeat => Color::srgb(0.72, 0.28, 0.22),
+        VehiclePartKind::WeaponMount => Color::srgb(0.50, 0.16, 0.14),
+        VehiclePartKind::Engine
+        | VehiclePartKind::Track
+        | VehiclePartKind::ArmorPlate
+        | VehiclePartKind::Turret => Color::srgb(0.40, 0.42, 0.46),
+    }
+}
+
+/// Vehicle system: reactively attach the child sprite(s) to every `Vehicle`.
+/// Stock 1-tall designs reuse the hand-drawn `entity_cart` sprite; freeform
+/// and multi-Z designs render as a composed grid — one `VisualChild` colored
+/// quad per cell, XY-placed and lifted by Z so a tall body extends upward.
+/// Vehicles are mobile, so — like Person / animal sprites — they omit
+/// `FogPersistent`.
 pub fn spawn_vehicle_sprites(
     mut commands: Commands,
-    query: Query<Entity, (With<Vehicle>, Without<VehicleVisual>)>,
+    query: Query<(Entity, &Vehicle), Without<VehicleVisual>>,
+    registry: Res<VehicleDesignRegistry>,
     sprite_lib: Res<SpriteLibrary>,
 ) {
-    let Some(handle) = sprite_lib.get("entity_cart") else {
-        return;
-    };
-    for entity in query.iter() {
-        let mut sprite = Sprite::from_image(handle.clone());
-        sprite.anchor = Anchor::BottomCenter;
+    for (entity, vehicle) in query.iter() {
         commands
             .entity(entity)
             .insert((VehicleVisual, EntityFogState::default()));
+
+        let design = registry.get(vehicle.design_id);
+        // Bounding box of the design grid (used by both render paths).
+        let bounds = design.and_then(|d| d.grid.bounds());
+        let stock_flat = design
+            .map(|d| {
+                d.author_faction.is_none()
+                    && bounds.map(|(lo, hi)| hi.z - lo.z == 0).unwrap_or(true)
+            })
+            .unwrap_or(true);
+
+        if stock_flat {
+            // Hand-drawn stock sprite.
+            let Some(handle) = sprite_lib.get("entity_cart") else {
+                continue;
+            };
+            let mut sprite = Sprite::from_image(handle.clone());
+            sprite.anchor = Anchor::BottomCenter;
+            commands.entity(entity).with_children(|parent| {
+                parent.spawn((
+                    VisualChild,
+                    sprite,
+                    Transform::from_xyz(0.0, -8.0, 0.1),
+                    GlobalTransform::default(),
+                    Visibility::Inherited,
+                    InheritedVisibility::default(),
+                ));
+            });
+            continue;
+        }
+
+        // Composed freeform render — one colored quad per cell.
+        let (Some(d), Some((lo, hi))) = (design, bounds) else {
+            continue;
+        };
+        let w = (hi.x - lo.x + 1) as f32;
+        let depth = (hi.y - lo.y + 1) as f32;
+        // Cell size shrinks as the design widens so it stays roughly tile-sized.
+        let cell_px = (14.0 / w.max(3.0)).clamp(3.0, 5.0);
+        let cells: Vec<(IVec3, VehiclePartKind)> =
+            d.grid.cells.iter().map(|(p, c)| (*p, c.kind)).collect();
         commands.entity(entity).with_children(|parent| {
-            parent.spawn((
-                VisualChild,
-                sprite,
-                Transform::from_xyz(0.0, -8.0, 0.1),
-                GlobalTransform::default(),
-                Visibility::Inherited,
-                InheritedVisibility::default(),
-            ));
+            for (p, kind) in cells {
+                let gx = (p.x - lo.x) as f32;
+                let gy = (p.y - lo.y) as f32;
+                let gz = (p.z - lo.z) as f32;
+                let sx = (gx - (w - 1.0) / 2.0) * cell_px;
+                // Z lifts the cell upward; deeper (higher y) cells nudge up
+                // slightly for a shallow 3/4 read.
+                let sy = -8.0 + 2.0 + gz * cell_px + (gy - (depth - 1.0) / 2.0) * 1.5;
+                let zorder = 0.1 + gz * 0.002 + gy * 0.0003;
+                let mut sprite =
+                    Sprite::from_color(vehicle_cell_color(kind), Vec2::splat(cell_px * 0.95));
+                sprite.anchor = Anchor::BottomCenter;
+                parent.spawn((
+                    VisualChild,
+                    sprite,
+                    Transform::from_xyz(sx, sy, zorder),
+                    GlobalTransform::default(),
+                    Visibility::Inherited,
+                    InheritedVisibility::default(),
+                ));
+            }
         });
     }
 }
