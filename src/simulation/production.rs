@@ -172,6 +172,16 @@ pub fn production_system(
                         // `PLOW_YIELD_MULT_*`. Grain-only (other crops have no
                         // plow bonus today).
                         if let Some(plant_entity) = spawned {
+                            // A farmer's `Task::Planter` is deliberate
+                            // cultivation — mark the crop `Cultivated` so it
+                            // skips the 20% wild sprout roll. `PlayPlant` is
+                            // recreation, not cultivation, so it keeps the
+                            // wild odds.
+                            if !is_play {
+                                commands
+                                    .entity(plant_entity)
+                                    .insert(crate::simulation::plants::Cultivated);
+                            }
                             if matches!(plant_kind, PlantKind::Grain) {
                                 if let Some(pid) = plot_index.plot_at(tx, ty) {
                                     if let Some(&plot_e) = plot_index.by_id.get(&pid) {

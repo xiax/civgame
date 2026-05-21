@@ -3502,6 +3502,20 @@ fn current_ag_tile_count(brain: &SettlementBrain) -> u32 {
         .sum()
 }
 
+/// Grain a person eats per game-year. Derivation: `HUNGER_RATE = 2.0`
+/// hunger/real-s; a game-day is `TICKS_PER_DAY = 3600` ticks × 0.05 s/tick
+/// (20 Hz) = 180 real-s ⇒ 360 hunger/day; grain is 150 cal/unit ⇒ 2.4
+/// grain/person/day; a year is 4 × `DAYS_PER_SEASON = 5` = 20 game-days ⇒
+/// 2.4 × 20 = 48. If those timescale knobs change, re-derive this.
+pub const GRAIN_PER_PERSON_PER_YEAR: u32 = 48;
+/// Typical per-tile annual grain yield used for plot sizing — the middle
+/// nutrient tier (`grain_yield_for_nutrients`: ≥120 → 4).
+pub const GRAIN_YIELD_PER_TILE_PLANNING: u32 = 4;
+/// Bad-year / seed-reserve / winter-carryover margin folded into the demand
+/// target. Tribes kept reserves; one failed harvest shouldn't mean famine.
+pub const SUPPLY_SAFETY_NUMER: u32 = 5; // 1.25× as 5/4
+pub const SUPPLY_SAFETY_DENOM: u32 = 4;
+
 fn parcel_targets<F: SurveyFactionView>(
     faction: &F,
     settlement: &Settlement,
@@ -3524,7 +3538,10 @@ fn parcel_targets<F: SurveyFactionView>(
         // (food need ∩ labor cap ∩ seed stock), divided by the average
         // active-tiles-per-plot (~96, plot is 16×16 = 256 tiles, ~3/8 of
         // which is plantable Cropland in the new mosaic).
-        let food_tiles = ((members as u32) * 16) / 4; // 16 grain/person/year, 4 grain/tile/year
+        // food_tiles = members × annual grain need × safety ÷ per-tile yield.
+        // ≈ members × 15 (48 × 1.25 ÷ 4) ⇒ a 20-tribe needs ~300 tiles.
+        let food_tiles = ((members as u32) * GRAIN_PER_PERSON_PER_YEAR * SUPPLY_SAFETY_NUMER)
+            .div_ceil(SUPPLY_SAFETY_DENOM * GRAIN_YIELD_PER_TILE_PLANNING);
         let labor_tiles = (((members as u32) * 60) / 100).saturating_mul(24);
         let grain_seed_stock = faction.seed_total();
         // Don't let the seed budget shrink below tiles already in production

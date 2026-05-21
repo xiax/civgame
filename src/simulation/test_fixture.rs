@@ -5043,11 +5043,13 @@ mod smoke {
         }
     }
 
-    /// Seasonal jellyfish integration: a freshly-seeded belt plot lands in
-    /// `FieldTileIndex` with un-prepared tiles (kind != Cropland, nutrients
-    /// pre-loaded from `TileData.fertility`). Founders pay Spring 1 to till.
+    /// Seasonal jellyfish integration: a freshly-seeded belt plot lands every
+    /// tile in `FieldTileIndex`, and pre-stamps a *bounded* starter patch of
+    /// `Cropland` (≤ half the plot) so year 1 is a real first crop instead of
+    /// a from-zero prepare spike. The tribe tills the remainder over the
+    /// following seasons.
     #[test]
-    fn seed_belt_does_not_stamp_cropland_and_seeds_field_tile_index() {
+    fn seed_belt_pre_stamps_bounded_starter_cropland() {
         use crate::simulation::farm::{seed_starting_farms_system, FieldTileIndex};
         use crate::simulation::land::{PlotIndex, TenureHolder};
         use crate::simulation::organic_settlement::{
@@ -5090,14 +5092,15 @@ mod smoke {
             .run_system_once(seed_starting_farms_system)
             .expect("seed_starting_farms_system should run");
 
-        // Every belt tile should be in PlotIndex.ag_tiles AND FieldTileIndex,
-        // but the chunk_map tile kind should NOT be Cropland yet.
+        // Every belt tile lands in PlotIndex.ag_tiles AND FieldTileIndex; a
+        // bounded fraction is pre-stamped Cropland (the starter patch).
         let world = sim.app.world();
         let plot_index = world.resource::<PlotIndex>();
         let field_tiles = world.resource::<FieldTileIndex>();
         let chunk_map = world.resource::<ChunkMap>();
         let mut sampled_tiles = 0;
         let mut sampled_field_entries = 0;
+        let mut cropland_tiles = 0;
         for ty in 40..56 {
             for tx in 40..56 {
                 assert!(
@@ -5108,11 +5111,9 @@ mod smoke {
                     sampled_field_entries += 1;
                 }
                 let z = chunk_map.surface_z_at(tx, ty);
-                let kind = chunk_map.tile_at(tx, ty, z).kind;
-                assert!(
-                    kind != TileKind::Cropland,
-                    "carve must not stamp Cropland on belt tile ({tx},{ty}); got {kind:?}"
-                );
+                if chunk_map.tile_at(tx, ty, z).kind == TileKind::Cropland {
+                    cropland_tiles += 1;
+                }
                 sampled_tiles += 1;
             }
         }
@@ -5120,6 +5121,11 @@ mod smoke {
         assert_eq!(
             sampled_field_entries, 256,
             "every belt tile must seed a FieldTileIndex entry"
+        );
+        // A starter patch is pre-stamped — some tiles, never the whole plot.
+        assert!(
+            (1..=128).contains(&cropland_tiles),
+            "starter crop must be a bounded patch (1..=128 tiles); got {cropland_tiles}"
         );
     }
 

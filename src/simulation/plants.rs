@@ -49,6 +49,15 @@ pub struct Plant {
     pub tile_pos: (i32, i32),
 }
 
+/// Marks a plant that was deliberately sown by a farmer via `Task::Planter`,
+/// as opposed to wild scatter (`try_scatter_seed`) or recreational
+/// `PlayPlant`. A cultivated crop skips the 20% wild sprout roll in
+/// `plant_lifecycle_system` — selected seed tended in worked soil reliably
+/// reaches Seedling, so a deliberately-planted field doesn't lose 80% of its
+/// tiles at the first season edge.
+#[derive(Component)]
+pub struct Cultivated;
+
 /// Growth points contributed to a plant of `kind` for the season that just
 /// ended. Encodes per-species physiology — berries peak in spring, grain
 /// peaks mid-summer, trees grow through summer and a long autumn before
@@ -160,7 +169,12 @@ impl PlantKind {
     pub fn harvest_extra_yields(self) -> Vec<(ResourceId, u32)> {
         use crate::economy::core_ids;
         match self {
-            PlantKind::Grain => vec![(core_ids::grain_seed(), 1)],
+            // 2 seeds per harvest: a real grain harvest returns far more than
+            // one replant-seed. At +1 the seed stock only breaks even (sow 1,
+            // reap 1) so a seed-short founding village can never ramp toward
+            // its demand target; +2 lets the stock grow year-over-year while
+            // staying bounded.
+            PlantKind::Grain => vec![(core_ids::grain_seed(), 2)],
             PlantKind::BerryBush => {
                 vec![(core_ids::berry_seed(), 1)]
             }
@@ -565,6 +579,27 @@ mod tests {
         );
     }
 
+    /// A `Cultivated` (deliberately-sown) grain seed skips the 20% wild
+    /// sprout roll — it always advances to Seedling, so a planted field
+    /// doesn't lose 80% of its tiles at the first season edge.
+    #[test]
+    fn cultivated_grain_seed_always_sprouts() {
+        for _ in 0..200 {
+            let mut app = build_lifecycle_app();
+            let e =
+                spawn_lifecycle_plant(&mut app, (0, 0), PlantKind::Grain, GrowthStage::Seed, 3);
+            app.world_mut().entity_mut(e).insert(Cultivated);
+            app.update(); // prime in Spring
+            set_season(&mut app, Season::Summer);
+            app.update(); // prev=Spring (+4) → threshold 3 crossed
+            assert_eq!(
+                plant_get(&app, e).map(|(s, _)| s),
+                Some(GrowthStage::Seedling),
+                "cultivated grain seed must always sprout"
+            );
+        }
+    }
+
     /// Mature tree fruiting cycle reverts to Mature with zeroed growth excess
     /// regardless of whether scatter dice rolls success or failure.
     #[test]
@@ -764,7 +799,7 @@ pub fn plant_lifecycle_system(
     mut last_season: Local<Option<Season>>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
-    mut query: Query<(Entity, &mut Plant)>,
+    mut query: Query<(Entity, &mut Plant, Option<&Cultivated>)>,
 ) {
     let prev = match *last_season {
         Some(s) if s == calendar.season => return,
@@ -781,7 +816,7 @@ pub fn plant_lifecycle_system(
     let mut to_kill: Vec<(Entity, (i32, i32), bool)> = Vec::new();
     let mut scatter_jobs: Vec<((i32, i32), PlantKind, f32, i32)> = Vec::new();
 
-    for (entity, mut plant) in query.iter_mut() {
+    for (entity, mut plant, cultivated) in query.iter_mut() {
         // ── Winter mortality for grain ────────────────────────────────────
         if calendar.season == Season::Winter && plant.kind == PlantKind::Grain {
             let scatter_now = plant.stage == GrowthStage::Mature;
@@ -803,7 +838,9 @@ pub fn plant_lifecycle_system(
         if threshold > 0 && plant.growth >= threshold {
             match plant.stage {
                 GrowthStage::Seed => {
-                    if fastrand::f32() < 0.20 {
+                    // Deliberately-sown crops (`Cultivated`) sprout reliably;
+                    // only wild scatter / PlayPlant rolls the 20% odds.
+                    if cultivated.is_some() || fastrand::f32() < 0.20 {
                         plant.growth = 0;
                         plant.stage = GrowthStage::Seedling;
                     } else {

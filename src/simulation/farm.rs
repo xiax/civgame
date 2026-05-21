@@ -433,12 +433,13 @@ pub fn seed_starting_farms_system(
     registry: Res<crate::simulation::faction::FactionRegistry>,
     mut plot_index: ResMut<crate::simulation::land::PlotIndex>,
     plot_q: Query<&crate::simulation::land::Plot>,
-    chunk_map: Res<crate::world::chunk::ChunkMap>,
+    mut chunk_map: ResMut<crate::world::chunk::ChunkMap>,
     storage_tiles: Query<(&crate::simulation::faction::FactionStorageTile, &Transform)>,
     spatial: Res<crate::world::spatial::SpatialIndex>,
     mut ground_items: Query<&mut crate::simulation::items::GroundItem>,
     brains: Res<crate::simulation::organic_settlement::SettlementBrains>,
     mut field_tiles: ResMut<FieldTileIndex>,
+    mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
 ) {
     use crate::simulation::land::Plot;
     use crate::simulation::organic_settlement::ParcelShape;
@@ -449,7 +450,14 @@ pub fn seed_starting_farms_system(
         return;
     }
     const PLOT_Z: i8 = 0;
-    const STARTING_GRAIN_SEEDS: u32 = 32;
+    /// Floor on starting grain seed for tiny / fixture factions.
+    const MIN_STARTING_GRAIN_SEEDS: u32 = 32;
+    /// Founders carry provisions. The seeded edible-food stock covers the
+    /// year-1 establishment shortfall (spawn → first harvest bridge + the gap
+    /// left by a partial first crop) — ~0.6 of a year's food per founder. It
+    /// runs out; foraging/hunting still bridges the rest of year 1.
+    const YEAR1_FOOD_BUFFER_NUMER: u32 = 3;
+    const YEAR1_FOOD_BUFFER_DENOM: u32 = 5;
 
     // Snapshot which factions already have an Agricultural plot.
     let mut already_seeded: ahash::AHashSet<u32> = ahash::AHashSet::new();
@@ -462,7 +470,8 @@ pub fn seed_starting_farms_system(
     }
 
     // Stage work — gather faction ids first so we don't borrow registry mutably while iterating.
-    let mut work: Vec<(u32, crate::simulation::settlement::SettlementId, (i32, i32))> = Vec::new();
+    let mut work: Vec<(u32, crate::simulation::settlement::SettlementId, (i32, i32), u32)> =
+        Vec::new();
     for (&fid, faction) in registry.factions.iter() {
         if fid == 0 {
             continue;
@@ -482,10 +491,18 @@ pub fn seed_starting_farms_system(
         let Some(sid) = settlement_map.first_for_faction(fid) else {
             continue;
         };
-        work.push((fid, sid, faction.home_tile));
+        work.push((fid, sid, faction.home_tile, faction.member_count.max(1)));
     }
 
-    for (fid, sid, home) in work {
+    for (fid, sid, home, members) in work {
+        // Demand-driven sizing — same expression as `parcel_targets`
+        // `food_tiles`: members × annual grain need × safety ÷ per-tile yield.
+        use crate::simulation::organic_settlement::{
+            GRAIN_PER_PERSON_PER_YEAR, GRAIN_YIELD_PER_TILE_PLANNING, SUPPLY_SAFETY_DENOM,
+            SUPPLY_SAFETY_NUMER,
+        };
+        let demand_tiles = (members * GRAIN_PER_PERSON_PER_YEAR * SUPPLY_SAFETY_NUMER)
+            .div_ceil(SUPPLY_SAFETY_DENOM * GRAIN_YIELD_PER_TILE_PLANNING);
         // Site the starting plot on an Agricultural BELT parcel from the
         // settlement brain (populated by the OnEnter kickoff survey) — so the
         // tick-0 farm is already outside town, consistent with the runtime
@@ -535,25 +552,57 @@ pub fn seed_starting_farms_system(
             let entity = commands.spawn(plot).id();
             plot_index.by_id.insert(pid, entity);
             plot_index.by_settlement.entry(sid.0).or_default().push(pid);
-            // Seasonal-farming jellyfish: the belt is left UN-prepared at
-            // game start (founders pay Spring 1 to till it). Record plot
-            // membership for road protection + planner lookups, and seed
-            // a `FieldTileIndex` entry per tile so the prepare/plant/fallow
-            // dispatchers have a per-tile state to read.
+            // Seasonal-farming jellyfish: most of the belt is left UN-prepared
+            // at game start (the tribe tills it over the following seasons),
+            // but a mottled STARTER patch is pre-stamped `Cropland` so year 1
+            // is a real first crop rather than a from-zero prepare spike —
+            // founders break ground as part of settling. Budget: half the
+            // annual demand, capped at half the plot so it never paves the
+            // whole field. `field_tile_role` mottles the patch.
+            use crate::simulation::land::{field_tile_role, FieldTileRole};
+            use crate::world::tile::{TileData, TileKind};
+            let plot_area = rect.w as u32 * rect.h as u32;
+            let mut starter_budget = (demand_tiles / 2).min(plot_area / 2);
+            let starter_seed = (fid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
             for ty in rect.y0..rect.y0 + rect.h as i32 {
                 for tx in rect.x0..rect.x0 + rect.w as i32 {
                     plot_index.by_tile.insert((tx, ty), pid);
                     plot_index.ag_tiles.insert((tx, ty));
                     let z = chunk_map.surface_z_at(tx, ty);
                     let cur = chunk_map.tile_at(tx, ty, z);
-                    field_tiles.ensure_entry((tx, ty), pid, cur.fertility);
+                    let role = field_tile_role(starter_seed, fid, (tx, ty), rect);
+                    let pre_stamp = starter_budget > 0
+                        && matches!(role, FieldTileRole::Cropland | FieldTileRole::CroplandLow)
+                        && (cur.kind == TileKind::Grass || cur.kind.is_soil_like());
+                    if pre_stamp {
+                        let fert: u8 = if role == FieldTileRole::Cropland { 200 } else { 120 };
+                        chunk_map.set_tile(
+                            tx,
+                            ty,
+                            z,
+                            TileData {
+                                kind: TileKind::Cropland,
+                                elevation: cur.elevation,
+                                fertility: fert,
+                                flags: cur.flags,
+                                ore: cur.ore,
+                            },
+                        );
+                        tile_changed
+                            .send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
+                        field_tiles.ensure_entry((tx, ty), pid, fert);
+                        starter_budget -= 1;
+                    } else {
+                        field_tiles.ensure_entry((tx, ty), pid, cur.fertility);
+                    }
                 }
             }
         }
 
-        // Pre-seed physical grain seeds at a faction storage tile. `FactionStorage`
-        // is only a rollup cache and is rebuilt every Economy tick from
-        // `GroundItem`s, so writing it directly would vanish before posting.
+        // Pre-seed physical grain seeds + a year-1 food buffer at a faction
+        // storage tile. `FactionStorage` is only a rollup cache rebuilt every
+        // Economy tick from `GroundItem`s, so writing it directly would vanish
+        // before posting.
         let storage_tile = storage_tiles
             .iter()
             .find_map(|(storage, transform)| {
@@ -561,6 +610,9 @@ pub fn seed_starting_farms_system(
                     .then_some(world_to_tile(transform.translation.truncate()))
             })
             .unwrap_or(home);
+        // Seed grain scaled to the annual demand so `parcel_targets`'
+        // `seed_tiles` budget isn't pinned to a flat floor.
+        let starting_seeds = demand_tiles.max(MIN_STARTING_GRAIN_SEEDS);
         crate::simulation::items::spawn_or_merge_ground_item(
             &mut commands,
             &spatial,
@@ -568,8 +620,23 @@ pub fn seed_starting_farms_system(
             storage_tile.0,
             storage_tile.1,
             crate::economy::core_ids::grain_seed(),
-            STARTING_GRAIN_SEEDS,
+            starting_seeds,
         );
+        // Edible-food provisions buffer — bridges spawn → first harvest and
+        // the partial-first-crop gap (Change 4).
+        let food_buffer = (members * GRAIN_PER_PERSON_PER_YEAR * YEAR1_FOOD_BUFFER_NUMER)
+            / YEAR1_FOOD_BUFFER_DENOM;
+        if food_buffer > 0 {
+            crate::simulation::items::spawn_or_merge_ground_item(
+                &mut commands,
+                &spatial,
+                &mut ground_items,
+                storage_tile.0,
+                storage_tile.1,
+                crate::economy::core_ids::grain(),
+                food_buffer,
+            );
+        }
     }
 }
 
