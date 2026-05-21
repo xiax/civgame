@@ -11,6 +11,7 @@ use super::schedule::{BucketSlot, SimClock};
 use super::tasks::{task_interacts_from_adjacent, TaskKind};
 use super::technology::HORSEBACK_RIDING;
 use super::typed_task::ActionQueue;
+use super::vehicle::BoardedVehicle;
 use crate::pathfinding::path_request::{
     cooldown_for_streak, FollowStatus, PathDebugFlags, PathFollow, PathKind, PathRequestQueue,
     DEFAULT_PATH_BUDGET,
@@ -92,19 +93,24 @@ pub fn movement_system(
     path_flags: Res<PathDebugFlags>,
     mut path_diag: ResMut<PathfindingDiagnostics>,
     mut claimed_this_tick: Local<AHashSet<(i32, i32, i32)>>,
-    mut query: Query<(
-        Entity,
-        &mut Transform,
-        &mut PersonAI,
-        &mut ActionQueue,
-        &LodLevel,
-        &mut MovementState,
-        &mut PathFollow,
-        &BucketSlot,
-        Option<&RelationshipMemory>,
-        Option<&MountedOn>,
-        Option<&crate::simulation::medicine::Sickness>,
-    )>,
+    mut query: Query<
+        (
+            Entity,
+            &mut Transform,
+            &mut PersonAI,
+            &mut ActionQueue,
+            &LodLevel,
+            &mut MovementState,
+            &mut PathFollow,
+            &BucketSlot,
+            Option<&RelationshipMemory>,
+            Option<&MountedOn>,
+            Option<&crate::simulation::medicine::Sickness>,
+        ),
+        // A boarded vehicle driver is moved by `vehicle_crew_sync_system`, not
+        // by their own path — skip them here.
+        Without<BoardedVehicle>,
+    >,
 ) {
     let dt = time.delta_secs();
     // Game speed lives on `Time<Virtual>::set_relative_speed` and drives
@@ -928,7 +934,7 @@ pub fn recover_stranded_agents_system(
             &LodLevel,
             &mut PathFollow,
         ),
-        (With<Person>, Without<MountedOn>),
+        (With<Person>, Without<MountedOn>, Without<BoardedVehicle>),
     >,
 ) {
     for (entity, mut transform, mut ai, mut aq, lod, mut pf) in query.iter_mut() {

@@ -299,9 +299,27 @@ Manual acceptance (`cargo run`, never `--sandbox`, Bronze Age start):
   `footprint_astar` (heading/turn-radius/clearance A* over `VehicleNode`, generic `cell_ok`
   closure); `VehicleOccupancyIndex` + `vehicle_occupancy_sync_system` + `footprint_tiles`;
   rollover pure fns `step_tip_torque` / `vehicle_rolls_over`. 25 vehicle tests + full suite
-  (949) pass. **Deferred to Phase 4:** the live vehicle movement system (`VehiclePathFollow`,
-  the rollover Bevy system, crew ejection / cargo spill) — nothing moves a vehicle until the
-  cargo-haul task exists, so the movement wiring lands with Phase 4. Phases 4-7 pending.
+  (949) pass.
+- **Phase 4 — shipped (vehicle-leads movement).** `cart.rs` **deleted**. The vehicle is the
+  authoritative mover — it owns a `VehiclePathFollow` planned by `footprint_astar` (clearance- +
+  occupancy-checked); the driver boards via `BoardedVehicle` and rides it.
+  - `Task::VehicleCargoHaul { vehicle, blueprint, resource_id }` (`TaskKind` 54).
+  - `htn_vehicle_haul_dispatch_system` claims a vehicle + routes the worker on foot to board it;
+    `vehicle_cargo_haul_task_system` boards + drives the load/deliver state machine via
+    `plan_vehicle_route` → `footprint_astar`; `vehicle_movement_system` steps the vehicle;
+    `vehicle_rollover_system` overturns unstable ones (eject crew / spill cargo / release
+    animals); `vehicle_crew_sync_system` rides the crew; `vehicle_haul_recovery_system`
+    re-pools a vehicle whose driver was lost.
+  - `footprint_astar`, `VehicleOccupancyIndex`, `vertical_clearance_at`, and the rollover
+    functions from Phase 3 are now all **live**. `movement_system` / `recover_stranded_agents_system`
+    skip `Without<BoardedVehicle>`. `compute_faction_storage_system` folds `VehicleInventory`.
+  - 948-test suite passes — incl. `vehicle_haul_end_to_end_delivers_via_vehicle_movement`
+    (worker walks → boards → vehicle drives storage→blueprint → delivers) and
+    `vehicle_movement_steps_along_a_planned_route`.
+  - **Deferred:** the vehicle re-parks in place (no drive-back-to-yard); rollover *recovery* is
+    a righting task for a later phase (an overturned vehicle is an inert hulk the dispatcher
+    skips). AI factions get no vehicles until Phase 5 (AI auto-queue + autonomous `VehicleYard`
+    building) — the old `cart_assembly_system` auto-cart trigger is gone. Phases 5-7 pending.
 
 ## Assumptions
 

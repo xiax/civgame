@@ -136,12 +136,12 @@ pub enum TaskKind {
     /// centre — worker doesn't tile-walk in v2.0), 1 free hand, counts as
     /// labor. Executor: `draftwork::plow_task_system`.
     Plow = 53,
-    /// Animal Husbandry v2.1: a worker drives a draft-animal-hitched `Cart`
-    /// to ferry bulk material from faction storage to a construction
-    /// blueprint. Two phases re-dispatched by `cart::htn_cart_haul_dispatch_system`
-    /// (load at storage → deliver at blueprint). Interacts-from-adjacent,
-    /// counts as labor. Executor: `cart::cart_haul_task_system`.
-    CartHaul = 54,
+    /// Vehicle system (Phase 4): a worker drives a `Vehicle` to ferry bulk
+    /// material from faction storage to a construction blueprint. Two phases
+    /// re-dispatched by `vehicle::htn_vehicle_haul_dispatch_system` (load at
+    /// storage → deliver at blueprint). Interacts-from-adjacent, counts as
+    /// labor. Executor: `vehicle::vehicle_cargo_haul_task_system`.
+    VehicleCargoHaul = 54,
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -201,7 +201,7 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::Drink as u16 => "Drinking",
         x if x == TaskKind::PrepareField as u16 => "Preparing Field",
         x if x == TaskKind::Plow as u16 => "Plowing",
-        x if x == TaskKind::CartHaul as u16 => "Cart Hauling",
+        x if x == TaskKind::VehicleCargoHaul as u16 => "Vehicle Hauling",
         _ => "Unemployed",
     }
 }
@@ -279,7 +279,7 @@ pub fn task_interacts_from_adjacent(task_id: u16) -> bool {
         || task_id == TaskKind::Drink as u16
         || task_id == TaskKind::PrepareField as u16
         || task_id == TaskKind::Plow as u16
-        || task_id == TaskKind::CartHaul as u16
+        || task_id == TaskKind::VehicleCargoHaul as u16
 }
 
 /// Tasks that count as productive labor — these drain willpower over time
@@ -311,7 +311,7 @@ pub fn task_is_labor(task_id: u16) -> bool {
         || task_id == TaskKind::Butcher as u16
         || task_id == TaskKind::PrepareField as u16
         || task_id == TaskKind::Plow as u16
-        || task_id == TaskKind::CartHaul as u16
+        || task_id == TaskKind::VehicleCargoHaul as u16
 }
 
 /// Spiral search outward from `target` for the closest tile that is passable
@@ -903,11 +903,11 @@ pub fn goal_dispatch_system(
                         {
                             Some(TaskKind::HaulMaterials as u16)
                         }
-                        // Animal Husbandry v2.1: a cart haul is re-dispatched per
-                        // phase (load → deliver) by `htn_cart_haul_dispatch_system`;
-                        // mid-phase ticks must preserve the `Task::CartHaul` chain.
-                        AgentGoal::Haul if aq.current_task_kind() == TaskKind::CartHaul as u16 => {
-                            Some(TaskKind::CartHaul as u16)
+                        // Vehicle system: a cargo haul is re-dispatched per
+                        // phase (load → deliver) by `htn_vehicle_haul_dispatch_system`;
+                        // mid-phase ticks must preserve the `Task::VehicleCargoHaul` chain.
+                        AgentGoal::Haul if aq.current_task_kind() == TaskKind::VehicleCargoHaul as u16 => {
+                            Some(TaskKind::VehicleCargoHaul as u16)
                         }
                         // Phase 5e-ii: hunter-arm chain (`htn_equip_hunting_spear_dispatch_system`)
                         // runs without an ActivePlan; the dispatcher is now

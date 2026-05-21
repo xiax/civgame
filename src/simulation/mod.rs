@@ -8,7 +8,6 @@ pub mod building_template;
 pub mod camp;
 pub mod capital;
 pub mod carry;
-pub mod cart;
 pub mod carve;
 pub mod civic_milestones;
 pub mod clear_obstacle;
@@ -1138,45 +1137,53 @@ impl Plugin for SimulationPlugin {
                 // tile, dispatches `Task::Plow`.
                 (draftwork::htn_plow_dispatch_system,).in_set(SimulationSet::ParallelB),
             )
-            // Animal Husbandry v2.1: cart pipeline. Dispatcher (ParallelB)
-            // re-fires per haul phase; executor (Sequential) loads / delivers;
-            // cart-follow snaps the cart transform to the hauler after
-            // movement; assembly runs daily in Economy.
+            // Vehicle system (Phase 4): vehicle-leads cargo-haul pipeline.
+            // Dispatcher (ParallelB) claims a vehicle + routes the worker to
+            // board it; executor drives the load/deliver state machine.
             .add_systems(
                 FixedUpdate,
                 // Runs before the hand-haul dispatcher so a bulky Haul claim
-                // is routed through a cart when one is available; the
+                // is routed through a vehicle when one is available; the
                 // hand-haul dispatcher then skips the now-busy worker.
                 (
-                    cart::htn_cart_haul_dispatch_system
+                    vehicle::htn_vehicle_haul_dispatch_system
                         .before(htn::htn_acquire_good_dispatch_system),
                 )
                     .in_set(SimulationSet::ParallelB),
             )
+            // Sequential: executor → vehicle movement → rollover → crew sync,
+            // all after `movement_system` (worker arrival flips to Working).
             .add_systems(
                 FixedUpdate,
                 (
-                    cart::cart_haul_task_system,
-                    cart::cart_follow_system.after(movement::movement_system),
+                    vehicle::vehicle_cargo_haul_task_system,
+                    vehicle::vehicle_movement_system,
+                    vehicle::vehicle_rollover_system,
+                    vehicle::vehicle_crew_sync_system,
                 )
+                    .chain()
+                    .after(movement::movement_system)
                     .in_set(SimulationSet::Sequential),
-            )
-            .add_systems(
-                FixedUpdate,
-                (cart::cart_assembly_system,).in_set(SimulationSet::Economy),
             )
             // Vehicle system (Phase 2): cadence-gated assembly — drains
             // `VehicleAssemblyQueue` into spawned parked `Vehicle` entities.
+            // `vehicle_haul_recovery_system` re-pools a vehicle whose driver
+            // was lost mid-haul.
             .add_systems(
                 FixedUpdate,
-                (vehicle::vehicle_assembly_system,).in_set(SimulationSet::Economy),
+                (
+                    vehicle::vehicle_assembly_system,
+                    vehicle::vehicle_haul_recovery_system,
+                )
+                    .in_set(SimulationSet::Economy),
             )
             // Vehicle system (Phase 3): rebuild the tile → vehicle occupancy
-            // index after movement settles, before vision / combat read it.
+            // index after vehicle movement settles, before vision / combat.
             .add_systems(
                 FixedUpdate,
                 vehicle::vehicle_occupancy_sync_system
                     .after(movement::sync_indexed_after_move_system)
+                    .after(vehicle::vehicle_crew_sync_system)
                     .in_set(SimulationSet::Sequential),
             )
             // Phase 4 (sanitation): emit pass writes `WastePile` intensity

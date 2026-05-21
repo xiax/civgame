@@ -2,7 +2,7 @@ use crate::economy::resource_catalog::ResourceCatalog;
 use crate::rendering::pixel_art::{AnimalTextures, ArtMode, EntityTextures};
 use crate::rendering::sprite_library::SpriteLibrary;
 use crate::simulation::animals::{Cat, Cow, Deer, Fox, Horse, Pig, Rabbit, Wolf};
-use crate::simulation::cart::{Cart, CartVisual};
+use crate::simulation::vehicle::{Vehicle, VehicleVisual};
 use crate::simulation::construction::{
     Bed, Blueprint, BuildSiteKind, Campfire, Chair, Door, Loom, Table, Wall, WallMaterial, Well,
     Workbench,
@@ -370,12 +370,12 @@ pub fn spawn_chair_sprites(
     }
 }
 
-/// Animal Husbandry v2.1: reactively attach a child sprite to every `Cart`.
-/// Carts are mobile (they trail a hauler), so — like Person / animal sprites
-/// — they deliberately omit `FogPersistent`.
-pub fn spawn_cart_sprites(
+/// Vehicle system: reactively attach a child sprite to every `Vehicle`.
+/// Vehicles are mobile (they trail a driver), so — like Person / animal
+/// sprites — they deliberately omit `FogPersistent`.
+pub fn spawn_vehicle_sprites(
     mut commands: Commands,
-    query: Query<Entity, (With<Cart>, Without<CartVisual>)>,
+    query: Query<Entity, (With<Vehicle>, Without<VehicleVisual>)>,
     sprite_lib: Res<SpriteLibrary>,
 ) {
     let Some(handle) = sprite_lib.get("entity_cart") else {
@@ -386,7 +386,7 @@ pub fn spawn_cart_sprites(
         sprite.anchor = Anchor::BottomCenter;
         commands
             .entity(entity)
-            .insert((CartVisual, EntityFogState::default()));
+            .insert((VehicleVisual, EntityFogState::default()));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,

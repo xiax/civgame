@@ -26,14 +26,35 @@ use serde::Deserialize;
 
 use crate::economy::core_ids;
 use crate::economy::resource_catalog::ResourceId;
-use crate::simulation::faction::StorageTileMap;
+use crate::pathfinding::chunk_graph::ChunkGraph;
+use crate::pathfinding::chunk_router::ChunkRouter;
+use crate::pathfinding::connectivity::ChunkConnectivity;
+use crate::pathfinding::vehicle_path::{footprint_astar, VehicleNode, VehiclePathResult, VehiclePathScratch};
+use crate::simulation::animals::{
+    AnimalUse, AnimalWorkClaim, DomesticAnimal, DomesticSpecies, Tamed,
+};
+use crate::simulation::combat::Health;
+use crate::simulation::construction::Blueprint;
+use crate::simulation::draftwork::{release_animal_work_claim, TRAINING_THRESHOLD_DRAFT};
+use crate::simulation::faction::{FactionMember, StorageTileMap};
+use crate::simulation::goals::AgentGoal;
 use crate::simulation::items::GroundItem;
-use crate::simulation::schedule::SimClock;
+use crate::simulation::jobs::{
+    record_progress_filtered, JobBoard, JobClaim, JobCompletedEvent, JobKind, JobProgress,
+};
+use crate::simulation::lod::LodLevel;
+use crate::simulation::person::{AiState, Drafted, Person, PersonAI};
+use crate::simulation::schedule::{BucketSlot, SimClock};
+use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::technology::{
     TechId, ANIMAL_HUSBANDRY, BRONZE_CASTING, HORSE_TAMING, OX_CART, WAR_CHARIOT,
 };
+use crate::simulation::typed_task::{ActionQueue, Task, UNEMPLOYED_TASK_KIND};
+use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
+use crate::world::seasons::TICKS_PER_DAY;
 use crate::world::spatial::SpatialIndex;
-use crate::world::terrain::tile_to_world;
+use crate::world::terrain::{tile_to_world, world_to_tile, TILE_SIZE};
+use crate::world::tile::TileKind;
 
 // ── grid bounds ───────────────────────────────────────────────────────────
 
@@ -324,6 +345,36 @@ pub struct Vehicle {
     pub state: VehicleState,
     pub anchor_tile: (i32, i32),
     pub z: i8,
+    /// Worker currently driving the vehicle on a cargo haul; `None` while
+    /// parked / idle. The cargo-haul dispatcher (Phase 4) picks vehicles
+    /// with `hauler == None`.
+    pub hauler: Option<Entity>,
+}
+
+/// Render marker — `entity_sprites::spawn_vehicle_sprites` attaches the child
+/// sprite once and stamps this so it isn't re-attached.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct VehicleVisual;
+
+/// A planned multi-tile route for a `Vehicle`, authoritative on the `Vehicle`
+/// entity (Phase 4 — the vehicle *leads*, crew follow). `path` is a node
+/// sequence from `footprint_astar`; `cursor` is the next node to reach. The
+/// component is removed by `vehicle_movement_system` when the path completes —
+/// its absence is the "vehicle arrived" signal the cargo-haul executor reads.
+#[derive(Component, Clone, Debug)]
+pub struct VehiclePathFollow {
+    pub path: Vec<VehicleNode>,
+    pub cursor: usize,
+    /// Tip-torque accumulated over this route leg (rollover input).
+    pub tip_torque: f32,
+}
+
+/// Placed on a person while they are driving / riding a `Vehicle`. While
+/// boarded the person does not path on their own — `movement_system` skips
+/// them and `vehicle_crew_sync_system` snaps their `Transform` to the vehicle.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct BoardedVehicle {
+    pub vehicle: Entity,
 }
 
 /// Cargo carried on a vehicle. Generalises `cart::CartInventory` — same
@@ -1212,6 +1263,7 @@ fn spawn_vehicle(
                 state: VehicleState::Parked,
                 anchor_tile: tile,
                 z: 0,
+                hauler: None,
             },
             VehicleInventory::default(),
             VehicleCrew::default(),
@@ -1357,6 +1409,941 @@ pub fn step_tip_torque(stats: &VehicleStats, ctx: &RolloverContext) -> f32 {
 /// far more torque before overturning than a tall narrow one.
 pub fn vehicle_rolls_over(stats: &VehicleStats, accumulated_torque: f32) -> bool {
     accumulated_torque > stats.stability
+}
+
+// ── Phase 4: cargo hauling — vehicle-leads movement ───────────────────────
+//
+// A `Vehicle` whose design has cargo capacity ferries bulk construction
+// material from faction storage into a blueprint. Unlike the retired
+// worker-driven cart, the **vehicle is the authoritative mover**: it owns a
+// `VehiclePathFollow` planned by the heading-aware `footprint_astar`
+// (clearance- + occupancy-checked); the driver and hitched animals ride it.
+//
+// 1. **Dispatcher (`htn_vehicle_haul_dispatch_system`, ParallelB).** For each
+//    `JobClaim::Haul` holder whose posting still needs `>=
+//    VEHICLE_HAUL_MIN_REMAINING` units, picks an idle owner-faction cargo
+//    vehicle (+ trained draft animals), and routes the worker on foot to the
+//    vehicle so they can board it.
+// 2. **Executor (`vehicle_cargo_haul_task_system`, Sequential).** On arrival
+//    the worker boards (`BoardedVehicle`); the executor then drives the
+//    two-phase load/deliver state machine by planning the vehicle's
+//    `footprint_astar` route to storage / the blueprint and resolving the
+//    cargo transfer once the vehicle arrives.
+// 3. **`vehicle_movement_system`** steps the vehicle along its route;
+//    **`vehicle_rollover_system`** overturns an unstable one;
+//    **`vehicle_crew_sync_system`** snaps the boarded crew + draft animals to
+//    the vehicle each tick.
+
+/// Minimum un-delivered quantity on a `JobProgress::Haul` posting before a
+/// vehicle is worth hitching — below this the per-trip hitch overhead isn't
+/// amortised and the worker hand-carries instead.
+pub const VEHICLE_HAUL_MIN_REMAINING: u32 = 12;
+
+/// TTL backstop on a draft `AnimalWorkClaim`. The executor explicit-releases
+/// on completion; this only matters if the worker dies mid-haul.
+pub const VEHICLE_CLAIM_TTL_TICKS: u32 = (TICKS_PER_DAY as u32).saturating_mul(2);
+
+/// Per-unit weight of a resource from the catalog (grams). Defaults to a
+/// conservative 1 kg when the catalog has no entry.
+fn unit_weight_g(rid: ResourceId) -> u32 {
+    core_ids::catalog()
+        .get(rid)
+        .map(|d| d.weight_g)
+        .filter(|w| *w > 0)
+        .unwrap_or(1000)
+}
+
+/// How many units of `rid` a vehicle with `payload_g` cargo can carry.
+pub fn capacity_units(payload_g: u32, rid: ResourceId) -> u32 {
+    (payload_g / unit_weight_g(rid)).max(1)
+}
+
+/// The cargo payload (grams) of a design — `derive_stats().max_payload_g`.
+pub fn design_payload_g(design: &VehicleDesign, data: &VehicleData) -> u32 {
+    derive_stats(&design.grid, data).max_payload_g
+}
+
+/// True when a design can be used for cargo hauling — a `Cargo`-purpose
+/// design with a non-zero payload.
+pub fn design_is_cargo_capable(design: &VehicleDesign, data: &VehicleData) -> bool {
+    design.allowed_purpose == VehiclePurpose::Cargo && design_payload_g(design, data) > 0
+}
+
+/// Find one trained Cattle / Horse owned by `faction_id` not already claimed
+/// and not in `taken` (claimed earlier this pass).
+fn pick_idle_draft_animal(
+    faction_id: u32,
+    animals_q: &Query<(Entity, &DomesticAnimal, &Tamed), Without<AnimalWorkClaim>>,
+    taken: &ahash::AHashSet<Entity>,
+) -> Option<Entity> {
+    for (e, da, tamed) in animals_q.iter() {
+        if tamed.owner_faction != faction_id || taken.contains(&e) {
+            continue;
+        }
+        if da.training < TRAINING_THRESHOLD_DRAFT {
+            continue;
+        }
+        if matches!(da.species, DomesticSpecies::Cattle | DomesticSpecies::Horse) {
+            return Some(e);
+        }
+    }
+    None
+}
+
+/// Nearest tile in `tiles` to `from` by chebyshev distance.
+fn nearest_tile(from: (i32, i32), tiles: &[(i32, i32)]) -> Option<(i32, i32)> {
+    tiles
+        .iter()
+        .copied()
+        .min_by_key(|&(x, y)| (x - from.0).abs().max((y - from.1).abs()))
+}
+
+/// Sum of a blueprint's unmet deposit slots for `rid`.
+fn blueprint_remaining_need(bp: &Blueprint, rid: ResourceId) -> u32 {
+    let mut total = 0u32;
+    for i in 0..bp.deposit_count as usize {
+        if bp.deposits[i].resource_id == rid {
+            total = total.saturating_add(
+                bp.deposits[i].needed.saturating_sub(bp.deposits[i].deposited) as u32,
+            );
+        }
+    }
+    total
+}
+
+/// Live cargo weight (grams) of a vehicle's inventory.
+fn cargo_weight_g(inv: &VehicleInventory) -> u32 {
+    inv.items
+        .iter()
+        .map(|(rid, q)| unit_weight_g(*rid).saturating_mul(*q))
+        .fold(0u32, |a, b| a.saturating_add(b))
+}
+
+/// Chebyshev distance between two tiles.
+fn cheb(a: (i32, i32), b: (i32, i32)) -> i32 {
+    (a.0 - b.0).abs().max((a.1 - b.1).abs())
+}
+
+/// True iff `tile` is a road-grade surface (vehicles roll fastest here).
+fn is_road_like(chunk_map: &ChunkMap, tile: (i32, i32)) -> bool {
+    matches!(
+        chunk_map.tile_kind_at(tile.0, tile.1),
+        Some(TileKind::Road | TileKind::Bridge | TileKind::Dam)
+    )
+}
+
+/// `VehiclePathFollow.cursor` starts here — `path[0]` is the start node.
+const ROUTE_CURSOR_START: usize = 1;
+/// Node budget for one `footprint_astar` call.
+const VEHICLE_ROUTE_BUDGET: usize = 6_000;
+/// Pixels-per-second a vehicle travels per unit of its terrain speed cap.
+const VEHICLE_SPEED_PER_CAP: f32 = 40.0;
+/// `vehicle_haul_recovery_system` cadence (ticks).
+const VEHICLE_RECOVERY_CADENCE: u64 = 60;
+/// Health lost per spanned Z-level when a vehicle overturns under its crew.
+const ROLLOVER_FALL_DAMAGE_PER_Z: u8 = 8;
+
+/// Plan a `footprint_astar` route for a vehicle from its current pose to a
+/// tile adjacent to (or on) `target`. Tries `target` then its surrounding
+/// rings as goal anchors; `cell_ok` folds `passable_at` + clearance +
+/// occupancy (excluding the vehicle itself). Returns the node path, or `None`
+/// if no candidate anchor is reachable.
+#[allow(clippy::too_many_arguments)]
+fn plan_vehicle_route(
+    scratch: &mut VehiclePathScratch,
+    design: &VehicleDesign,
+    data: &VehicleData,
+    self_e: Entity,
+    from_anchor: (i32, i32),
+    from_z: i8,
+    from_heading: u8,
+    target: (i32, i32),
+    chunk_map: &ChunkMap,
+    occupancy: &VehicleOccupancyIndex,
+) -> Option<Vec<VehicleNode>> {
+    let footprint = VehicleFootprint::from_grid(&design.grid);
+    let height_z = footprint.height_z.max(1) as i32;
+    let stats = derive_stats(&design.grid, data);
+    let turn_cost = ((stats.turn_radius * 30.0) as u32).max(40);
+
+    let cell_ok = |x: i32, y: i32, z: i32| -> bool {
+        if !chunk_map.passable_at(x, y, z) {
+            return false;
+        }
+        if chunk_map.vertical_clearance_at(x, y) < height_z {
+            return false;
+        }
+        match occupancy.0.get(&(x, y)) {
+            Some(&occ) => occ == self_e,
+            None => true,
+        }
+    };
+
+    let start = VehicleNode::new(from_anchor.0, from_anchor.1, from_z, from_heading);
+    // Goal anchors: the target tile, then its surrounding rings (closest first).
+    let mut goals: Vec<(i32, i32)> = vec![target];
+    for r in 1..=2i32 {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx.abs().max(dy.abs()) == r {
+                    goals.push((target.0 + dx, target.1 + dy));
+                }
+            }
+        }
+    }
+    for g in goals {
+        match footprint_astar(
+            scratch,
+            &footprint.offsets_by_heading,
+            start,
+            g,
+            turn_cost,
+            cell_ok,
+            VEHICLE_ROUTE_BUDGET,
+        ) {
+            VehiclePathResult::Found(path) if path.len() >= 2 => return Some(path),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// True iff a vehicle of `design` parked at `anchor`/`heading` has a footprint
+/// tile within chebyshev 1 of `target` — close enough to load / deliver.
+fn footprint_reaches(
+    design: &VehicleDesign,
+    anchor: (i32, i32),
+    heading: u8,
+    target: (i32, i32),
+) -> bool {
+    footprint_tiles(design, anchor, heading)
+        .iter()
+        .any(|&t| cheb(t, target) <= 1)
+}
+
+/// ParallelB dispatcher. For each idle `JobClaim::Haul` holder whose posting
+/// is bulky enough to amortise a vehicle, claims an idle owner-faction cargo
+/// vehicle (+ trained draft animals) and routes the worker **on foot** to the
+/// vehicle so the executor can board them. The vehicle itself moves later via
+/// `footprint_astar` — this leg is plain single-tile person routing.
+#[allow(clippy::too_many_arguments)]
+pub fn htn_vehicle_haul_dispatch_system(
+    mut commands: Commands,
+    clock: Res<SimClock>,
+    chunk_map: Res<ChunkMap>,
+    chunk_graph: Res<ChunkGraph>,
+    chunk_router: Res<ChunkRouter>,
+    chunk_connectivity: Res<ChunkConnectivity>,
+    board: Res<JobBoard>,
+    registry: Res<VehicleDesignRegistry>,
+    data: Res<VehicleData>,
+    mut vehicles_q: Query<(Entity, &mut Vehicle, &VehicleInventory, &mut VehicleDraft)>,
+    animals_q: Query<(Entity, &DomesticAnimal, &Tamed), Without<AnimalWorkClaim>>,
+    mut workers: Query<
+        (
+            Entity,
+            &mut PersonAI,
+            &mut ActionQueue,
+            &AgentGoal,
+            &FactionMember,
+            &Transform,
+            &LodLevel,
+            &BucketSlot,
+            &JobClaim,
+        ),
+        (With<Person>, Without<Drafted>, Without<BoardedVehicle>),
+    >,
+) {
+    let now = clock.tick as u32;
+    let mut claimed_this_pass: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+
+    for (worker, mut ai, mut aq, goal, fm, tr, lod, slot, claim) in workers.iter_mut() {
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
+        if !matches!(claim.kind, JobKind::Haul) || !matches!(*goal, AgentGoal::Haul) {
+            continue;
+        }
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
+            continue;
+        }
+        let Some(posting) = board.get(claim.job_id) else {
+            continue;
+        };
+        let (blueprint, resource_id, delivered, target) = match posting.progress {
+            JobProgress::Haul {
+                blueprint,
+                resource_id,
+                delivered,
+                target,
+                ..
+            } => (blueprint, resource_id, delivered, target),
+            _ => continue,
+        };
+        if target.saturating_sub(delivered) < VEHICLE_HAUL_MIN_REMAINING {
+            continue;
+        }
+
+        // Resume this worker's already-claimed vehicle (a prior walk-to-vehicle
+        // leg that was preempted), or claim a fresh idle one.
+        let resumed = vehicles_q
+            .iter()
+            .find(|(_, v, _, _)| v.hauler == Some(worker))
+            .map(|(e, v, _, _)| (e, v.anchor_tile));
+
+        let (vehicle_e, vehicle_tile) = if let Some(found) = resumed {
+            found
+        } else {
+            let pick = vehicles_q.iter().find_map(|(e, v, _, _)| {
+                if v.owner_faction != fm.faction_id
+                    || v.hauler.is_some()
+                    || v.state == VehicleState::Overturned
+                {
+                    return None;
+                }
+                let design = registry.get(v.design_id)?;
+                if design_is_cargo_capable(design, &data) {
+                    Some((e, v.anchor_tile, design.required_animals))
+                } else {
+                    None
+                }
+            });
+            let Some((vehicle_e, vehicle_tile, required_animals)) = pick else {
+                continue;
+            };
+            // Claim trained draft animals for a draft design.
+            let mut hitched: Vec<Entity> = Vec::new();
+            let mut ok = true;
+            for _ in 0..required_animals {
+                match pick_idle_draft_animal(fm.faction_id, &animals_q, &claimed_this_pass) {
+                    Some(a) => {
+                        claimed_this_pass.insert(a);
+                        hitched.push(a);
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            for &a in &hitched {
+                commands.entity(a).insert(AnimalWorkClaim {
+                    worker,
+                    use_kind: AnimalUse::Cart,
+                    expires_tick: now.saturating_add(VEHICLE_CLAIM_TTL_TICKS),
+                });
+            }
+            if let Ok((_, mut v, _, mut draft)) = vehicles_q.get_mut(vehicle_e) {
+                v.hauler = Some(worker);
+                draft.hitched = hitched;
+            }
+            (vehicle_e, vehicle_tile)
+        };
+
+        // Route the worker on foot to the vehicle so they can board it.
+        let worker_tile = world_to_tile(tr.translation.truncate());
+        let cur_chunk = ChunkCoord(
+            worker_tile.0.div_euclid(CHUNK_SIZE as i32),
+            worker_tile.1.div_euclid(CHUNK_SIZE as i32),
+        );
+        let routed = assign_task_with_routing(
+            &mut ai,
+            worker_tile,
+            cur_chunk,
+            vehicle_tile,
+            TaskKind::VehicleCargoHaul,
+            None,
+            &chunk_graph,
+            &chunk_router,
+            &chunk_map,
+            &chunk_connectivity,
+        );
+        if !routed {
+            continue;
+        }
+        let _ = aq.dispatch(Task::VehicleCargoHaul {
+            vehicle: vehicle_e,
+            blueprint,
+            resource_id,
+        });
+    }
+}
+
+/// `repark_vehicle` for the executor's 4-tuple query — clears the haul state
+/// (`hauler` / draft / in-flight route) so the vehicle re-pools as idle.
+fn repark_helper(
+    commands: &mut Commands,
+    vehicles_q: &mut Query<(
+        &mut Vehicle,
+        &mut VehicleInventory,
+        &mut VehicleDraft,
+        Option<&VehiclePathFollow>,
+    )>,
+    vehicle_e: Entity,
+) {
+    if let Ok((mut v, _, mut draft, _)) = vehicles_q.get_mut(vehicle_e) {
+        if v.state != VehicleState::Overturned {
+            v.state = VehicleState::Parked;
+        }
+        v.hauler = None;
+        draft.hitched.clear();
+    }
+    commands.entity(vehicle_e).remove::<VehiclePathFollow>();
+}
+
+/// Sequential executor for `Task::VehicleCargoHaul`. Boards the worker when
+/// they reach the vehicle, then drives the two-phase load/deliver state
+/// machine — planning the vehicle's `footprint_astar` route and resolving the
+/// cargo transfer on arrival.
+#[allow(clippy::too_many_arguments)]
+pub fn vehicle_cargo_haul_task_system(
+    mut commands: Commands,
+    mut board: ResMut<JobBoard>,
+    mut completed_events: EventWriter<JobCompletedEvent>,
+    clock: Res<SimClock>,
+    registry: Res<VehicleDesignRegistry>,
+    data: Res<VehicleData>,
+    chunk_map: Res<ChunkMap>,
+    occupancy: Res<VehicleOccupancyIndex>,
+    storage_tile_map: Res<StorageTileMap>,
+    spatial: Res<SpatialIndex>,
+    mut ground_items: Query<&mut GroundItem>,
+    mut bp_q: Query<&mut Blueprint>,
+    mut vehicles_q: Query<(
+        &mut Vehicle,
+        &mut VehicleInventory,
+        &mut VehicleDraft,
+        Option<&VehiclePathFollow>,
+    )>,
+    mut workers: Query<
+        (
+            Entity,
+            &mut PersonAI,
+            &mut ActionQueue,
+            &mut Transform,
+            &BucketSlot,
+            &LodLevel,
+            &JobClaim,
+            Option<&BoardedVehicle>,
+        ),
+        With<Person>,
+    >,
+    mut scratch: Local<VehiclePathScratch>,
+) {
+    for (worker, mut ai, mut aq, mut tr, slot, lod, claim, boarded) in workers.iter_mut() {
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
+        if aq.current_task_kind() != TaskKind::VehicleCargoHaul as u16 {
+            continue;
+        }
+        let Some((vehicle_e, blueprint, rid)) = aq.current.as_vehicle_cargo_haul() else {
+            aq.cancel_chain(&mut ai);
+            continue;
+        };
+
+        let release_draft = |commands: &mut Commands,
+                             vq: &mut Query<(
+            &mut Vehicle,
+            &mut VehicleInventory,
+            &mut VehicleDraft,
+            Option<&VehiclePathFollow>,
+        )>| {
+            if let Ok((_, _, draft, _)) = vq.get(vehicle_e) {
+                for &a in &draft.hitched {
+                    release_animal_work_claim(commands, a);
+                }
+            }
+        };
+
+        // The vehicle vanished — abort cleanly.
+        if vehicles_q.get(vehicle_e).is_err() {
+            release_draft(&mut commands, &mut vehicles_q);
+            commands.entity(worker).remove::<JobClaim>();
+            if boarded.is_some() {
+                commands.entity(worker).remove::<BoardedVehicle>();
+            }
+            aq.cancel_chain(&mut ai);
+            continue;
+        }
+        // Claim revoked under us.
+        if !matches!(claim.kind, JobKind::Haul) {
+            release_draft(&mut commands, &mut vehicles_q);
+            repark_helper(&mut commands, &mut vehicles_q, vehicle_e);
+            if boarded.is_some() {
+                commands.entity(worker).remove::<BoardedVehicle>();
+            }
+            aq.cancel_chain(&mut ai);
+            continue;
+        }
+
+        // ── Boarding ────────────────────────────────────────────────────
+        if boarded.is_none() {
+            // Still walking to the vehicle until movement flips us to Working.
+            if ai.state != AiState::Working {
+                continue;
+            }
+            commands
+                .entity(worker)
+                .insert(BoardedVehicle { vehicle: vehicle_e });
+            if let Ok((mut v, _, _, _)) = vehicles_q.get_mut(vehicle_e) {
+                v.hauler = Some(worker);
+                v.state = VehicleState::Moving;
+            }
+            // The route is planned on the next tick's boarded branch.
+            continue;
+        }
+
+        // ── Boarded: drive the load/deliver state machine ────────────────
+        let (anchor, heading, vz, has_path, loaded, design_id) = {
+            let (v, inv, _, path) = vehicles_q.get(vehicle_e).unwrap();
+            (
+                v.anchor_tile,
+                v.heading,
+                v.z,
+                path.is_some(),
+                !inv.is_empty(),
+                v.design_id,
+            )
+        };
+        // Wait while the vehicle is still travelling.
+        if has_path {
+            continue;
+        }
+        let Some(design) = registry.get(design_id) else {
+            release_draft(&mut commands, &mut vehicles_q);
+            repark_helper(&mut commands, &mut vehicles_q, vehicle_e);
+            commands.entity(worker).remove::<BoardedVehicle>();
+            commands.entity(worker).remove::<JobClaim>();
+            aq.cancel_chain(&mut ai);
+            continue;
+        };
+
+        let abort = |commands: &mut Commands,
+                     vq: &mut Query<(
+            &mut Vehicle,
+            &mut VehicleInventory,
+            &mut VehicleDraft,
+            Option<&VehiclePathFollow>,
+        )>,
+                     ai: &mut PersonAI,
+                     aq: &mut ActionQueue| {
+            if let Ok((_, _, draft, _)) = vq.get(vehicle_e) {
+                for &a in &draft.hitched {
+                    release_animal_work_claim(commands, a);
+                }
+            }
+            repark_helper(commands, vq, vehicle_e);
+            commands.entity(worker).remove::<BoardedVehicle>();
+            commands.entity(worker).remove::<JobClaim>();
+            aq.cancel_chain(ai);
+        };
+
+        if !loaded {
+            // ── LOAD: drive to storage, then transfer cargo ──────────────
+            let Some(src) = storage_tile_map
+                .by_faction
+                .get(&claim.faction_id)
+                .and_then(|tiles| nearest_tile(anchor, tiles))
+            else {
+                abort(&mut commands, &mut vehicles_q, &mut ai, &mut aq);
+                continue;
+            };
+            if !footprint_reaches(design, anchor, heading, src) {
+                match plan_vehicle_route(
+                    &mut scratch, design, &data, vehicle_e, anchor, vz, heading, src,
+                    &chunk_map, &occupancy,
+                ) {
+                    Some(path) => {
+                        commands.entity(vehicle_e).insert(VehiclePathFollow {
+                            path,
+                            cursor: ROUTE_CURSOR_START,
+                            tip_torque: 0.0,
+                        });
+                    }
+                    None => abort(&mut commands, &mut vehicles_q, &mut ai, &mut aq),
+                }
+                continue;
+            }
+            // At the storage tile — transfer cargo.
+            let need = bp_q
+                .get(blueprint)
+                .map(|bp| blueprint_remaining_need(&bp, rid))
+                .unwrap_or(0);
+            if need == 0 {
+                release_draft(&mut commands, &mut vehicles_q);
+                repark_helper(&mut commands, &mut vehicles_q, vehicle_e);
+                commands.entity(worker).remove::<BoardedVehicle>();
+                commands.entity(worker).remove::<JobClaim>();
+                aq.finish_task(&mut ai);
+                continue;
+            }
+            let payload_g = design_payload_g(design, &data);
+            let want = need.min(capacity_units(payload_g, rid));
+            let mut loaded_qty = 0u32;
+            for gi_e in spatial.get(src.0, src.1).to_vec() {
+                if loaded_qty >= want {
+                    break;
+                }
+                if let Ok(mut gi) = ground_items.get_mut(gi_e) {
+                    if gi.item.resource_id != rid || gi.qty == 0 {
+                        continue;
+                    }
+                    let take = (want - loaded_qty).min(gi.qty);
+                    gi.qty -= take;
+                    loaded_qty += take;
+                    if gi.qty == 0 {
+                        commands.entity(gi_e).despawn_recursive();
+                    }
+                }
+            }
+            if loaded_qty == 0 {
+                abort(&mut commands, &mut vehicles_q, &mut ai, &mut aq);
+                continue;
+            }
+            if let Ok((mut v, mut inv, _, _)) = vehicles_q.get_mut(vehicle_e) {
+                inv.add(rid, loaded_qty);
+                v.state = VehicleState::Moving;
+            }
+            // Next tick the boarded branch plans the deliver route.
+        } else {
+            // ── DELIVER: drive to the blueprint, then deposit ────────────
+            let Ok(deliver_tile) = bp_q
+                .get(blueprint)
+                .map(|bp| bp.work_stand.unwrap_or(bp.tile))
+            else {
+                // Blueprint gone — spill the load at the vehicle, abort.
+                let carried: Vec<(ResourceId, u32)> = vehicles_q
+                    .get(vehicle_e)
+                    .map(|(_, inv, _, _)| inv.items.clone())
+                    .unwrap_or_default();
+                for (r, q) in carried {
+                    if q > 0 {
+                        crate::simulation::items::spawn_or_merge_ground_item(
+                            &mut commands, &spatial, &mut ground_items, anchor.0, anchor.1, r, q,
+                        );
+                    }
+                }
+                if let Ok((_, mut inv, _, _)) = vehicles_q.get_mut(vehicle_e) {
+                    inv.items.clear();
+                }
+                abort(&mut commands, &mut vehicles_q, &mut ai, &mut aq);
+                continue;
+            };
+            if !footprint_reaches(design, anchor, heading, deliver_tile) {
+                match plan_vehicle_route(
+                    &mut scratch, design, &data, vehicle_e, anchor, vz, heading, deliver_tile,
+                    &chunk_map, &occupancy,
+                ) {
+                    Some(path) => {
+                        commands.entity(vehicle_e).insert(VehiclePathFollow {
+                            path,
+                            cursor: ROUTE_CURSOR_START,
+                            tip_torque: 0.0,
+                        });
+                    }
+                    None => abort(&mut commands, &mut vehicles_q, &mut ai, &mut aq),
+                }
+                continue;
+            }
+            // At the blueprint — deposit the load.
+            let carried = vehicles_q
+                .get(vehicle_e)
+                .map(|(_, inv, _, _)| inv.qty_of(rid))
+                .unwrap_or(0);
+            let mut deposited = 0u32;
+            if let Ok(mut bp) = bp_q.get_mut(blueprint) {
+                let mut remaining = carried;
+                for i in 0..bp.deposit_count as usize {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if bp.deposits[i].resource_id != rid {
+                        continue;
+                    }
+                    let still =
+                        bp.deposits[i].needed.saturating_sub(bp.deposits[i].deposited) as u32;
+                    let take = still.min(remaining).min(u8::MAX as u32);
+                    bp.deposits[i].deposited =
+                        bp.deposits[i].deposited.saturating_add(take as u8);
+                    remaining -= take;
+                    deposited += take;
+                }
+            }
+            let residual = {
+                let mut res = 0u32;
+                if let Ok((_, mut inv, _, _)) = vehicles_q.get_mut(vehicle_e) {
+                    inv.take(rid, carried);
+                    res = carried.saturating_sub(deposited);
+                }
+                res
+            };
+            if residual > 0 {
+                crate::simulation::items::spawn_or_merge_ground_item(
+                    &mut commands, &spatial, &mut ground_items, anchor.0, anchor.1, rid, residual,
+                );
+            }
+            if deposited > 0 {
+                record_progress_filtered(
+                    &mut commands,
+                    &mut board,
+                    &mut completed_events,
+                    claim,
+                    JobKind::Haul,
+                    Some(rid),
+                    deposited,
+                );
+            }
+            let posting_done = board
+                .get(claim.job_id)
+                .map(|p| p.progress.is_complete())
+                .unwrap_or(true);
+            if posting_done {
+                release_draft(&mut commands, &mut vehicles_q);
+                repark_helper(&mut commands, &mut vehicles_q, vehicle_e);
+                // Unboard: place the worker on the vehicle's tile, free them.
+                commands.entity(worker).remove::<BoardedVehicle>();
+                commands.entity(worker).remove::<JobClaim>();
+                let wp = tile_to_world(anchor.0, anchor.1);
+                tr.translation.x = wp.x;
+                tr.translation.y = wp.y;
+                ai.target_tile = anchor;
+                ai.dest_tile = anchor;
+                aq.finish_task(&mut ai);
+            } else if let Ok((mut v, _, _, _)) = vehicles_q.get_mut(vehicle_e) {
+                // More to haul — next tick plans another load run.
+                v.state = VehicleState::Moving;
+            }
+        }
+    }
+}
+
+/// Sequential (after `movement_system`): step every vehicle along its
+/// `VehiclePathFollow`, updating `anchor_tile` / `heading` / `z` as it
+/// completes each node and accumulating rollover tip-torque per step. The
+/// component is removed when the route completes — the executor's
+/// "vehicle arrived" signal.
+#[allow(clippy::too_many_arguments)]
+pub fn vehicle_movement_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    clock: Res<SimClock>,
+    chunk_map: Res<ChunkMap>,
+    registry: Res<VehicleDesignRegistry>,
+    data: Res<VehicleData>,
+    lod_q: Query<&LodLevel>,
+    mut vehicles: Query<(
+        Entity,
+        &mut Vehicle,
+        &mut Transform,
+        &VehicleInventory,
+        &mut VehiclePathFollow,
+    )>,
+) {
+    let dt = time.delta_secs() * clock.scale_factor();
+    for (e, mut v, mut tf, inv, mut pf) in vehicles.iter_mut() {
+        if v.state == VehicleState::Overturned {
+            continue;
+        }
+        // A vehicle whose driver is Dormant holds position.
+        if let Some(h) = v.hauler {
+            if matches!(lod_q.get(h), Ok(LodLevel::Dormant)) {
+                continue;
+            }
+        }
+        if pf.cursor >= pf.path.len() {
+            commands.entity(e).remove::<VehiclePathFollow>();
+            v.state = VehicleState::Parked;
+            continue;
+        }
+        let Some(design) = registry.get(v.design_id) else {
+            commands.entity(e).remove::<VehiclePathFollow>();
+            continue;
+        };
+        let stats = derive_stats(&design.grid, &data);
+        let node = pf.path[pf.cursor];
+        let goal = tile_to_world(node.x, node.y);
+        let here = tf.translation.truncate();
+        let delta = goal - here;
+        let cap = if is_road_like(&chunk_map, v.anchor_tile) {
+            stats.road_speed_cap
+        } else {
+            stats.offroad_speed_cap
+        };
+        let step = (cap.max(0.2) * VEHICLE_SPEED_PER_CAP * dt).max(0.5);
+        if delta.length() <= step {
+            // Reached the node — snap, commit pose, accumulate rollover.
+            tf.translation.x = goal.x;
+            tf.translation.y = goal.y;
+            let prev = pf.path[pf.cursor.saturating_sub(1)];
+            let turned = node.heading != prev.heading;
+            let z_slope = (node.z as i32 - prev.z as i32).abs();
+            let overloaded = cargo_weight_g(inv) > stats.max_payload_g;
+            let ctx = RolloverContext {
+                turn_sharpness: if turned {
+                    (2.0 / stats.turn_radius.max(0.5)).min(2.0)
+                } else {
+                    0.0
+                },
+                z_slope,
+                rough_terrain: matches!(
+                    chunk_map.tile_kind_at(node.x, node.y),
+                    Some(TileKind::Marsh | TileKind::Sand | TileKind::Scrub | TileKind::Snow)
+                ),
+                overloaded,
+            };
+            pf.tip_torque += step_tip_torque(&stats, &ctx);
+            v.anchor_tile = (node.x, node.y);
+            v.heading = node.heading;
+            v.z = node.z;
+            pf.cursor += 1;
+        } else {
+            let dir = delta / delta.length();
+            tf.translation.x += dir.x * step;
+            tf.translation.y += dir.y * step;
+        }
+    }
+}
+
+/// Sequential (after `vehicle_movement_system`): overturn a vehicle whose
+/// accumulated tip-torque has beaten its `stability`. Ejects the crew (fall
+/// damage scaled by height), spills the cargo, releases the draft animals.
+#[allow(clippy::too_many_arguments)]
+pub fn vehicle_rollover_system(
+    mut commands: Commands,
+    chunk_map: Res<ChunkMap>,
+    registry: Res<VehicleDesignRegistry>,
+    data: Res<VehicleData>,
+    spatial: Res<SpatialIndex>,
+    mut ground_items: Query<&mut GroundItem>,
+    mut vehicles: Query<(
+        &mut Vehicle,
+        &mut VehicleInventory,
+        &mut VehicleDraft,
+        &VehiclePathFollow,
+    )>,
+    mut workers: Query<
+        (&mut Transform, &mut PersonAI, &mut ActionQueue, &mut Health),
+        (With<Person>, Without<Vehicle>),
+    >,
+) {
+    for (mut v, mut inv, mut draft, pf) in vehicles.iter_mut() {
+        if v.state == VehicleState::Overturned {
+            continue;
+        }
+        let Some(design) = registry.get(v.design_id) else {
+            continue;
+        };
+        let stats = derive_stats(&design.grid, &data);
+        if !vehicle_rolls_over(&stats, pf.tip_torque) {
+            continue;
+        }
+        v.state = VehicleState::Overturned;
+        let (ax, ay) = v.anchor_tile;
+
+        // Eject the driver onto an adjacent passable tile, with fall damage.
+        if let Some(hauler) = v.hauler.take() {
+            if let Ok((mut tr, mut ai, mut aq, mut health)) = workers.get_mut(hauler) {
+                let landing = (-1..=1)
+                    .flat_map(|dy| (-1..=1).map(move |dx| (dx, dy)))
+                    .map(|(dx, dy)| (ax + dx, ay + dy))
+                    .find(|&(tx, ty)| {
+                        chunk_map.passable_at(tx, ty, chunk_map.surface_z_at(tx, ty))
+                    })
+                    .unwrap_or((ax, ay));
+                let wp = tile_to_world(landing.0, landing.1);
+                tr.translation.x = wp.x;
+                tr.translation.y = wp.y;
+                let fall = stats.height_z.saturating_mul(ROLLOVER_FALL_DAMAGE_PER_Z);
+                health.current = health.current.saturating_sub(fall);
+                ai.target_tile = landing;
+                ai.dest_tile = landing;
+                aq.cancel_chain(&mut ai);
+            }
+            commands.entity(hauler).remove::<BoardedVehicle>();
+            commands.entity(hauler).remove::<JobClaim>();
+        }
+
+        // Spill the cargo at the overturn tile.
+        for (rid, qty) in std::mem::take(&mut inv.items) {
+            if qty > 0 {
+                crate::simulation::items::spawn_or_merge_ground_item(
+                    &mut commands, &spatial, &mut ground_items, ax, ay, rid, qty,
+                );
+            }
+        }
+        // Release the draft animals.
+        for &a in &draft.hitched {
+            release_animal_work_claim(&mut commands, a);
+        }
+        draft.hitched.clear();
+    }
+}
+
+/// Sequential (after `vehicle_rollover_system`): snap the boarded driver and
+/// every hitched draft animal to the vehicle's position each tick — the
+/// vehicle leads, the crew ride it.
+pub fn vehicle_crew_sync_system(
+    vehicles: Query<(&Vehicle, &VehicleDraft, &Transform)>,
+    mut crew: Query<&mut Transform, Without<Vehicle>>,
+    mut crew_ai: Query<&mut PersonAI>,
+) {
+    for (v, draft, vtf) in vehicles.iter() {
+        if let Some(hauler) = v.hauler {
+            if let Ok(mut tr) = crew.get_mut(hauler) {
+                tr.translation.x = vtf.translation.x;
+                tr.translation.y = vtf.translation.y;
+            }
+            if let Ok(mut ai) = crew_ai.get_mut(hauler) {
+                ai.current_z = v.z;
+            }
+        }
+        for (i, &animal) in draft.hitched.iter().enumerate() {
+            if let Ok(mut tr) = crew.get_mut(animal) {
+                tr.translation.x = vtf.translation.x + TILE_SIZE * (0.5 + i as f32 * 0.4);
+                tr.translation.y = vtf.translation.y + TILE_SIZE * 0.6;
+            }
+        }
+    }
+}
+
+/// Economy (cadence-gated): re-park a vehicle whose `hauler` has died or is no
+/// longer running a `VehicleCargoHaul` — backstop for a driver lost mid-haul.
+pub fn vehicle_haul_recovery_system(
+    mut commands: Commands,
+    clock: Res<SimClock>,
+    mut vehicles: Query<(Entity, &mut Vehicle, &VehicleInventory, &mut VehicleDraft)>,
+    workers: Query<(&ActionQueue, Option<&BoardedVehicle>), With<Person>>,
+) {
+    if clock.tick % VEHICLE_RECOVERY_CADENCE != 0 {
+        return;
+    }
+    for (e, mut v, _inv, mut draft) in vehicles.iter_mut() {
+        let Some(hauler) = v.hauler else {
+            continue;
+        };
+        let alive = match workers.get(hauler) {
+            Ok((aq, boarded)) => {
+                aq.current_task_kind() == TaskKind::VehicleCargoHaul as u16 || boarded.is_some()
+            }
+            Err(_) => false,
+        };
+        if alive {
+            continue;
+        }
+        for &a in &draft.hitched {
+            release_animal_work_claim(&mut commands, a);
+        }
+        draft.hitched.clear();
+        v.hauler = None;
+        if v.state != VehicleState::Overturned {
+            v.state = VehicleState::Parked;
+        }
+        commands.entity(e).remove::<VehiclePathFollow>();
+    }
 }
 
 #[cfg(test)]
@@ -1704,6 +2691,23 @@ mod tests {
             "a tall narrow overloaded vehicle on a slope ({torque} vs \
              stability {}) must overturn",
             stats.stability
+        );
+    }
+
+    #[test]
+    fn capacity_units_is_positive() {
+        let data = data();
+        let (_, registry) = load_vehicle_assets();
+        let wagon = registry.by_name("Four-Wheel Wagon").unwrap();
+        let payload = design_payload_g(wagon, &data);
+        assert!(payload > 0, "a cargo wagon must have a non-zero payload");
+        assert!(capacity_units(payload, core_ids::wood()) >= 1);
+        assert!(capacity_units(payload, core_ids::stone()) >= 1);
+        assert!(design_is_cargo_capable(wagon, &data));
+        let chariot = registry.by_name("War Chariot").unwrap();
+        assert!(
+            !design_is_cargo_capable(chariot, &data),
+            "a War-purpose chariot is not a cargo hauler"
         );
     }
 

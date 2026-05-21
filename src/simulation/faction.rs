@@ -3566,9 +3566,9 @@ pub fn compute_faction_storage_system(
         &crate::simulation::animals::Tamed,
         &crate::simulation::animals::PackAnimalInventory,
     )>,
-    carts: Query<(
-        &crate::simulation::cart::Cart,
-        &crate::simulation::cart::CartInventory,
+    vehicles: Query<(
+        &crate::simulation::vehicle::Vehicle,
+        &crate::simulation::vehicle::VehicleInventory,
     )>,
     mut registry: ResMut<FactionRegistry>,
 ) {
@@ -3648,13 +3648,13 @@ pub fn compute_faction_storage_system(
         }
     }
 
-    // Animal Husbandry v2.1: cart-cargo pass. A cart's `CartInventory` holds
+    // Vehicle system (Phase 4): vehicle-cargo pass. A `VehicleInventory` holds
     // material that was withdrawn from a storage tile (load phase) but not
     // yet deposited into a blueprint — folding it into the rollup keeps the
     // faction's apparent inventory conservation-correct across the haul.
-    // Only `FactionTile` / `Hybrid` (settled) backends carry carts.
-    for (cart, inv) in carts.iter() {
-        let Some(faction) = registry.factions.get_mut(&cart.owner_faction) else {
+    // Only `FactionTile` / `Hybrid` (settled) backends carry vehicles.
+    for (vehicle, inv) in vehicles.iter() {
+        let Some(faction) = registry.factions.get_mut(&vehicle.owner_faction) else {
             continue;
         };
         if !matches!(

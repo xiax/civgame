@@ -284,8 +284,8 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             tech_gate: Some(ARD_PLOW),
             requires_station: Some(StationKind::Workbench),
         },
-        // 15 — Cart Wheel (Wood). Composable cart part; two of these plus
-        // one frame assemble into a `Cart` (see `cart::cart_assembly_system`).
+        // 15 — Cart Wheel (Wood). Legacy composable cart part — retained as a
+        // catalog resource; vehicle assembly now uses the `design_bill` path.
         CraftRecipe {
             name: "Cart Wheel (Wood)",
             inputs: vec![(wood, 3), (tools, 1)],

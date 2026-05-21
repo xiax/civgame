@@ -6020,88 +6020,97 @@ mod smoke {
         let _ = TaskKind::Plow;
     }
 
-    /// Animal Husbandry v2.1: `cart_assembly_system` gives a qualifying
-    /// faction (ANIMAL_HUSBANDRY tech + a free HitchingPost + timber in
-    /// storage) exactly one parked `Cart`.
+    /// Vehicle system (Phase 2/4): `vehicle_assembly_system` drains a queued
+    /// order — consuming the design's resource bill from faction storage and
+    /// spawning exactly one parked `Vehicle` at the faction's `VehicleYard`.
     #[test]
-    fn cart_assembly_builds_cart_from_storage_timber() {
+    fn vehicle_assembly_builds_vehicle_from_storage_bill() {
         use crate::economy::core_ids;
-        use crate::simulation::cart::Cart;
-        use crate::simulation::faction::FactionRegistry;
-        use crate::simulation::husbandry::HitchingPost;
         use crate::simulation::schedule::SimClock;
-        use crate::simulation::technology::ANIMAL_HUSBANDRY;
-        use crate::world::seasons::TICKS_PER_DAY;
+        use crate::simulation::vehicle::{
+            design_bill, Vehicle, VehicleAssemblyQueue, VehicleDesignRegistry, VehicleYard,
+        };
 
         let mut sim = TestSim::new(0xCA27A);
         sim.flat_world(3, 0, TileKind::Grass);
         let fid = sim.player_faction_id;
         sim.spawn_storage_tile(fid, (0, 0));
-        sim.spawn_ground_item((0, 0), core_ids::wood(), 40);
-        sim.spawn_ground_item((0, 0), core_ids::tools(), 6);
 
-        {
-            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
-            registry.add_member(fid);
-            let f = registry.factions.get_mut(&fid).unwrap();
-            f.techs.unlock(ANIMAL_HUSBANDRY);
+        // Resolve the Handcart design + its raw bill, stock it into storage.
+        let (design_id, bill) = {
+            let registry = sim.app.world().resource::<VehicleDesignRegistry>();
+            let hc = registry.by_name("Handcart").unwrap();
+            (hc.id, design_bill(hc))
+        };
+        for (rid, qty) in &bill {
+            sim.spawn_ground_item((0, 0), *rid, *qty);
         }
-        sim.app.world_mut().spawn(HitchingPost::new(fid, (2, 0)));
 
-        // Tick so the SpatialIndex registers the storage ground items, then
-        // park the clock on a daily boundary and drive the assembly system.
+        sim.app.world_mut().spawn(VehicleYard {
+            faction_id: fid,
+            tile: (2, 0),
+        });
+        sim.app
+            .world_mut()
+            .resource_mut::<VehicleAssemblyQueue>()
+            .entries
+            .push((fid, design_id));
+
+        // Tick so the SpatialIndex registers the storage items, then park the
+        // clock on the assembly cadence boundary and drive the system.
         sim.tick_n(10);
-        sim.app.world_mut().resource_mut::<SimClock>().tick = TICKS_PER_DAY as u64;
+        sim.app.world_mut().resource_mut::<SimClock>().tick = 60;
         let assembly_id = sim
             .app
             .world_mut()
-            .register_system(crate::simulation::cart::cart_assembly_system);
+            .register_system(crate::simulation::vehicle::vehicle_assembly_system);
         sim.app.world_mut().run_system(assembly_id).unwrap();
 
-        let mut carts = sim.app.world_mut().query::<&Cart>();
-        let cart_count = carts
+        let mut vehicles = sim.app.world_mut().query::<&Vehicle>();
+        let count = vehicles
             .iter(sim.app.world())
-            .filter(|c| c.owner_faction == fid)
+            .filter(|v| v.owner_faction == fid)
             .count();
         assert_eq!(
-            cart_count, 1,
-            "cart_assembly_system must build exactly one cart for the faction"
+            count, 1,
+            "vehicle_assembly_system must build exactly one vehicle"
         );
 
-        // Running it again must NOT build a second cart (one-cart cap).
-        sim.app.world_mut().run_system(assembly_id).unwrap();
-        let mut carts2 = sim.app.world_mut().query::<&Cart>();
-        let cart_count2 = carts2
+        // The bill must have been consumed from storage.
+        let _ = core_ids::wood();
+        let mut items = sim.app.world_mut().query::<&crate::simulation::items::GroundItem>();
+        let leftover: u32 = items
             .iter(sim.app.world())
-            .filter(|c| c.owner_faction == fid)
-            .count();
-        assert_eq!(
-            cart_count2, 1,
-            "cart assembly is capped at one cart per faction"
-        );
+            .filter(|gi| bill.iter().any(|(r, _)| *r == gi.item.resource_id))
+            .map(|gi| gi.qty)
+            .sum();
+        assert_eq!(leftover, 0, "the design bill is fully consumed on assembly");
     }
 
-    /// Animal Husbandry v2.1: the cart-haul executor loads bulk material at a
-    /// storage tile (load phase) then deposits it into a blueprint and credits
-    /// the `JobKind::Haul` posting (deliver phase), releasing the animal claim
-    /// and dropping the worker's `JobClaim` on completion.
+    /// Vehicle system (Phase 4): the cargo-haul executor loads bulk material
+    /// at a storage tile (load phase) then deposits it into a blueprint and
+    /// credits the `JobKind::Haul` posting (deliver phase), releasing the
+    /// draft-animal claim and dropping the worker's `JobClaim` on completion.
     #[test]
-    fn cart_haul_executor_loads_then_delivers_and_credits_posting() {
+    fn vehicle_haul_executor_loads_then_delivers_and_credits_posting() {
         use crate::economy::core_ids;
         use crate::simulation::animals::{AnimalUse, AnimalWorkClaim, Tamed};
-        use crate::simulation::cart::{Cart, CartInventory, CartSize, CART_PHASE_WORK_TICKS};
         use crate::simulation::construction::{Blueprint, BuildSiteKind, GoodNeed, WallMaterial};
         use crate::simulation::faction::FactionRegistry;
-        use crate::simulation::husbandry::HitchingPost;
         use crate::simulation::jobs::{
             HaulSource, JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
             PosterClass,
         };
         use crate::simulation::person::{AiState, PersonAI};
+        use crate::simulation::schedule::SimClock;
         use crate::simulation::typed_task::{ActionQueue, Task};
+        use crate::simulation::vehicle::{
+            BoardedVehicle, Vehicle, VehicleCrew, VehicleDesignRegistry, VehicleDraft,
+            VehicleInventory, VehiclePurpose, VehicleState,
+        };
 
         let mut sim = TestSim::new(0xCA27B);
-        sim.flat_world(3, 0, TileKind::Grass);
+        sim.flat_world(14, 0, TileKind::Grass);
         let fid = sim.player_faction_id;
         let storage_tile = (0, 0);
         sim.spawn_storage_tile(fid, storage_tile);
@@ -6142,6 +6151,43 @@ mod smoke {
             bp.deposit_count = 1;
         }
 
+        // Four-Wheel Wagon: a cargo design with enough payload for 30 stone.
+        let design_id = {
+            let registry = sim.app.world().resource::<VehicleDesignRegistry>();
+            registry.by_name("Four-Wheel Wagon").unwrap().id
+        };
+        let vehicle = sim
+            .app
+            .world_mut()
+            .spawn((
+                Vehicle {
+                    owner_faction: fid,
+                    design_id,
+                    purpose: VehiclePurpose::Cargo,
+                    heading: 0,
+                    state: VehicleState::Moving,
+                    anchor_tile: (0, 0),
+                    z: 0,
+                    hauler: None,
+                },
+                VehicleInventory::default(),
+                VehicleCrew::default(),
+                VehicleDraft { hitched: Vec::new(), required_animals: 2 },
+                Transform::from_xyz(0.0, 0.0, 0.25),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ))
+            .id();
+
+        // Tick a few times so `StorageTileMap` + `SpatialIndex` populate from
+        // the spawned `FactionStorageTile` / `GroundItem`.
+        sim.tick_n(5);
+
+        // Now place the boarded driver + draft animal. The worker has already
+        // walked to and boarded the vehicle (the foot-routing + boarding leg
+        // is exercised by the end-to-end test); here we drive the executor's
+        // load/deliver state machine directly.
         let worker = sim.spawn_person(fid, (0, 0), |b| {
             b.goal(AgentGoal::Haul);
         });
@@ -6157,34 +6203,14 @@ mod smoke {
                 },
             ))
             .id();
-        let post = sim
-            .app
-            .world_mut()
-            .spawn(HitchingPost::new(fid, (3, 0)))
-            .id();
-        let cart = sim
-            .app
-            .world_mut()
-            .spawn((
-                Cart {
-                    size: CartSize::OxCart,
-                    frame: core_ids::cart_frame_medium(),
-                    wheels: core_ids::cart_wheel_wood(),
-                    capacity_g: 180_000,
-                    durability: 600,
-                    owner_faction: fid,
-                    hitched_to: Some(animal),
-                    hauler: Some(worker),
-                    parked_at: None,
-                },
-                CartInventory::default(),
-                Transform::from_xyz(0.0, 0.0, 0.25),
-                GlobalTransform::default(),
-                Visibility::Visible,
-                InheritedVisibility::default(),
-            ))
-            .id();
-        let _ = post;
+        {
+            let mut v = sim.app.world_mut().get_mut::<Vehicle>(vehicle).unwrap();
+            v.hauler = Some(worker);
+        }
+        {
+            let mut draft = sim.app.world_mut().get_mut::<VehicleDraft>(vehicle).unwrap();
+            draft.hitched = vec![animal];
+        }
 
         // Post the Haul job + attach the claim.
         let job_id = {
@@ -6220,59 +6246,49 @@ mod smoke {
             fail_count: 0,
         });
 
-        // Populate the SpatialIndex so the load phase can see the storage
-        // tile's stone — drive the indexer once instead of ticking (which
-        // would also fire the dispatcher / movement and disturb the setup).
-        let index_id = sim
-            .app
+        // The worker has already walked to + boarded the vehicle (the
+        // dispatcher's foot-routing leg is exercised by the integration test);
+        // here we drive the executor's load/deliver state machine directly.
+        sim.app
             .world_mut()
-            .register_system(crate::simulation::movement::sync_indexed_after_move_system);
-        sim.app.world_mut().run_system(index_id).unwrap();
+            .entity_mut(worker)
+            .insert(BoardedVehicle { vehicle });
+        {
+            let world = sim.app.world_mut();
+            let mut ai = world.get_mut::<PersonAI>(worker).unwrap();
+            ai.state = AiState::Working;
+            let mut aq = world.get_mut::<ActionQueue>(worker).unwrap();
+            aq.current = Task::VehicleCargoHaul {
+                vehicle,
+                blueprint,
+                resource_id: core_ids::stone(),
+            };
+        }
+
+        // Bucket-invariant: with `population = 0`, `is_active` is always true
+        // so the executor processes the worker on a bare `run_system` call.
+        sim.app.world_mut().resource_mut::<SimClock>().population = 0;
 
         let executor_id = sim
             .app
             .world_mut()
-            .register_system(crate::simulation::cart::cart_haul_task_system);
+            .register_system(crate::simulation::vehicle::vehicle_cargo_haul_task_system);
 
-        // ── Load phase ──────────────────────────────────────────────────
-        {
-            let world = sim.app.world_mut();
-            let mut ai = world.get_mut::<PersonAI>(worker).unwrap();
-            ai.state = AiState::Working;
-            ai.work_progress = CART_PHASE_WORK_TICKS as u8;
-            ai.dest_tile = storage_tile;
-            let mut aq = world.get_mut::<ActionQueue>(worker).unwrap();
-            aq.current = Task::CartHaul {
-                cart,
-                animal,
-                blueprint,
-                resource_id: core_ids::stone(),
-            };
-        }
+        // ── Load phase ── vehicle parked on the storage tile ─────────────
         sim.app.world_mut().run_system(executor_id).unwrap();
         {
-            let inv = sim.app.world().get::<CartInventory>(cart).unwrap();
+            let inv = sim.app.world().get::<VehicleInventory>(vehicle).unwrap();
             assert_eq!(
                 inv.qty_of(core_ids::stone()),
                 30,
-                "load phase must fill the cart with the blueprint's 30-stone need"
+                "load phase must fill the vehicle with the blueprint's 30-stone need"
             );
         }
 
-        // ── Deliver phase ───────────────────────────────────────────────
+        // ── Deliver phase ── drive the vehicle to the blueprint tile ─────
         {
-            let world = sim.app.world_mut();
-            let mut ai = world.get_mut::<PersonAI>(worker).unwrap();
-            ai.state = AiState::Working;
-            ai.work_progress = CART_PHASE_WORK_TICKS as u8;
-            ai.dest_tile = bp_tile;
-            let mut aq = world.get_mut::<ActionQueue>(worker).unwrap();
-            aq.current = Task::CartHaul {
-                cart,
-                animal,
-                blueprint,
-                resource_id: core_ids::stone(),
-            };
+            let mut v = sim.app.world_mut().get_mut::<Vehicle>(vehicle).unwrap();
+            v.anchor_tile = bp_tile;
         }
         sim.app.world_mut().run_system(executor_id).unwrap();
 
@@ -6288,16 +6304,226 @@ mod smoke {
         );
         assert!(
             sim.app.world().get::<JobClaim>(worker).is_none(),
-            "worker JobClaim released on cart-haul completion"
+            "worker JobClaim released on vehicle-haul completion"
         );
         assert!(
             sim.app.world().get::<AnimalWorkClaim>(animal).is_none(),
-            "animal AnimalWorkClaim released on cart-haul completion"
+            "draft AnimalWorkClaim released on vehicle-haul completion"
         );
-        let cart_c = sim.app.world().get::<Cart>(cart).unwrap();
+        let v = sim.app.world().get::<Vehicle>(vehicle).unwrap();
+        let draft = sim.app.world().get::<VehicleDraft>(vehicle).unwrap();
         assert!(
-            cart_c.hauler.is_none() && cart_c.hitched_to.is_none(),
-            "cart un-hitched + re-parked on completion"
+            v.hauler.is_none() && draft.hitched.is_empty(),
+            "vehicle un-hitched + re-parked on completion"
+        );
+    }
+
+    /// Vehicle system (Phase 4): `vehicle_movement_system` steps a vehicle
+    /// along its `footprint_astar`-style `VehiclePathFollow` route — the
+    /// vehicle is the authoritative mover. The route component is consumed
+    /// (removed) when the vehicle reaches the final node.
+    #[test]
+    fn vehicle_movement_steps_along_a_planned_route() {
+        use crate::pathfinding::vehicle_path::VehicleNode;
+        use crate::simulation::vehicle::{
+            Vehicle, VehicleDesignRegistry, VehicleInventory, VehiclePathFollow, VehiclePurpose,
+            VehicleState,
+        };
+
+        let mut sim = TestSim::new(0xCA27C);
+        sim.flat_world(10, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+
+        let design_id = {
+            let registry = sim.app.world().resource::<VehicleDesignRegistry>();
+            registry.by_name("Handcart").unwrap().id
+        };
+        let start = tile_to_world(0, 0);
+        let vehicle = sim
+            .app
+            .world_mut()
+            .spawn((
+                Vehicle {
+                    owner_faction: fid,
+                    design_id,
+                    purpose: VehiclePurpose::Cargo,
+                    heading: 0,
+                    state: VehicleState::Moving,
+                    anchor_tile: (0, 0),
+                    z: 0,
+                    hauler: None,
+                },
+                VehicleInventory::default(),
+                VehiclePathFollow {
+                    path: vec![
+                        VehicleNode::new(0, 0, 0, 0),
+                        VehicleNode::new(0, 1, 0, 0),
+                        VehicleNode::new(0, 2, 0, 0),
+                        VehicleNode::new(0, 3, 0, 0),
+                    ],
+                    cursor: 1,
+                    tip_torque: 0.0,
+                },
+                Transform::from_xyz(start.x, start.y, 0.25),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ))
+            .id();
+
+        // The registered `vehicle_movement_system` runs each FixedUpdate tick.
+        sim.tick_n(200);
+
+        let v = sim.app.world().get::<Vehicle>(vehicle).unwrap();
+        assert_eq!(
+            v.anchor_tile, (0, 3),
+            "the vehicle drove the full route to the final node"
+        );
+        assert!(
+            sim.app.world().get::<VehiclePathFollow>(vehicle).is_none(),
+            "the route component is removed once the vehicle arrives"
+        );
+    }
+
+    /// Vehicle system (Phase 4) — end-to-end: a worker claims a bulky Haul
+    /// posting, walks to a parked cargo vehicle, boards it, then the **vehicle
+    /// itself** drives (via `footprint_astar`) to storage, loads, drives to
+    /// the blueprint, and deposits — crediting the posting.
+    #[test]
+    fn vehicle_haul_end_to_end_delivers_via_vehicle_movement() {
+        use crate::economy::core_ids;
+        use crate::simulation::construction::{Blueprint, BuildSiteKind, GoodNeed, WallMaterial};
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{
+            HaulSource, JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
+            PosterClass,
+        };
+        use crate::simulation::vehicle::{
+            Vehicle, VehicleCrew, VehicleDesignRegistry, VehicleDraft, VehicleInventory,
+            VehiclePurpose, VehicleState,
+        };
+
+        let mut sim = TestSim::new(0xCA27D);
+        sim.flat_world(16, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        let storage_tile = (0, 0);
+        sim.spawn_storage_tile(fid, storage_tile);
+        sim.spawn_ground_item(storage_tile, core_ids::stone(), 60);
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.add_member(fid);
+        }
+
+        // Blueprint that needs 14 stone (Handcart-sized, no draft animals).
+        let bp_tile = (8, 0);
+        let bp_world = tile_to_world(bp_tile.0, bp_tile.1);
+        let blueprint = sim
+            .app
+            .world_mut()
+            .spawn((
+                Blueprint::new(fid, None, BuildSiteKind::Wall(WallMaterial::Palisade), bp_tile, 0),
+                Transform::from_xyz(bp_world.x, bp_world.y, 0.5),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        {
+            let mut bp = sim.app.world_mut().get_mut::<Blueprint>(blueprint).unwrap();
+            bp.deposits[0] = GoodNeed {
+                resource_id: core_ids::stone(),
+                needed: 14,
+                deposited: 0,
+            };
+            bp.deposit_count = 1;
+        }
+
+        // A parked Handcart (required_animals = 0 — human-drawn).
+        let design_id = {
+            let registry = sim.app.world().resource::<VehicleDesignRegistry>();
+            registry.by_name("Handcart").unwrap().id
+        };
+        let veh_tile = (4, 0);
+        let vw = tile_to_world(veh_tile.0, veh_tile.1);
+        let vehicle = sim
+            .app
+            .world_mut()
+            .spawn((
+                Vehicle {
+                    owner_faction: fid,
+                    design_id,
+                    purpose: VehiclePurpose::Cargo,
+                    heading: 0,
+                    state: VehicleState::Parked,
+                    anchor_tile: veh_tile,
+                    z: 0,
+                    hauler: None,
+                },
+                VehicleInventory::default(),
+                VehicleCrew::default(),
+                VehicleDraft { hitched: Vec::new(), required_animals: 0 },
+                Transform::from_xyz(vw.x, vw.y, 0.25),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ))
+            .id();
+
+        let worker = sim.spawn_person(fid, (1, 0), |b| {
+            b.goal(AgentGoal::Haul);
+        });
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            board.faction_postings_mut(fid).push(JobPosting {
+                id,
+                faction_id: fid,
+                kind: JobKind::Haul,
+                progress: JobProgress::Haul {
+                    blueprint,
+                    resource_id: core_ids::stone(),
+                    delivered: 0,
+                    target: 14,
+                    source: HaulSource::Storage,
+                },
+                claimants: vec![worker],
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            });
+            id
+        };
+        sim.app.world_mut().entity_mut(worker).insert(JobClaim {
+            job_id,
+            faction_id: fid,
+            kind: JobKind::Haul,
+            posted_tick: 0,
+            fail_count: 0,
+        });
+
+        sim.tick_n(1200);
+
+        let deposited = sim
+            .app
+            .world()
+            .get::<Blueprint>(blueprint)
+            .unwrap()
+            .deposits[0]
+            .deposited;
+        assert_eq!(
+            deposited, 14,
+            "the vehicle drove storage→blueprint and delivered the full 14-stone haul"
+        );
+        // The vehicle genuinely moved under its own `VehiclePathFollow` — it
+        // is no longer parked at its spawn tile.
+        let v = sim.app.world().get::<Vehicle>(vehicle).unwrap();
+        assert_ne!(
+            v.anchor_tile, veh_tile,
+            "the vehicle moved from its spawn tile under footprint pathing"
         );
     }
 
