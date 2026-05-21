@@ -318,8 +318,24 @@ Manual acceptance (`cargo run`, never `--sandbox`, Bronze Age start):
     `vehicle_movement_steps_along_a_planned_route`.
   - **Deferred:** the vehicle re-parks in place (no drive-back-to-yard); rollover *recovery* is
     a righting task for a later phase (an overturned vehicle is an inert hulk the dispatcher
-    skips). AI factions get no vehicles until Phase 5 (AI auto-queue + autonomous `VehicleYard`
-    building) — the old `cart_assembly_system` auto-cart trigger is gone. Phases 5-7 pending.
+    skips).
+- **Phase 5 — partial.** AI provisioning shipped: `vehicle_yard_intent_emitter_system` (drops a
+  `VehicleYard` blueprint for a settled `ANIMAL_HUSBANDRY` faction ≥10 members, no yard) +
+  `vehicle_ai_queue_system` (enqueues a Handcart once a yard is built) — restores autonomous
+  vehicle provisioning for AI factions. Inspector "Vehicle" section shipped (design / state /
+  footprint / stats / cargo / crew / route, nested `VehicleInspectorParams`).
+  - **Freeform 3D designer shipped** — `src/ui/vehicle_designer.rs` `egui::Window`
+    (`VehicleDesignerState` resource, toggled by a HUD "Vehicles" button). Per-Z-layer grid
+    editor over the `6×4×4` cell grid (left-click place / right-click clear), part palette,
+    material `ComboBox`, live `derive_stats` + `design_bill` preview, `validate_grid` results,
+    Queue button gated on a valid design. Queue emits the new faction-level
+    `PlayerCommand::QueueCustomVehicle { name, grid, purpose, required_animals }` — the UI stays
+    event-only; `drain_player_command_events_system` registers the design into
+    `VehicleDesignRegistry` (authored by the player faction) and enqueues it.
+  - 950-test suite passes (incl. `vehicle_designer_custom_queue_registers_and_enqueues`).
+  **Still pending in Phase 5:** AI freeform-design proposal generation into
+  `VehicleDesignRegistry`, custom-sprite / multi-Z rendering, and the right-click vehicle menu
+  (move / load / repair / right / crew / hitch / deconstruct). Phases 6-7 pending.
 
 ## Assumptions
 

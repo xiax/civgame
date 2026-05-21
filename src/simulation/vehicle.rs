@@ -36,7 +36,7 @@ use crate::simulation::animals::{
 use crate::simulation::combat::Health;
 use crate::simulation::construction::Blueprint;
 use crate::simulation::draftwork::{release_animal_work_claim, TRAINING_THRESHOLD_DRAFT};
-use crate::simulation::faction::{FactionMember, StorageTileMap};
+use crate::simulation::faction::{FactionMember, FactionRegistry, StorageTileMap};
 use crate::simulation::goals::AgentGoal;
 use crate::simulation::items::GroundItem;
 use crate::simulation::jobs::{
@@ -934,6 +934,23 @@ impl VehicleData {
     pub fn material_count(&self) -> usize {
         self.materials.len()
     }
+
+    /// All loaded material profiles — the designer UI's material picker.
+    pub fn materials(&self) -> &[MaterialProfile] {
+        &self.materials
+    }
+
+    /// All loaded part definitions — the designer UI's part palette.
+    pub fn parts(&self) -> &[PartDef] {
+        &self.parts
+    }
+}
+
+/// Durability ceiling for a fresh cell of `material` — the material's
+/// catalog durability with a graceful fallback. Shared by the catalog
+/// loader and the designer UI so a hand-built cell matches a stock one.
+pub fn cell_durability(material: ResourceId, data: &VehicleData) -> u16 {
+    data.material(material).map(|m| m.durability).unwrap_or(100)
 }
 
 /// All known vehicle designs, keyed by id. Seeded from the RON stock
@@ -2343,6 +2360,132 @@ pub fn vehicle_haul_recovery_system(
             v.state = VehicleState::Parked;
         }
         commands.entity(e).remove::<VehiclePathFollow>();
+    }
+}
+
+// ── Phase 5: AI vehicle provisioning ──────────────────────────────────────
+//
+// AI factions don't build vehicle yards or queue vehicles by hand. Two daily
+// Economy systems give a qualifying settled faction a cargo vehicle: an
+// intent emitter drops a `VehicleYard` blueprint, and once the yard is built
+// the auto-queue enqueues a conservative stock template (`Handcart`).
+
+/// Minimum member count before a faction is worth a vehicle yard — below this
+/// the haul volume doesn't amortise the yard's build cost.
+const YARD_MIN_MEMBERS: u32 = 10;
+
+/// Economy (daily): emit a `VehicleYard` blueprint for a settled faction with
+/// `ANIMAL_HUSBANDRY`, enough members, and no yard (built or pending).
+#[allow(clippy::too_many_arguments)]
+pub fn vehicle_yard_intent_emitter_system(
+    mut commands: Commands,
+    clock: Res<SimClock>,
+    registry: Res<FactionRegistry>,
+    chunk_map: Res<ChunkMap>,
+    bp_map: Res<crate::simulation::construction::BlueprintMap>,
+    bp_q: Query<&Blueprint>,
+    yards: Query<&VehicleYard>,
+) {
+    if clock.tick % (TICKS_PER_DAY as u64) != 0 {
+        return;
+    }
+    let mut have_yard: ahash::AHashSet<u32> = ahash::AHashSet::default();
+    for y in yards.iter() {
+        have_yard.insert(y.faction_id);
+    }
+    let pending_yard = |fid: u32| -> bool {
+        bp_map.0.values().any(|&e| {
+            bp_q
+                .get(e)
+                .map(|bp| {
+                    bp.faction_id == fid
+                        && bp.kind == crate::simulation::construction::BuildSiteKind::VehicleYard
+                })
+                .unwrap_or(false)
+        })
+    };
+
+    for (&fid, faction) in registry.factions.iter() {
+        if faction.parent_faction.is_some() || faction.member_count < YARD_MIN_MEMBERS {
+            continue;
+        }
+        if faction.caps.home.is_mobile() || !faction.techs.has(ANIMAL_HUSBANDRY) {
+            continue;
+        }
+        if have_yard.contains(&fid) || pending_yard(fid) {
+            continue;
+        }
+        // Place near a settlement edge — a ring 8..14 from home on open ground.
+        let home = faction.home_tile;
+        let mut placement: Option<(i32, i32)> = None;
+        'outer: for r in 8i32..=14 {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if dx.abs() != r && dy.abs() != r {
+                        continue;
+                    }
+                    let t = (home.0 + dx, home.1 + dy);
+                    let Some(k) = chunk_map.tile_kind_at(t.0, t.1) else {
+                        continue;
+                    };
+                    if matches!(k, TileKind::Grass | TileKind::Scrub | TileKind::Cropland)
+                        && bp_map.0.get(&t).is_none()
+                    {
+                        placement = Some(t);
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        let Some(tile) = placement else {
+            continue;
+        };
+        let z = chunk_map.surface_z_at(tile.0, tile.1) as i8;
+        let bp = Blueprint::new(
+            fid,
+            None,
+            crate::simulation::construction::BuildSiteKind::VehicleYard,
+            tile,
+            z,
+        );
+        let wp = tile_to_world(tile.0, tile.1);
+        commands.spawn((
+            bp,
+            Transform::from_xyz(wp.x, wp.y, 0.2),
+            GlobalTransform::default(),
+            Visibility::Visible,
+            InheritedVisibility::default(),
+        ));
+    }
+}
+
+/// Economy (daily): for a settled faction that owns a built `VehicleYard` but
+/// no `Vehicle` (and has none queued), enqueue a conservative stock template.
+pub fn vehicle_ai_queue_system(
+    clock: Res<SimClock>,
+    mut queue: ResMut<VehicleAssemblyQueue>,
+    registry: Res<VehicleDesignRegistry>,
+    yards: Query<&VehicleYard>,
+    vehicles: Query<&Vehicle>,
+) {
+    if clock.tick % (TICKS_PER_DAY as u64) != 0 {
+        return;
+    }
+    let Some(handcart) = registry.by_name("Handcart").map(|d| d.id) else {
+        return;
+    };
+    let mut yard_factions: ahash::AHashSet<u32> = ahash::AHashSet::default();
+    for y in yards.iter() {
+        yard_factions.insert(y.faction_id);
+    }
+    for fid in yard_factions {
+        if vehicles.iter().any(|v| v.owner_faction == fid) {
+            continue;
+        }
+        if queue.entries.iter().any(|&(f, _)| f == fid) {
+            continue;
+        }
+        queue.entries.push((fid, handcart));
     }
 }
 

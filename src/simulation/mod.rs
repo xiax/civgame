@@ -1172,6 +1172,9 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (
+                    // Phase 5: AI provisioning — yard intent + auto-queue.
+                    vehicle::vehicle_yard_intent_emitter_system,
+                    vehicle::vehicle_ai_queue_system,
                     vehicle::vehicle_assembly_system,
                     vehicle::vehicle_haul_recovery_system,
                 )

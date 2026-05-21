@@ -6527,6 +6527,141 @@ mod smoke {
         );
     }
 
+    /// Vehicle system (Phase 5): AI provisioning. A settled `ANIMAL_HUSBANDRY`
+    /// faction with enough members gets a `VehicleYard` blueprint emitted; once
+    /// a yard is built and the faction owns no vehicle, the auto-queue enqueues
+    /// a stock template.
+    #[test]
+    fn vehicle_ai_provisions_yard_and_queues_vehicle() {
+        use crate::simulation::construction::{Blueprint, BuildSiteKind};
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::technology::ANIMAL_HUSBANDRY;
+        use crate::simulation::vehicle::{VehicleAssemblyQueue, VehicleYard};
+
+        let mut sim = TestSim::new(0xCA27E);
+        sim.flat_world(20, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            for _ in 0..10 {
+                registry.add_member(fid);
+            }
+            let f = registry.factions.get_mut(&fid).unwrap();
+            f.techs.unlock(ANIMAL_HUSBANDRY);
+        }
+
+        // ── Yard intent emitter ──────────────────────────────────────────
+        let emit_id = sim
+            .app
+            .world_mut()
+            .register_system(crate::simulation::vehicle::vehicle_yard_intent_emitter_system);
+        sim.app.world_mut().run_system(emit_id).unwrap();
+        let mut bps = sim.app.world_mut().query::<&Blueprint>();
+        let yard_bp = bps
+            .iter(sim.app.world())
+            .filter(|b| b.faction_id == fid && b.kind == BuildSiteKind::VehicleYard)
+            .count();
+        assert_eq!(
+            yard_bp, 1,
+            "the emitter must drop exactly one VehicleYard blueprint"
+        );
+
+        // ── Auto-queue (a yard now exists) ───────────────────────────────
+        sim.app.world_mut().spawn(VehicleYard {
+            faction_id: fid,
+            tile: (12, 0),
+        });
+        let queue_id = sim
+            .app
+            .world_mut()
+            .register_system(crate::simulation::vehicle::vehicle_ai_queue_system);
+        sim.app.world_mut().run_system(queue_id).unwrap();
+        let queued = sim
+            .app
+            .world()
+            .resource::<VehicleAssemblyQueue>()
+            .entries
+            .iter()
+            .filter(|&&(f, _)| f == fid)
+            .count();
+        assert_eq!(queued, 1, "the auto-queue must enqueue one vehicle");
+
+        // Idempotent — a second pass must not double-queue.
+        sim.app.world_mut().run_system(queue_id).unwrap();
+        let queued2 = sim
+            .app
+            .world()
+            .resource::<VehicleAssemblyQueue>()
+            .entries
+            .iter()
+            .filter(|&&(f, _)| f == fid)
+            .count();
+        assert_eq!(queued2, 1, "auto-queue is idempotent while a vehicle is pending");
+    }
+
+    /// Vehicle system (Phase 5): the freeform designer's Queue button emits
+    /// `PlayerCommand::QueueCustomVehicle`. Draining that command must register
+    /// a fresh design in `VehicleDesignRegistry` (authored by the player
+    /// faction) and enqueue it for assembly.
+    #[test]
+    fn vehicle_designer_custom_queue_registers_and_enqueues() {
+        use crate::simulation::player_command::{
+            drain_player_command_events_system, PlayerCommand, PlayerCommandEvent,
+        };
+        use crate::simulation::vehicle::{
+            VehicleAssemblyQueue, VehicleDesignRegistry, VehiclePurpose,
+        };
+
+        let mut sim = TestSim::new(0x5EED);
+        sim.flat_world(10, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+
+        // Reuse a stock template's grid as a stand-in freeform body.
+        let (grid, before_len) = {
+            let reg = sim.app.world().resource::<VehicleDesignRegistry>();
+            (reg.iter().next().unwrap().grid.clone(), reg.len())
+        };
+
+        sim.app.world_mut().send_event(PlayerCommandEvent {
+            actors: Vec::new(),
+            command: PlayerCommand::QueueCustomVehicle {
+                name: "Test Wagon".to_string(),
+                grid,
+                purpose: VehiclePurpose::Cargo,
+                required_animals: 0,
+            },
+        });
+        let drain_id = sim
+            .app
+            .world_mut()
+            .register_system(drain_player_command_events_system);
+        sim.app.world_mut().run_system(drain_id).unwrap();
+
+        let reg = sim.app.world().resource::<VehicleDesignRegistry>();
+        assert_eq!(
+            reg.len(),
+            before_len + 1,
+            "the custom design must be registered"
+        );
+        let design = reg
+            .by_name("Test Wagon")
+            .expect("registry must hold the named custom design");
+        assert_eq!(
+            design.author_faction,
+            Some(fid),
+            "a custom design is authored by the player faction"
+        );
+
+        let queued = sim
+            .app
+            .world()
+            .resource::<VehicleAssemblyQueue>()
+            .entries
+            .iter()
+            .any(|&(f, d)| f == fid && d == design.id);
+        assert!(queued, "the custom design must be enqueued for assembly");
+    }
+
     /// Draftwork v2: human-drawn fallback. With NO trained draft animal in
     /// the faction, the executor still completes the plowing (the dispatcher
     /// dispatches `Task::Plow { animal: None }`, the executor uses

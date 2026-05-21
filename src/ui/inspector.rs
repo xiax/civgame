@@ -107,6 +107,27 @@ pub struct TaskDisplayParams<'w, 's> {
     pub plants: Query<'w, 's, &'static Plant>,
     pub corpse_q: Query<'w, 's, &'static Corpse>,
     pub carrying_q: Query<'w, 's, &'static crate::simulation::corpse::Carrying>,
+    /// Nested so the panel's top-level param count stays under Bevy's ceiling.
+    pub vehicle: VehicleInspectorParams<'w, 's>,
+}
+
+/// Vehicle inspector surface — the selected entity's `Vehicle` state plus the
+/// design catalog needed to label it and derive live stats.
+#[derive(SystemParam)]
+pub struct VehicleInspectorParams<'w, 's> {
+    pub vehicles: Query<
+        'w,
+        's,
+        (
+            &'static crate::simulation::vehicle::Vehicle,
+            &'static crate::simulation::vehicle::VehicleInventory,
+            &'static crate::simulation::vehicle::VehicleDraft,
+            &'static crate::simulation::vehicle::VehicleCrew,
+            Option<&'static crate::simulation::vehicle::VehiclePathFollow>,
+        ),
+    >,
+    pub registry: Res<'w, crate::simulation::vehicle::VehicleDesignRegistry>,
+    pub data: Res<'w, crate::simulation::vehicle::VehicleData>,
 }
 
 /// Wage-aware-labor-market inspector surface: skill peaks, earnings,
@@ -184,6 +205,103 @@ pub fn inspector_panel_system(
     )>,
 ) {
     let Some(entity) = selected.0 else { return };
+
+    // ── Vehicle inspector ────────────────────────────────────────────────
+    if let Ok((vehicle, inv, draft, crew, path)) = task_display.vehicle.vehicles.get(entity) {
+        use crate::simulation::vehicle::{derive_stats, VehicleState};
+        let design = task_display.vehicle.registry.get(vehicle.design_id);
+        egui::Window::new("Inspector")
+            .default_pos([10.0, 10.0])
+            .default_width(360.0)
+            .resizable(true)
+            .show(contexts.ctx_mut(), |ui| {
+                egui::CollapsingHeader::new(egui::RichText::new("Vehicle").strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let name = design.map(|d| d.name.as_str()).unwrap_or("(unknown design)");
+                        ui.label(format!("Design: {name}"));
+                        ui.label(format!(
+                            "State: {}",
+                            match vehicle.state {
+                                VehicleState::Parked => "Parked",
+                                VehicleState::Moving => "Moving",
+                                VehicleState::Loading => "Loading",
+                                VehicleState::Overturned => "Overturned!",
+                            }
+                        ));
+                        ui.label(format!(
+                            "Anchor: ({}, {})  z {}  heading {}",
+                            vehicle.anchor_tile.0, vehicle.anchor_tile.1, vehicle.z, vehicle.heading
+                        ));
+                        if let Some(design) = design {
+                            if let Some((lo, hi)) = design.grid.bounds() {
+                                ui.label(format!(
+                                    "Footprint: {}×{}  height {}",
+                                    hi.x - lo.x + 1,
+                                    hi.y - lo.y + 1,
+                                    hi.z - lo.z + 1
+                                ));
+                            }
+                            let stats = derive_stats(&design.grid, &task_display.vehicle.data);
+                            ui.label(format!(
+                                "Empty {} kg  ·  max payload {} kg",
+                                stats.empty_mass_g / 1000,
+                                stats.max_payload_g / 1000
+                            ));
+                            ui.label(format!(
+                                "Speed: road {:.2}  off-road {:.2}",
+                                stats.road_speed_cap, stats.offroad_speed_cap
+                            ));
+                            ui.label(format!(
+                                "Stability: {:.2}  ·  turn radius {:.1}",
+                                stats.stability, stats.turn_radius
+                            ));
+                        }
+                        let carried: u32 = inv.total_qty();
+                        ui.label(format!("Cargo: {carried} units"));
+                        for (rid, qty) in &inv.items {
+                            if *qty > 0 {
+                                ui.label(format!(
+                                    "  • {} ×{qty}",
+                                    crate::economy::core_ids::catalog()
+                                        .get(*rid)
+                                        .map(|d| d.display_name.as_str())
+                                        .unwrap_or("?")
+                                ));
+                            }
+                        }
+                        match vehicle.hauler {
+                            Some(h) => ui.label(format!("Driver: entity {}", h.index())),
+                            None => ui.label("Driver: none (parked)"),
+                        };
+                        ui.label(format!(
+                            "Crew: {} passenger(s)",
+                            crew.passengers.len()
+                        ));
+                        ui.label(format!(
+                            "Draft: {}/{} animal(s) hitched",
+                            draft.hitched.len(),
+                            draft.required_animals
+                        ));
+                        match path {
+                            Some(p) => ui.label(format!(
+                                "Route: en route ({}/{} nodes)",
+                                p.cursor,
+                                p.path.len()
+                            )),
+                            None => ui.label("Route: idle"),
+                        };
+                        if vehicle.state == VehicleState::Overturned {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 90, 60),
+                                "⚠ Overturned — movement disabled.",
+                            );
+                        }
+                    });
+            });
+        return;
+    }
+
     let Ok((
         (needs, mood, skills, ai, agent, goal, personality, sex, member, profession, stats),
         (

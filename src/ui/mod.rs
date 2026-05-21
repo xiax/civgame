@@ -13,6 +13,7 @@ pub mod orders;
 pub mod selection;
 pub mod spawn_select;
 pub mod tech_panel;
+pub mod vehicle_designer;
 pub mod world_map;
 
 pub use selection::{SelectedEntities, SelectedEntity, SelectionDrag};
@@ -39,6 +40,7 @@ impl Plugin for UiPlugin {
             .insert_resource(inspector::PendingInspectorAction::default())
             .insert_resource(spawn_select::SpawnSelectTexture::default())
             .insert_resource(migration_panel::MigrationPanelOpen::default())
+            .insert_resource(vehicle_designer::VehicleDesignerState::default())
             .add_event::<activity_log::ActivityLogEvent>()
             .add_systems(
                 Update,
@@ -59,7 +61,10 @@ impl Plugin for UiPlugin {
                     hud::apply_draft_toggle_system,
                     migration_panel::migration_panel_system,
                     world_map::world_map_system,
-                    tech_panel::tech_panel_system,
+                    (
+                        tech_panel::tech_panel_system,
+                        vehicle_designer::vehicle_designer_system,
+                    ),
                     debug_panel::debug_panel_system,
                     job_board::job_board_panel_system,
                     hover::hover_info_system,

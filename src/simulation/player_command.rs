@@ -166,6 +166,16 @@ pub enum PlayerCommand {
     QueueVehicle {
         design_id: u32,
     },
+    /// Faction-level: register a freeform design built in the vehicle
+    /// designer, then queue it for assembly. `drain_player_command_events_system`
+    /// inserts the design into `VehicleDesignRegistry` (assigning a fresh id)
+    /// and pushes it onto `VehicleAssemblyQueue` for the player faction.
+    QueueCustomVehicle {
+        name: String,
+        grid: crate::simulation::vehicle::VehicleGrid,
+        purpose: crate::simulation::vehicle::VehiclePurpose,
+        required_animals: u8,
+    },
 }
 
 /// Per-actor authority marker. Replaces `PlayerOrder` once Commit 3 lands.
@@ -247,6 +257,7 @@ pub fn drain_player_command_events_system(
     mut player_craft: ResMut<crate::simulation::jobs::PlayerCraftRequest>,
     player_faction: Res<crate::simulation::faction::PlayerFaction>,
     mut vehicle_queue: ResMut<crate::simulation::vehicle::VehicleAssemblyQueue>,
+    mut vehicle_registry: ResMut<crate::simulation::vehicle::VehicleDesignRegistry>,
 ) {
     let now = clock.tick as u32;
     for ev in reader.read() {
@@ -264,6 +275,27 @@ pub fn drain_player_command_events_system(
                         player_faction.faction_id,
                         crate::simulation::vehicle::VehicleDesignId(design_id),
                     ));
+                }
+                PlayerCommand::QueueCustomVehicle {
+                    ref name,
+                    ref grid,
+                    purpose,
+                    required_animals,
+                } => {
+                    use crate::simulation::vehicle::{VehicleDesign, VehicleDesignId};
+                    let id = vehicle_registry.insert(VehicleDesign {
+                        id: VehicleDesignId(0), // reassigned by `insert`
+                        name: name.clone(),
+                        grid: grid.clone(),
+                        allowed_purpose: purpose,
+                        required_animals,
+                        tech_gates: Vec::new(),
+                        author_faction: Some(player_faction.faction_id),
+                        revision: 0,
+                    });
+                    vehicle_queue
+                        .entries
+                        .push((player_faction.faction_id, id));
                 }
                 _ => {
                     // Other commands need actors; skip a malformed event.
@@ -486,7 +518,8 @@ pub fn player_command_lifecycle_system(
             PlayerCommand::SendScout { .. }
             | PlayerCommand::SetMigrationIntent { .. }
             | PlayerCommand::SetPackedAutonomy { .. }
-            | PlayerCommand::QueueVehicle { .. } => Some(CommandStatus::Completed),
+            | PlayerCommand::QueueVehicle { .. }
+            | PlayerCommand::QueueCustomVehicle { .. } => Some(CommandStatus::Completed),
         };
         if let Some(new_status) = outcome {
             cmd.status = new_status;
@@ -1188,7 +1221,7 @@ fn dispatch_one(
             }
             DispatchOutcome::Active
         }
-        QueueVehicle { .. } => {
+        QueueVehicle { .. } | QueueCustomVehicle { .. } => {
             // Faction-level — applied directly in
             // `drain_player_command_events_system` (empty `actors`). If an
             // event ever arrives carrying actors, the dispatch is a no-op.

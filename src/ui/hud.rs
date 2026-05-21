@@ -37,6 +37,7 @@ pub struct HudResources<'w> {
     pub debug_state: ResMut<'w, DebugPanelState>,
     pub draft_req: ResMut<'w, DraftToggleRequest>,
     pub migration_panel: ResMut<'w, crate::ui::migration_panel::MigrationPanelOpen>,
+    pub vehicle_designer: ResMut<'w, crate::ui::vehicle_designer::VehicleDesignerState>,
     pub camera_view_z: Res<'w, CameraViewZ>,
     pub map_view_mode: ResMut<'w, MapViewMode>,
     pub calendar: Res<'w, Calendar>,
@@ -62,6 +63,7 @@ pub fn hud_system(
     let debug_state = &mut *res.debug_state;
     let draft_req = &mut *res.draft_req;
     let migration_panel = &mut *res.migration_panel;
+    let vehicle_designer = &mut *res.vehicle_designer;
     let camera_view_z = &*res.camera_view_z;
     let map_view_mode = &mut *res.map_view_mode;
     let calendar = &*res.calendar;
@@ -142,6 +144,15 @@ pub fn hud_system(
                         });
                         if ui.add(tech_btn).clicked() {
                             tech_panel_open.0 = !tech_panel_open.0;
+                        }
+
+                        let veh_btn = egui::Button::new("Vehicles").fill(if vehicle_designer.open {
+                            egui::Color32::from_rgb(140, 100, 200)
+                        } else {
+                            egui::Color32::from_gray(60)
+                        });
+                        if ui.add(veh_btn).clicked() {
+                            vehicle_designer.open = !vehicle_designer.open;
                         }
 
                         ui.separator();
