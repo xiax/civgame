@@ -1278,6 +1278,87 @@ pub fn vehicle_assembly_system(
     queue.entries = keep;
 }
 
+// ── Phase 3: occupancy index, clearance, rollover ─────────────────────────
+
+/// 2D tile → `Vehicle` entity index. A footprint tile is exclusive
+/// regardless of Z — two vehicles never share a tile. Rebuilt every tick by
+/// `vehicle_occupancy_sync_system`; the clearance-aware pathfinder treats an
+/// entry as a hard block.
+#[derive(Resource, Default)]
+pub struct VehicleOccupancyIndex(pub ahash::AHashMap<(i32, i32), Entity>);
+
+/// The XY tiles a design occupies when parked at `anchor` facing `heading`.
+pub fn footprint_tiles(
+    design: &VehicleDesign,
+    anchor: (i32, i32),
+    heading: u8,
+) -> Vec<(i32, i32)> {
+    let fp = VehicleFootprint::from_grid(&design.grid);
+    fp.offsets_by_heading[(heading % 4) as usize]
+        .iter()
+        .map(|o| (anchor.0 + o.x, anchor.1 + o.y))
+        .collect()
+}
+
+/// Sequential system (after movement): full rebuild of the occupancy index.
+/// Vehicles are few, so a clear-and-restamp is cheaper than incremental
+/// bookkeeping and is despawn-correct by construction.
+pub fn vehicle_occupancy_sync_system(
+    mut index: ResMut<VehicleOccupancyIndex>,
+    registry: Res<VehicleDesignRegistry>,
+    vehicles: Query<(Entity, &Vehicle)>,
+) {
+    index.0.clear();
+    for (e, v) in vehicles.iter() {
+        let Some(design) = registry.get(v.design_id) else {
+            continue;
+        };
+        for tile in footprint_tiles(design, v.anchor_tile, v.heading) {
+            index.0.insert(tile, e);
+        }
+    }
+}
+
+// ── rollover ──────────────────────────────────────────────────────────────
+
+/// Tip-torque tunables. Multiplied by the vehicle's COM height — a tall
+/// vehicle converts the same disturbance into far more overturning torque.
+const TURN_TORQUE_WEIGHT: f32 = 0.4;
+const SLOPE_TORQUE_WEIGHT: f32 = 0.5;
+const ROUGH_TORQUE_WEIGHT: f32 = 0.3;
+const OVERLOAD_TORQUE_WEIGHT: f32 = 0.6;
+
+/// The disturbances acting on a vehicle during one movement step.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RolloverContext {
+    /// Turn sharpness this step: `0` straight, `1` at the `turn_radius`
+    /// limit, `> 1` sharper than the vehicle should turn.
+    pub turn_sharpness: f32,
+    /// Absolute terrain Z-change on the step.
+    pub z_slope: i32,
+    /// Rough terrain underfoot (marsh / sand / scrub).
+    pub rough_terrain: bool,
+    /// `loaded_mass > max_payload` — the vehicle is over its rated load.
+    pub overloaded: bool,
+}
+
+/// Overturning torque produced by one movement step. Scaled by COM height so
+/// a tall narrow design genuinely tips and a wide low one barely registers.
+pub fn step_tip_torque(stats: &VehicleStats, ctx: &RolloverContext) -> f32 {
+    let disturbance = ctx.turn_sharpness.max(0.0) * TURN_TORQUE_WEIGHT
+        + ctx.z_slope.max(0) as f32 * SLOPE_TORQUE_WEIGHT
+        + if ctx.rough_terrain { ROUGH_TORQUE_WEIGHT } else { 0.0 }
+        + if ctx.overloaded { OVERLOAD_TORQUE_WEIGHT } else { 0.0 };
+    stats.center_of_mass.z.max(0.0) * disturbance
+}
+
+/// True when accumulated tip-torque has overcome the vehicle's `stability`.
+/// `stability` is `track_width / com_height`, so a wide low vehicle resists
+/// far more torque before overturning than a tall narrow one.
+pub fn vehicle_rolls_over(stats: &VehicleStats, accumulated_torque: f32) -> bool {
+    accumulated_torque > stats.stability
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1562,6 +1643,67 @@ mod tests {
         assert_eq!(
             bill.iter().find(|(r, _)| *r == copper).map(|(_, q)| *q),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn footprint_tiles_track_anchor_and_heading() {
+        let (_, registry) = load_vehicle_assets();
+        let wagon = registry.by_name("Four-Wheel Wagon").unwrap();
+        let h0 = footprint_tiles(wagon, (10, 10), 0);
+        let h1 = footprint_tiles(wagon, (10, 10), 1);
+        assert_eq!(h0.len(), h1.len(), "rotation preserves the tile count");
+        // Every tile is offset from the anchor.
+        assert!(h0.iter().all(|&(x, y)| x >= 10 && y >= 10));
+        // A 3-wide × 4-deep wagon footprint changes shape under rotation.
+        assert_ne!(h0, h1);
+    }
+
+    #[test]
+    fn wide_cart_on_road_does_not_roll() {
+        let data = data();
+        let (_, registry) = load_vehicle_assets();
+        let oxcart = registry.by_name("Ox Cart").unwrap();
+        let stats = derive_stats(&oxcart.grid, &data);
+        // Loaded, on a road: a gentle in-radius turn, no slope, no rough
+        // ground — but at its rated load.
+        let ctx = RolloverContext {
+            turn_sharpness: 0.6,
+            z_slope: 0,
+            rough_terrain: false,
+            overloaded: false,
+        };
+        let torque = step_tip_torque(&stats, &ctx);
+        assert!(
+            !vehicle_rolls_over(&stats, torque),
+            "a road-bound ox cart ({torque} vs stability {}) must not tip",
+            stats.stability
+        );
+    }
+
+    #[test]
+    fn tall_narrow_overloaded_on_slope_rolls() {
+        let data = data();
+        // A 1×1 column 4 cells tall — high COM, minimal track width.
+        let tall = grid_from(&[
+            (0, 0, 0, VehiclePartKind::Frame),
+            (0, 0, 1, VehiclePartKind::Frame),
+            (0, 0, 2, VehiclePartKind::Frame),
+            (0, 0, 3, VehiclePartKind::CrewSeat),
+        ]);
+        let stats = derive_stats(&tall, &data);
+        let ctx = RolloverContext {
+            turn_sharpness: 1.5,
+            z_slope: 1,
+            rough_terrain: true,
+            overloaded: true,
+        };
+        let torque = step_tip_torque(&stats, &ctx);
+        assert!(
+            vehicle_rolls_over(&stats, torque),
+            "a tall narrow overloaded vehicle on a slope ({torque} vs \
+             stability {}) must overturn",
+            stats.stability
         );
     }
 

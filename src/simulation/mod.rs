@@ -248,6 +248,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(husbandry::HitchingPostMap::default())
             .insert_resource(vehicle::VehicleYardMap::default())
             .insert_resource(vehicle::VehicleAssemblyQueue::default())
+            .insert_resource(vehicle::VehicleOccupancyIndex::default())
             .insert_resource(construction::StructureIndex::default())
             .insert_resource(construction::BlueprintMap::default())
             .insert_resource(construction::ConstructionPosterPool::default())
@@ -1169,6 +1170,14 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (vehicle::vehicle_assembly_system,).in_set(SimulationSet::Economy),
+            )
+            // Vehicle system (Phase 3): rebuild the tile → vehicle occupancy
+            // index after movement settles, before vision / combat read it.
+            .add_systems(
+                FixedUpdate,
+                vehicle::vehicle_occupancy_sync_system
+                    .after(movement::sync_indexed_after_move_system)
+                    .in_set(SimulationSet::Sequential),
             )
             // Phase 4 (sanitation): emit pass writes `WastePile` intensity
             // into `SanitationMap`; decay pass exponentially shrinks every

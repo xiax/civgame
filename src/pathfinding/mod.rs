@@ -14,6 +14,7 @@ pub mod path_request;
 pub mod pool;
 pub mod step;
 pub mod tile_cost;
+pub mod vehicle_path;
 pub mod worker;
 
 pub struct PathfindingPlugin;

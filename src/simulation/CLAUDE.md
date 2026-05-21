@@ -404,7 +404,7 @@ The cart half of draftwork: a composable draft-animal vehicle that ferries bulk 
 
 **Simplification vs. plan:** parts are data on the `Cart` (frame + wheel `ResourceId`), not separate child entities; `Hitch`/`UnhitchAndPark` are folded into the `CartHaul` executor (no separate animation tasks — same precedent as the v2.0 plow). Cart durability decrements but never blocks (repair task deferred). Plan: `plans/animal-husbandry-v2-draftwork.md`.
 
-## Vehicle system (`vehicle.rs`) — Phases 1-2
+## Vehicle system (`vehicle.rs`) — Phases 1-3
 
 Freeform customizable-vehicle subsystem (`plans/vehicle-system.md`); supersedes `cart.rs` in a later phase. Designs live on a bounded **3D cell grid** (6 wide × 4 deep × 4 tall) — height is load-bearing for mass / stability / clearance / combat.
 
@@ -414,7 +414,11 @@ Freeform customizable-vehicle subsystem (`plans/vehicle-system.md`); supersedes 
 - **VehicleYard** (`BuildSiteKind::VehicleYard`, 12 wood + 6 stone, `ANIMAL_HUSBANDRY`) — assembly + parking anchor; `VehicleYardMap` on the `PenMap` hook pattern. `HitchingPost.parked_cart` renamed `parked_vehicle`.
 - **Assembly.** `PlayerCommand::QueueVehicle { design_id }` (faction-level, empty `actors`) → `VehicleAssemblyQueue`; right-click a player VehicleYard → "Assemble Vehicle ▸" submenu. `vehicle_assembly_system` (Economy, 60-tick cadence) drains the queue: `design_bill` (one unit per cell material + a `tools` per mechanical cell) checked against faction storage, consumed, then a parked `Vehicle` is spawned at the yard.
 
-**Simplification vs. plan:** Phase 2 ships an autonomous `vehicle_assembly_system` (the `cart_assembly_system` precedent) rather than the full `JobKind::Assemble` + `HaulToVehicleOrder`/`AssembleVehicle` worker-task pipeline; the spawned `Vehicle` has no `Indexed` yet (`VehicleOccupancyIndex` lands in Phase 3). Phases 3-7 (clearance-aware pathing, rollover, cargo-haul migration, designer UI, combat) pending.
+- **Pathfinding (Phase 3).** `pathfinding::vehicle_path::footprint_astar` — heading-aware A* over `VehicleNode { x, y, z, heading }`. Successors: forward / forward-diagonal translates (z ±1) + turn-in-place (cost from `turn_radius`); each candidate rotates the footprint to the heading and tests every cell via a generic `cell_ok(x,y,z)` closure (the live caller folds `ChunkMap::passable_at` + `vertical_clearance_at` + `VehicleOccupancyIndex`). Generic over the closure so the module has no `simulation::` dependency. `ChunkMap::vertical_clearance_at(x,y)` counts open `Air`/`Ramp` Z-levels above the surface — clearance gating for tall vehicles.
+- **Occupancy (Phase 3).** `VehicleOccupancyIndex` (tile → `Vehicle` entity, 2D) — full rebuild each tick by `vehicle_occupancy_sync_system` (Sequential, after `sync_indexed_after_move_system`). `footprint_tiles(design, anchor, heading)` is the shared footprint enumerator.
+- **Rollover (Phase 3).** Pure functions: `step_tip_torque(stats, RolloverContext)` scales turn/slope/rough/overload disturbance by COM height; `vehicle_rolls_over(stats, torque)` compares accumulated torque to `stability`. Tuned so a road-bound loaded ox cart never tips while a tall narrow overloaded design on a slope does.
+
+**Simplification vs. plan:** Phase 2 ships an autonomous `vehicle_assembly_system` (the `cart_assembly_system` precedent) rather than the full `JobKind::Assemble` worker-task pipeline. Phase 3 ships the pathfinder, occupancy index, clearance helper, and rollover *logic*; the live vehicle movement system (`VehiclePathFollow`, the rollover Bevy system, crew ejection) lands in Phase 4 — nothing moves a vehicle until the cargo-haul task exists. Phases 4-7 (cargo-haul migration, designer UI, combat, docs) pending.
 
 ## Animal spawn distribution (`animals.rs::spawn_animals`)
 

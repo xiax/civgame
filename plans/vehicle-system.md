@@ -295,6 +295,13 @@ Manual acceptance (`cargo run`, never `--sandbox`, Bronze Age start):
   suite (940) pass. **Simplification:** autonomous assembly system (`cart_assembly_system`
   precedent), not the full `JobKind::Assemble` worker-task pipeline; `Vehicle` carries no
   `Indexed` yet (Phase 3). Phases 3-7 pending.
+- **Phase 3 — shipped (logic).** `ChunkMap::vertical_clearance_at`; `pathfinding/vehicle_path.rs`
+  `footprint_astar` (heading/turn-radius/clearance A* over `VehicleNode`, generic `cell_ok`
+  closure); `VehicleOccupancyIndex` + `vehicle_occupancy_sync_system` + `footprint_tiles`;
+  rollover pure fns `step_tip_torque` / `vehicle_rolls_over`. 25 vehicle tests + full suite
+  (949) pass. **Deferred to Phase 4:** the live vehicle movement system (`VehiclePathFollow`,
+  the rollover Bevy system, crew ejection / cargo spill) — nothing moves a vehicle until the
+  cargo-haul task exists, so the movement wiring lands with Phase 4. Phases 4-7 pending.
 
 ## Assumptions
 

@@ -481,6 +481,33 @@ impl ChunkMap {
         matches!(head.kind, TileKind::Air | TileKind::Ramp)
     }
 
+    /// Number of open `Air` / `Ramp` Z-levels directly above the surface at
+    /// `(tile_x, tile_y)`, counted until the first solid tile (or `Z_MAX`).
+    /// Drives vehicle vertical-clearance gating — a vehicle spanning
+    /// `height_z` world Z-levels needs `vertical_clearance_at >= height_z`
+    /// over every footprint tile or it fails at the overhang / tunnel mouth.
+    /// Returns 0 for an unloaded chunk.
+    pub fn vertical_clearance_at(&self, tile_x: i32, tile_y: i32) -> i32 {
+        let surf = self.surface_z_at(tile_x, tile_y);
+        if surf < Z_MIN {
+            return 0;
+        }
+        let mut clear = 0;
+        let mut z = surf + 1;
+        while z <= Z_MAX {
+            if matches!(
+                self.tile_at(tile_x, tile_y, z).kind,
+                TileKind::Air | TileKind::Ramp
+            ) {
+                clear += 1;
+                z += 1;
+            } else {
+                break;
+            }
+        }
+        clear
+    }
+
     /// 3D step passability for an agent moving from (sx,sy,sz) to (dx,dy,dz).
     /// 8-connected in XY, |Δz| ≤ 1. Both endpoints must be standable.
     pub fn passable_step_3d(&self, from: (i32, i32, i32), to: (i32, i32, i32)) -> bool {
