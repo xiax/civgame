@@ -671,13 +671,19 @@ impl GoalScorer for SurvivalHungerScorer {
             "Very Hungry"
         } else if ctx.needs.hunger > 180.0 && has_food {
             "Hungry (Eating)"
-        } else if ctx.needs.hunger > 150.0 && !has_food {
+        } else if ctx.needs.hunger >= crate::simulation::needs::EAT_TRIGGER_HUNGER as f32
+            && !has_food
+        {
             "Hungry"
         } else {
-            // Below every legacy cliff — no HTN food/eat method will
-            // match. Returning Survive here would pin the agent on a
-            // goal that can't decompose into a task. Fall through to
-            // lower-class scorers instead.
+            // Below the dispatcher gate (EAT_TRIGGER_HUNGER, 180) no HTN
+            // food/eat method's precondition matches and both food
+            // dispatchers early-return. Emitting Survive here would pin
+            // the agent on a Survival-class, work-preempting goal that
+            // can't decompose into a task. Fall through to lower-class
+            // scorers instead — sub-180 hunger prep is faction/economy
+            // scope (GatherFood / Stockpile postings), not personal
+            // Survive.
             return None;
         };
         Some(
@@ -1346,12 +1352,13 @@ mod tests {
         (reg, fid)
     }
 
+    /// Boundary: empty-handed `Survive` fires exactly at the dispatcher
+    /// gate `EAT_TRIGGER_HUNGER (180)` — not below it (where no food task
+    /// can decompose), and not just above it.
     #[test]
-    fn survival_scorer_fires_above_foraging_threshold() {
+    fn survival_scorer_fires_at_dispatcher_gate() {
         let (reg, fid) = make_faction();
         let faction = reg.factions.get(&fid).unwrap();
-        let mut needs = Needs::default();
-        needs.hunger = 175.0;
         let agent = EconomicAgent::default();
         let member = FactionMember {
             faction_id: fid,
@@ -1359,13 +1366,28 @@ mod tests {
         };
         let board = JobBoard::default();
         let skills = Skills::default();
+
+        // Just below the gate: no Survive — the goal could not decompose.
+        let mut needs = Needs::default();
+        needs.hunger = 179.0;
         let ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
-        let score = SurvivalHungerScorer
-            .score(&ctx)
-            .expect("hunger above 150 fires");
-        assert_eq!(score.class, GoalClass::Survival);
-        assert_eq!(score.goal, AgentGoal::Survive);
-        assert!(score.score > 0.4);
+        assert!(
+            SurvivalHungerScorer.score(&ctx).is_none(),
+            "hunger 179 must not emit Survive — below the 180 dispatcher gate",
+        );
+
+        // At and above the gate: Survive fires.
+        for h in [180.0_f32, 200.0] {
+            let mut needs = Needs::default();
+            needs.hunger = h;
+            let ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
+            let score = SurvivalHungerScorer
+                .score(&ctx)
+                .unwrap_or_else(|| panic!("hunger {h} fires"));
+            assert_eq!(score.class, GoalClass::Survival);
+            assert_eq!(score.goal, AgentGoal::Survive);
+            assert!(score.score > 0.4);
+        }
     }
 
     #[test]
@@ -1385,12 +1407,12 @@ mod tests {
         assert!(SurvivalHungerScorer.score(&ctx).is_none());
     }
 
-    /// Regression: the scorer must NOT emit `Survive` in the dead-zone
-    /// between `hunger_utility >= 0.10` (~hunger 110) and the legacy
-    /// `HUNGER_FORAGE_REQUIRED = 150` cliff. Every HTN food/eat method
-    /// gates on `hunger >= EAT_TRIGGER_HUNGER (180)`; emitting Survive
-    /// at hunger 120 pins the agent on a goal that can't decompose into
-    /// a task.
+    /// Regression: the scorer must NOT emit `Survive` anywhere below the
+    /// dispatcher gate `EAT_TRIGGER_HUNGER (180)`. Every HTN food/eat
+    /// method gates on `hunger >= 180` and both food dispatchers
+    /// early-return below it, so emitting Survive at e.g. hunger 155 pins
+    /// the agent on a Survival-class, work-preempting goal that can't
+    /// decompose into a task.
     #[test]
     fn survival_scorer_silent_in_pre_cliff_dead_zone() {
         let (reg, fid) = make_faction();
@@ -1402,7 +1424,7 @@ mod tests {
         };
         let board = JobBoard::default();
         let skills = Skills::default();
-        for h in [110.0_f32, 120.0, 140.0, 149.0] {
+        for h in [110.0_f32, 120.0, 140.0, 149.0, 155.0, 170.0, 179.0] {
             let mut needs = Needs::default();
             needs.hunger = h;
             let ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
@@ -1614,7 +1636,7 @@ mod tests {
         let (reg, fid) = make_faction();
         let faction = reg.factions.get(&fid).unwrap();
         let mut needs = Needs::default();
-        needs.hunger = 160.0; // forage-required tier; SurvivalHungerScorer fires moderately
+        needs.hunger = 190.0; // above the 180 gate; SurvivalHungerScorer fires moderately
         let agent = EconomicAgent::default();
         let member = FactionMember {
             faction_id: fid,
@@ -1857,8 +1879,8 @@ mod tests {
     }
 
     /// Survival precedence holds even after Phase B/C wiring: across
-    /// the grid, every (hunger ≥ HUNGER_FORAGE_REQUIRED, no held food)
-    /// tuple must pick `Survive` regardless of every other axis.
+    /// the grid, every (hunger ≥ EAT_TRIGGER_HUNGER, no held food) tuple
+    /// must pick `Survive` regardless of every other axis.
     #[test]
     fn sweep_survival_precedence_is_total() {
         let (reg, fid) = make_faction();
@@ -1873,7 +1895,7 @@ mod tests {
         let mut registry = GoalScorerRegistry::default();
         register_default_scorers(&mut registry);
 
-        for hunger in [155.0, 180.0, 210.0] {
+        for hunger in [180.0, 200.0, 210.0] {
             for social in [50.0, 220.0] {
                 for greg in [10_u8, 240] {
                     let mut needs = Needs::default();
@@ -1891,6 +1913,41 @@ mod tests {
                     );
                     assert_eq!(pick.class, GoalClass::Survival);
                 }
+            }
+        }
+    }
+
+    /// Claimed-worker protection: in the 150–180 band an empty-handed
+    /// agent must NOT surface a Survival-class `Survive` goal. `Survive`
+    /// is `UninterruptibleExceptSurvival` and preempts claimed work; a
+    /// worker re-evaluating goals at hunger 175 would otherwise drop its
+    /// job for a goal that can't decompose into a task. Survive may only
+    /// preempt at or above the 180 dispatcher gate.
+    #[test]
+    fn no_survival_preempt_below_dispatcher_gate() {
+        let (reg, fid) = make_faction();
+        let faction = reg.factions.get(&fid).unwrap();
+        let agent = EconomicAgent::default();
+        let member = FactionMember {
+            faction_id: fid,
+            ..Default::default()
+        };
+        let board = JobBoard::default();
+        let skills = Skills::default();
+        let mut registry = GoalScorerRegistry::default();
+        register_default_scorers(&mut registry);
+
+        for hunger in [155.0_f32, 170.0, 179.0] {
+            let mut needs = Needs::default();
+            needs.hunger = hunger;
+            let ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
+            if let Some(pick) = registry.best(&ctx) {
+                assert_ne!(
+                    pick.class,
+                    GoalClass::Survival,
+                    "hunger {hunger}: no Survival-class goal may preempt below the 180 gate — got {:?}",
+                    pick.goal,
+                );
             }
         }
     }

@@ -2,7 +2,7 @@ use super::construction::{AutonomousBuildingToggle, Blueprint, BlueprintMap};
 use super::faction::{FactionChief, FactionMember, FactionRegistry, StorageTileMap, SOLO};
 use super::jobs::JobClaim;
 use super::lod::LodLevel;
-use super::needs::Needs;
+use super::needs::{Needs, EAT_TRIGGER_HUNGER};
 use super::person::{AiState, Drafted, PersonAI, UNEMPLOYED_TASK_KIND};
 use super::schedule::{BucketSlot, SimClock};
 use crate::economy::agent::EconomicAgent;
@@ -30,23 +30,27 @@ use bevy::prelude::*;
 // arithmetic. Tune them here in one place; `goal_update_system` references
 // them by name.
 
+/// The single hunger threshold at which a food task becomes executable: the
+/// scorer/cascade may emit personal `Survive`, the AcquireFood dispatcher acts,
+/// and every food HTN method's precondition is satisfied. Held equal to
+/// `EAT_TRIGGER_HUNGER` so goal selection and HTN gates cannot drift — emitting
+/// `Survive` below this would pin the agent on a goal that can't decompose.
+const HUNGER_ACT: f32 = EAT_TRIGGER_HUNGER as f32;
 /// Below this hunger an agent will start a Build/Lead task; above it the
-/// agent prioritises Survive.
-const HUNGER_WORK_CEILING: f32 = 150.0;
+/// agent prioritises Survive. Aligned with `HUNGER_ACT` so there is no band
+/// where the agent stops taking work but Survive cannot yet fire.
+const HUNGER_WORK_CEILING: f32 = HUNGER_ACT;
 /// Above this hunger an agent enters Survive even if they have food on hand.
 const HUNGER_SURVIVE_DESPERATE: f32 = 200.0;
 /// Above this hunger an agent enters Survive when they hold food (eating it
 /// is faster than going hungry).
-const HUNGER_EAT_HELD: f32 = 180.0;
+const HUNGER_EAT_HELD: f32 = HUNGER_ACT;
 /// Above this hunger an agent enters Survive when they have NO food (must go
-/// hunt/forage immediately).
-const HUNGER_FORAGE_REQUIRED: f32 = 150.0;
+/// hunt/forage immediately). Equals `HUNGER_ACT`: emergency foraging starts
+/// exactly when the AcquireFood dispatcher / methods are willing to act.
+const HUNGER_FORAGE_REQUIRED: f32 = HUNGER_ACT;
 /// Above this hunger the starvation flag fires (used for emergency reactions).
-/// Held at `EAT_TRIGGER_HUNGER` so the goal label flips at exactly the same
-/// hunger level the AcquireFood dispatcher / methods are willing to act on —
-/// otherwise an agent in (HUNGER_STARVING, EAT_TRIGGER_HUNGER) is labelled
-/// "Starving (Faction has food)" while every dispatcher silently bails.
-const HUNGER_STARVING: f32 = 180.0;
+const HUNGER_STARVING: f32 = HUNGER_ACT;
 /// Above this sleep need an agent enters Sleep.
 const SLEEP_TIRED: f32 = 180.0;
 /// Above this sleep need an agent prefers not to start a long task.
