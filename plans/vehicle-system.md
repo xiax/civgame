@@ -281,6 +281,21 @@ Manual acceptance (`cargo run`, never `--sandbox`, Bronze Age start):
 - **Save-game serialization** of freeform designs — blocked on the project having no save
   layer; `VehicleDesignRegistry` is a single serializable resource when one lands.
 
+## Progress
+
+- **Phase 1 — shipped.** `src/simulation/vehicle.rs` (data model, enums, validation,
+  `derive_stats`, `VehicleFootprint`, `VehicleInventory`) + `assets/data/vehicles/core.ron`
+  (6 materials, 10 parts, 5 stock templates) + tolerant loader `load_vehicle_assets`
+  (`VehicleData` + `VehicleDesignRegistry` resources, inserted in `SimulationPlugin::build`).
+- **Phase 2 — shipped.** `BuildSiteKind::VehicleYard` (12 wood + 6 stone, `ANIMAL_HUSBANDRY`)
+  + `VehicleYard`/`VehicleYardMap` (hook pattern). `HitchingPost.parked_cart`→`parked_vehicle`.
+  `PlayerCommand::QueueVehicle` + right-click "Assemble Vehicle" submenu →
+  `VehicleAssemblyQueue` → `vehicle_assembly_system` (Economy, cadence-gated): `design_bill`
+  consumed from faction storage, parked `Vehicle` spawned at the yard. 16 vehicle tests + full
+  suite (940) pass. **Simplification:** autonomous assembly system (`cart_assembly_system`
+  precedent), not the full `JobKind::Assemble` worker-task pipeline; `Vehicle` carries no
+  `Indexed` yet (Phase 3). Phases 3-7 pending.
+
 ## Assumptions
 
 - First playable content stops at ancient vehicles; tank/siege parts are extension points.

@@ -86,6 +86,7 @@ pub mod test_fixture;
 pub mod trader;
 pub mod typed_task;
 pub mod utility_curves;
+pub mod vehicle;
 pub mod well;
 pub mod wild_herd;
 pub mod world_sim;
@@ -161,6 +162,21 @@ impl Plugin for SimulationPlugin {
             .on_add(husbandry::on_hitching_post_add)
             .on_remove(husbandry::on_hitching_post_remove);
 
+        // Vehicle system (Phase 2): VehicleYard tile index — same on_add /
+        // on_remove hook pattern as the husbandry maps.
+        app.world_mut()
+            .register_component_hooks::<vehicle::VehicleYard>()
+            .on_add(vehicle::on_vehicle_yard_add)
+            .on_remove(vehicle::on_vehicle_yard_remove);
+
+        // Vehicle system: load the material / part catalog + stock-template
+        // design registry from `assets/data/vehicles/*.ron`. Inserted here
+        // (not in `WorldPlugin`) so the headless test fixture — which builds
+        // `SimulationPlugin` without `WorldPlugin` — also has them.
+        let (vehicle_data, vehicle_registry) = vehicle::load_vehicle_assets();
+        app.insert_resource(vehicle_data);
+        app.insert_resource(vehicle_registry);
+
         app.add_plugins(jobs::JobsPlugin)
             .add_plugins(projects::ProjectsPlugin)
             .add_event::<combat::CombatEvent>()
@@ -230,6 +246,8 @@ impl Plugin for SimulationPlugin {
             .insert_resource(husbandry::StableMap::default())
             .insert_resource(husbandry::FeedTroughMap::default())
             .insert_resource(husbandry::HitchingPostMap::default())
+            .insert_resource(vehicle::VehicleYardMap::default())
+            .insert_resource(vehicle::VehicleAssemblyQueue::default())
             .insert_resource(construction::StructureIndex::default())
             .insert_resource(construction::BlueprintMap::default())
             .insert_resource(construction::ConstructionPosterPool::default())
@@ -1145,6 +1163,12 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (cart::cart_assembly_system,).in_set(SimulationSet::Economy),
+            )
+            // Vehicle system (Phase 2): cadence-gated assembly — drains
+            // `VehicleAssemblyQueue` into spawned parked `Vehicle` entities.
+            .add_systems(
+                FixedUpdate,
+                (vehicle::vehicle_assembly_system,).in_set(SimulationSet::Economy),
             )
             // Phase 4 (sanitation): emit pass writes `WastePile` intensity
             // into `SanitationMap`; decay pass exponentially shrinks every

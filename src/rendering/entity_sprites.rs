@@ -1859,6 +1859,9 @@ pub fn spawn_blueprint_sprites(
             // reads better.
             BuildSiteKind::Pen | BuildSiteKind::Stable => textures.wall_palisade_ascii.clone(),
             BuildSiteKind::FeedTrough | BuildSiteKind::HitchingPost => textures.table_ascii.clone(),
+            // Stub: a vehicle yard reads as a timber work-area — reuse the
+            // workbench sprite until dedicated art ships.
+            BuildSiteKind::VehicleYard => textures.workbench_ascii.clone(),
         };
 
         let mut ghost_sprite = Sprite::from_image(ghost_img);

@@ -54,6 +54,8 @@ pub enum MenuAction {
     ReadItem(crate::simulation::technology::TechId),
     /// Faction-level: craft a tablet encoding the given tech.
     EncodeTablet(crate::simulation::technology::TechId),
+    /// Faction-level: queue a vehicle design for assembly at a Vehicle Yard.
+    QueueVehicle(u32),
     /// Pitch the player faction's mobile camp at this tile (only
     /// available when `caps.home.is_mobile()` and `camp_state ==
     /// Packed`). The chief is the dispatched actor; the apply system
@@ -98,6 +100,7 @@ impl MenuAction {
                 BuildSiteKind::Stable => "Build Stable",
                 BuildSiteKind::FeedTrough => "Build Feed Trough",
                 BuildSiteKind::HitchingPost => "Build Hitching Post",
+                BuildSiteKind::VehicleYard => "Build Vehicle Yard",
             },
             MenuAction::DigDown => "Dig Down",
             MenuAction::Deconstruct => "Deconstruct",
@@ -108,6 +111,7 @@ impl MenuAction {
             MenuAction::HoldLecture(_) => "Hold Lecture",
             MenuAction::ReadItem(_) => "Read",
             MenuAction::EncodeTablet(_) => "Encode Tablet",
+            MenuAction::QueueVehicle(_) => "Assemble Vehicle",
             MenuAction::PitchCampHere => "Pitch Camp Here",
         }
     }
@@ -145,17 +149,21 @@ pub struct ContextMenuState {
     pub tile_entities: Vec<TileEntityInfo>,
     /// Ground-item stacks on the target tile (Section 3).
     pub tile_items: Vec<TileItemInfo>,
+    /// Stock vehicle designs offered when the target tile holds a
+    /// player-faction `VehicleYard`. `(action, display name)`.
+    pub vehicle_options: Vec<(MenuAction, String)>,
 }
 
 impl ContextMenuState {
     fn clear_tile_data(&mut self) {
         self.tile_entities.clear();
         self.tile_items.clear();
+        self.vehicle_options.clear();
     }
 }
 
 /// All build options the player could potentially place on an open tile.
-fn all_build_options() -> [BuildSiteKind; 19] {
+fn all_build_options() -> [BuildSiteKind; 20] {
     [
         BuildSiteKind::Wall(WallMaterial::Palisade),
         BuildSiteKind::Wall(WallMaterial::WattleDaub),
@@ -176,6 +184,7 @@ fn all_build_options() -> [BuildSiteKind; 19] {
         BuildSiteKind::Monument,
         BuildSiteKind::Latrine,
         BuildSiteKind::Well,
+        BuildSiteKind::VehicleYard,
     ]
 }
 
@@ -230,6 +239,10 @@ pub struct RoutingResources<'w, 's> {
     // poster pool, not faction-wide community adoption.
     pub poster_pool: Res<'w, crate::simulation::construction::ConstructionPosterPool>,
     pub settlement_map: Res<'w, crate::simulation::settlement::SettlementMap>,
+    // Vehicle system (Phase 2): yard lookup + stock-design listing for the
+    // "Assemble Vehicle" submenu.
+    pub vehicle_yard_map: Res<'w, crate::simulation::vehicle::VehicleYardMap>,
+    pub vehicle_registry: Res<'w, crate::simulation::vehicle::VehicleDesignRegistry>,
     #[system_param(ignore)]
     pub _marker: std::marker::PhantomData<&'s ()>,
 }
@@ -247,6 +260,7 @@ pub fn right_click_context_menu_system(
     spatial: Res<SpatialIndex>,
     tile_display: TileDisplayQueries,
     routing: RoutingResources,
+    vehicle_yard_q: Query<&crate::simulation::vehicle::VehicleYard>,
     mut menu_state: ResMut<ContextMenuState>,
     mut cmd_events: EventWriter<crate::simulation::player_command::PlayerCommandEvent>,
 ) {
@@ -437,6 +451,24 @@ pub fn right_click_context_menu_system(
                         }
                     }
 
+                    // Vehicle system (Phase 2): a player-faction Vehicle
+                    // Yard on this tile offers an "Assemble Vehicle" submenu
+                    // of every stock design.
+                    if let Some(&yard_e) = routing.vehicle_yard_map.0.get(&pos_tile) {
+                        let own_yard = vehicle_yard_q
+                            .get(yard_e)
+                            .map(|y| y.faction_id == player_faction.faction_id)
+                            .unwrap_or(false);
+                        if own_yard {
+                            for d in routing.vehicle_registry.iter() {
+                                menu_state.vehicle_options.push((
+                                    MenuAction::QueueVehicle(d.id.0),
+                                    format!("Assemble {}", d.name),
+                                ));
+                            }
+                        }
+                    }
+
                     menu_state.open = true;
                     menu_state.screen_pos = egui::pos2(cursor_pos.x, cursor_pos.y);
                     menu_state.target_tile = pos_tile;
@@ -462,6 +494,7 @@ pub fn right_click_context_menu_system(
 
     let actions = menu_state.actions.clone();
     let build_options = menu_state.build_options.clone();
+    let vehicle_options = menu_state.vehicle_options.clone();
     let target_tile = menu_state.target_tile;
     let target_z = menu_state.target_z;
     // Clone enough display data to use in the closure without borrow issues.
@@ -507,6 +540,18 @@ pub fn right_click_context_menu_system(
                             let resp = ui.add_enabled(*unlocked, btn);
                             if resp.clicked() {
                                 chosen = Some(*opt);
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                }
+
+                // Section 1b — Vehicle Yard assembly submenu.
+                if !vehicle_options.is_empty() {
+                    ui.menu_button("Assemble Vehicle \u{25B8}", |ui| {
+                        for (act, name) in &vehicle_options {
+                            if ui.button(name).clicked() {
+                                chosen = Some(*act);
                                 ui.close_menu();
                             }
                         }
@@ -574,6 +619,18 @@ pub fn right_click_context_menu_system(
         });
 
     if let Some(action) = chosen {
+        // QueueVehicle is faction-level — emit with empty `actors` so the
+        // drain system applies it directly (no per-worker dispatch).
+        if let MenuAction::QueueVehicle(design_id) = action {
+            cmd_events.send(crate::simulation::player_command::PlayerCommandEvent {
+                actors: Vec::new(),
+                command: crate::simulation::player_command::PlayerCommand::QueueVehicle {
+                    design_id,
+                },
+            });
+            menu_state.open = false;
+            return;
+        }
         if let Some(cmd) = menu_action_to_command(action, target_tile, target_z) {
             // Broadcast to every non-drafted player-faction worker in
             // `SelectedEntities`. Drafted units are owned by
@@ -664,6 +721,7 @@ fn menu_action_to_command(
         MenuAction::HoldLecture(tech) => PlayerCommand::HoldLecture { tech },
         MenuAction::ReadItem(tech) => PlayerCommand::ReadItem { tech },
         MenuAction::EncodeTablet(tech) => PlayerCommand::EncodeTablet { tech },
+        MenuAction::QueueVehicle(design_id) => PlayerCommand::QueueVehicle { design_id },
         MenuAction::PitchCampHere => PlayerCommand::PitchCamp {
             tile: target_tile,
             z: target_z,

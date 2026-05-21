@@ -382,7 +382,7 @@ pub fn cart_assembly_system(
         }
         // Find a free hitching post owned by this faction.
         let Some((post_entity, post_tile)) = posts.iter().find_map(|(e, p)| {
-            if p.faction_id == faction_id && p.parked_cart.is_none() {
+            if p.faction_id == faction_id && p.parked_vehicle.is_none() {
                 Some((e, p.tile))
             } else {
                 None
@@ -496,7 +496,7 @@ pub fn cart_assembly_system(
             post_tile,
         );
         if let Ok((_, mut post)) = posts.get_mut(post_entity) {
-            post.parked_cart = Some(cart);
+            post.parked_vehicle = Some(cart);
         }
         cart_factions.insert(faction_id);
     }
@@ -639,8 +639,8 @@ pub fn htn_cart_haul_dispatch_system(
             }
             if let Some(post_e) = freed_post {
                 if let Ok((_, mut post)) = posts_q.get_mut(post_e) {
-                    if post.parked_cart == Some(cart_e) {
-                        post.parked_cart = None;
+                    if post.parked_vehicle == Some(cart_e) {
+                        post.parked_vehicle = None;
                     }
                 }
             }
@@ -730,7 +730,7 @@ fn repark_cart(
         .unwrap_or(u32::MAX);
     let post_e = posts_q
         .iter()
-        .find(|(_, p)| p.faction_id == faction && p.parked_cart.is_none())
+        .find(|(_, p)| p.faction_id == faction && p.parked_vehicle.is_none())
         .map(|(e, _)| e);
     if let Ok((mut cart, _)) = carts_q.get_mut(cart_e) {
         cart.hauler = None;
@@ -739,7 +739,7 @@ fn repark_cart(
     }
     if let Some(pe) = post_e {
         if let Ok((_, mut post)) = posts_q.get_mut(pe) {
-            post.parked_cart = Some(cart_e);
+            post.parked_vehicle = Some(cart_e);
         }
     }
 }

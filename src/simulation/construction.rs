@@ -562,6 +562,10 @@ pub enum BuildSiteKind {
     /// Single hitching post — placeholder for v2 cart/plow integration.
     /// Tech-gate `ANIMAL_HUSBANDRY` (cheap, no functional payload yet).
     HitchingPost,
+    /// Vehicle yard — assembly + parking anchor for the vehicle system.
+    /// Finalises to a `vehicle::VehicleYard` entity. Tech-gated on
+    /// `ANIMAL_HUSBANDRY`. See `plans/vehicle-system.md`.
+    VehicleYard,
 }
 
 /// Marker component on tile entities representing portable shelter.
@@ -614,6 +618,7 @@ impl BuildSiteKind {
             BuildSiteKind::Stable => "Stable",
             BuildSiteKind::FeedTrough => "Feed Trough",
             BuildSiteKind::HitchingPost => "Hitching Post",
+            BuildSiteKind::VehicleYard => "Vehicle Yard",
         }
     }
 
@@ -870,6 +875,7 @@ enum BuildRecipeIdx {
     Stable,
     FeedTrough,
     HitchingPost,
+    VehicleYard,
 }
 
 fn build_recipes_table() -> Vec<BuildRecipe> {
@@ -1108,6 +1114,15 @@ fn build_recipes_table() -> Vec<BuildRecipe> {
             work_ticks: 20,
             tech_gate: Some(ANIMAL_HUSBANDRY),
             deconstruct_refund: vec![(wood, 1)],
+        },
+        // Vehicle yard — assembly + parking anchor. Timber-framed work area
+        // with stone footings. Tech-gated on `ANIMAL_HUSBANDRY`.
+        BuildRecipe {
+            name: "Vehicle Yard",
+            inputs: vec![(wood, 12), (stone, 6)],
+            work_ticks: 120,
+            tech_gate: Some(ANIMAL_HUSBANDRY),
+            deconstruct_refund: vec![(wood, 6), (stone, 3)],
         },
     ]
 }
@@ -1911,6 +1926,7 @@ pub fn recipe_for(kind: BuildSiteKind) -> &'static BuildRecipe {
         BuildSiteKind::Stable => BuildRecipeIdx::Stable,
         BuildSiteKind::FeedTrough => BuildRecipeIdx::FeedTrough,
         BuildSiteKind::HitchingPost => BuildRecipeIdx::HitchingPost,
+        BuildSiteKind::VehicleYard => BuildRecipeIdx::VehicleYard,
     };
     &build_recipes()[idx as usize]
 }
@@ -6858,6 +6874,19 @@ pub fn construction_system(
                     .spawn((
                         crate::simulation::husbandry::HitchingPost::new(bp.faction_id, tile),
                         StructureLabel(BuildSiteKind::HitchingPost.label()),
+                        Transform::from_xyz(world_pos.x, world_pos.y, 0.2),
+                        GlobalTransform::default(),
+                        Visibility::Visible,
+                        InheritedVisibility::default(),
+                    ))
+                    .id(),
+                BuildSiteKind::VehicleYard => commands
+                    .spawn((
+                        crate::simulation::vehicle::VehicleYard {
+                            faction_id: bp.faction_id,
+                            tile,
+                        },
+                        StructureLabel(BuildSiteKind::VehicleYard.label()),
                         Transform::from_xyz(world_pos.x, world_pos.y, 0.2),
                         GlobalTransform::default(),
                         Visibility::Visible,

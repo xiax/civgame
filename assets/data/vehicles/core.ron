@@ -1,0 +1,112 @@
+// Vehicle system — core data file (Phase 1).
+//
+// `materials` profiles are keyed by an existing catalog resource key; a
+// material whose resource is absent from the catalog is skipped (tolerant
+// loader). `parts` define per-cell structural mass + capacities. `templates`
+// are the stock freeform designs assembled on a 3D cell grid.
+//
+// Grid axes: x = width (right), y = depth (forward), z = up. One grid
+// Z-cell = one world Z-level. Bounds: 6 wide x 4 deep x 4 tall.
+VehicleDataFile(
+    materials: [
+        MaterialProfile(resource: "wood",   density_pct: 100, strength: 40,  friction: 50, traction: 55, durability: 200),
+        MaterialProfile(resource: "stone",  density_pct: 250, strength: 70,  friction: 65, traction: 30, durability: 320),
+        MaterialProfile(resource: "skin",   density_pct: 35,  strength: 10,  friction: 40, traction: 40, durability: 80),
+        MaterialProfile(resource: "copper", density_pct: 380, strength: 85,  friction: 55, traction: 60, durability: 280),
+        MaterialProfile(resource: "tin",    density_pct: 260, strength: 60,  friction: 55, traction: 55, durability: 240),
+        MaterialProfile(resource: "iron",   density_pct: 400, strength: 110, friction: 50, traction: 80, durability: 420),
+    ],
+    parts: [
+        PartDef(kind: frame,        base_mass_g: 4000, cargo_volume_g: 0,     crew_capacity: 0, tech_gates: []),
+        PartDef(kind: deck,         base_mass_g: 3000, cargo_volume_g: 0,     crew_capacity: 0, tech_gates: []),
+        PartDef(kind: wall,         base_mass_g: 3500, cargo_volume_g: 0,     crew_capacity: 0, tech_gates: []),
+        PartDef(kind: axle,         base_mass_g: 3000, cargo_volume_g: 0,     crew_capacity: 0, tech_gates: []),
+        PartDef(kind: wheel,        base_mass_g: 5000, cargo_volume_g: 0,     crew_capacity: 0, tech_gates: []),
+        PartDef(kind: hitch,        base_mass_g: 1500, cargo_volume_g: 0,     crew_capacity: 0, tech_gates: []),
+        PartDef(kind: yoke,         base_mass_g: 2500, cargo_volume_g: 0,     crew_capacity: 0, tech_gates: []),
+        PartDef(kind: cargo_bay,    base_mass_g: 2000, cargo_volume_g: 80000, crew_capacity: 0, tech_gates: []),
+        PartDef(kind: crew_seat,    base_mass_g: 1200, cargo_volume_g: 0,     crew_capacity: 1, tech_gates: []),
+        PartDef(kind: weapon_mount, base_mass_g: 2500, cargo_volume_g: 0,     crew_capacity: 0, tech_gates: ["war_chariot"]),
+    ],
+    templates: [
+        TemplateDef(
+            name: "Handcart",
+            purpose: cargo,
+            required_animals: 0,
+            tech_gates: ["animal_husbandry"],
+            cells: [
+                CellDef(x: 0, y: 0, z: 0, kind: wheel,     material: "wood"),
+                CellDef(x: 1, y: 0, z: 0, kind: wheel,     material: "wood"),
+                CellDef(x: 0, y: 1, z: 0, kind: axle,      material: "wood"),
+                CellDef(x: 1, y: 1, z: 0, kind: axle,      material: "wood"),
+                CellDef(x: 0, y: 2, z: 0, kind: frame,     material: "wood"),
+                CellDef(x: 1, y: 2, z: 0, kind: cargo_bay, material: "wood"),
+                CellDef(x: 0, y: 3, z: 0, kind: hitch,     material: "wood"),
+            ],
+        ),
+        TemplateDef(
+            name: "Ox Cart",
+            purpose: cargo,
+            required_animals: 2,
+            tech_gates: ["ox_cart"],
+            cells: [
+                CellDef(x: 0, y: 0, z: 0, kind: wheel,     material: "wood"),
+                CellDef(x: 1, y: 0, z: 0, kind: wheel,     material: "wood"),
+                CellDef(x: 0, y: 1, z: 0, kind: axle,      material: "wood"),
+                CellDef(x: 1, y: 1, z: 0, kind: axle,      material: "wood"),
+                CellDef(x: 0, y: 2, z: 0, kind: cargo_bay, material: "wood"),
+                CellDef(x: 1, y: 2, z: 0, kind: cargo_bay, material: "wood"),
+                CellDef(x: 0, y: 3, z: 0, kind: yoke,      material: "wood"),
+                CellDef(x: 1, y: 3, z: 0, kind: frame,     material: "wood"),
+            ],
+        ),
+        TemplateDef(
+            name: "Four-Wheel Wagon",
+            purpose: cargo,
+            required_animals: 2,
+            tech_gates: ["ox_cart"],
+            cells: [
+                CellDef(x: 1, y: 0, z: 0, kind: yoke,      material: "wood"),
+                CellDef(x: 0, y: 1, z: 0, kind: wheel,     material: "wood"),
+                CellDef(x: 1, y: 1, z: 0, kind: axle,      material: "wood"),
+                CellDef(x: 2, y: 1, z: 0, kind: wheel,     material: "wood"),
+                CellDef(x: 0, y: 2, z: 0, kind: cargo_bay, material: "wood"),
+                CellDef(x: 1, y: 2, z: 0, kind: cargo_bay, material: "wood"),
+                CellDef(x: 2, y: 2, z: 0, kind: cargo_bay, material: "wood"),
+                CellDef(x: 0, y: 3, z: 0, kind: wheel,     material: "wood"),
+                CellDef(x: 1, y: 3, z: 0, kind: axle,      material: "wood"),
+                CellDef(x: 2, y: 3, z: 0, kind: wheel,     material: "wood"),
+            ],
+        ),
+        TemplateDef(
+            name: "Light Chariot",
+            purpose: war,
+            required_animals: 1,
+            tech_gates: ["horse_taming"],
+            cells: [
+                CellDef(x: 0, y: 0, z: 0, kind: wheel,     material: "wood"),
+                CellDef(x: 1, y: 0, z: 0, kind: wheel,     material: "wood"),
+                CellDef(x: 0, y: 1, z: 0, kind: axle,      material: "wood"),
+                CellDef(x: 1, y: 1, z: 0, kind: axle,      material: "wood"),
+                CellDef(x: 0, y: 2, z: 0, kind: frame,     material: "wood"),
+                CellDef(x: 1, y: 2, z: 0, kind: crew_seat, material: "wood"),
+                CellDef(x: 0, y: 3, z: 0, kind: hitch,     material: "wood"),
+            ],
+        ),
+        TemplateDef(
+            name: "War Chariot",
+            purpose: war,
+            required_animals: 2,
+            tech_gates: ["war_chariot"],
+            cells: [
+                CellDef(x: 0, y: 0, z: 0, kind: wheel,        material: "wood"),
+                CellDef(x: 1, y: 0, z: 0, kind: wheel,        material: "wood"),
+                CellDef(x: 0, y: 1, z: 0, kind: axle,         material: "copper"),
+                CellDef(x: 1, y: 1, z: 0, kind: axle,         material: "copper"),
+                CellDef(x: 0, y: 2, z: 0, kind: crew_seat,    material: "wood"),
+                CellDef(x: 1, y: 2, z: 0, kind: weapon_mount, material: "wood"),
+                CellDef(x: 0, y: 3, z: 0, kind: yoke,         material: "wood"),
+            ],
+        ),
+    ],
+)

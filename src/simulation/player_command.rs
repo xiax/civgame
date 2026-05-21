@@ -159,6 +159,13 @@ pub enum PlayerCommand {
     SetPackedAutonomy {
         mode: crate::simulation::faction::PackedMigrationAutonomy,
     },
+    /// Faction-level: queue a vehicle of the given design for assembly at
+    /// the player faction's `VehicleYard`. Applied directly in
+    /// `drain_player_command_events_system` (empty `actors`) — the
+    /// `vehicle_assembly_system` drains the queue.
+    QueueVehicle {
+        design_id: u32,
+    },
 }
 
 /// Per-actor authority marker. Replaces `PlayerOrder` once Commit 3 lands.
@@ -238,6 +245,8 @@ pub fn drain_player_command_events_system(
     mut id_gen: ResMut<PlayerCommandIdGen>,
     mut existing: Query<&mut Commanded>,
     mut player_craft: ResMut<crate::simulation::jobs::PlayerCraftRequest>,
+    player_faction: Res<crate::simulation::faction::PlayerFaction>,
+    mut vehicle_queue: ResMut<crate::simulation::vehicle::VehicleAssemblyQueue>,
 ) {
     let now = clock.tick as u32;
     for ev in reader.read() {
@@ -249,6 +258,12 @@ pub fn drain_player_command_events_system(
                         player_craft.0 =
                             Some((crate::simulation::crafting::RECIPE_CLAY_TABLET, Some(tech)));
                     }
+                }
+                PlayerCommand::QueueVehicle { design_id } => {
+                    vehicle_queue.entries.push((
+                        player_faction.faction_id,
+                        crate::simulation::vehicle::VehicleDesignId(design_id),
+                    ));
                 }
                 _ => {
                     // Other commands need actors; skip a malformed event.
@@ -470,7 +485,8 @@ pub fn player_command_lifecycle_system(
             // Phase 2/3: stamp-and-done faction commands.
             PlayerCommand::SendScout { .. }
             | PlayerCommand::SetMigrationIntent { .. }
-            | PlayerCommand::SetPackedAutonomy { .. } => Some(CommandStatus::Completed),
+            | PlayerCommand::SetPackedAutonomy { .. }
+            | PlayerCommand::QueueVehicle { .. } => Some(CommandStatus::Completed),
         };
         if let Some(new_status) = outcome {
             cmd.status = new_status;
@@ -1170,6 +1186,12 @@ fn dispatch_one(
                         command_actor: actor,
                     });
             }
+            DispatchOutcome::Active
+        }
+        QueueVehicle { .. } => {
+            // Faction-level — applied directly in
+            // `drain_player_command_events_system` (empty `actors`). If an
+            // event ever arrives carrying actors, the dispatch is a no-op.
             DispatchOutcome::Active
         }
     }

@@ -404,6 +404,18 @@ The cart half of draftwork: a composable draft-animal vehicle that ferries bulk 
 
 **Simplification vs. plan:** parts are data on the `Cart` (frame + wheel `ResourceId`), not separate child entities; `Hitch`/`UnhitchAndPark` are folded into the `CartHaul` executor (no separate animation tasks — same precedent as the v2.0 plow). Cart durability decrements but never blocks (repair task deferred). Plan: `plans/animal-husbandry-v2-draftwork.md`.
 
+## Vehicle system (`vehicle.rs`) — Phases 1-2
+
+Freeform customizable-vehicle subsystem (`plans/vehicle-system.md`); supersedes `cart.rs` in a later phase. Designs live on a bounded **3D cell grid** (6 wide × 4 deep × 4 tall) — height is load-bearing for mass / stability / clearance / combat.
+
+- **Data model.** `VehiclePartKind` (Frame/Deck/Wall/Axle/Wheel/Hitch/Yoke/CargoBay/CrewSeat/WeaponMount + reserved Engine/Track/ArmorPlate/Turret), `VehicleCell { kind, material: ResourceId, durability }`, `VehicleGrid` (sparse `Vec<(IVec3, VehicleCell)>`), `VehicleDesign`, `VehiclePurpose`, `VehicleStats`, `VehicleFootprint` (XY offsets pre-rotated for 4 headings), `VehicleInventory` (the `CartInventory` API), plus `Vehicle`/`VehicleCrew`/`VehicleDraft`/`VehicleState` component scaffolding.
+- **Catalog.** `assets/data/vehicles/core.ron` (materials keyed by catalog `ResourceId`; part defs; stock templates Handcart / Ox Cart / Four-Wheel Wagon / Light Chariot / War Chariot). `load_vehicle_assets()` (tolerant loader, mirrors the archetype loader) builds `VehicleData` + `VehicleDesignRegistry`, inserted in `SimulationPlugin::build`.
+- **`validate_design`** — deterministic 3D checks (connectivity, floating cells, wheel↔axle, control cell, draft capacity, axle overload, cargo reachability, chariot rule). **`derive_stats`** — mass / 3D center-of-mass / `stability = track_width/com.z` / payload / draft power / speed caps, all from the cell bill-of-materials.
+- **VehicleYard** (`BuildSiteKind::VehicleYard`, 12 wood + 6 stone, `ANIMAL_HUSBANDRY`) — assembly + parking anchor; `VehicleYardMap` on the `PenMap` hook pattern. `HitchingPost.parked_cart` renamed `parked_vehicle`.
+- **Assembly.** `PlayerCommand::QueueVehicle { design_id }` (faction-level, empty `actors`) → `VehicleAssemblyQueue`; right-click a player VehicleYard → "Assemble Vehicle ▸" submenu. `vehicle_assembly_system` (Economy, 60-tick cadence) drains the queue: `design_bill` (one unit per cell material + a `tools` per mechanical cell) checked against faction storage, consumed, then a parked `Vehicle` is spawned at the yard.
+
+**Simplification vs. plan:** Phase 2 ships an autonomous `vehicle_assembly_system` (the `cart_assembly_system` precedent) rather than the full `JobKind::Assemble` + `HaulToVehicleOrder`/`AssembleVehicle` worker-task pipeline; the spawned `Vehicle` has no `Indexed` yet (`VehicleOccupancyIndex` lands in Phase 3). Phases 3-7 (clearance-aware pathing, rollover, cargo-haul migration, designer UI, combat) pending.
+
 ## Animal spawn distribution (`animals.rs::spawn_animals`)
 
 Initial-condition only. Per-species `SocialPattern`: `HERD` (Deer/Horse/Cow, 8–15, r=5), `PACK` (Wolf/Pig/Rabbit/Fox, 3–6, r=3), `SOLITARY` (Cat). `cluster_spawn_tiles` pops shuffled centers from species biome pool and lays members within `cluster_radius` and stamps `HerdMember { cluster_id }` on every HERD member (Deer/Horse/Cow). `HerdClusterGen` issues monotonic ids; `wild_herd::seed_wild_herds_system` also draws cluster ids from it so wild-herd bloomed individuals share the same flow-field plumbing. `animal_reproduction_system` propagates the mother's cluster id to newborn HERD calves; `wild_herd::spawn_herd_members` propagates the wild herd's `cluster_id` at bloom.
