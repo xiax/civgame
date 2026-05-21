@@ -90,18 +90,21 @@ Free-agent gathering. In Market mode, when should_craft declines (cooldown or no
   Stockpile JobClaims (chief-driven) or Survive (food only).
 
 
-Fix memory leaks in late game.
+X - Fix memory leaks in late game.
+
 I need logging to track performance metrics and identify bottlenecks in the code that is slowing down each tick, give me a plan to do this comprehensively please.
 
 
 
-Settlements shouldn't be split by a river when placing initial settlements and camps
+X - Settlements shouldn't be split by a river when placing initial settlements and camps
 
-Add initial stone tools to spawn
+Add initial food and resources and stone tools to spawn appropriate for each era.
 
 Adjust work time and show progress bars. Cutting down trees should take way longer with initial stone tools
 
-Add a fishing system to the game that works well with existing systems and is robust and extensible and true to history. Add swimming knowledge.
+Add a fishing system to the game that works well with existing systems and is robust and extensible and true to history. 
+
+Add swimming to the game.
 
 X - Nomadic tribes should migrate way farther, they shouldn't be migrating to just within the gathering distance of their current settlement and actually look for good spots where there is a lot of food. They should send scouts far further away to look for good locations. Migration is also extremely buggy. I see people left behind in migrations, people not migrating properly, people still gathered around the old faction base and people no gain to the new faction base properly. Can you plan a comprehensive robust, and extensible migration system? I would also like it if it is possible to play a faction on the move rather than migration just being an atomic task.
 
