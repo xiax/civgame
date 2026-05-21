@@ -2239,6 +2239,57 @@ impl Default for CampState {
     }
 }
 
+/// Faction-level raid lifecycle. Source of truth for the raid system;
+/// `raid_target` / `under_raid` are derived projections kept in sync so
+/// existing HTN / goal call sites compile unchanged.
+///
+/// `Idle` → `Preparing` (sustained food + hunger crisis, target picked,
+/// party selected by physical capability) → `Marching` (party armed, or
+/// half-armed past half-timeout) → `Engaged` (a raider reached the enemy
+/// home) → `Cooldown` (raid ended) → `Idle`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RaidPhase {
+    #[default]
+    Idle,
+    Preparing {
+        since_tick: u32,
+        target: u32,
+    },
+    Marching {
+        since_tick: u32,
+        target: u32,
+    },
+    Engaged {
+        since_tick: u32,
+        target: u32,
+    },
+    Cooldown {
+        until_tick: u32,
+    },
+}
+
+impl RaidPhase {
+    /// Target faction id while a raid is in flight (`Preparing` /
+    /// `Marching` / `Engaged`); `None` for `Idle` / `Cooldown`.
+    pub fn target(&self) -> Option<u32> {
+        match self {
+            RaidPhase::Preparing { target, .. }
+            | RaidPhase::Marching { target, .. }
+            | RaidPhase::Engaged { target, .. } => Some(*target),
+            _ => None,
+        }
+    }
+
+    /// True for the phases whose party members actively pursue
+    /// `AgentGoal::Raid` (prep-equip, march, or fight).
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            RaidPhase::Preparing { .. } | RaidPhase::Marching { .. } | RaidPhase::Engaged { .. }
+        )
+    }
+}
+
 /// Migration coarse phase. `Surveying` is the AI autopilot survey
 /// window (player factions never enter it — `nomad_autopilot` gates).
 /// `PendingCommit` validates the final target before the camp is touched.
@@ -2671,6 +2722,24 @@ pub struct FactionData {
         ),
         crate::simulation::jobs::WageEMA,
     >,
+    /// Raid lifecycle state machine — the source of truth for raids.
+    /// `raid_target` / `under_raid` are kept in sync as derived
+    /// projections. Driven by `raid::faction_decision_system`.
+    pub raid_phase: RaidPhase,
+    /// Last tick at which the faction's food stock was *not* in deficit
+    /// (`food_total >= members`). The deficit duration is `now - this`.
+    /// Lazily initialised to the current tick on first observation.
+    pub food_deficit_streak_tick: u32,
+    /// Last tick at which average member hunger was *below*
+    /// `RAID_MIN_AVG_HUNGER`. The crisis duration is `now - this`.
+    pub hunger_crisis_streak_tick: u32,
+    /// Raiders selected (by physical capability) for the current raid.
+    /// Populated at `Idle → Preparing`, cleared on return to `Idle`.
+    /// The only set whose `goal_update_system` may assign `AgentGoal::Raid`.
+    pub raid_party: Vec<Entity>,
+    /// Telemetry: food units stolen during the current raid. Reset on
+    /// return to `Idle` (after logging to the activity log).
+    pub raid_stolen_food: u32,
 }
 
 impl FactionData {
@@ -2786,6 +2855,11 @@ impl FactionRegistry {
                 // they apply their own preset/lifestyle.
                 caps: crate::simulation::archetype::FactionCapabilities::default(),
                 wage_signal: ahash::AHashMap::default(),
+                raid_phase: RaidPhase::default(),
+                food_deficit_streak_tick: 0,
+                hunger_crisis_streak_tick: 0,
+                raid_party: Vec::new(),
+                raid_stolen_food: 0,
             },
         );
         id
@@ -3594,6 +3668,16 @@ impl FactionRegistry {
         self.factions
             .get(&faction_id)
             .map(|f| f.under_raid)
+            .unwrap_or(false)
+    }
+
+    /// True if `entity` is a selected raider of `faction_id` and the faction
+    /// is in an active raid phase (`Preparing` / `Marching` / `Engaged`).
+    /// The sole gate for assigning `AgentGoal::Raid` in `goal_update_system`.
+    pub fn is_raid_party_member(&self, faction_id: u32, entity: Entity) -> bool {
+        self.factions
+            .get(&faction_id)
+            .map(|f| f.raid_phase.is_active() && f.raid_party.contains(&entity))
             .unwrap_or(false)
     }
 }

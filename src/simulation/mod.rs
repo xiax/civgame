@@ -601,6 +601,16 @@ impl Plugin for SimulationPlugin {
             // IntoSystemConfigs ceiling). Ordered after the combat
             // dispatcher so chief / lead / defend / raid take
             // priority over bureaucrat town-hall stationing.
+            // Raid preparation dispatcher — arms raid-party members before
+            // the march. Its own add_systems call (the main ParallelB tuple
+            // is at the 20-element ceiling). Runs before the combat
+            // dispatcher so a `Preparing` raider equips rather than marches.
+            .add_systems(
+                FixedUpdate,
+                (raid::raid_prep_dispatch_system
+                    .before(htn::htn_combat_faction_dispatch_system),)
+                    .in_set(SimulationSet::ParallelB),
+            )
             .add_systems(
                 FixedUpdate,
                 (

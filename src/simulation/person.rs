@@ -251,6 +251,10 @@ pub struct PersonAI {
     /// or immature (P6b). Throttles retargeting to one swap per ~40 ticks so
     /// a stale-cluster reflex can't loop forever.
     pub last_retarget_tick: u64,
+    /// Last tick this agent stole food during a raid. The raid executor
+    /// enforces a per-raider steal cooldown (`RAID_STEAL_COOLDOWN_TICKS`)
+    /// so a single raider can't drain a storage tile in one visit.
+    pub last_raid_steal_tick: u32,
 }
 
 /// Re-export of the typed-task sentinel for "no current task".
@@ -279,6 +283,7 @@ impl Default for PersonAI {
             active_method: None,
             active_gather_claim: None,
             last_retarget_tick: 0,
+            last_raid_steal_tick: 0,
         }
     }
 }

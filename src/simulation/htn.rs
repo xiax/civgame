@@ -8685,6 +8685,19 @@ pub fn htn_combat_faction_dispatch_system(
         // Per-goal target resolution.
         let (abstract_task, abstract_kind, dest, target_entity, task_kind) = match *goal {
             AgentGoal::Raid => {
+                // Only march once the faction has finished preparing. While
+                // `Preparing`, `raid_prep_dispatch_system` arms the party.
+                let raid_phase = faction_registry
+                    .factions
+                    .get(&member.faction_id)
+                    .map(|f| f.raid_phase);
+                if !matches!(
+                    raid_phase,
+                    Some(crate::simulation::faction::RaidPhase::Marching { .. })
+                        | Some(crate::simulation::faction::RaidPhase::Engaged { .. })
+                ) {
+                    continue;
+                }
                 let Some(target_faction) = faction_registry.raid_target(member.faction_id) else {
                     continue;
                 };

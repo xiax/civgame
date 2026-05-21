@@ -321,6 +321,19 @@ OnEnter coverage lives in `test_fixture::onenter_era_seeding`: drives the real s
 - **Live chase (`combat::hunt_chase_system`):** Sequential, after `sync_indexed_after_move_system`, before combat. Reads `aq.current = Task::Hunt { prey }`; on despawn → `record_target_failure + aq.cancel()`; on prey-moved within `HUNT_LEASH_RADIUS (30)` → update `dest_tile`/`target_tile` and replan; beyond leash → cancel with `FailedTarget`.
 - **`Carrying(Entity)`** marker for "carrying corpse E"; inserted at pickup, removed at butcher/decay/rescue/muster/hunter-demote. `respond_to_distress_system` recruits any same-faction Hunter within `HUNTER_RESPOND_RANGE=50` regardless of LOS.
 
+## Raids (`raid.rs`)
+
+Faction-level raid state machine — `FactionData.raid_phase: RaidPhase` is the source of truth; `raid_target` / `under_raid` are derived projections kept in sync each tick so existing HTN / goal / UI call sites compile unchanged.
+
+- **`RaidPhase`** `{ Idle, Preparing { since_tick, target }, Marching { .. }, Engaged { .. }, Cooldown { until_tick } }`. `is_active()` = `Preparing|Marching|Engaged`.
+- **Sustained-pressure trigger (`faction_decision_system`, Economy):** raid only when BOTH `food_deficit` (`food_total < members`) AND `hunger_crisis` (`avg_hunger >= RAID_MIN_AVG_HUNGER=140`) have held for `RAID_TRIGGER_DAYS=2` days. Per-faction streak counters `food_deficit_streak_tick` / `hunger_crisis_streak_tick` track the last tick each condition was *false* (lazy-init to `now`). No emergency override; no single-tick flip. `RAID_COOLDOWN_DAYS=10` after every raid (half-length on an aborted prep).
+- **Target filter** (`pick_raid_target`): excludes SOLO / self / same-root kin / tributary pairs (`dominance_over` / `subordinate_to`) / food-poor (`food <= members * RAID_RIVAL_RESERVE_PER_MEMBER=5`) / beyond `RAID_MAX_TRAVEL_TILES=500` chebyshev. Picks nearest.
+- **Capability drafting** (`raid_capability` + `select_raid_party`): ranks members by `0.5*hp_frac + 0.3*str_norm + 0.2*armed`; rejects dead / destroyed-torso / <50% HP. Party cap = `min(RAID_MAX_PARTY_ABS=8, ceil(members * 0.35))`. Chief and `Drafted` excluded; chief topped up only if party would be `< RAID_MIN_PARTY=2`. Stored in `FactionData.raid_party` — the **only** set `goal_update_system` may put on `AgentGoal::Raid` (via `FactionRegistry::is_raid_party_member`).
+- **Preparing phase:** `raid_prep_dispatch_system` (ParallelB, before the combat dispatcher) routes unarmed party members to withdraw+equip a `weapon` from faction storage (mirrors the hunting-spear dispatcher; `WithdrawMaterial → Equip` chain, `production::finish_withdraw_material` primes the Equip leg). `Preparing → Marching` when all party armed, or half-armed past `RAID_PREP_TIMEOUT_TICKS/2`. Aborts to `Cooldown` on food/hunger recovery, target loss, or genuine inability to arm by `RAID_PREP_TIMEOUT_TICKS=3 days`.
+- **March / engage:** `htn_combat_faction_dispatch_system`'s `Raid` arm only marches a `Marching|Engaged` faction (skips `Preparing`). `raid_detection_system` flips `Marching → Engaged` when a raider reaches the enemy home (chebyshev ≤ 1) and sets the target's `under_raid` alarm.
+- **`raid_execution_system`** (Economy): only `Engaged` raiders within chebyshev ≤ 1 of the enemy home steal food. Per-raider steal cooldown via `PersonAI.last_raid_steal_tick` (`RAID_STEAL_COOLDOWN_TICKS`); reserve gate keeps the target above `members * 5`; successful steal bumps `FactionData.raid_stolen_food`.
+- **End conditions (`Engaged → Cooldown`):** food recovered, target drained below reserve, `RAID_ENGAGED_TIMEOUT_TICKS=2 days`, or living party `< RAID_MIN_PARTY`. Clears `raid_party`, resets `raid_stolen_food`.
+
 ## Plant lifecycle (`plants.rs`)
 
 Calendar-driven, season-edge-triggered. `Plant.growth: u16` is a stage-time accumulator; on each season change `plant_lifecycle_system` adds `season_growth(kind, prev_season)` and runs at most one stage transition.

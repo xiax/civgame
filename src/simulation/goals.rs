@@ -30,8 +30,6 @@ use bevy::prelude::*;
 // arithmetic. Tune them here in one place; `goal_update_system` references
 // them by name.
 
-/// Below this hunger an agent is willing to leave camp for a raid.
-const HUNGER_RAID_CEILING: f32 = 120.0;
 /// Below this hunger an agent will start a Build/Lead task; above it the
 /// agent prioritises Survive.
 const HUNGER_WORK_CEILING: f32 = 150.0;
@@ -1062,9 +1060,7 @@ pub fn goal_update_system(
                 }
                 continue;
             }
-            if registry.raid_target(member.faction_id).is_some()
-                && needs.hunger < HUNGER_RAID_CEILING
-            {
+            if registry.is_raid_party_member(member.faction_id, entity) {
                 if *goal != AgentGoal::Raid {
                     *goal = AgentGoal::Raid;
                     ai.state = AiState::Idle;
