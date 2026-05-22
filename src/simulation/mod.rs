@@ -401,13 +401,46 @@ impl Plugin for SimulationPlugin {
                         .after(person::spawn_population)
                         .after(organic_settlement::kickoff_initial_survey_system)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
-                    // Farm-planner §15: ensure every starting village has at
-                    // least one Agricultural plot + seed grain in storage so
-                    // farming can start on tick 1 instead of waiting for the
-                    // organic carve pipeline.
-                    farm::seed_starting_farms_system
-                        .after(construction::seed_starting_buildings_system)
-                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    // Nested tuple — keeps the outer OnEnter tuple within
+                    // Bevy's 20-element arity limit. `plans/spawn-farm-seeding.md`:
+                    // re-survey → project plans → carve plots so
+                    // `seed_starting_farms_system` stamps its starter Cropland
+                    // into a real carved Agricultural plot (and
+                    // `PlotIndex.by_faction_hash` is established before any
+                    // runtime carve can mismatch + re-tear-down).
+                    (
+                        // Re-survey post-seed so `SettlementBrain.parcels`
+                        // reflect the actual built structures. Without this
+                        // the Agricultural belt placement (driven by built-up
+                        // footprint) is stale and would shift on the first
+                        // runtime survey — orphaning any seed-stamped
+                        // Cropland.
+                        organic_settlement::resurvey_after_seeding_system
+                            .after(construction::seed_starting_buildings_system)
+                            .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                        // Project the brain into the compatibility
+                        // `SettlementPlan` surface that `carve_plots_system`
+                        // reads. Iterates every eligible faction at OnEnter;
+                        // no spine pushes (road carving stays owned by the
+                        // kickoff survey + seed pass).
+                        settlement::project_initial_settlement_plans_system
+                            .after(organic_settlement::resurvey_after_seeding_system)
+                            .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                        // Carve `Plot` entities for every village's projected
+                        // plan at OnEnter so `seed_starting_farms_system`
+                        // stamps its starter Cropland into a real, indexed
+                        // `PlotIndex.ag_tiles`-backed Agricultural plot.
+                        land::carve_plots_system
+                            .after(settlement::project_initial_settlement_plans_system)
+                            .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                        // Farm-planner §15: stamp the bounded starter Cropland
+                        // patch into the carved Agricultural plot + seed grain
+                        // so farming can start on tick 1.
+                        farm::seed_starting_farms_system
+                            .after(construction::seed_starting_buildings_system)
+                            .after(land::carve_plots_system)
+                            .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    ),
                     // Seed wells are stamped as finished `Well` entities; carve
                     // their visible stepwell shaft + helix and project the
                     // charged water column so they look (and read) as dug from

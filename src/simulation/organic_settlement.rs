@@ -732,6 +732,48 @@ pub fn survey_one_settlement(
     brains.0.insert(diff.settlement_id, diff.brain);
 }
 
+/// Post-seed re-survey run once at `OnEnter(GameState::Playing)` after
+/// `seed_starting_buildings_system`. Recomputes each `SettlementBrain`
+/// against the *actual built structures* (the pre-seed kickoff brain has
+/// no buildings, so `build_ag_belt` keyed off an empty footprint). Without
+/// this re-pass the first post-build runtime survey would shift the
+/// Agricultural belt out from under any plot we'd just carved, orphaning
+/// the seeded Cropland patch — see `plans/spawn-farm-seeding.md`.
+///
+/// Shares `survey_one_settlement`'s synchronous core with the kickoff pass.
+/// Sandbox-bypassed for parity with `seed_starting_buildings_system`.
+#[allow(clippy::too_many_arguments)]
+pub fn resurvey_after_seeding_system(
+    mut brains: ResMut<SettlementBrains>,
+    mut parcel_index: ResMut<SettlementParcelIndex>,
+    mut road_queue: ResMut<RoadCarveQueue>,
+    settlements: Query<&Settlement>,
+    registry: Res<FactionRegistry>,
+    chunk_map: Res<ChunkMap>,
+    maps: OrganicStructureMaps,
+    member_q: Query<(&FactionMember, &Transform)>,
+) {
+    for settlement in settlements.iter() {
+        let Some(faction) = registry.factions.get(&settlement.owner_faction) else {
+            continue;
+        };
+        if settlement.owner_faction == SOLO || !faction.caps.settlement.is_full_settlement() {
+            continue;
+        }
+        survey_one_settlement(
+            settlement,
+            faction,
+            0,
+            &mut brains,
+            &mut road_queue,
+            &chunk_map,
+            &maps,
+            &member_q,
+        );
+    }
+    parcel_index.rebuild(&brains);
+}
+
 /// Initial-survey pass run once at `OnEnter(GameState::Playing)` so the
 /// `seed_starting_buildings_system` can read `SettlementBrain.parcels` (and
 /// their `frontage_edge`) when choosing seed-time house anchors. Without

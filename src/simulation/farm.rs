@@ -457,39 +457,34 @@ pub fn state_owned_ag_plots_for_faction(
 }
 
 /// Game-start seeding (farm-planner §15). Runs once at `OnEnter(Playing)`
-/// after `seed_starting_buildings_system`. For every settled, non-SOLO
-/// village faction, ensure at least one 16×16 Agricultural plot exists at a
-/// good nearby spot, set its tenure based on the economy preset, and pre-
-/// seed the appropriate storage with grain seeds so the first farm cycle
-/// can begin immediately.
+/// after `carve_plots_system` has owned tick-0 plot creation via the
+/// `survey → project → carve` pipeline (see `plans/spawn-farm-seeding.md`).
+/// For every settled non-SOLO non-nomadic village faction, finds the carved
+/// Agricultural plot nearest home, pre-stamps a bounded contiguous `Cropland`
+/// starter patch inside it so year 1 is a real first crop (not a from-zero
+/// Prepare spike), seeds grain seeds + a year-1 food buffer at storage.
 ///
-/// Skipped for nomadic factions (no plots / no settlement). Skipped for
-/// any faction that already has at least one Agricultural plot — runtime
-/// carving will own ongoing supply.
+/// Skipped for nomadic factions (no plots / no settlement) and households
+/// (the village owns plot seeding).
 pub fn seed_starting_farms_system(
-    mut commands: Commands,
     options: Res<crate::game_state::GameStartOptions>,
     settlement_map: Res<crate::simulation::settlement::SettlementMap>,
     registry: Res<crate::simulation::faction::FactionRegistry>,
-    mut plot_index: ResMut<crate::simulation::land::PlotIndex>,
+    plot_index: Res<crate::simulation::land::PlotIndex>,
     plot_q: Query<&crate::simulation::land::Plot>,
     mut chunk_map: ResMut<crate::world::chunk::ChunkMap>,
     storage_tiles: Query<(&crate::simulation::faction::FactionStorageTile, &Transform)>,
     spatial: Res<crate::world::spatial::SpatialIndex>,
     mut ground_items: Query<&mut crate::simulation::items::GroundItem>,
-    brains: Res<crate::simulation::organic_settlement::SettlementBrains>,
-    mut field_tiles: ResMut<FieldTileIndex>,
+    mut commands: Commands,
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
 ) {
-    use crate::simulation::land::Plot;
-    use crate::simulation::organic_settlement::ParcelShape;
     use crate::simulation::settlement::TileRect;
 
     if !options.seed_buildings {
         // Sandbox / minimal start — skip seeding farms.
         return;
     }
-    const PLOT_Z: i8 = 0;
     /// Floor on starting grain seed for tiny / fixture factions.
     const MIN_STARTING_GRAIN_SEEDS: u32 = 32;
     /// Founders carry provisions. The seeded edible-food stock covers the
@@ -498,16 +493,6 @@ pub fn seed_starting_farms_system(
     /// runs out; foraging/hunting still bridges the rest of year 1.
     const YEAR1_FOOD_BUFFER_NUMER: u32 = 3;
     const YEAR1_FOOD_BUFFER_DENOM: u32 = 5;
-
-    // Snapshot which factions already have an Agricultural plot.
-    let mut already_seeded: ahash::AHashSet<u32> = ahash::AHashSet::new();
-    for (_, &ent) in plot_index.by_id.iter() {
-        if let Ok(plot) = plot_q.get(ent) {
-            if plot.zone_kind == ZoneKind::Agricultural {
-                already_seeded.insert(plot.faction_id);
-            }
-        }
-    }
 
     // Stage work — gather faction ids first so we don't borrow registry mutably while iterating.
     let mut work: Vec<(u32, crate::simulation::settlement::SettlementId, (i32, i32), u32)> =
@@ -525,9 +510,6 @@ pub fn seed_starting_farms_system(
         ) {
             continue;
         }
-        if already_seeded.contains(&fid) {
-            continue;
-        }
         let Some(sid) = settlement_map.first_for_faction(fid) else {
             continue;
         };
@@ -543,26 +525,19 @@ pub fn seed_starting_farms_system(
         };
         let demand_tiles = (members * GRAIN_PER_PERSON_PER_YEAR * SUPPLY_SAFETY_NUMER)
             .div_ceil(SUPPLY_SAFETY_DENOM * GRAIN_YIELD_PER_TILE_PLANNING);
-        // Site the starting plot on an Agricultural BELT parcel from the
-        // settlement brain (populated by the OnEnter kickoff survey) — so the
-        // tick-0 farm is already outside town, consistent with the runtime
-        // belt. Pick the belt parcel nearest home (deterministic tiebreak by
-        // origin). If the brain produced no belt parcel (e.g. no fertile land
-        // around the settlement), skip the plot entirely — `carve_plots_system`
-        // will carve belt plots once the layout settles; we still pre-seed the
-        // grain below so planting works the moment a plot exists. NO near-home
-        // fallback (that was the "farms all over the base" regression).
-        let belt_rect: Option<TileRect> = brains.0.get(&sid).and_then(|brain| {
-            brain
-                .parcels
-                .iter()
-                .filter_map(|p| match (p.district_hint, &p.shape) {
-                    (
-                        Some(crate::simulation::organic_settlement::DistrictKind::Agricultural),
-                        ParcelShape::Rect(r),
-                    ) => Some(*r),
-                    _ => None,
-                })
+
+        // Find the carved Agricultural plot nearest home. `carve_plots_system`
+        // has already run in the same OnEnter chain, so every village that
+        // got a belt parcel has an Agricultural plot here with `ag_tiles` +
+        // `FieldTileIndex` populated. Deterministic tie-break matches the
+        // legacy belt scan: `(chebyshev, rect.x0, rect.y0)`.
+        let plot_ids = plot_index.by_settlement.get(&sid.0);
+        let belt_rect: Option<TileRect> = plot_ids.and_then(|ids| {
+            ids.iter()
+                .filter_map(|pid| plot_index.by_id.get(pid).copied())
+                .filter_map(|ent| plot_q.get(ent).ok())
+                .filter(|p| p.zone_kind == ZoneKind::Agricultural && p.faction_id == fid)
+                .map(|p| p.rect)
                 .min_by_key(|r| {
                     let cx = r.x0 + r.w as i32 / 2;
                     let cy = r.y0 + r.h as i32 / 2;
@@ -571,27 +546,6 @@ pub fn seed_starting_farms_system(
         });
 
         if let Some(rect) = belt_rect {
-            let pid = plot_index.alloc_id();
-            let plot = Plot {
-                id: pid,
-                settlement_id: sid.0,
-                faction_id: fid,
-                rect,
-                z: PLOT_Z,
-                zone_kind: ZoneKind::Agricultural,
-                tenure: Tenure::StateOwned,
-                holder: crate::simulation::land::TenureHolder::State { faction_id: fid },
-                base_value: crate::simulation::land::PLOT_BASE_VALUE,
-                last_valued_tick: 0,
-                missed_payments: 0,
-                frontage_edge: None,
-                access_tile: None,
-                parent_plot: None,
-                plowed_year: None,
-            };
-            let entity = commands.spawn(plot).id();
-            plot_index.by_id.insert(pid, entity);
-            plot_index.by_settlement.entry(sid.0).or_default().push(pid);
             // Seasonal-farming jellyfish: most of the belt is left UN-prepared
             // at game start (the tribe tills it over the following seasons),
             // but a bounded contiguous STARTER patch is pre-tilled to `Cropland`
@@ -599,19 +553,21 @@ pub fn seed_starting_farms_system(
             // ground as part of settling. Budget: half the annual demand,
             // capped at half the plot so it never paves the whole field.
             // Fertility is NOT overridden — the patch's planting viability
-            // rides on natural world-gen soil (the belt is fertility-selected
-            // by `build_ag_belt`); the founder grain buffer covers a weak year.
+            // rides on natural world-gen soil; the founder grain buffer
+            // covers a weak year. `ag_tiles` / `FieldTileIndex` / `by_tile`
+            // are already populated by `carve_plots_system`; do not re-insert
+            // here (nutrients already equal natural fertility).
             use crate::world::tile::{TileData, TileKind};
             let plot_area = rect.w as u32 * rect.h as u32;
             let mut starter_budget = (demand_tiles / 2).min(plot_area / 2);
-            for ty in rect.y0..rect.y0 + rect.h as i32 {
+            'rows: for ty in rect.y0..rect.y0 + rect.h as i32 {
                 for tx in rect.x0..rect.x0 + rect.w as i32 {
-                    plot_index.by_tile.insert((tx, ty), pid);
-                    plot_index.ag_tiles.insert((tx, ty));
+                    if starter_budget == 0 {
+                        break 'rows;
+                    }
                     let z = chunk_map.surface_z_at(tx, ty);
                     let cur = chunk_map.tile_at(tx, ty, z);
-                    let pre_stamp = starter_budget > 0
-                        && cur.kind != TileKind::Cropland
+                    let pre_stamp = cur.kind != TileKind::Cropland
                         && (cur.kind == TileKind::Grass || cur.kind.is_soil_like());
                     if pre_stamp {
                         chunk_map.set_tile(
@@ -630,7 +586,6 @@ pub fn seed_starting_farms_system(
                             .send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
                         starter_budget -= 1;
                     }
-                    field_tiles.ensure_entry((tx, ty), pid, cur.fertility);
                 }
             }
         }

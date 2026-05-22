@@ -98,18 +98,16 @@ I need logging to track performance metrics and identify bottlenecks in the code
 
 X - Settlements shouldn't be split by a river when placing initial settlements and camps
 
-Add initial food and resources and stone tools to spawn appropriate for each era.
 
-Adjust work time and show progress bars. Cutting down trees should take way longer with initial stone tools
 
 X - Add a fishing system to the game that works well with existing systems and is robust and extensible and true to history. 
 
-Add swimming to the game.
+X - Add swimming to the game.
 
 X - Nomadic tribes should migrate way farther, they shouldn't be migrating to just within the gathering distance of their current settlement and actually look for good spots where there is a lot of food. They should send scouts far further away to look for good locations. Migration is also extremely buggy. I see people left behind in migrations, people not migrating properly, people still gathered around the old faction base and people no gain to the new faction base properly. Can you plan a comprehensive robust, and extensible migration system? I would also like it if it is possible to play a faction on the move rather than migration just being an atomic task.
 
 
-Need UI overhaul to add commands for all actions players can take, in a way that is robust and extensible in the future
+
 
 X- Overhaul technology system to be entirely knowledge based, please propose a system for technological adoption that is true to history that uses the knowledge based system.
 
@@ -161,5 +159,14 @@ X - Not making a tile cropland when seeding because its fertility doesn't meet s
 
 X - Import new animal sprites
 
-Faction queues way too many crafting jobs for stuff the faction doesn't even need.
+X - Faction queues way too many crafting jobs for stuff the faction doesn't even need.
 
+Add initial food and resources and stone tools to spawn appropriate for each era.
+
+Adjust work time and show progress bars. Cutting down trees should take way longer with initial stone tools
+
+Need UI overhaul to add commands for all actions players can take, in a way that is robust and extensible in the future
+
+Need debug menu overhaul that works with the current version of the game and contains all important tools a developer needs to debug and test the game like entity spawners and ways to give resources to factions, etc.
+
+Workers spend too much time preparing fields that they miss the chance to actually plant seeds.

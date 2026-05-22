@@ -1039,6 +1039,55 @@ pub fn zone_overlay_gizmo_system(
     }
 }
 
+/// Shared planning core. Computes the `(plan, new_hash)` pair for one
+/// faction, preferring an organic `SettlementBrain` projection when one
+/// exists and falling back to `build_settlement_plan`. Caller is expected to
+/// have filtered out SOLO / memberless factions; the OnEnter wrapper iterates
+/// every eligible faction once, while `settlement_planner_system` runs it
+/// inside its stagger + `needs_plan` gate.
+pub fn project_plan_for_faction(
+    fid: u32,
+    faction: &FactionData,
+    tick: u64,
+    settlement_map: &SettlementMap,
+    brains: &crate::simulation::organic_settlement::SettlementBrains,
+) -> (SettlementPlan, u64) {
+    let organic_brain = settlement_map
+        .first_for_faction(fid)
+        .and_then(|sid| brains.0.get(&sid));
+    let new_hash = organic_brain
+        .map(|brain| brain.layout_hash ^ ((fid as u64) << 32))
+        .unwrap_or_else(|| culture_hash(faction));
+    let plan = organic_brain
+        .map(|brain| {
+            crate::simulation::organic_settlement::compat_plan_from_brain(fid, faction, tick, brain)
+        })
+        .unwrap_or_else(|| build_settlement_plan(fid, faction, tick));
+    (plan, new_hash)
+}
+
+/// OnEnter(Playing) one-shot: project a `SettlementPlan` for every non-SOLO
+/// member-bearing faction so `carve_plots_system` can run inside the
+/// `OnEnter` chain and own all tick-0 plots (`PlotIndex.by_faction_hash`
+/// established before any runtime stagger can fire). Does **not** push spine
+/// segments onto `RoadCarveQueue` — OnEnter road carving is already owned by
+/// `kickoff_initial_survey_system` + `seed_starting_buildings_system`.
+pub fn project_initial_settlement_plans_system(
+    registry: Res<FactionRegistry>,
+    settlement_map: Res<SettlementMap>,
+    brains: Res<crate::simulation::organic_settlement::SettlementBrains>,
+    mut plans: ResMut<SettlementPlans>,
+) {
+    for (&fid, faction) in registry.factions.iter() {
+        if fid == SOLO || faction.member_count == 0 {
+            continue;
+        }
+        let (plan, _new_hash) =
+            project_plan_for_faction(fid, faction, 0, &settlement_map, &brains);
+        plans.0.insert(fid, plan);
+    }
+}
+
 /// System: re-evaluates each non-SOLO faction's settlement plan periodically.
 /// Throttled — at most one faction is re-planned per tick to spread CPU cost.
 /// On a culture-hash bump (i.e. a fresh spine geometry), enqueues every
@@ -1068,12 +1117,10 @@ pub fn settlement_planner_system(
             continue;
         }
 
-        let organic_brain = settlement_map
-            .first_for_faction(fid)
-            .and_then(|sid| brains.0.get(&sid));
-        let new_hash = organic_brain
-            .map(|brain| brain.layout_hash ^ ((fid as u64) << 32))
-            .unwrap_or_else(|| culture_hash(faction));
+        // Compute candidate plan + hash via the shared helper before the
+        // `needs_plan` gate so OnEnter and runtime read the same projection.
+        let (plan, new_hash) =
+            project_plan_for_faction(fid, faction, tick, &settlement_map, &brains);
         let prev_hash = plans.0.get(&fid).map(|p| p.culture_hash);
         let needs_plan = match plans.0.get(&fid) {
             Some(p) => {
@@ -1086,13 +1133,6 @@ pub fn settlement_planner_system(
         if !needs_plan {
             continue;
         }
-        let plan = organic_brain
-            .map(|brain| {
-                crate::simulation::organic_settlement::compat_plan_from_brain(
-                    fid, faction, tick, brain,
-                )
-            })
-            .unwrap_or_else(|| build_settlement_plan(fid, faction, tick));
 
         // Enqueue spine carving once per culture_hash bump. Reuses
         // `RoadCarveQueue` (one Bresenham line per drained entry) — segments

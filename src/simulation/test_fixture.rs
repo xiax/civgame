@@ -5273,11 +5273,8 @@ mod smoke {
     #[test]
     fn seed_starting_farms_spawns_physical_grain_seed_at_storage() {
         use crate::economy::core_ids;
-        use crate::simulation::farm::seed_starting_farms_system;
-        use crate::simulation::land::{Plot, PlotIndex, TenureHolder};
-        use crate::simulation::organic_settlement::{
-            DistrictKind, Parcel, ParcelShape, ParcelSuitability, SettlementBrain, SettlementBrains,
-        };
+        use crate::simulation::farm::{seed_starting_farms_system, FieldTileIndex};
+        use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
         use crate::simulation::settlement::{SettlementMap, TileRect, ZoneKind};
         use bevy::ecs::system::RunSystemOnce;
 
@@ -5289,11 +5286,12 @@ mod smoke {
         // Let the normal settlement + storage-tile indexes populate.
         sim.tick_n(2);
 
-        // Mirror the real OnEnter flow: the kickoff survey populates the
-        // settlement brain with an Agricultural BELT parcel BEFORE the farm
-        // seeder runs. Inject one far from home so we can assert the seed
-        // plot lands ON the belt (not a near-home fallback — that path is
-        // gone by design).
+        // Mirror the new OnEnter flow (`plans/spawn-farm-seeding.md`):
+        // `carve_plots_system` runs in-chain before `seed_starting_farms_system`,
+        // so a carved Agricultural plot is the seeder's input — inject one
+        // directly. `seed_starting_farms_system` finds the carved plot, stamps
+        // a bounded starter Cropland patch inside it, and spawns the grain
+        // seeds + year-1 food buffer at faction storage.
         let fid = sim.player_faction_id;
         let belt_rect = TileRect::new(40, 40, 16, 16);
         {
@@ -5302,20 +5300,49 @@ mod smoke {
                 .resource::<SettlementMap>()
                 .first_for_faction(fid)
                 .expect("player settlement should exist after tick_n(2)");
-            let mut brain = SettlementBrain::new(sid, fid, 42);
-            brain.parcels.push(Parcel {
-                id: 0,
-                shape: ParcelShape::Rect(belt_rect),
-                frontage_edge: None,
-                access_tile: None,
-                holder: TenureHolder::State { faction_id: fid },
-                district_hint: Some(DistrictKind::Agricultural),
-                suitability: ParcelSuitability::default(),
-            });
-            world
-                .resource_mut::<SettlementBrains>()
-                .0
-                .insert(sid, brain);
+            let chunk_map = world.resource::<ChunkMap>();
+            let mut tile_state: Vec<((i32, i32), u8)> = Vec::with_capacity(256);
+            for ty in belt_rect.y0..belt_rect.y0 + belt_rect.h as i32 {
+                for tx in belt_rect.x0..belt_rect.x0 + belt_rect.w as i32 {
+                    let z = chunk_map.surface_z_at(tx, ty);
+                    tile_state.push(((tx, ty), chunk_map.tile_at(tx, ty, z).fertility));
+                }
+            }
+            let pid = world.resource_mut::<PlotIndex>().alloc_id();
+            let plot_entity = world
+                .spawn(Plot {
+                    id: pid,
+                    settlement_id: sid.0,
+                    faction_id: fid,
+                    rect: belt_rect,
+                    z: 0,
+                    zone_kind: ZoneKind::Agricultural,
+                    tenure: Tenure::StateOwned,
+                    holder: TenureHolder::State { faction_id: fid },
+                    base_value: 0.0,
+                    last_valued_tick: 0,
+                    missed_payments: 0,
+                    frontage_edge: None,
+                    access_tile: None,
+                    parent_plot: None,
+                    plowed_year: None,
+                })
+                .id();
+            {
+                let mut plot_index = world.resource_mut::<PlotIndex>();
+                plot_index.by_id.insert(pid, plot_entity);
+                plot_index.by_settlement.entry(sid.0).or_default().push(pid);
+                for &(tile, _fert) in &tile_state {
+                    plot_index.by_tile.insert(tile, pid);
+                    plot_index.ag_tiles.insert(tile);
+                }
+            }
+            {
+                let mut field_tiles = world.resource_mut::<FieldTileIndex>();
+                for &(tile, fert) in &tile_state {
+                    field_tiles.ensure_entry(tile, pid, fert);
+                }
+            }
         }
 
         sim.app
@@ -5340,7 +5367,8 @@ mod smoke {
         assert_eq!(
             seeded,
             vec![belt_rect],
-            "startup farm must be sited ON the brain's belt parcel, not near home"
+            "carved Agricultural plot must survive seed_starting_farms_system \
+             (the seeder no longer creates plots — carve_plots_system owns it)"
         );
 
         let grain_seed = core_ids::grain_seed();
@@ -5469,11 +5497,8 @@ mod smoke {
     #[test]
     fn seed_belt_pre_stamps_bounded_starter_cropland() {
         use crate::simulation::farm::{seed_starting_farms_system, FieldTileIndex};
-        use crate::simulation::land::{PlotIndex, TenureHolder};
-        use crate::simulation::organic_settlement::{
-            DistrictKind, Parcel, ParcelShape, ParcelSuitability, SettlementBrain, SettlementBrains,
-        };
-        use crate::simulation::settlement::{SettlementMap, TileRect};
+        use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
+        use crate::simulation::settlement::{SettlementMap, TileRect, ZoneKind};
         use bevy::ecs::system::RunSystemOnce;
 
         let mut sim = TestSim::new(0xCA11_F1E1);
@@ -5483,26 +5508,59 @@ mod smoke {
 
         let fid = sim.player_faction_id;
         let belt_rect = TileRect::new(40, 40, 16, 16);
+        // The carve pipeline now owns Plot creation at OnEnter (per
+        // `plans/spawn-farm-seeding.md`). Inject a carved Agricultural plot
+        // directly to mimic `carve_plots_system` so the test exercises the
+        // refactored `seed_starting_farms_system` in isolation.
         {
             let world = sim.app.world_mut();
             let sid = world
                 .resource::<SettlementMap>()
                 .first_for_faction(fid)
                 .expect("settlement");
-            let mut brain = SettlementBrain::new(sid, fid, 42);
-            brain.parcels.push(Parcel {
-                id: 0,
-                shape: ParcelShape::Rect(belt_rect),
-                frontage_edge: None,
-                access_tile: None,
-                holder: TenureHolder::State { faction_id: fid },
-                district_hint: Some(DistrictKind::Agricultural),
-                suitability: ParcelSuitability::default(),
-            });
-            world
-                .resource_mut::<SettlementBrains>()
-                .0
-                .insert(sid, brain);
+            let chunk_map = world.resource::<ChunkMap>();
+            let mut tile_state: Vec<((i32, i32), u8)> = Vec::with_capacity(256);
+            for ty in belt_rect.y0..belt_rect.y0 + belt_rect.h as i32 {
+                for tx in belt_rect.x0..belt_rect.x0 + belt_rect.w as i32 {
+                    let z = chunk_map.surface_z_at(tx, ty);
+                    tile_state.push(((tx, ty), chunk_map.tile_at(tx, ty, z).fertility));
+                }
+            }
+            let pid = world.resource_mut::<PlotIndex>().alloc_id();
+            let plot_entity = world
+                .spawn(Plot {
+                    id: pid,
+                    settlement_id: sid.0,
+                    faction_id: fid,
+                    rect: belt_rect,
+                    z: 0,
+                    zone_kind: ZoneKind::Agricultural,
+                    tenure: Tenure::StateOwned,
+                    holder: TenureHolder::State { faction_id: fid },
+                    base_value: 0.0,
+                    last_valued_tick: 0,
+                    missed_payments: 0,
+                    frontage_edge: None,
+                    access_tile: None,
+                    parent_plot: None,
+                    plowed_year: None,
+                })
+                .id();
+            {
+                let mut plot_index = world.resource_mut::<PlotIndex>();
+                plot_index.by_id.insert(pid, plot_entity);
+                plot_index.by_settlement.entry(sid.0).or_default().push(pid);
+                for &(tile, _fert) in &tile_state {
+                    plot_index.by_tile.insert(tile, pid);
+                    plot_index.ag_tiles.insert(tile);
+                }
+            }
+            {
+                let mut field_tiles = world.resource_mut::<FieldTileIndex>();
+                for &(tile, fert) in &tile_state {
+                    field_tiles.ensure_entry(tile, pid, fert);
+                }
+            }
         }
 
         sim.app
@@ -17894,29 +17952,55 @@ mod onenter_era_seeding {
     }
 
     /// Cropland only ever appears inside an Agricultural plot — the seed
-    /// pipeline no longer stamps a house yard. After the full OnEnter chain,
-    /// every `Cropland` tile near home must be registered in
-    /// `PlotIndex.ag_tiles`.
+    /// pipeline now stamps its starter Cropland into a carve-owned plot
+    /// (`plans/spawn-farm-seeding.md`). Asserts the invariant immediately
+    /// after `OnEnter` *and* after enough ticks for at least one runtime
+    /// `settlement_planner_system` + `carve_plots_system` cycle so we'd see
+    /// the historical orphaning-by-belt-shift if it returned.
     #[test]
     fn seeded_cropland_stays_inside_agricultural_plots() {
+        use crate::simulation::settlement::{SettlementPlans, ZoneKind};
+
         let mut sim = fixture_with_flat_world();
         configure_start(&mut sim, Era::Neolithic);
         trigger_onenter(&mut sim);
 
-        let world = sim.app.world();
-        let (_, _, home) = player_seeded_beds_near_home(&sim);
-        let chunk_map = world.resource::<ChunkMap>();
-        let plot_index = world.resource::<crate::simulation::land::PlotIndex>();
-        for ty in home.1 - 80..=home.1 + 80 {
-            for tx in home.0 - 80..=home.0 + 80 {
-                if chunk_map.tile_kind_at(tx, ty) == Some(TileKind::Cropland) {
+        let check_invariant = |sim: &TestSim, label: &str| {
+            let world = sim.app.world();
+            let (_, _, home) = player_seeded_beds_near_home(sim);
+            let chunk_map = world.resource::<ChunkMap>();
+            let plot_index = world.resource::<crate::simulation::land::PlotIndex>();
+            let plans = world.resource::<SettlementPlans>();
+            for ty in home.1 - 80..=home.1 + 80 {
+                for tx in home.0 - 80..=home.0 + 80 {
+                    if chunk_map.tile_kind_at(tx, ty) != Some(TileKind::Cropland) {
+                        continue;
+                    }
                     assert!(
                         plot_index.ag_tiles.contains(&(tx, ty)),
-                        "Cropland tile ({tx},{ty}) is outside any Agricultural plot"
+                        "{label}: Cropland tile ({tx},{ty}) is outside any \
+                         Agricultural plot"
+                    );
+                    let covered = plans.0.values().any(|p| {
+                        p.zones
+                            .iter()
+                            .any(|z| z.kind == ZoneKind::Agricultural && z.rect.contains(tx, ty))
+                    });
+                    assert!(
+                        covered,
+                        "{label}: Cropland tile ({tx},{ty}) not covered by \
+                         any current SettlementPlans Agricultural zone"
                     );
                 }
             }
-        }
+        };
+
+        check_invariant(&sim, "post-OnEnter");
+        // Long enough to clear at least one `settlement_planner_system` +
+        // `carve_plots_system` cycle (stagger %60 + replan headroom). If the
+        // bug returned the belt would shift and orphan some Cropland.
+        sim.tick_n(180);
+        check_invariant(&sim, "post-tick180");
     }
 
     fn assert_perm_settlement_adopted(sim: &TestSim, label: &str) {

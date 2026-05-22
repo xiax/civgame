@@ -1,5 +1,12 @@
 # Zone-Backed Spawn Farm Seeding
 
+**Status: SHIPPED.** Survey → project → carve segment runs in-chain at
+`OnEnter(Playing)`; `seed_starting_farms_system` refactored to stamp into the
+carved plot. `seed_belt_pre_stamps_bounded_starter_cropland`,
+`seed_starting_farms_spawns_physical_grain_seed_at_storage`, and
+`seeded_cropland_stays_inside_agricultural_plots` (post-OnEnter + post-tick180
+re-assertion) green. `cargo test --bin civgame` — 1049 passed.
+
 ## Context
 
 `seed_starting_farms_system` (`farm.rs:469`) currently creates a `Plot` entity **directly**
