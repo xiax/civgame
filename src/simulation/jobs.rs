@@ -7,7 +7,9 @@ use crate::simulation::faction::{FactionData, FactionMember, FactionRegistry, SO
 use crate::simulation::goals::{is_maintenance_goal, AgentGoal, Personality};
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::{PersonAI, Profession, UNEMPLOYED_TASK_KIND};
-use crate::simulation::projects::{compute_priority, ProjectPhase, Projects, PRIORITY_PLAYER};
+use crate::simulation::projects::{
+    compute_priority, food_pressure, ProjectPhase, Projects, CRITICAL_FOOD_TRIGGER, PRIORITY_PLAYER,
+};
 use crate::simulation::schedule::SimClock;
 use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::technology::CROP_CULTIVATION;
@@ -2444,7 +2446,7 @@ pub fn chief_job_posting_system(
         //     re-post.
         for p in board.faction_postings_mut(faction_id).iter_mut() {
             if matches!(p.source, JobSource::Chief) {
-                p.priority = compute_priority(faction, faction_id, p.kind, &p.progress, &projects);
+                p.priority = compute_priority(faction, faction_id, p.kind, &p.progress, &projects, &calendar);
             }
         }
 
@@ -2485,7 +2487,7 @@ pub fn chief_job_posting_system(
                 blueprint: bp_entity,
             };
             let priority =
-                compute_priority(faction, faction_id, JobKind::Build, &progress, &projects);
+                compute_priority(faction, faction_id, JobKind::Build, &progress, &projects, &calendar);
             board.faction_postings_mut(faction_id).push(JobPosting {
                 id,
                 faction_id,
@@ -2554,6 +2556,7 @@ pub fn chief_job_posting_system(
                         JobKind::Stockpile,
                         &progress,
                         &projects,
+                        &calendar,
                     );
                     board.faction_postings_mut(faction_id).push(JobPosting {
                         id,
@@ -2647,6 +2650,7 @@ pub fn chief_job_posting_system(
                     JobKind::Stockpile,
                     &progress,
                     &projects,
+                    &calendar,
                 );
                 board.faction_postings_mut(faction_id).push(JobPosting {
                     id,
@@ -2738,6 +2742,7 @@ pub fn chief_job_posting_system(
                     JobKind::Stockpile,
                     &progress,
                     &projects,
+                    &calendar,
                 );
                 board.faction_postings_mut(faction_id).push(JobPosting {
                     id,
@@ -2840,6 +2845,7 @@ pub fn chief_job_posting_system(
                                     JobKind::Haul,
                                     &progress,
                                     &projects,
+                                    &calendar,
                                 );
                                 board.faction_postings_mut(faction_id).push(JobPosting {
                                     id,
@@ -2874,7 +2880,7 @@ pub fn chief_job_posting_system(
                         source: HaulSource::Storage,
                     };
                     let priority =
-                        compute_priority(faction, faction_id, JobKind::Haul, &progress, &projects);
+                        compute_priority(faction, faction_id, JobKind::Haul, &progress, &projects, &calendar);
                     board.faction_postings_mut(faction_id).push(JobPosting {
                         id,
                         faction_id,
@@ -3021,6 +3027,7 @@ pub fn chief_job_posting_system(
                             JobKind::Farm,
                             &progress,
                             &projects,
+                            &calendar,
                         );
                         board.faction_postings_mut(faction_id).push(JobPosting {
                             id,
@@ -3184,7 +3191,7 @@ pub fn chief_job_posting_system(
                 };
                 let id = board.alloc_id();
                 let priority =
-                    compute_priority(faction, faction_id, JobKind::Plow, &progress, &projects);
+                    compute_priority(faction, faction_id, JobKind::Plow, &progress, &projects, &calendar);
                 board.faction_postings_mut(faction_id).push(JobPosting {
                     id,
                     faction_id,
@@ -3329,7 +3336,7 @@ pub fn chief_job_posting_system(
                         tech_payload: None,
                     };
                     let priority =
-                        compute_priority(faction, faction_id, JobKind::Craft, &progress, &projects);
+                        compute_priority(faction, faction_id, JobKind::Craft, &progress, &projects, &calendar);
                     board.faction_postings_mut(faction_id).push(JobPosting {
                         id,
                         faction_id,
@@ -3384,6 +3391,7 @@ pub fn chief_job_posting_system(
                             JobKind::Stockpile,
                             &progress,
                             &projects,
+                            &calendar,
                         );
                         board.faction_postings_mut(faction_id).push(JobPosting {
                             id,
@@ -3765,6 +3773,7 @@ fn bucket_share(
 pub fn job_claim_system(
     mut commands: Commands,
     clock: Res<SimClock>,
+    calendar: Res<crate::world::seasons::Calendar>,
     registry: Res<FactionRegistry>,
     mut board: ResMut<JobBoard>,
     chunk_map: Res<crate::world::chunk::ChunkMap>,
@@ -3864,7 +3873,39 @@ pub fn job_claim_system(
             // Good so food can't crowd out wood/stone slots.
             let (kind, rid) = cap_bucket(p);
             let share = bucket_share(&budget, kind, rid);
-            let cap = ((share * faction.member_count as f32).round() as u32).max(1);
+            let mut cap = ((share * faction.member_count as f32).round() as u32).max(1);
+            // Phase-weighted seasonal claim floor: an open seasonal `FieldWork`
+            // posting (`assigned_farmer == None` — Spring prep/plant, Autumn
+            // harvest) pulls a phase-weighted fraction of the village onto
+            // field work, overriding the normal Farm budget cap. Suppressed
+            // under acute food pressure so emergency foraging wins; the Plow
+            // and Summer-caretaker (`assigned_farmer == Some`) postings are
+            // untouched (they don't match this pattern).
+            if kind == JobKind::Farm {
+                if let JobProgress::FieldWork {
+                    assigned_farmer: None,
+                    ..
+                } = p.progress
+                {
+                    if (food_pressure(faction) as f32) < CRITICAL_FOOD_TRIGGER {
+                        let season_share = match calendar.season {
+                            crate::world::seasons::Season::Spring => {
+                                Some(crate::simulation::farm::SEASONAL_FARM_CLAIM_SHARE_SPRING)
+                            }
+                            crate::world::seasons::Season::Autumn => {
+                                Some(crate::simulation::farm::SEASONAL_FARM_CLAIM_SHARE_AUTUMN)
+                            }
+                            // Summer / Winter keep the normal Farm budget cap.
+                            _ => None,
+                        };
+                        if let Some(ss) = season_share {
+                            let floor =
+                                ((ss * faction.member_count as f32).ceil() as u32).max(1);
+                            cap = cap.max(floor);
+                        }
+                    }
+                }
+            }
             let count = claim_counts
                 .get(&(faction_id, kind, rid))
                 .copied()
@@ -4381,6 +4422,66 @@ pub fn planting_area_contains(progress: &JobProgress, tile: (i32, i32)) -> bool 
         JobProgress::FieldWork { area, .. } => area.contains(tile),
         _ => false,
     }
+}
+
+/// Credit a `FieldWork` posting by `delta`, **gated on its `phase`**. Mirrors
+/// `record_progress_filtered`'s completion + claim-release + `JobCompletedEvent`
+/// path. The phase gate is the structural guard against cross-phase crediting:
+/// a Prepare-phase executor passes `Prepare`, the planting executor passes
+/// `Plant`, the harvest path passes `Harvest`, so a worker holding a claim on
+/// a posting of a *different* seasonal phase can never advance it. No-op when
+/// the posting is gone, isn't `FieldWork`, or carries a different phase.
+pub fn record_fieldwork_progress(
+    commands: &mut Commands,
+    board: &mut JobBoard,
+    completed_events: &mut EventWriter<JobCompletedEvent>,
+    job_id: JobId,
+    phase: crate::simulation::farm::FarmWorkPhase,
+    delta: u32,
+) {
+    if delta == 0 {
+        return;
+    }
+    let Some(posting) = board.get_mut(job_id) else {
+        return;
+    };
+    let JobProgress::FieldWork {
+        phase: posting_phase,
+        completed,
+        target,
+        ..
+    } = &mut posting.progress
+    else {
+        return;
+    };
+    if *posting_phase != phase {
+        return;
+    }
+    *completed = completed.saturating_add(delta);
+    if *completed < *target {
+        return;
+    }
+    // Completion: drop the posting, release every claimant, fire the event.
+    let job_id = posting.id;
+    let faction_id = posting.faction_id;
+    let kind = posting.kind;
+    let target_rid = posting.progress.target_rid();
+    let claimants: Vec<Entity> = std::mem::take(&mut posting.claimants);
+    if let Some((fid, idx)) = board.locate(job_id) {
+        board.postings.get_mut(&fid).unwrap().swap_remove(idx);
+    }
+    for c in &claimants {
+        commands.entity(*c).remove::<JobClaim>();
+        commands.entity(*c).remove::<ClaimTarget>();
+    }
+    completed_events.send(JobCompletedEvent {
+        job_id,
+        faction_id,
+        kind,
+        claimants,
+        completed: true,
+        target_rid,
+    });
 }
 
 const RELEASE_SWEEP_INTERVAL: u64 = 60;

@@ -193,6 +193,14 @@ pub struct GatherRoutingResources<'w, 's> {
     /// path to apply the `PLOW_YIELD_MULT_*` bonus. Bundled here so
     /// `gather_system` stays under Bevy's 16-param ceiling.
     pub tilled_q: Query<'w, 's, (), With<crate::simulation::draftwork::Tilled>>,
+    /// Seasonal-farming jellyfish: the Grain harvest branch credits an Autumn
+    /// `FieldWork { phase: Harvest }` posting via `record_fieldwork_progress`
+    /// when the harvester holds a `JobClaim::Farm` on it — without this,
+    /// Autumn harvest postings never progress (harvest runs through
+    /// `gather_system`, which had no `FieldWork` hook). Bundled here so
+    /// `gather_system` stays under Bevy's 16-param ceiling.
+    pub job_board: ResMut<'w, crate::simulation::jobs::JobBoard>,
+    pub job_completed: EventWriter<'w, crate::simulation::jobs::JobCompletedEvent>,
 }
 
 /// Phase 5c-ii-c-ii chain handoff: called by every `gather_system` exit path
@@ -410,6 +418,7 @@ pub fn gather_system(
         Option<&crate::simulation::reproduction::HouseholdMember>,
         &AgentGoal,
         &mut MethodHistory,
+        Option<&crate::simulation::jobs::JobClaim>,
     )>,
 ) {
     use crate::simulation::shared_knowledge::KnowledgeTier;
@@ -427,6 +436,7 @@ pub fn gather_system(
         household_member,
         _goal,
         mut method_history,
+        job_claim,
     ) in agent_query.iter_mut()
     {
         // Resolve the finest tier the agent writes to — same rule as
@@ -727,6 +737,39 @@ pub fn gather_system(
                     PlantKind::Tree => MemoryKind::wood(),
                 };
                 shared.report_depleted(agent_tier, (tx, ty), depleted_kind);
+            }
+
+            // Seasonal-farming jellyfish: credit an Autumn `FieldWork`
+            // posting's Harvest phase when this harvester holds a
+            // `JobClaim::Farm` on it and the reaped tile is inside the
+            // posting's area. `record_fieldwork_progress` no-ops unless the
+            // backing posting is `FieldWork { phase: Harvest }`, so a
+            // Prepare/Plant claim can't be cross-credited by a harvest.
+            if matches!(kind, PlantKind::Grain) {
+                if let Some(claim) = job_claim {
+                    if matches!(claim.kind, crate::simulation::jobs::JobKind::Farm) {
+                        let in_area = routing
+                            .job_board
+                            .get(claim.job_id)
+                            .map(|p| {
+                                crate::simulation::jobs::planting_area_contains(
+                                    &p.progress,
+                                    (tx, ty),
+                                )
+                            })
+                            .unwrap_or(false);
+                        if in_area {
+                            crate::simulation::jobs::record_fieldwork_progress(
+                                &mut commands,
+                                &mut routing.job_board,
+                                &mut routing.job_completed,
+                                claim.job_id,
+                                crate::simulation::farm::FarmWorkPhase::Harvest,
+                                1,
+                            );
+                        }
+                    }
+                }
             }
         } else {
             // ── Tile harvest (stone / wall) ───────────────────────────────────

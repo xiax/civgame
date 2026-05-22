@@ -7448,12 +7448,15 @@ mod smoke {
             let world = sim.app.world();
             let registry = world.resource::<FactionRegistry>();
             let projects = world.resource::<Projects>();
+            let calendar = world.resource::<crate::world::seasons::Calendar>();
             let faction = registry.factions.get(&sim.player_faction_id).unwrap();
             compute_workforce_budget(
                 faction,
                 projects,
                 sim.player_faction_id,
                 WorkforceBudget::default(),
+                calendar,
+                true,
             )
         };
         // free is EMA-blended from the prior tick's value (default 0.15);
@@ -7488,8 +7491,16 @@ mod smoke {
             let world = sim.app.world();
             let registry = world.resource::<FactionRegistry>();
             let projects = world.resource::<Projects>();
+            let calendar = world.resource::<crate::world::seasons::Calendar>();
             let faction = registry.factions.get(&sim.player_faction_id).unwrap();
-            budget = compute_workforce_budget(faction, projects, sim.player_faction_id, budget);
+            budget = compute_workforce_budget(
+                faction,
+                projects,
+                sim.player_faction_id,
+                budget,
+                calendar,
+                true,
+            );
         }
 
         assert!(
@@ -7523,6 +7534,82 @@ mod smoke {
                 budget,
             );
         }
+    }
+
+    #[test]
+    fn workforce_budget_farm_slot_collapses_without_backlog() {
+        // Seasonal-farming jellyfish: the Farm budget slot must draw share
+        // only while the season has outstanding queued field work. With
+        // `farm_backlog = false` (Winter, or the mid-Spring post-planting
+        // window) the slot collapses to ~0 and reroutes to `free`, even at
+        // high `farm_pressure` (zero grain). With `farm_backlog = true` it
+        // scales with the season-aware pressure.
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::projects::{compute_workforce_budget, Projects, WorkforceBudget};
+        use crate::simulation::technology::CROP_CULTIVATION;
+        use crate::world::seasons::{Calendar, Season};
+
+        let mut sim = TestSim::new(0xFA12);
+        sim.flat_world(1, 0, TileKind::Grass);
+        for i in 0..8 {
+            sim.spawn_person(sim.player_faction_id, (i, 0), |_| {});
+        }
+        // Farm capacity-eligibility needs CROP_CULTIVATION; zero grain stored
+        // ⇒ full annual deficit ⇒ high farm_pressure in Spring.
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
+            f.techs.unlock(CROP_CULTIVATION);
+        }
+        let mut spring = Calendar::default();
+        spring.season = Season::Spring;
+
+        let world = sim.app.world();
+        let registry = world.resource::<FactionRegistry>();
+        let projects = world.resource::<Projects>();
+        let faction = registry.factions.get(&sim.player_faction_id).unwrap();
+
+        // Backlog present: Farm slot carries a real share.
+        let mut with_backlog = WorkforceBudget::default();
+        for _ in 0..30 {
+            with_backlog = compute_workforce_budget(
+                faction,
+                projects,
+                sim.player_faction_id,
+                with_backlog,
+                &spring,
+                true,
+            );
+        }
+        // No backlog: Farm slot collapses; its share reroutes to `free`.
+        let mut no_backlog = WorkforceBudget::default();
+        for _ in 0..30 {
+            no_backlog = compute_workforce_budget(
+                faction,
+                projects,
+                sim.player_faction_id,
+                no_backlog,
+                &spring,
+                false,
+            );
+        }
+
+        assert!(
+            with_backlog.farm > 0.05,
+            "Spring farm backlog should give Farm a real share, got {:?}",
+            with_backlog,
+        );
+        assert!(
+            no_backlog.farm <= 0.02,
+            "no farm backlog should collapse the Farm slot, got {:?}",
+            no_backlog,
+        );
+        assert!(
+            no_backlog.free > with_backlog.free,
+            "collapsed Farm share should reroute to free: no_backlog {:?} vs with_backlog {:?}",
+            no_backlog,
+            with_backlog,
+        );
     }
 
     #[test]

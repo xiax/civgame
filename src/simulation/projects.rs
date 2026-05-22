@@ -227,6 +227,13 @@ pub fn blueprint_remaining_inputs(
 
 pub const PRIORITY_PLAYER: u8 = 220;
 
+/// Priority floor for an open seasonal `FieldWork` posting (Spring prep /
+/// planting, Autumn harvest). Set above the realistic ceilings of chief Haul
+/// (`BASE_HAUL 90 + haul_pressure 50 = 140`), Build (`40 + 40 = 80`) and Craft
+/// (`50 + craft_pressure ≤ 100 = 150`), and below `PRIORITY_PLAYER` so player
+/// orders still preempt. Applied in `compute_priority`.
+pub const SEASONAL_FARM_PRIORITY: u8 = 170;
+
 const BASE_GATHER_FOOD: u8 = 80;
 const BASE_GATHER_MATERIAL: u8 = 60;
 const BASE_HAUL: u8 = 90;
@@ -247,6 +254,7 @@ pub fn compute_priority(
     posting_kind: JobKind,
     progress: &JobProgress,
     projects: &Projects,
+    calendar: &crate::world::seasons::Calendar,
 ) -> u8 {
     let base = match posting_kind {
         JobKind::Stockpile => match progress {
@@ -269,13 +277,34 @@ pub fn compute_priority(
         }
         (JobKind::Haul, JobProgress::Haul { .. }) => haul_pressure(),
         (JobKind::Build, JobProgress::Building { .. }) => build_pressure(),
-        (JobKind::Farm, _) => farm_pressure(faction),
+        (JobKind::Farm, _) => farm_pressure(faction, calendar),
         (JobKind::Craft, _) => craft_pressure(faction),
-        (JobKind::Plow, _) => farm_pressure(faction),
+        (JobKind::Plow, _) => farm_pressure(faction, calendar),
         _ => 0,
     };
 
-    base.saturating_add(pressure)
+    let mut priority = base.saturating_add(pressure);
+
+    // Seasonal hard-priority: an *open* seasonal `FieldWork` posting (Spring
+    // prep / planting, Autumn harvest — `assigned_farmer == None`) outranks
+    // normal chief Build / Haul / Craft so the village doesn't starve its own
+    // in-season field work. Summer caretaker Prepare (`assigned_farmer ==
+    // Some`) and Plow are deliberately not boosted. Suppressed when food is
+    // acute (`food_pressure >= CRITICAL_FOOD_TRIGGER`) so emergency
+    // `Stockpile` still wins.
+    if posting_kind == JobKind::Farm {
+        if let JobProgress::FieldWork {
+            assigned_farmer: None,
+            ..
+        } = progress
+        {
+            if (food_pressure(faction) as f32) < CRITICAL_FOOD_TRIGGER {
+                priority = priority.max(SEASONAL_FARM_PRIORITY.min(PRIORITY_PLAYER - 1));
+            }
+        }
+    }
+
+    priority
 }
 
 /// 0..=100: how badly does the faction need food right now? Scales with the
@@ -327,21 +356,41 @@ pub fn haul_pressure() -> u8 {
     50
 }
 
-/// 0..=100: how badly does the faction need farmed grain. Scaled to the
-/// same urgency range as the other pressure helpers so the workforce
-/// budget can compare slots directly.
-pub fn farm_pressure(faction: &FactionData) -> u8 {
+/// 0..=100: how badly does the faction need farmed grain. Season-aware — one
+/// signal feeding both `compute_priority` and `compute_workforce_budget`:
+/// `0` in `WinterDormant`, the full annual deficit ratio in
+/// `SpringPrepPlant` / `AutumnHarvest`, and attenuated by
+/// `SUMMER_FARM_PRESSURE_SCALE` in `SummerMaintenance`. The deficit is
+/// measured against the *annual* grain target (`farm::annual_grain_target`),
+/// not a trivial token stockpile, so a village that holds a little grain
+/// still reads real Spring/Autumn pressure.
+pub fn farm_pressure(faction: &FactionData, calendar: &crate::world::seasons::Calendar) -> u8 {
+    use crate::simulation::farm::{farm_season_phase, FarmSeasonPhase};
     if !faction_can_perform(faction, JobKind::Farm) {
         return 0;
     }
+    if faction.member_count == 0 {
+        return 0;
+    }
+    let phase = farm_season_phase(calendar);
+    if matches!(phase, FarmSeasonPhase::WinterDormant) {
+        return 0;
+    }
     let grain = faction.storage.stock_of(crate::economy::core_ids::grain());
-    let target = faction.member_count.saturating_mul(4);
+    let target = crate::simulation::farm::annual_grain_target(faction.member_count);
     if grain >= target || target == 0 {
         return 0;
     }
-    let deficit = (target - grain) as f32;
-    let target_f = target as f32;
-    ((deficit / target_f).clamp(0.0, 1.0) * 100.0) as u8
+    let deficit_ratio = ((target - grain) as f32 / target as f32).clamp(0.0, 1.0);
+    let base = deficit_ratio * 100.0;
+    let shaped = match phase {
+        FarmSeasonPhase::SummerMaintenance => {
+            base * crate::simulation::farm::SUMMER_FARM_PRESSURE_SCALE
+        }
+        // Spring / Autumn carry the full annual deficit.
+        _ => base,
+    };
+    shaped.clamp(0.0, 100.0) as u8
 }
 
 /// 0..=100: craft-supply gap pressure across all craftable goods.
@@ -509,7 +558,7 @@ const CRAFT_WORKERS_PER_ITEM: f32 = 1.0;
 /// Trigger threshold for the critical-food override. Per-head food below
 /// 20% of target makes `food_pressure` ≥ 80, at which point we force
 /// `stockpile_food` to at least `CRITICAL_FOOD_FLOOR`.
-const CRITICAL_FOOD_TRIGGER: f32 = 80.0;
+pub const CRITICAL_FOOD_TRIGGER: f32 = 80.0;
 const CRITICAL_FOOD_FLOOR: f32 = 0.45;
 
 /// Compute the next workforce budget from current pressures, blend with the
@@ -519,11 +568,20 @@ const CRITICAL_FOOD_FLOOR: f32 = 0.45;
 /// then allocated linearly with a per-slot floor — pressure 80 vs 40 yields
 /// a 2:1 split, not a winner-take-all softmax flip. EMA absorbs single-tick
 /// step changes from discrete project add/complete events.
+/// `farm_backlog` is `true` when the faction has any non-complete
+/// `JobProgress::FieldWork` or `JobProgress::Plow` posting. The budget keys
+/// the Farm slot on grain stock (`farm_pressure`), not on whether field work
+/// remains, so without this gate the slot keeps reserving share through the
+/// mid-Spring post-planting window (and Winter). When `false` the Farm slot
+/// collapses past `SHARE_FLOOR` and is rerouted to `free`, like a
+/// policy-disabled slot.
 pub fn compute_workforce_budget(
     faction: &FactionData,
     projects: &Projects,
     faction_id: u32,
     previous: WorkforceBudget,
+    calendar: &crate::world::seasons::Calendar,
+    farm_backlog: bool,
 ) -> WorkforceBudget {
     let food = food_pressure(faction) as f32;
     let mut waiting_build = 0u32;
@@ -564,7 +622,16 @@ pub fn compute_workforce_budget(
     let haul = ((waiting_build + waiting_gather) as f32 / 4.0).clamp(0.0, 1.0) * 100.0;
     let build = (waiting_build as f32 / 2.0).clamp(0.0, 1.0) * 100.0;
 
-    let farm = farm_pressure(faction) as f32;
+    // Budget-layer farm-backlog gate: the Farm slot draws workforce share only
+    // while the season's queued field work is still outstanding. No backlog
+    // (Winter, or the mid-Spring window after every `FieldWork` posting has
+    // completed) ⇒ zero raw pressure and the slot is treated as policy-dormant
+    // below.
+    let farm = if farm_backlog {
+        farm_pressure(faction, calendar) as f32
+    } else {
+        0.0
+    };
     let craft = craft_pressure(faction) as f32;
 
     let mut raw_food = stockpile_food_pressure;
@@ -621,7 +688,11 @@ pub fn compute_workforce_budget(
             Some(kind) => faction_can_perform(faction, kind),
         };
         capacity_eligible[i] = cap_ok;
-        chief_eligible[i] = cap_ok && chief_will_post_for_slot(faction, i);
+        // Slot 4 (Farm): with no outstanding field-work backlog the chief
+        // posts nothing, so collapse the slot like a policy-disabled one —
+        // its proportional share reroutes to `free`.
+        let chief_posts = chief_will_post_for_slot(faction, i) && (i != 4 || farm_backlog);
+        chief_eligible[i] = cap_ok && chief_posts;
         if chief_eligible[i] {
             raw[i] = raws[i].max(0.0).min(CULTURE_RAW_CAP);
         }
@@ -875,14 +946,30 @@ const BUDGET_RECOMPUTE_INTERVAL: u64 = 60;
 pub fn workforce_budget_system(
     clock: Res<SimClock>,
     projects: Res<Projects>,
+    board: Res<JobBoard>,
+    calendar: Res<crate::world::seasons::Calendar>,
     mut registry: ResMut<crate::simulation::faction::FactionRegistry>,
 ) {
     if clock.tick % BUDGET_RECOMPUTE_INTERVAL != 0 {
         return;
     }
     for (&faction_id, faction) in registry.factions.iter_mut() {
-        let next =
-            compute_workforce_budget(faction, &projects, faction_id, faction.workforce_budget);
+        // Farm-backlog: any non-complete FieldWork or Plow posting means the
+        // season still has queued field work; the Farm budget slot stays live.
+        let farm_backlog = board.faction_postings(faction_id).iter().any(|p| {
+            matches!(
+                p.progress,
+                JobProgress::FieldWork { .. } | JobProgress::Plow { .. }
+            ) && !p.progress.is_complete()
+        });
+        let next = compute_workforce_budget(
+            faction,
+            &projects,
+            faction_id,
+            faction.workforce_budget,
+            &calendar,
+            farm_backlog,
+        );
         faction.workforce_budget = next;
     }
 }

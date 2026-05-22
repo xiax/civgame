@@ -46,6 +46,46 @@ pub const HARVEST_NUTRIENT_DEBIT: u8 = 30;
 /// Per-season-edge fallow recovery (capped by per-tile fertility ceiling).
 pub const FALLOW_NUTRIENTS_PER_SEASON: u8 = 15;
 
+// ── Annual-planning constants (single source of truth) ───────────────────────
+// Rehomed here from `organic_settlement.rs` so the farm-demand model and the
+// seasonal `farm_pressure` signal read the same numbers. `organic_settlement`
+// re-exports these at the old paths so `parcel_targets` doesn't churn.
+
+/// Grain a person eats per game-year. Derivation: `HUNGER_RATE = 2.0`
+/// hunger/real-s; a game-day is `TICKS_PER_DAY = 3600` ticks × 0.05 s/tick
+/// (20 Hz) = 180 real-s ⇒ 360 hunger/day; grain is 150 cal/unit ⇒ 2.4
+/// grain/person/day; a year is 4 × `DAYS_PER_SEASON = 5` = 20 game-days ⇒
+/// 2.4 × 20 = 48. If those timescale knobs change, re-derive this.
+pub const GRAIN_PER_PERSON_PER_YEAR: u32 = 48;
+/// Typical per-tile annual grain yield used for plot sizing — the middle
+/// nutrient tier (`grain_yield_for_nutrients`: ≥120 → 4).
+pub const GRAIN_YIELD_PER_TILE_PLANNING: u32 = 4;
+/// Bad-year / seed-reserve / winter-carryover margin folded into the demand
+/// target. Tribes kept reserves; one failed harvest shouldn't mean famine.
+pub const SUPPLY_SAFETY_NUMER: u32 = 5; // 1.25× as 5/4
+pub const SUPPLY_SAFETY_DENOM: u32 = 4;
+
+/// Phase-weighted seasonal `FieldWork` claim-share floors — the fraction of
+/// the village that may pile onto open seasonal field work, overriding the
+/// normal Farm workforce-budget cap. Heavier in Spring (prep + planting rush)
+/// than Autumn (harvest).
+pub const SEASONAL_FARM_CLAIM_SHARE_SPRING: f32 = 0.65;
+pub const SEASONAL_FARM_CLAIM_SHARE_AUTUMN: f32 = 0.45;
+/// Summer caretaker pressure is a fraction of the full annual deficit — fields
+/// are mostly planted, only stragglers remain.
+pub const SUMMER_FARM_PRESSURE_SCALE: f32 = 0.35;
+
+/// Annual grain a faction of `members` should hold for food security,
+/// including the bad-year safety margin. This is the stock target the
+/// seasonal `farm_pressure` signal measures the deficit against. Shares the
+/// `GRAIN_PER_PERSON_PER_YEAR × SUPPLY_SAFETY` expression with
+/// `organic_settlement::parcel_targets`' `food_tiles` (which divides further
+/// by `GRAIN_YIELD_PER_TILE_PLANNING`).
+#[inline]
+pub fn annual_grain_target(members: u32) -> u32 {
+    (members * GRAIN_PER_PERSON_PER_YEAR * SUPPLY_SAFETY_NUMER).div_ceil(SUPPLY_SAFETY_DENOM)
+}
+
 /// What the village should be doing in the field this season. Pure function
 /// of `Calendar.season`. No state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -690,7 +730,7 @@ pub fn prepare_field_task_system(
         With<crate::simulation::person::Person>,
     >,
 ) {
-    use crate::simulation::jobs::{record_progress, JobKind};
+    use crate::simulation::jobs::{record_fieldwork_progress, JobKind};
     use crate::simulation::person::AiState;
     use crate::simulation::skills::SkillKind;
     use crate::simulation::tasks::TaskKind;
@@ -739,15 +779,18 @@ pub fn prepare_field_task_system(
                 state.nutrients = EXHAUSTED_FLOOR;
             }
         }
-        // Credit the claimed posting's Prepare phase.
+        // Credit the claimed posting's Prepare phase. `record_fieldwork_progress`
+        // no-ops unless the backing posting is `FieldWork { phase: Prepare }`,
+        // so a worker that strayed onto a Plant/Harvest claim can't be credited
+        // here.
         if let Some(claim) = claim_opt {
             if matches!(claim.kind, JobKind::Farm) {
-                record_progress(
+                record_fieldwork_progress(
                     &mut commands,
                     &mut board,
                     &mut completed_events,
-                    claim,
-                    JobKind::Farm,
+                    claim.job_id,
+                    FarmWorkPhase::Prepare,
                     1,
                 );
             }
@@ -830,6 +873,15 @@ mod tests {
             farm_season_phase(&cal_with(Season::Winter, 1)),
             FarmSeasonPhase::WinterDormant
         );
+    }
+
+    #[test]
+    fn annual_grain_target_scales_with_population() {
+        assert_eq!(annual_grain_target(0), 0);
+        // 1 person: 1 × 48 × 5 / 4 = 60.
+        assert_eq!(annual_grain_target(1), 60);
+        // 20 people: 20 × 48 × 5 / 4 = 1200.
+        assert_eq!(annual_grain_target(20), 1200);
     }
 
     #[test]

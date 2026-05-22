@@ -3502,19 +3502,13 @@ fn current_ag_tile_count(brain: &SettlementBrain) -> u32 {
         .sum()
 }
 
-/// Grain a person eats per game-year. Derivation: `HUNGER_RATE = 2.0`
-/// hunger/real-s; a game-day is `TICKS_PER_DAY = 3600` ticks × 0.05 s/tick
-/// (20 Hz) = 180 real-s ⇒ 360 hunger/day; grain is 150 cal/unit ⇒ 2.4
-/// grain/person/day; a year is 4 × `DAYS_PER_SEASON = 5` = 20 game-days ⇒
-/// 2.4 × 20 = 48. If those timescale knobs change, re-derive this.
-pub const GRAIN_PER_PERSON_PER_YEAR: u32 = 48;
-/// Typical per-tile annual grain yield used for plot sizing — the middle
-/// nutrient tier (`grain_yield_for_nutrients`: ≥120 → 4).
-pub const GRAIN_YIELD_PER_TILE_PLANNING: u32 = 4;
-/// Bad-year / seed-reserve / winter-carryover margin folded into the demand
-/// target. Tribes kept reserves; one failed harvest shouldn't mean famine.
-pub const SUPPLY_SAFETY_NUMER: u32 = 5; // 1.25× as 5/4
-pub const SUPPLY_SAFETY_DENOM: u32 = 4;
+// Annual-planning constants now live in `farm.rs` (single source of truth,
+// shared with the seasonal `farm_pressure` signal). Re-exported here so
+// `parcel_targets` and other call sites don't churn.
+pub use crate::simulation::farm::{
+    GRAIN_PER_PERSON_PER_YEAR, GRAIN_YIELD_PER_TILE_PLANNING, SUPPLY_SAFETY_DENOM,
+    SUPPLY_SAFETY_NUMER,
+};
 
 fn parcel_targets<F: SurveyFactionView>(
     faction: &F,

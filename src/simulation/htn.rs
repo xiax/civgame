@@ -6775,6 +6775,37 @@ pub fn resolve_farm_scope(
     }
 }
 
+/// The [`FarmWorkPhase`](crate::simulation::farm::FarmWorkPhase) of the
+/// `FieldWork` posting backing a Farm claim, if any. `None` when there is no
+/// claim, the claim isn't `JobKind::Farm`, the posting has despawned, or the
+/// posting isn't a `FieldWork` posting (e.g. a bootstrap chief Farm posting).
+///
+/// Each farm dispatcher honours a `Some` result as a hard phase gate —
+/// `htn_prepare_field_dispatch_system` acts only on `Prepare`,
+/// `htn_plant_from_storage_dispatch_system` only on `Plant`,
+/// `htn_harvest_plant_dispatch_system` only on `Harvest` — so a worker whose
+/// claim resolved to a different seasonal phase can't act out of phase. A
+/// `None` result (no posting) preserves the autonomous Private / Bootstrap
+/// behaviour seasonally gated by `FarmWorkScorer`.
+pub fn claimed_fieldwork_phase(
+    claim_opt: Option<&crate::simulation::jobs::JobClaim>,
+    board: &crate::simulation::jobs::JobBoard,
+) -> Option<crate::simulation::farm::FarmWorkPhase> {
+    use crate::simulation::jobs::{JobKind, JobProgress};
+    let claim = claim_opt?;
+    if !matches!(claim.kind, JobKind::Farm) {
+        return None;
+    }
+    let posting = board
+        .faction_postings(claim.faction_id)
+        .iter()
+        .find(|p| p.id == claim.job_id)?;
+    match posting.progress {
+        JobProgress::FieldWork { phase, .. } => Some(phase),
+        _ => None,
+    }
+}
+
 pub fn htn_plant_from_storage_dispatch_system(
     chunk_map: Res<ChunkMap>,
     chunk_graph: Res<ChunkGraph>,
@@ -6848,6 +6879,17 @@ pub fn htn_plant_from_storage_dispatch_system(
             .unwrap_or(false);
         if !has_tech {
             continue;
+        }
+
+        // Phase gate: a Communal `JobClaim::Farm` whose posting is a Prepare
+        // or Harvest `FieldWork` must not be advanced by the planting
+        // dispatcher (it would credit the wrong seasonal posting). Private /
+        // Bootstrap workers have no `FieldWork` posting → `None` → autonomous
+        // planting continues, seasonally gated by `FarmWorkScorer`.
+        if let Some(phase) = claimed_fieldwork_phase(claim_opt, &farm_plot_params.board) {
+            if phase != crate::simulation::farm::FarmWorkPhase::Plant {
+                continue;
+            }
         }
 
         // Resolve which storage / plot the worker is bound to. Communal/
@@ -10117,6 +10159,16 @@ pub fn htn_harvest_plant_dispatch_system(
             cur_tx.div_euclid(CHUNK_SIZE as i32),
             cur_ty.div_euclid(CHUNK_SIZE as i32),
         );
+
+        // Phase gate: a Communal `JobClaim::Farm` whose posting is a Prepare
+        // or Plant `FieldWork` must not be advanced by the harvest dispatcher.
+        // Private / Bootstrap workers have no `FieldWork` posting → `None` →
+        // autonomous harvest continues, seasonally gated by `FarmWorkScorer`.
+        if let Some(phase) = claimed_fieldwork_phase(claim_opt, &farm_plot_params.board) {
+            if phase != crate::simulation::farm::FarmWorkPhase::Harvest {
+                continue;
+            }
+        }
 
         let scope = resolve_farm_scope(
             actor,

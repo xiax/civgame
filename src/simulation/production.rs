@@ -5,7 +5,8 @@ use super::faction::{
 };
 use super::items::{spawn_or_merge_ground_item, GroundItem};
 use super::jobs::{
-    planting_area_contains, record_progress, JobBoard, JobClaim, JobCompletedEvent, JobKind,
+    planting_area_contains, record_fieldwork_progress, JobBoard, JobClaim, JobCompletedEvent,
+    JobKind,
 };
 use super::lod::LodLevel;
 use super::needs::Needs;
@@ -232,21 +233,26 @@ pub fn production_system(
                             actor,
                             activity: ActivityKind::Farming,
                         });
-                        // Credit a Farm posting if this worker holds one and the
-                        // tile falls within the posting's designated area.
+                        // Credit a Farm posting's Plant phase if this worker
+                        // holds one and the tile falls within the posting's
+                        // designated area. `record_fieldwork_progress` no-ops
+                        // unless the backing posting is `FieldWork { phase:
+                        // Plant }`, so a Prepare/Harvest claim can't be
+                        // cross-credited by a planting completion.
                         if let Some(claim) = claim_opt {
                             let tile = (tx as i32, ty as i32);
-                            let in_area = board
-                                .get(claim.job_id)
-                                .map(|p| planting_area_contains(&p.progress, tile))
-                                .unwrap_or(false);
+                            let in_area = matches!(claim.kind, JobKind::Farm)
+                                && board
+                                    .get(claim.job_id)
+                                    .map(|p| planting_area_contains(&p.progress, tile))
+                                    .unwrap_or(false);
                             if in_area {
-                                record_progress(
+                                record_fieldwork_progress(
                                     &mut commands,
                                     &mut board,
                                     &mut job_completed,
-                                    claim,
-                                    JobKind::Farm,
+                                    claim.job_id,
+                                    crate::simulation::farm::FarmWorkPhase::Plant,
                                     1,
                                 );
                             }
