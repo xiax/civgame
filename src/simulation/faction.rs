@@ -1373,7 +1373,24 @@ pub fn household_contract_posting_system(world: &mut World) {
                 None => continue,
             };
             let tier = MaslowTier::next_unmet(needs);
-            let recipe = pick_household_recipe(tier, &village_techs);
+            // Cloth is accessible if the household, the parent village, or the
+            // head holds any — a Belonging contract only fires on a real gap.
+            let cloth = crate::economy::core_ids::cloth();
+            let has_accessible_cloth = data.storage.stock_of(cloth) > 0
+                || registry
+                    .factions
+                    .get(&parent)
+                    .map_or(false, |v| v.storage.stock_of(cloth) > 0)
+                || world
+                    .get::<EconomicAgent>(head)
+                    .map_or(false, |a| a.quantity_of_resource(cloth) > 0)
+                || world
+                    .get::<crate::simulation::items::Equipment>(head)
+                    .map_or(false, |e| e.has_resource(cloth));
+            let Some(recipe) = pick_household_recipe(tier, &village_techs, has_accessible_cloth)
+            else {
+                continue;
+            };
             out.push((hid, parent, head, recipe));
         }
         out
@@ -1404,39 +1421,35 @@ pub fn household_contract_posting_system(world: &mut World) {
 }
 
 /// Maslow-tier → craft-recipe selection for `household_contract_posting_system`.
-/// Tier-3 Belonging → Woven Cloth (recipe 4) for clothing/social
-/// signalling. Tier-4 Esteem → Stone Tools (recipe 0). Lower tiers
-/// (Physiological / Safety) currently have no household-craftable
-/// remedy — they fall through to Tools too so the household isn't a
-/// dead poster while M4 buy-orders + M5 market-buy paths handle the
-/// food/build supply side. Recipes whose `tech_gate` isn't met by the
-/// village fall back to Tools (recipe 0 — gated on FLINT_KNAPPING which
-/// every starting faction learns).
+/// Functional craft demand (see `plans/...curried-dewdrop.md`): a household
+/// only posts a contract for a concrete gap.
+/// - Belonging → Woven Cloth (recipe 4), but **only** when the village can
+///   weave (`LOOM_WEAVING`) AND no accessible Cloth already exists.
+/// - Every other tier → `None`. The old unconditional Stone-Tools fallback is
+///   removed — there is no functional Tools deficit to chase, so a household
+///   with no Belonging gap simply skips this cycle.
 pub(crate) fn pick_household_recipe(
     tier: Option<crate::simulation::goals::MaslowTier>,
     village_techs: &FactionTechs,
-) -> RecipeId {
+    has_accessible_cloth: bool,
+) -> Option<RecipeId> {
     use crate::simulation::crafting::craft_recipes;
     use crate::simulation::goals::MaslowTier;
 
-    let preferred: RecipeId = match tier {
-        Some(MaslowTier::Belonging) => 4, // Woven Cloth
-        Some(MaslowTier::Esteem) => 0,    // Stone Tools
-        _ => 0,                           // Stone Tools default
-    };
-    // Tech-gate check against the village's `FactionTechs`. A village
-    // without LOOM_WEAVING can't fulfil a Cloth contract → fall back
-    // to Tools. Tools is recipe 0 — gated on FLINT_KNAPPING which
-    // every faction learns at spawn (paleolithic seed).
-    if let Some(recipe) = craft_recipes().get(preferred as usize) {
-        if let Some(tech) = recipe.tech_gate {
-            if !village_techs.has(tech) {
-                return 0;
+    match tier {
+        Some(MaslowTier::Belonging) => {
+            if has_accessible_cloth {
+                return None;
             }
+            let recipe = craft_recipes().get(4)?;
+            if let Some(tech) = recipe.tech_gate {
+                if !village_techs.has(tech) {
+                    return None;
+                }
+            }
+            Some(4)
         }
-        preferred
-    } else {
-        0
+        _ => None,
     }
 }
 
@@ -2519,6 +2532,13 @@ pub struct FactionData {
     /// to a legacy `Good` enum variant.
     pub resource_supply: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
     pub resource_demand: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
+    /// Functional craft demand: per crafted-output `ResourceId`, the netted
+    /// deficit (consumers lacking the good minus spare supply). Computed by
+    /// `resource_demand_system` via `jobs::compute_craft_demand`; read by the
+    /// chief Craft posting branch. Distinct from `resource_demand` (which holds
+    /// only gatherable blueprint + food demand) — crafted goods are produced,
+    /// not foraged, so they must not feed `opportunity.rs`'s MaterialDeficit.
+    pub craft_demand: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
     /// The current tribal chief of this faction, if one has been designated.
     pub chief_entity: Option<Entity>,
     /// Architectural / behavioural personality. Drives planner, selector,
@@ -2810,6 +2830,7 @@ impl FactionRegistry {
                 activity_log: ActivityLog::default(),
                 resource_supply: ahash::AHashMap::default(),
                 resource_demand: ahash::AHashMap::default(),
+                craft_demand: ahash::AHashMap::default(),
                 chief_entity: None,
                 culture,
                 lineage,
@@ -3792,21 +3813,77 @@ pub fn center_camera_on_player_faction(
 pub fn resource_demand_system(
     clock: Res<SimClock>,
     mut registry: ResMut<FactionRegistry>,
-    agent_query: Query<(&FactionMember, &EconomicAgent)>,
+    agent_query: Query<(
+        Entity,
+        &FactionMember,
+        &EconomicAgent,
+        &crate::simulation::person::Profession,
+        &crate::simulation::items::Equipment,
+        &crate::simulation::carry::Carrier,
+    )>,
     bp_map: Res<crate::simulation::construction::BlueprintMap>,
     bp_query: Query<&crate::simulation::construction::Blueprint>,
+    board: Res<crate::simulation::jobs::JobBoard>,
+    craft_orders: Query<&crate::simulation::crafting::CraftOrder>,
+    plot_index: Res<crate::simulation::land::PlotIndex>,
+    plot_q: Query<&crate::simulation::land::Plot>,
 ) {
     if clock.tick % 60 != 0 {
         return;
     }
 
+    use crate::economy::resource_catalog::{ResourceClass, ResourceId};
+
     for faction in registry.factions.values_mut() {
         faction.resource_supply.clear();
         faction.resource_demand.clear();
+        faction.craft_demand.clear();
     }
 
-    // 1. Tally supply (agents' inventories + faction stocks)
-    for (member, agent) in agent_query.iter() {
+    // Resolve core_ids upfront so we pay one OnceLock read per attribute.
+    let fruit = crate::economy::core_ids::fruit();
+    let meat = crate::economy::core_ids::meat();
+    let grain = crate::economy::core_ids::grain();
+    let tools = crate::economy::core_ids::tools();
+    let weapon = crate::economy::core_ids::weapon();
+    let ard_plow = crate::economy::core_ids::ard_plow();
+
+    // ── In-flight craft tally — units already being crafted, keyed
+    // (faction, output ResourceId). Live Craft postings + live CraftOrders.
+    let recipes = crate::simulation::crafting::craft_recipes();
+    let mut in_flight: ahash::AHashMap<(u32, ResourceId), u32> = ahash::AHashMap::default();
+    for (&fid, postings) in board.postings.iter() {
+        for p in postings.iter() {
+            if let crate::simulation::jobs::JobProgress::Crafting {
+                recipe,
+                crafted,
+                target,
+                ..
+            } = &p.progress
+            {
+                if let Some(r) = recipes.get(*recipe as usize) {
+                    let remaining = target.saturating_sub(*crafted);
+                    if remaining > 0 {
+                        *in_flight.entry((fid, r.output_resource)).or_insert(0) += remaining;
+                    }
+                }
+            }
+        }
+    }
+    for order in craft_orders.iter() {
+        if let Some(r) = recipes.get(order.recipe_id as usize) {
+            *in_flight
+                .entry((order.faction_id, r.output_resource))
+                .or_insert(0) += r.output_qty as u32;
+        }
+    }
+
+    // 1. Tally supply (agents' inventories + faction stocks) and, in the same
+    // pass, count unarmed combatants (Hunters + active raiders without a
+    // weapon equipped, carried, or in inventory).
+    let is_weapon = |rid: ResourceId| rid.class() == Some(ResourceClass::Weapon);
+    let mut unarmed: ahash::AHashMap<u32, u32> = ahash::AHashMap::default();
+    for (entity, member, agent, profession, equipment, carrier) in agent_query.iter() {
         if member.faction_id == SOLO {
             continue;
         }
@@ -3815,6 +3892,26 @@ pub fn resource_demand_system(
                 if *qty > 0 {
                     *faction.resource_supply.entry(item.resource_id).or_insert(0) += *qty;
                 }
+            }
+        }
+        let is_combatant = *profession == crate::simulation::person::Profession::Hunter
+            || registry.is_raid_party_member(member.faction_id, entity);
+        if is_combatant {
+            let armed = equipment.items.values().any(|it| is_weapon(it.resource_id))
+                || carrier
+                    .left
+                    .as_ref()
+                    .map_or(false, |s| is_weapon(s.item.resource_id))
+                || carrier
+                    .right
+                    .as_ref()
+                    .map_or(false, |s| is_weapon(s.item.resource_id))
+                || agent
+                    .inventory
+                    .iter()
+                    .any(|(it, q)| *q > 0 && is_weapon(it.resource_id));
+            if !armed {
+                *unarmed.entry(member.faction_id).or_insert(0) += 1;
             }
         }
     }
@@ -3841,44 +3938,67 @@ pub fn resource_demand_system(
         }
     }
 
-    // Food demand from population size. Resolve core_ids upfront so we
-    // pay one OnceLock read per attribute, not per faction.
-    let fruit = crate::economy::core_ids::fruit();
-    let meat = crate::economy::core_ids::meat();
-    let grain = crate::economy::core_ids::grain();
-    let tools = crate::economy::core_ids::tools();
-    let weapon = crate::economy::core_ids::weapon();
-    let cloth = crate::economy::core_ids::cloth();
-    let luxury = crate::economy::core_ids::luxury();
-    let shield = crate::economy::core_ids::shield();
-    let armor = crate::economy::core_ids::armor();
+    // Food demand from population size. Crafted-good demand is NOT a
+    // population quota — it is computed functionally below into
+    // `craft_demand`, a separate field that `opportunity.rs` does not read.
     for faction in registry.factions.values_mut() {
         let food_demand = faction.member_count * 10;
         faction.resource_demand.insert(fruit, food_demand);
         faction.resource_demand.insert(meat, food_demand);
         faction.resource_demand.insert(grain, food_demand);
+    }
 
-        // Crafted-good demand: scales with member count. Drives
-        // `chief_job_posting_system`'s recipe selection (highest output
-        // deficit wins).
-        faction
-            .resource_demand
-            .insert(tools, faction.member_count.div_ceil(2));
-        faction
-            .resource_demand
-            .insert(weapon, faction.member_count.div_ceil(2));
-        faction
-            .resource_demand
-            .insert(cloth, faction.member_count.div_ceil(2));
-        faction
-            .resource_demand
-            .insert(luxury, faction.member_count.div_ceil(3));
-        faction
-            .resource_demand
-            .insert(shield, faction.member_count.div_ceil(4));
-        faction
-            .resource_demand
-            .insert(armor, faction.member_count.div_ceil(4));
+    // 3. Functional craft demand (see `jobs::compute_craft_demand`).
+    // Tools the Ard Plow recipe consumes per unit — the derived-input knob.
+    let ard_plow_tools_input: u32 = recipes
+        .iter()
+        .find(|r| r.output_resource == ard_plow)
+        .map(|r| {
+            r.inputs
+                .iter()
+                .filter(|(id, _)| *id == tools)
+                .map(|(_, q)| *q)
+                .sum()
+        })
+        .unwrap_or(0);
+
+    let faction_ids: Vec<u32> = registry.factions.keys().copied().collect();
+    for fid in faction_ids {
+        let (has_ard_plow_tech, ard_in_storage, weapon_in_storage, tools_in_storage) = {
+            let f = &registry.factions[&fid];
+            (
+                f.techs.has(crate::simulation::technology::ARD_PLOW),
+                f.storage.stock_of(ard_plow),
+                f.storage.stock_of(weapon),
+                f.storage.stock_of(tools),
+            )
+        };
+        let has_ag_plot = !crate::simulation::farm::state_owned_ag_plots_for_faction(
+            fid,
+            &plot_index,
+            &plot_q,
+        )
+        .is_empty();
+        let wants_ard_plow = has_ard_plow_tech
+            && has_ag_plot
+            && ard_in_storage == 0
+            && in_flight.get(&(fid, ard_plow)).copied().unwrap_or(0) == 0;
+
+        let inputs = crate::simulation::jobs::CraftDemandInputs {
+            unarmed_combatants: unarmed.get(&fid).copied().unwrap_or(0),
+            spare_weapons: weapon_in_storage
+                + in_flight.get(&(fid, weapon)).copied().unwrap_or(0),
+            wants_ard_plow,
+            spare_tools: tools_in_storage + in_flight.get(&(fid, tools)).copied().unwrap_or(0),
+            ard_plow_tools_input,
+            weapon,
+            ard_plow,
+            tools,
+        };
+        let demand = crate::simulation::jobs::compute_craft_demand(&inputs);
+        if let Some(f) = registry.factions.get_mut(&fid) {
+            f.craft_demand = demand;
+        }
     }
 }
 

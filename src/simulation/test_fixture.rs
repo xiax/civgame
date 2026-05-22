@@ -1706,6 +1706,102 @@ mod smoke {
     }
 
     #[test]
+    fn chief_posts_no_craft_without_functional_consumer() {
+        // Functional craft demand: a faction of plain members invents no
+        // crafted-good demand — the old population quota is gone.
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::jobs::{JobBoard, JobProgress};
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        for i in 0..6 {
+            sim.spawn_person(sim.player_faction_id, (i, 0), |b| {
+                b.profession(Profession::None);
+            });
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            for _ in 0..6 {
+                registry.add_member(sim.player_faction_id);
+            }
+        }
+        sim.tick_n(120);
+
+        {
+            let registry = sim.app.world().resource::<FactionRegistry>();
+            let f = &registry.factions[&sim.player_faction_id];
+            assert!(
+                f.craft_demand.is_empty(),
+                "plain members must not generate craft demand: {:?}",
+                f.craft_demand
+            );
+        }
+        let board = sim.app.world().resource::<JobBoard>();
+        let craft_postings = board
+            .faction_postings(sim.player_faction_id)
+            .iter()
+            .filter(|p| matches!(p.progress, JobProgress::Crafting { .. }))
+            .count();
+        assert_eq!(
+            craft_postings, 0,
+            "no functional deficit ⇒ no chief Craft posting",
+        );
+    }
+
+    #[test]
+    fn unarmed_hunter_drives_weapon_craft_demand() {
+        // An unarmed Hunter is a real functional consumer → Weapon demand;
+        // a Hunter already holding a weapon nets it back to zero.
+        use crate::economy::core_ids;
+        use crate::simulation::faction::FactionRegistry;
+
+        let weapon = core_ids::weapon();
+
+        // Case A: unarmed hunter ⇒ weapon demand.
+        {
+            let mut sim = TestSim::new(0xC0FFEE);
+            sim.flat_world(1, 0, TileKind::Grass);
+            sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+                b.profession(Profession::Hunter);
+            });
+            {
+                let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+                registry.add_member(sim.player_faction_id);
+            }
+            sim.tick_n(65);
+            let registry = sim.app.world().resource::<FactionRegistry>();
+            let f = &registry.factions[&sim.player_faction_id];
+            assert!(
+                f.craft_demand.get(&weapon).copied().unwrap_or(0) >= 1,
+                "unarmed hunter must drive weapon demand: {:?}",
+                f.craft_demand
+            );
+        }
+
+        // Case B: hunter holding a weapon ⇒ no weapon demand.
+        {
+            let mut sim = TestSim::new(0xC0FFEE);
+            sim.flat_world(1, 0, TileKind::Grass);
+            sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+                b.profession(Profession::Hunter).add_inventory(weapon, 1);
+            });
+            {
+                let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+                registry.add_member(sim.player_faction_id);
+            }
+            sim.tick_n(65);
+            let registry = sim.app.world().resource::<FactionRegistry>();
+            let f = &registry.factions[&sim.player_faction_id];
+            assert_eq!(
+                f.craft_demand.get(&weapon).copied().unwrap_or(0),
+                0,
+                "armed hunter must not drive weapon demand: {:?}",
+                f.craft_demand
+            );
+        }
+    }
+
+    #[test]
     fn chief_still_posts_food_stockpile_under_default_policy() {
         // Companion: default (all-communist) policy must still post
         // Stockpile{Calories} when food is low. Pins R6-a's
@@ -3188,29 +3284,64 @@ mod smoke {
 
     #[test]
     fn funded_household_posts_paid_craft_contract_per_day() {
-        // R6 follow-on: spawn a household sub-faction with a
-        // pre-funded treasury; tick one game-day; assert exactly
-        // one paid `JobKind::Craft` posting with
-        // `poster_class=HouseholdHead` lands on the village's job
-        // board. Validates:
+        // Functional craft demand: a household with a Belonging-tier head, a
+        // weaving-capable village, and no accessible Cloth posts one paid
+        // Woven-Cloth contract on the village board. Validates the
+        // household-poster plumbing:
         // - household_contract_posting_system fires per-day.
-        // - post_craft_contract_from_treasury debits the household
-        //   treasury and credits a JobEscrow sidecar.
-        // - The posting routes to the village board (parent
-        //   faction), not a separate per-household board.
-        // - System-wide currency invariant holds (debit + escrow ==
-        //   const).
-        use crate::simulation::faction::{FactionRegistry, HOUSEHOLD_CONTRACT_REWARD};
-        use crate::simulation::jobs::{JobBoard, JobKind, PosterClass};
+        // - post_craft_contract_from_treasury debits the household treasury
+        //   and credits a JobEscrow sidecar.
+        // - The posting routes to the village board (parent faction).
+        // - System-wide currency invariant holds.
+        use crate::simulation::faction::{
+            FactionChief, FactionRegistry, HOUSEHOLD_CONTRACT_REWARD,
+        };
+        use crate::simulation::jobs::{JobBoard, JobKind, JobProgress, PosterClass};
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::needs::Needs;
+        use crate::simulation::schedule::SimClock;
+        use crate::simulation::technology::LOOM_WEAVING;
         use crate::world::seasons::TICKS_PER_DAY;
 
         let mut sim = TestSim::new(0xC0FFEE);
         sim.flat_world(2, 0, TileKind::Grass);
-        let head = sim.spawn_person(sim.player_faction_id, (5, 5), |_| {});
+        let village_id = sim.player_faction_id;
+
+        // Village chief who has Learned LOOM_WEAVING — `buildable_techs`
+        // (the household tech gate via `community_adoption_bitset`) is the
+        // chief + architect Learned union.
+        let chief = sim.spawn_person(village_id, (0, 0), |_| {});
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.factions.get_mut(&village_id).unwrap().chief_entity = Some(chief);
+        }
+        sim.app.world_mut().entity_mut(chief).insert(FactionChief);
+        {
+            let mut ck = sim
+                .app
+                .world_mut()
+                .get_mut::<PersonKnowledge>(chief)
+                .unwrap();
+            ck.aware |= 1u64 << LOOM_WEAVING;
+            ck.learned |= 1u64 << LOOM_WEAVING;
+        }
+
+        // Household head pinned at Belonging tier: physiological + safety
+        // needs satisfied, social need unmet.
+        let mut belonging = Needs::default();
+        belonging.hunger = 0.0;
+        belonging.thirst = 0.0;
+        belonging.sleep = 0.0;
+        belonging.shelter = 0.0;
+        belonging.safety = 0.0;
+        belonging.reproduction = 0.0;
+        belonging.social = 200.0;
+        let head = sim.spawn_person(village_id, (5, 5), |b| {
+            b.needs(belonging);
+        });
 
         // Spawn a household with the player faction as parent + seed
         // treasury well above the minimum.
-        let village_id = sim.player_faction_id;
         let household_id = {
             let catalog = sim
                 .app
@@ -3222,15 +3353,18 @@ mod smoke {
             registry.factions.get_mut(&id).unwrap().treasury = 50.0;
             id
         };
-        let _ = household_id;
 
+        // Jump to just before the per-day cadence so the head's needs don't
+        // decay out of Belonging tier before the posting system fires.
+        {
+            let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
+            clock.tick = TICKS_PER_DAY as u64 - 3;
+        }
         let baseline = CurrencySnapshot::capture(&mut sim.app);
+        sim.tick_n(8);
 
-        // Tick one game-day so the cadence fires.
-        sim.tick_n(TICKS_PER_DAY as u32 + 5);
-
-        // The village's job board should now have at least one
-        // HouseholdHead-posted Craft job with the right reward.
+        // The village's job board should now have a HouseholdHead-posted
+        // Woven-Cloth (recipe 4) Craft job with the right reward.
         let board = sim.app.world().resource::<JobBoard>();
         let postings: Vec<_> = board
             .faction_postings(village_id)
@@ -3243,8 +3377,15 @@ mod smoke {
             .collect();
         assert!(
             !postings.is_empty(),
-            "expected at least one HouseholdHead Craft posting on village board",
+            "expected a HouseholdHead Craft posting on the village board",
         );
+        assert!(
+            postings
+                .iter()
+                .any(|p| matches!(p.progress, JobProgress::Crafting { recipe: 4, .. })),
+            "household contract must be the Woven Cloth recipe",
+        );
+        drop(board);
 
         // System-wide currency invariant: debit went household
         // treasury → escrow; total preserved.
@@ -7831,31 +7972,37 @@ mod smoke {
 
     #[test]
     fn household_picks_cloth_recipe_at_belonging_tier_when_loom_known() {
-        // M3 regression: `pick_household_recipe` should select recipe 4
-        // (Woven Cloth) when the head is Belonging-tier AND the village
-        // has LOOM_WEAVING; fall back to recipe 0 (Stone Tools) when the
-        // tech is missing or the tier is Esteem/lower.
+        // Functional craft demand: `pick_household_recipe` returns
+        // `Some(4)` (Woven Cloth) only for a Belonging-tier head when the
+        // village has LOOM_WEAVING AND no accessible Cloth exists; every
+        // other case returns `None` (no Tools fallback).
         use crate::simulation::faction::{pick_household_recipe, FactionTechs};
         use crate::simulation::goals::MaslowTier;
         use crate::simulation::technology::LOOM_WEAVING;
 
         let mut techs = FactionTechs::default();
-        // Without LOOM_WEAVING, the Cloth recipe is unfulfillable → Tools.
+        // Without LOOM_WEAVING, the Cloth recipe is unfulfillable → None.
         assert_eq!(
-            pick_household_recipe(Some(MaslowTier::Belonging), &techs),
-            0,
-            "village without LOOM_WEAVING must fall back to Tools at Belonging tier",
+            pick_household_recipe(Some(MaslowTier::Belonging), &techs, false),
+            None,
+            "village without LOOM_WEAVING must not post at Belonging tier",
         );
 
-        // Add LOOM_WEAVING and the same tier picks Cloth.
+        // With LOOM_WEAVING and no accessible Cloth, Belonging picks Cloth.
         techs.unlock(LOOM_WEAVING);
         assert_eq!(
-            pick_household_recipe(Some(MaslowTier::Belonging), &techs),
-            4,
+            pick_household_recipe(Some(MaslowTier::Belonging), &techs, false),
+            Some(4),
             "village with LOOM_WEAVING must commission Cloth at Belonging tier",
         );
+        // But not when Cloth is already accessible.
+        assert_eq!(
+            pick_household_recipe(Some(MaslowTier::Belonging), &techs, true),
+            None,
+            "Belonging tier must not commission Cloth when Cloth is on hand",
+        );
 
-        // Esteem and lower tiers always pick Tools.
+        // Esteem and lower tiers never post (no functional Tools deficit).
         for tier in [
             None,
             Some(MaslowTier::Physiological),
@@ -7864,9 +8011,9 @@ mod smoke {
             Some(MaslowTier::SelfActualization),
         ] {
             assert_eq!(
-                pick_household_recipe(tier, &techs),
-                0,
-                "tier {:?} should pick Tools (recipe 0)",
+                pick_household_recipe(tier, &techs, false),
+                None,
+                "tier {:?} must not post a craft contract",
                 tier,
             );
         }

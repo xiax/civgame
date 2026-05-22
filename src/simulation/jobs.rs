@@ -1896,6 +1896,29 @@ pub fn esteem_driven_posting_system(world: &mut World) {
         return;
     }
 
+    let luxury = crate::economy::core_ids::luxury();
+
+    // Functional gate (see craft-demand plan): dedup against any live
+    // Luxury-output craft contract already on a faction's board.
+    let mut faction_has_luxury_contract: ahash::AHashSet<u32> = ahash::AHashSet::default();
+    {
+        let board = world.resource::<JobBoard>();
+        let recipes = crate::simulation::crafting::craft_recipes();
+        for (&fid, postings) in board.postings.iter() {
+            for p in postings.iter() {
+                if let JobProgress::Crafting { recipe, .. } = &p.progress {
+                    if recipes
+                        .get(*recipe as usize)
+                        .map_or(false, |r| r.output_resource == luxury)
+                    {
+                        faction_has_luxury_contract.insert(fid);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     // Snapshot eligible agents (entity, faction_id) so we can later
     // mutate without holding query borrows during the posting calls
     // (which take &mut World).
@@ -1905,10 +1928,11 @@ pub fn esteem_driven_posting_system(world: &mut World) {
             Entity,
             &crate::simulation::needs::Needs,
             &crate::economy::agent::EconomicAgent,
+            &crate::simulation::items::Equipment,
             &crate::simulation::faction::FactionMember,
             &crate::simulation::lod::LodLevel,
         )>();
-        for (entity, needs, econ, member, lod) in q.iter(world) {
+        for (entity, needs, econ, equipment, member, lod) in q.iter(world) {
             if *lod == crate::simulation::lod::LodLevel::Dormant {
                 continue;
             }
@@ -1919,6 +1943,15 @@ pub fn esteem_driven_posting_system(world: &mut World) {
                 continue;
             }
             if MaslowTier::next_unmet(needs) != Some(MaslowTier::Esteem) {
+                continue;
+            }
+            // Skip when a Luxury contract is already live on the faction
+            // board, or the poster already owns a Luxury good — esteem
+            // posting requires a real lack of the output.
+            if faction_has_luxury_contract.contains(&member.faction_id) {
+                continue;
+            }
+            if econ.quantity_of_resource(luxury) > 0 || equipment.has_resource(luxury) {
                 continue;
             }
             intents.push((entity, member.faction_id));
@@ -3279,22 +3312,18 @@ pub fn chief_job_posting_system(
                         }
                         None => None,
                     };
-                    // Phase 2d: resource_supply/demand are ResourceId-keyed,
-                    // so we use the recipe's output_resource directly.
-                    let supply = faction
-                        .resource_supply
+                    // Functional craft demand — a per-output netted deficit
+                    // computed by `resource_demand_system` via
+                    // `compute_craft_demand`. An absent key means the good has
+                    // no functional consumer and is never autonomously crafted.
+                    let deficit = faction
+                        .craft_demand
                         .get(&recipe.output_resource)
                         .copied()
                         .unwrap_or(0);
-                    let demand = faction
-                        .resource_demand
-                        .get(&recipe.output_resource)
-                        .copied()
-                        .unwrap_or(0);
-                    if demand <= supply {
+                    if deficit == 0 {
                         continue;
                     }
-                    let deficit = demand - supply;
                     // Ingredient gate uses **storage stock**, not
                     // `resource_supply` (which includes member inventories).
                     // Only deposited inputs can be withdrawn to the bench, so a
@@ -3365,6 +3394,16 @@ pub fn chief_job_posting_system(
                         if target_rid == wood_id || target_rid == stone_id {
                             continue;
                         }
+                        // A missing input that is itself a recipe output (e.g.
+                        // Tools) can't be gathered — `craft_demand` already
+                        // carries its derived demand, so a Stockpile posting
+                        // here would only ever stall. Skip craftable inputs.
+                        if crate::simulation::crafting::craft_recipes()
+                            .iter()
+                            .any(|r| r.output_resource == target_rid)
+                        {
+                            continue;
+                        }
                         if !faction.policy_for(target_rid).chief_allocates_labor {
                             continue;
                         }
@@ -3411,6 +3450,125 @@ pub fn chief_job_posting_system(
                 }
             }
         }
+    }
+}
+
+/// Pure snapshot of one faction's functional craft needs — input to
+/// [`compute_craft_demand`]. See `plans/...curried-dewdrop.md`: autonomous
+/// crafting requires a concrete functional deficit, never a population quota.
+pub struct CraftDemandInputs {
+    /// Hunters + active raid-party members with no weapon equipped, carried,
+    /// or in inventory.
+    pub unarmed_combatants: u32,
+    /// Spare weapons available to arm someone: faction storage + in-flight
+    /// weapon crafts/orders. Equipped/carried/inventory weapons are NOT
+    /// counted here — they satisfy their holder (lowering `unarmed_combatants`),
+    /// not a spare pool.
+    pub spare_weapons: u32,
+    /// True when the faction is Aware of `ARD_PLOW`, owns ≥1 state-owned
+    /// Agricultural plot, and has no Ard Plow in storage or in flight.
+    pub wants_ard_plow: bool,
+    /// Spare Tools (storage + in-flight) — nets the derived Ard-Plow-ingredient
+    /// demand only.
+    pub spare_tools: u32,
+    /// Tools the Ard Plow recipe consumes per unit.
+    pub ard_plow_tools_input: u32,
+    pub weapon: crate::economy::resource_catalog::ResourceId,
+    pub ard_plow: crate::economy::resource_catalog::ResourceId,
+    pub tools: crate::economy::resource_catalog::ResourceId,
+}
+
+/// Pure functional craft-demand computation. Returns a per-output netted
+/// deficit map; an absent key means zero demand (that good is never
+/// autonomously crafted). Only Weapon, Ard Plow, and Tools-as-an-Ard-Plow-
+/// ingredient are modelled — Cloth/Luxury/Shield/Armor/cart-parts have no
+/// hard functional consumer, so autonomous posting for them is dropped.
+pub fn compute_craft_demand(
+    inp: &CraftDemandInputs,
+) -> AHashMap<crate::economy::resource_catalog::ResourceId, u32> {
+    let mut out: AHashMap<crate::economy::resource_catalog::ResourceId, u32> = AHashMap::default();
+
+    let weapon_deficit = inp.unarmed_combatants.saturating_sub(inp.spare_weapons);
+    if weapon_deficit > 0 {
+        out.insert(inp.weapon, weapon_deficit);
+    }
+
+    if inp.wants_ard_plow {
+        out.insert(inp.ard_plow, 1);
+        // Derived-input demand: the Ard Plow recipe consumes Tools, which are
+        // craftable (not gatherable). Emit just enough Tools demand to unblock
+        // one plow — no speculative reserve.
+        let tools_deficit = inp.ard_plow_tools_input.saturating_sub(inp.spare_tools);
+        if tools_deficit > 0 {
+            out.insert(inp.tools, tools_deficit);
+        }
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod craft_demand_tests {
+    use super::*;
+    use crate::economy::resource_catalog::ResourceId;
+
+    // Synthetic ids — `compute_craft_demand` only uses them as map keys, so
+    // these need no catalog. (weapon, ard_plow, tools).
+    const WEAPON: ResourceId = ResourceId(1);
+    const ARD_PLOW: ResourceId = ResourceId(2);
+    const TOOLS: ResourceId = ResourceId(3);
+
+    fn base() -> CraftDemandInputs {
+        CraftDemandInputs {
+            unarmed_combatants: 0,
+            spare_weapons: 0,
+            wants_ard_plow: false,
+            spare_tools: 0,
+            ard_plow_tools_input: 1,
+            weapon: WEAPON,
+            ard_plow: ARD_PLOW,
+            tools: TOOLS,
+        }
+    }
+
+    #[test]
+    fn population_alone_yields_no_demand() {
+        assert!(compute_craft_demand(&base()).is_empty());
+    }
+
+    #[test]
+    fn unarmed_combatants_drive_weapon_demand() {
+        let mut inp = base();
+        inp.unarmed_combatants = 4;
+        assert_eq!(compute_craft_demand(&inp).get(&WEAPON).copied(), Some(4));
+        // Spare weapons (storage + in-flight) net the deficit down.
+        inp.spare_weapons = 1;
+        assert_eq!(compute_craft_demand(&inp).get(&WEAPON).copied(), Some(3));
+        inp.spare_weapons = 4;
+        assert!(compute_craft_demand(&inp).get(&WEAPON).is_none());
+        inp.spare_weapons = 9;
+        assert!(compute_craft_demand(&inp).get(&WEAPON).is_none());
+    }
+
+    #[test]
+    fn ard_plow_derives_its_tools_ingredient() {
+        let mut inp = base();
+        inp.wants_ard_plow = true;
+        let out = compute_craft_demand(&inp);
+        assert_eq!(out.get(&ARD_PLOW).copied(), Some(1));
+        assert_eq!(out.get(&TOOLS).copied(), Some(1));
+        // Tools already stocked ⇒ plow still demanded, no derived tools.
+        inp.spare_tools = 1;
+        let out = compute_craft_demand(&inp);
+        assert_eq!(out.get(&ARD_PLOW).copied(), Some(1));
+        assert!(out.get(&TOOLS).is_none());
+    }
+
+    #[test]
+    fn no_plow_want_means_no_plow_or_tools() {
+        let out = compute_craft_demand(&base());
+        assert!(out.get(&ARD_PLOW).is_none());
+        assert!(out.get(&TOOLS).is_none());
     }
 }
 

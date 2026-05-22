@@ -1,38 +1,38 @@
-# Functional Craft Demand
+# Functional Craft Demand — SHIPPED
 
-## Summary
-Fix auto-crafting so factions stop inventing population-scaled demand for crafted goods. All autonomous craft posting paths will require a concrete functional deficit; explicit player craft requests stay unchanged.
+Autonomous craft posting now requires a concrete functional deficit, not a
+population-scaled quota. Player craft requests (`JobSource::Player`) untouched.
 
-## Key Changes
-- Replace the crafted-good quota in `resource_demand_system` with an internal craft-demand helper used by auto-posters.
-- Chief crafting will post only for functional gaps:
-  - `Weapon`: hunters or active raiders lacking a weapon.
-  - `Tools`: a small core reserve plus craft/architecture workers lacking tools.
-  - `Ard Plow`: agricultural faction with `ARD_PLOW`, plots, and no plow.
-  - No automatic chief `Luxury`, `Cloth`, `Armor`, `Shield`, or cart-part crafting until a real consumer/deficit exists.
-- Count existing supply broadly: faction storage, member inventory, carried items, equipped items, live craft postings, and live `CraftOrder`s.
-- Tighten private auto-contracts:
-  - Household contracts no longer fall back to Tools by default.
-  - Belonging contracts can post Cloth only when the household/faction lacks accessible Cloth.
-  - Esteem/luxury contracts post only when the poster/faction lacks the output and no duplicate output contract is already live.
-- Leave player-driven tablet/book and direct craft orders untouched.
+## What landed
 
-## Interfaces / Types
-- Add an internal helper, likely in `src/simulation/jobs.rs`, for auto craft demand:
-  - input: faction id/data, recipe/output, live member/equipment/carrying state, board/orders.
-  - output: remaining deficit for that recipe output.
-- Change `pick_household_recipe(...)` in `src/simulation/faction.rs` to return `Option<RecipeId>` and require a live output deficit.
-- Update `src/simulation/CLAUDE.md` to document functional craft demand replacing population quotas.
+- **`jobs::compute_craft_demand` + `CraftDemandInputs`** — pure helper. Models
+  only **Weapon** (unarmed Hunters + raid-party members, netted vs storage +
+  in-flight crafts/orders) and **Ard Plow** (faction has `ARD_PLOW` + a
+  state-owned Agricultural plot + no plow stored/in-flight). **Tools** appear
+  only as *derived* demand — the Ard Plow recipe's ingredient. No standalone
+  Tools/Cloth/Luxury/Shield/Armor/cart-part demand.
+- **`FactionData.craft_demand`** — new netted per-output deficit map.
+  `resource_demand_system` computes it (queries Profession/Equipment/Carrier,
+  JobBoard, CraftOrders, PlotIndex); the six population-quota inserts are gone.
+  `resource_demand` keeps only gatherable blueprint + food demand.
+- **Chief Craft branch** reads `craft_demand` directly (was `demand − supply`).
+  Blocked-input pull-posting now skips craftable inputs (Tools) — `craft_demand`
+  owns them; a Stockpile job for Tools would only stall.
+- **`pick_household_recipe` → `Option<RecipeId>`** — `Some(Woven Cloth)` only
+  for a Belonging-tier head when the village can weave and no accessible Cloth
+  exists; every other tier `None` (no Tools fallback).
+- **Esteem contracts** — gated: poster must hold no Luxury good and the faction
+  board must have no live Luxury craft contract (dedup).
 
-## Test Plan
-- Add tests that population alone creates no chief Craft posting.
-- Add tests that an unarmed Hunter creates Weapon demand, while inventory/equipped/storage weapons satisfy it.
-- Add tests that Tools are capped to the small functional reserve/worker gap.
-- Add tests that chief does not auto-post Luxury/Armor/Shield/Cloth without a real consumer.
-- Add tests that household/esteem auto-contracts do not duplicate outputs already available or already posted.
-- Run `cargo test --bin civgame` after implementation.
+## Tests
 
-## Assumptions
-- “All auto craft” includes chief, household, and esteem-driven autonomous contracts.
-- “Functional” means inventory/equipment/system-use deficits, not raw population quotas.
-- Explicit player craft requests remain exempt from these gates.
+`jobs::craft_demand_tests` (4 pure unit tests) + `test_fixture` integration:
+`chief_posts_no_craft_without_functional_consumer`,
+`unarmed_hunter_drives_weapon_craft_demand`, updated
+`funded_household_posts_paid_craft_contract_per_day` /
+`household_picks_cloth_recipe_at_belonging_tier_when_loom_known`. Full suite
+998 passing.
+
+Side fix: Ard Plows are now auto-craftable (were never in the old quota).
+Docs: `src/simulation/CLAUDE.md`. Full design rationale:
+`~/.claude/plans/evaluate-the-users-xiao1-civgame-plans-c-curried-dewdrop.md`.
