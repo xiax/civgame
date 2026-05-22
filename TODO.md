@@ -132,7 +132,7 @@ X - Add water usage and drinking for both humans and animals
 X - The way pack camp and pitch camp actually works isn't very realistic. The workers don't actually physically pack the camp. They don't carry the goods to the new camp, the camp itself just magically moves.
 
 
-Stockpile food job posting not tracking collected calories properly
+X - Stockpile food job posting not tracking collected calories properly
 
 
 X - And can we add farms to the settlement planner? Farming should be portioned and zoned properly and should be for both communist and capitalist economies. Chief assigns plots for farmers to farm in communist economies and farmers buy plots in capitalist economies.
@@ -143,11 +143,11 @@ X - Workers should be able to do more than one task at a time, like work and soc
 
 X - Make water actually flow, calculate z levels properly for water level and banks of river and make it more realistic with varying river sizes and stuff. Model water sources and reservoirs properly.
 
-Make edges between different biomes more organic, right now the edges are these jagged square blocks.
+X - Make edges between different biomes more organic, right now the edges are these jagged square blocks.
 
 X- Change how construction fallbacks work to be more unique per era rather than just fallback to previous era's construction policies. For example in neolithic if there is not material to build walls the planner shouldn't fall back to paleolithic patterns of building beds and hearths in crescent shapes, they should be building beds in sort of slums on the outskirts of the faction where there is free space, or longhouses with more beds in one house to save materials.
 
-Animals walk on water and walk through walls
+X - Animals walk on water and walk through walls
 
 X - Create a detailed plan to add pathfinding checks to the settlement planner to make sure each placed furniture is reachable. For seeding and placing houses make sure the interior of the house is reachable by pathfinding after fully built by simulating the build. Same should apply for farms.
 
@@ -155,9 +155,9 @@ Player faction and factions with permanent settlements shouldn't auto-migrate an
 
 X - Farming doesn't need the technology to be adopted by the faction, if either the chief or architect or any bureaucrat knows it, it can be planned and posted, only in free market does the individual farmer need to have the knowledge, though farmers with the knowledge work faster.
 
-Fix gap in survive goal for hunger and drink when no tasks under the goal meet requirements
+X - Fix gap in survive goal for hunger and drink when no tasks under the goal meet requirements
 
-Not making a tile cropland when seeding because its fertility doesn't meet some arbitrary requirement doesn't make sense from a realism perspective. Why would people just leave some land in the middle of their farm empty?
+Not making a tile cropland when seeding because its fertility doesn't meet some arbitrary requirement doesn't make sense from a realism perspective. Why would people just leave some land in the middle of their farm empty? I'm also seeing cropland being seeded that isn't actually in an agriculture zone.
 
 Import new animal sprites
 

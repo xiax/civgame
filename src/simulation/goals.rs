@@ -510,12 +510,16 @@ pub struct GoalValidationQueries<'w, 's> {
     pub bp_query: Query<'w, 's, &'static Blueprint>,
     pub wild_horse_q: Query<'w, 's, (), (With<Horse>, Without<Tamed>)>,
     /// Generalised taming candidate detector: any untamed
-    /// Horse / Cow / Pig / Cat eligible for the per-species tech gate. Used
-    /// by the `has_tameable_animal` snapshot consumed by `TameAnimalScorer`.
+    /// Horse / Cow / Pig / Cat eligible for the per-species tech gate. Carries
+    /// `&Transform` so `has_tameable_animal` can be gated on a candidate within
+    /// `goal_contract::TAME_SEARCH_RADIUS` of the agent — the same radius
+    /// `htn_tame_animal_dispatch_system` scans — rather than a global "exists
+    /// anywhere" check that would pin a curious agent on an indecomposable
+    /// `TameAnimal` goal.
     pub wild_tameable_q: Query<
         'w,
         's,
-        (),
+        &'static Transform,
         (
             Or<(With<Horse>, With<Cow>, With<Pig>, With<Cat>)>,
             Without<Tamed>,
@@ -1130,7 +1134,20 @@ pub fn goal_update_system(
                         || f.techs.has(DOG_DOMESTICATION)
                 })
                 .unwrap_or(false)
-            && !validation.wild_tameable_q.is_empty();
+            && {
+                // Executable-opportunity gate: require an untamed candidate
+                // within the dispatcher's scan radius, not just anywhere in
+                // the world. Otherwise `TameAnimalScorer` selects a goal that
+                // `htn_tame_animal_dispatch_system` cannot decompose.
+                let atx = (transform.translation.x / TILE_SIZE).floor() as i32;
+                let aty = (transform.translation.y / TILE_SIZE).floor() as i32;
+                const R: i32 = crate::simulation::goal_contract::TAME_SEARCH_RADIUS;
+                validation.wild_tameable_q.iter().any(|t| {
+                    let tx = (t.translation.x / TILE_SIZE).floor() as i32;
+                    let ty = (t.translation.y / TILE_SIZE).floor() as i32;
+                    (tx - atx).abs().max((ty - aty).abs()) <= R
+                })
+            };
 
         let (faction_food_ratio, can_return_camp) = if member.faction_id != SOLO {
             let per_member: f32 = match calendar.season {

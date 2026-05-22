@@ -234,6 +234,7 @@ pub fn htn_provide_care_dispatch_system(
     chunk_graph: Res<ChunkGraph>,
     chunk_router: Res<ChunkRouter>,
     chunk_connectivity: Res<ChunkConnectivity>,
+    clock: Res<SimClock>,
     injured_query: Query<(Entity, &Transform, &FactionMember), With<Injury>>,
     mut query: Query<
         (
@@ -245,11 +246,15 @@ pub fn htn_provide_care_dispatch_system(
             &FactionMember,
             &Profession,
             &LodLevel,
+            &mut crate::simulation::htn::MethodHistory,
         ),
         Without<Drafted>,
     >,
 ) {
-    for (agent, mut ai, mut aq, goal, transform, member, profession, lod) in query.iter_mut() {
+    let now = clock.tick;
+    for (agent, mut ai, mut aq, goal, transform, member, profession, lod, mut history) in
+        query.iter_mut()
+    {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -290,6 +295,13 @@ pub fn htn_provide_care_dispatch_system(
         }
 
         let Some((patient, patient_tile, _)) = best else {
+            crate::simulation::goal_contract::blocked(
+                &mut history,
+                &mut ai,
+                now,
+                AgentGoal::ProvideCare,
+                crate::simulation::goal_contract::BlockedReason::NoCarePatient,
+            );
             continue;
         };
         let dispatched = assign_task_with_routing(

@@ -24,6 +24,7 @@ pub mod faction;
 pub mod farm;
 pub mod gather;
 pub mod gather_claims;
+pub mod goal_contract;
 pub mod goal_scorers;
 pub mod goals;
 pub mod htn;
@@ -698,6 +699,15 @@ impl Plugin for SimulationPlugin {
                     animals::animal_work_claim_expiry_system,
                     husbandry::assign_preferred_home_system,
                 )
+                    .in_set(SimulationSet::Sequential),
+            )
+            // Goal/dispatcher contract backstop: catches agents on a
+            // multi-dispatcher contract goal (Craft / Build / Farm) that no
+            // ParallelB dispatcher could serve. Runs in Sequential (entirely
+            // after ParallelB) so every dispatcher has had its chance.
+            .add_systems(
+                FixedUpdate,
+                (goal_contract::goal_contract_backstop_system,)
                     .in_set(SimulationSet::Sequential),
             )
             // Husbandry intent emitter (faction-staggered, daily) + feed

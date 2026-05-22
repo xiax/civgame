@@ -44,6 +44,32 @@ Fix the recurring “goal selected but no task dispatched” class by making goa
   - private unprepared farm plot does not select `FarmWork` unless prepare can actually dispatch.
 - Run `cargo test --bin civgame`.
 
+## Progress
+
+Shipped (structural fix — ends the *permanent* idle loop):
+- `goal_contract.rs`: centralized scan radii, `BlockedReason`, `record_no_task_backstop`
+  (throttled synthetic `MethodHistory` failure), `blocked()` dev-log helper,
+  `goal_contract_backstop_system`.
+- Backstop wired: inline at the no-task `continue` of the 4 single-dispatcher
+  goals (`TameAnimal`/`ProvideCare`/`Socialize`/`Play`); generic post-ParallelB
+  system for the multi-dispatcher goals (`Craft`/`Build`/`Farm`).
+- `has_tameable_animal` gate is now radius-local (`TAME_SEARCH_RADIUS`), not a
+  global "exists anywhere" check — the worst broad-gate offender.
+- CLAUDE.md: generalized invariant + backstop + SeekCare parked-state doc.
+- Tests: `goal_contract::tests` (throttle + chronic-threshold accumulation);
+  full suite 958 passing.
+
+Deferred (idle-churn polish — backstop already guarantees correctness):
+- Per-scorer executable gates needing `GoalScoringContext` fields:
+  `ProvideCare` (radius-filter `CareNeed` opportunities), `Socialize`/`Play`
+  (`has_social_partner` / `has_play_option`), `Craft`
+  (`faction_has_craft_order_path`), `Build` (`has_build_material_path`),
+  `Farm` (seed-availability tightening of the seasonal-work snapshot).
+  Each needs the `GoalScoringContext` struct + its 3 build sites in
+  `goal_update_system` + the scorer body. Without them an agent may pick a
+  dead-end goal for up to ~60 ticks before the backstop releases it; with the
+  backstop it never loops permanently.
+
 ## Assumptions
 
 - No new crates.

@@ -6382,7 +6382,7 @@ pub fn htn_tame_animal_dispatch_system(
         Without<Drafted>,
     >,
 ) {
-    const VIEW_RADIUS: i32 = 15;
+    const VIEW_RADIUS: i32 = crate::simulation::goal_contract::TAME_SEARCH_RADIUS;
     let now = clock.tick;
     for (mut ai, mut aq, mut history, goal, transform, member, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
@@ -6445,6 +6445,13 @@ pub fn htn_tame_animal_dispatch_system(
             }
         }
         let Some((horse_entity, horse_tile)) = best_target else {
+            crate::simulation::goal_contract::blocked(
+                &mut history,
+                &mut ai,
+                now,
+                AgentGoal::TameAnimal,
+                crate::simulation::goal_contract::BlockedReason::NoLocalTameTarget,
+            );
             continue;
         };
 
@@ -6500,6 +6507,13 @@ pub fn htn_tame_animal_dispatch_system(
         let Some(pick) =
             dispatch_for_goal(&method_registry, abstract_task, &ctx, &history, now, None)
         else {
+            crate::simulation::goal_contract::blocked(
+                &mut history,
+                &mut ai,
+                now,
+                AgentGoal::TameAnimal,
+                crate::simulation::goal_contract::BlockedReason::NoMethod,
+            );
             continue;
         };
         let method = pick.method;
@@ -6508,6 +6522,13 @@ pub fn htn_tame_animal_dispatch_system(
         let mut tasks = method.expand(abstract_task, &ctx);
         if tasks.is_empty() {
             ai.active_method = None;
+            crate::simulation::goal_contract::blocked(
+                &mut history,
+                &mut ai,
+                now,
+                AgentGoal::TameAnimal,
+                crate::simulation::goal_contract::BlockedReason::NoMethod,
+            );
             continue;
         }
         let head = tasks.remove(0);
@@ -8531,7 +8552,7 @@ pub fn htn_socialize_dispatch_system(
         Without<Drafted>,
     >,
 ) {
-    const PARTNER_RADIUS: i32 = 12;
+    const PARTNER_RADIUS: i32 = crate::simulation::goal_contract::SOCIAL_PARTNER_RADIUS;
     let now = clock.tick;
     for (agent, mut ai, mut aq, mut history, goal, transform, member, lod, disposition_opt) in
         query.iter_mut()
@@ -8635,6 +8656,13 @@ pub fn htn_socialize_dispatch_system(
             now,
             Some(disposition),
         ) else {
+            crate::simulation::goal_contract::blocked(
+                &mut history,
+                &mut ai,
+                now,
+                AgentGoal::Socialize,
+                crate::simulation::goal_contract::BlockedReason::NoMethod,
+            );
             continue;
         };
         let method = pick.method;
@@ -8643,6 +8671,13 @@ pub fn htn_socialize_dispatch_system(
         let mut tasks = method.expand(abstract_task, &ctx);
         if tasks.is_empty() {
             ai.active_method = None;
+            crate::simulation::goal_contract::blocked(
+                &mut history,
+                &mut ai,
+                now,
+                AgentGoal::Socialize,
+                crate::simulation::goal_contract::BlockedReason::NoMethod,
+            );
             continue;
         }
         let head = tasks.remove(0);
@@ -10675,8 +10710,8 @@ pub fn htn_play_dispatch_system(
         Without<Drafted>,
     >,
 ) {
-    const PLAY_RADIUS: i32 = 12;
-    const ITEM_RADIUS: i32 = 8;
+    const PLAY_RADIUS: i32 = crate::simulation::goal_contract::PLAY_PARTNER_RADIUS;
+    const ITEM_RADIUS: i32 = crate::simulation::goal_contract::PLAY_ITEM_RADIUS;
 
     let now = clock.tick;
     for (
@@ -10976,6 +11011,13 @@ pub fn htn_play_dispatch_system(
             now,
             Some(disposition),
         ) else {
+            crate::simulation::goal_contract::blocked(
+                &mut history,
+                &mut ai,
+                now,
+                AgentGoal::Play,
+                crate::simulation::goal_contract::BlockedReason::NoPlayOption,
+            );
             continue;
         };
         let method = pick.method;
@@ -10984,6 +11026,13 @@ pub fn htn_play_dispatch_system(
         let mut tasks = method.expand(abstract_task, &ctx);
         if tasks.is_empty() {
             ai.active_method = None;
+            crate::simulation::goal_contract::blocked(
+                &mut history,
+                &mut ai,
+                now,
+                AgentGoal::Play,
+                crate::simulation::goal_contract::BlockedReason::NoMethod,
+            );
             continue;
         }
         let head = tasks.remove(0);
