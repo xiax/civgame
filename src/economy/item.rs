@@ -57,11 +57,28 @@ pub struct WeaponStats {
     pub damage_bonus: u8,
     /// Encoded as hundredths so `Item` stays `Copy + Eq` (1.00 = 100, 1.25 = 125).
     pub attack_speed_pct: u16,
+    /// Chebyshev reach in tiles. `1` = melee (the default for every melee
+    /// weapon — behaviour unchanged). `> 1` = ranged: `combat_system` fires
+    /// a `Projectile` instead of applying instant damage.
+    pub range: u8,
+    /// Projectile travel speed in hundredths of a tile per tick (so `Item`
+    /// stays `Copy + Eq`). `0` on melee weapons.
+    pub projectile_speed_pct: u16,
 }
 
 impl WeaponStats {
     pub fn attack_speed(self) -> f32 {
         self.attack_speed_pct as f32 / 100.0
+    }
+
+    /// Tiles per tick a projectile from this weapon travels.
+    pub fn projectile_speed(self) -> f32 {
+        self.projectile_speed_pct as f32 / 100.0
+    }
+
+    /// A ranged weapon fires a projectile rather than swinging.
+    pub fn is_ranged(self) -> bool {
+        self.range > 1
     }
 }
 
@@ -201,12 +218,14 @@ fn compute_combat_stats(
 ) -> (Option<WeaponStats>, Option<ArmorStats>) {
     use super::core_ids;
     let weapon_id = core_ids::weapon();
+    let bow_id = core_ids::bow();
+    let sling_id = core_ids::sling();
     let shield_id = core_ids::shield();
     let armor_id = core_ids::armor();
 
     let m = material.multiplier();
     let q = quality.multiplier();
-    if resource_id == weapon_id {
+    if resource_id == weapon_id || resource_id == bow_id || resource_id == sling_id {
         let damage_bonus = (2.0 * m * q).round().clamp(1.0, 60.0) as u8;
         // Fine/Masterwork weapons swing slightly faster.
         let attack_speed_pct = match quality {
@@ -215,10 +234,20 @@ fn compute_combat_stats(
             ItemQuality::Fine => 110,
             ItemQuality::Masterwork => 125,
         };
+        // Ranged weapons: bows reach 5 tiles, slings 4. Melee = 1.
+        let (range, projectile_speed_pct) = if resource_id == bow_id {
+            (5u8, 50u16)
+        } else if resource_id == sling_id {
+            (4u8, 65u16)
+        } else {
+            (1u8, 0u16)
+        };
         (
             Some(WeaponStats {
                 damage_bonus,
                 attack_speed_pct,
+                range,
+                projectile_speed_pct,
             }),
             None,
         )

@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 
+pub mod abstract_faction;
 pub mod animal_paths;
 pub mod animals;
 pub mod apprenticeship;
@@ -186,7 +187,9 @@ impl Plugin for SimulationPlugin {
             .add_event::<combat::CombatRetaliationStartedEvent>()
             .add_event::<combat::DistressCallEvent>()
             .add_event::<combat::HandDropEvent>()
+            .add_event::<combat::ProjectileFired>()
             .add_event::<knowledge::DiscoveryActionEvent>()
+            .add_event::<construction::WallDestroyed>()
             .add_event::<land::PlotEvictedEvent>()
             .add_event::<player_command::PlayerCommandEvent>()
             .insert_resource(player_command::PlayerCommandIdGen::default())
@@ -212,6 +215,7 @@ impl Plugin for SimulationPlugin {
                 r
             })
             .insert_resource(faction::FactionRegistry::default())
+            .insert_resource(abstract_faction::AbstractFactions::default())
             .insert_resource(faction::PlayerFaction::default())
             .insert_resource(faction::StorageTileMap::default())
             .insert_resource(faction::StorageReservations::default())
@@ -320,9 +324,20 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 OnEnter(crate::GameState::Playing),
                 (
-                    person::spawn_population
-                        .after(crate::world::terrain::spawn_world_system)
-                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    // Nested tuple: keeps the outer `OnEnter` tuple within
+                    // Bevy's 20-element arity limit.
+                    (
+                        person::spawn_population
+                            .after(crate::world::terrain::spawn_world_system)
+                            .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                        // Phase 2: seed the remaining faction slots as abstract
+                        // world-map factions on Globe cells far from the
+                        // player. `world_sim_system` ticks them; entity-driven
+                        // systems skip them via `FactionData.materialized`.
+                        abstract_faction::seed_abstract_factions_system
+                            .after(person::spawn_population)
+                            .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    ),
                     animals::spawn_animals
                         .after(person::spawn_population)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
@@ -485,6 +500,16 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (player_command::dispatch_player_command_system,).in_set(SimulationSet::ParallelB),
+            )
+            // Phase 3: materialise an abstract world-map faction into full
+            // entities when the player travels near and its home chunk
+            // streams in. Runs after `chunk_streaming_system` emits
+            // `ChunkLoadedEvent`.
+            .add_systems(
+                FixedUpdate,
+                abstract_faction::materialize_abstract_faction_system
+                    .after(crate::world::chunk_streaming::chunk_streaming_system)
+                    .run_if(in_state(crate::GameState::Playing)),
             )
             .add_systems(
                 FixedUpdate,
@@ -968,6 +993,23 @@ impl Plugin for SimulationPlugin {
             .add_systems(
                 FixedUpdate,
                 (corpse::corpse_follow_system.after(movement::movement_system),)
+                    .in_set(SimulationSet::Sequential),
+            )
+            // Ranged combat + wall durability + siege (vehicle-system-tanks).
+            .add_systems(
+                FixedUpdate,
+                (
+                    combat::spawn_projectile_system.after(combat::combat_system),
+                    combat::projectile_system
+                        .after(combat::spawn_projectile_system)
+                        .after(vehicle::vehicle_combat_system),
+                    vehicle::vehicle_turret_fire_system.after(combat::combat_system),
+                    vehicle::vehicle_siege_system.after(combat::combat_system),
+                    construction::wall_destruction_system
+                        .after(combat::combat_system)
+                        .after(combat::projectile_system)
+                        .after(vehicle::vehicle_siege_system),
+                )
                     .in_set(SimulationSet::Sequential),
             )
             .add_systems(

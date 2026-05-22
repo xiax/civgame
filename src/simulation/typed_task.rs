@@ -530,6 +530,14 @@ pub enum Task {
         method: crate::simulation::fishing::FishingMethod,
         output_resource: ResourceId,
     },
+    /// Siege system (vehicle-system-tanks Phase 7): the driver of a
+    /// siege-capable `Vehicle` keeps it parked adjacent to `target_tile`
+    /// (a `WallMap` wall); `vehicle::vehicle_siege_system` ticks
+    /// `apply_wall_damage` on a cooldown until the wall falls. A wall is a
+    /// static tile, not a unit — hence a dedicated task variant.
+    SiegeWall {
+        target_tile: (i32, i32),
+    },
 }
 
 /// Source for a `Task::Drink`. Inventory drinks consume one `clean_water`
@@ -904,6 +912,7 @@ pub fn task_kind_for(task: Task) -> u16 {
         Task::Plow { .. } => TK::Plow,
         Task::VehicleCargoHaul { .. } => TK::VehicleCargoHaul,
         Task::Fish { .. } => TK::Fishing,
+        Task::SiegeWall { .. } => TK::SiegeWall,
     };
     kind as u16
 }

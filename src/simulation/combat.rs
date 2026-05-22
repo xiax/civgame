@@ -177,6 +177,36 @@ pub struct CombatCooldown(pub f32);
 const ATTACK_DAMAGE: u8 = 2;
 const BASE_ATTACK_COOLDOWN: f32 = 1.0;
 
+// ── Ranged combat (plans/vehicle-system-tanks.md Phase 2) ─────────────────
+
+/// Emitted by `combat_system` when a unit with a ranged weapon (`range > 1`)
+/// strikes — instead of applying instant damage. `spawn_projectile_system`
+/// turns it into a flying `Projectile`.
+#[derive(Event, Clone, Copy, Debug)]
+pub struct ProjectileFired {
+    pub source: Entity,
+    pub target: Entity,
+    pub damage: u8,
+    pub origin: Vec3,
+    pub dest_tile: (i32, i32),
+    /// Tiles per tick.
+    pub speed: f32,
+}
+
+/// A projectile in flight. `progress` runs 0→1 over `origin`→`dest`; on
+/// arrival `projectile_system` applies armor-mitigated damage and despawns.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct Projectile {
+    pub source: Entity,
+    pub target: Entity,
+    pub damage: u8,
+    pub origin: Vec3,
+    pub dest: Vec3,
+    pub progress: f32,
+    /// Fraction of the origin→dest span travelled per tick.
+    pub step: f32,
+}
+
 /// Bundles `combat_system`'s three event writers into one `SystemParam`
 /// to stay under Bevy's 16-parameter ceiling after retaliation cleanup
 /// joined the system.
@@ -185,6 +215,7 @@ pub struct CombatEventWriters<'w> {
     pub combat: EventWriter<'w, CombatEvent>,
     pub discovery: EventWriter<'w, crate::simulation::knowledge::DiscoveryActionEvent>,
     pub retaliation: EventWriter<'w, CombatRetaliationStartedEvent>,
+    pub projectile: EventWriter<'w, ProjectileFired>,
 }
 
 pub fn combat_system(
@@ -320,11 +351,19 @@ pub fn combat_system(
             .map(|ai| ai.current_z)
             .unwrap_or_else(|_| chunk_map.surface_z_at(tx, ty) as i8);
 
+        // Equipped weapon — a `range > 1` weapon widens acquisition and fires
+        // a projectile instead of swinging.
+        let weapon_stats = attacker_eq
+            .and_then(|eq| eq.items.get(&EquipmentSlot::MainHand))
+            .and_then(|w| w.weapon_stats);
+        let weapon_range = weapon_stats.map(|w| w.range.max(1)).unwrap_or(1) as i32;
+
         let mut found = false;
-        'find: for dy in -1..=1i32 {
-            for dx in -1..=1i32 {
+        let mut found_tile = (tx, ty);
+        'find: for dy in -weapon_range..=weapon_range {
+            for dx in -weapon_range..=weapon_range {
                 for &e in spatial.get(tx + dx, ty + dy) {
-                    // Combat is adjacent — assume target is at the attacker's Z.
+                    // Within reach (Chebyshev ≤ range) and with line of sight.
                     if e == target
                         && has_los(
                             &chunk_map,
@@ -334,6 +373,7 @@ pub fn combat_system(
                         )
                     {
                         found = true;
+                        found_tile = (tx + dx, ty + dy);
                         break 'find;
                     }
                 }
@@ -401,6 +441,20 @@ pub fn combat_system(
             }
 
             if !attack_lands {
+                continue;
+            }
+
+            // Ranged weapon: fire a projectile; damage resolves on arrival in
+            // `projectile_system` (through the same armor-mitigation path).
+            if let Some(ws) = weapon_stats.filter(|w| w.is_ranged()) {
+                events.projectile.send(ProjectileFired {
+                    source: attacker,
+                    target,
+                    damage,
+                    origin: transform.translation,
+                    dest_tile: found_tile,
+                    speed: ws.projectile_speed().max(0.1),
+                });
                 continue;
             }
 
@@ -560,6 +614,134 @@ pub fn combat_retaliation_cleanup_system(
         if let Ok((mut ai, mut aq)) = q.get_mut(ev.victim) {
             aq.cancel_chain(&mut ai);
         }
+    }
+}
+
+/// Turns `ProjectileFired` events into flying `Projectile` entities. Runs in
+/// `Sequential` after `combat_system`.
+pub fn spawn_projectile_system(mut commands: Commands, mut events: EventReader<ProjectileFired>) {
+    for ev in events.read() {
+        let dest_xy = crate::world::terrain::tile_to_world(ev.dest_tile.0, ev.dest_tile.1);
+        let dest = Vec3::new(dest_xy.x, dest_xy.y, 0.6);
+        let origin = Vec3::new(ev.origin.x, ev.origin.y, 0.6);
+        let span = origin.distance(dest).max(TILE_SIZE);
+        // `speed` is tiles/tick; convert to a fraction of the flight span.
+        let step = (ev.speed * TILE_SIZE / span).clamp(0.05, 1.0);
+        commands.spawn((
+            Projectile {
+                source: ev.source,
+                target: ev.target,
+                damage: ev.damage,
+                origin,
+                dest,
+                progress: 0.0,
+                step,
+            },
+            Sprite {
+                color: Color::srgb(0.95, 0.9, 0.55),
+                custom_size: Some(Vec2::splat(4.0)),
+                ..default()
+            },
+            Transform::from_translation(origin),
+            GlobalTransform::default(),
+            Visibility::Visible,
+            InheritedVisibility::default(),
+        ));
+    }
+}
+
+/// Advances every `Projectile` along its origin→dest span; on arrival applies
+/// armor-mitigated damage to the target (Person `Body`, plain `Health`, or a
+/// bodiless `Vehicle` via `apply_vehicle_cell_damage`) and despawns. A target
+/// that moved off the aimed tile, or despawned, is a clean miss.
+#[allow(clippy::too_many_arguments)]
+pub fn projectile_system(
+    mut commands: Commands,
+    mut projectiles: Query<(Entity, &mut Projectile, &mut Transform), Without<Person>>,
+    mut health_query: Query<&mut Health>,
+    mut body_query: Query<&mut Body>,
+    equipment_query: Query<&Equipment>,
+    target_tf_query: Query<&Transform, Without<Projectile>>,
+    mut combat_targets: Query<&mut CombatTarget>,
+    registry: Res<crate::simulation::vehicle::VehicleDesignRegistry>,
+    mut vehicles: Query<(
+        &mut crate::simulation::vehicle::Vehicle,
+        &mut crate::simulation::vehicle::VehicleHealth,
+    )>,
+) {
+    for (proj_e, mut proj, mut tf) in projectiles.iter_mut() {
+        proj.progress = (proj.progress + proj.step).min(1.0);
+        tf.translation = proj.origin.lerp(proj.dest, proj.progress);
+        if proj.progress < 1.0 {
+            continue;
+        }
+
+        // Arrived. Resolve against the target if it is still on the aimed tile.
+        let dest_tile = (
+            (proj.dest.x / TILE_SIZE).floor() as i32,
+            (proj.dest.y / TILE_SIZE).floor() as i32,
+        );
+        let on_tile = target_tf_query
+            .get(proj.target)
+            .map(|t| {
+                let tx = (t.translation.x / TILE_SIZE).floor() as i32;
+                let ty = (t.translation.y / TILE_SIZE).floor() as i32;
+                (tx - dest_tile.0).abs().max((ty - dest_tile.1).abs()) <= 1
+            })
+            .unwrap_or(false);
+
+        if on_tile {
+            // Bodiless `Vehicle` target → per-cell damage.
+            if let Ok((mut v, mut vhealth)) = vehicles.get_mut(proj.target) {
+                if let Some(hit) =
+                    crate::simulation::vehicle::pick_hit_cell(&vhealth)
+                {
+                    if let Some(design) = registry.get(v.design_id).cloned() {
+                        let out = crate::simulation::vehicle::apply_vehicle_cell_damage(
+                            &mut vhealth,
+                            &design,
+                            hit,
+                            proj.damage as u16,
+                        );
+                        if out.movement_disabled {
+                            commands
+                                .entity(proj.target)
+                                .remove::<crate::simulation::vehicle::VehiclePathFollow>();
+                            if v.state == crate::simulation::vehicle::VehicleState::Moving {
+                                v.state = crate::simulation::vehicle::VehicleState::Parked;
+                            }
+                        }
+                    }
+                }
+            } else if body_query.contains(proj.target) {
+                let part = BodyPart::random();
+                let mut dmg = proj.damage;
+                if let Ok(eq) = equipment_query.get(proj.target) {
+                    let bit = part.coverage_bit();
+                    for armor in eq.items.values() {
+                        let Some(a) = armor.armor_stats else { continue };
+                        if a.covers(bit) && fastrand::u8(0..100) < a.coverage_pct {
+                            dmg = dmg.saturating_sub(a.damage_reduction);
+                        }
+                    }
+                }
+                if let Ok(mut body) = body_query.get_mut(proj.target) {
+                    let limb = body.get_mut(part);
+                    limb.current = limb.current.saturating_sub(dmg.max(1));
+                }
+            } else if let Ok(mut health) = health_query.get_mut(proj.target) {
+                health.current = health.current.saturating_sub(proj.damage);
+            }
+
+            // Retaliation — the struck target turns on the shooter.
+            if let Ok(mut ct) = combat_targets.get_mut(proj.target) {
+                if ct.0.is_none() {
+                    ct.0 = Some(proj.source);
+                }
+            }
+        }
+
+        commands.entity(proj_e).despawn_recursive();
     }
 }
 

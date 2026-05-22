@@ -121,6 +121,11 @@ pub fn auto_found_default_settlements_system(
         if map.by_faction.contains_key(faction_id) {
             continue;
         }
+        // Abstract world-map factions have no entities yet — they only found
+        // a Settlement when the player travels near and materialises them.
+        if !data.materialized {
+            continue;
+        }
         // Nomadic factions skip Settlement creation entirely. They have no
         // permanent market_tile, no plots, no treasury — `home_tile` is a
         // mutable camp anchor, and storage pools across member/pack-animal

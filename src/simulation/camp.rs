@@ -110,6 +110,10 @@ pub fn auto_found_default_camps_system(
         if map.by_faction.contains_key(faction_id) {
             continue;
         }
+        // Abstract world-map factions have no entities until materialised.
+        if !data.materialized {
+            continue;
+        }
         if !data.caps.settlement.is_camp() {
             continue;
         }

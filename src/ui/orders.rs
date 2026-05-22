@@ -10,7 +10,7 @@ use crate::simulation::combat::{CombatTarget, Health};
 use crate::simulation::construction::{
     faction_can_build, recipe_for, BarracksMap, BedMap, Blueprint, BlueprintMap, BuildSiteKind,
     CampfireMap, ChairMap, DoorMap, GranaryMap, LoomMap, MarketMap, MonumentMap, ShrineMap,
-    TableMap, WallMaterial, WorkbenchMap,
+    TableMap, WallMap, WallMaterial, WorkbenchMap,
 };
 use crate::simulation::corpse::Corpse;
 use crate::simulation::faction::SOLO;
@@ -134,6 +134,7 @@ fn vehicle_order_label(kind: crate::simulation::vehicle::VehicleOrderKind) -> &'
         K::Hitch => "Hitch Animals",
         K::Unhitch => "Unhitch Animals",
         K::Deconstruct => "Salvage Vehicle",
+        K::SiegeWall(_) => "Siege Wall Here",
     }
 }
 
@@ -145,6 +146,7 @@ fn build_vehicle_ops(
     target_tile: (i32, i32),
     include_move: bool,
     vehicle_q: &Query<&crate::simulation::vehicle::Vehicle>,
+    siege_target: Option<(i32, i32)>,
 ) -> Vec<(MenuAction, String)> {
     use crate::simulation::vehicle::{VehicleOrderKind as K, VehicleState};
     let Ok(v) = vehicle_q.get(vehicle) else {
@@ -165,6 +167,9 @@ fn build_vehicle_ops(
     }
     if include_move {
         push(K::MoveTo(target_tile));
+    }
+    if let Some(wall_tile) = siege_target {
+        push(K::SiegeWall(wall_tile));
     }
     push(K::Load);
     push(K::Unload);
@@ -306,6 +311,9 @@ pub struct RoutingResources<'w, 's> {
     pub vehicle_yard_map: Res<'w, crate::simulation::vehicle::VehicleYardMap>,
     pub vehicle_registry: Res<'w, crate::simulation::vehicle::VehicleDesignRegistry>,
     pub vehicle_occupancy: Res<'w, crate::simulation::vehicle::VehicleOccupancyIndex>,
+    // Siege (vehicle-system-tanks Phase 7): wall lookup for the
+    // "Siege Wall Here" vehicle order.
+    pub wall_map: Res<'w, WallMap>,
     #[system_param(ignore)]
     pub _marker: std::marker::PhantomData<&'s ()>,
 }
@@ -363,7 +371,22 @@ pub fn right_click_context_menu_system(
                     // Vehicle-only menu: the selected vehicle drives to the
                     // clicked tile, plus its standing right-click orders.
                     menu_state.clear_tile_data();
-                    menu_state.vehicle_ops = build_vehicle_ops(sv, pick.tile, true, &vehicle_q);
+                    // Offer "Siege Wall" when the clicked tile carries a wall
+                    // and the selected vehicle is siege-capable.
+                    let siege_target = if routing.wall_map.0.contains_key(&pick.tile) {
+                        vehicle_q
+                            .get(sv)
+                            .ok()
+                            .and_then(|v| routing.vehicle_registry.get(v.design_id))
+                            .filter(|d| {
+                                crate::simulation::vehicle::design_is_siege_capable(d)
+                            })
+                            .map(|_| pick.tile)
+                    } else {
+                        None
+                    };
+                    menu_state.vehicle_ops =
+                        build_vehicle_ops(sv, pick.tile, true, &vehicle_q, siege_target);
                     menu_state.open = true;
                     menu_state.screen_pos =
                         egui::pos2(pick.screen_pos.x, pick.screen_pos.y);
@@ -561,7 +584,7 @@ pub fn right_click_context_menu_system(
                             .unwrap_or(false)
                         {
                             menu_state.vehicle_ops =
-                                build_vehicle_ops(veh_e, pos_tile, false, &vehicle_q);
+                                build_vehicle_ops(veh_e, pos_tile, false, &vehicle_q, None);
                         }
                     }
 

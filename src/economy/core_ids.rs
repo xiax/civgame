@@ -144,6 +144,8 @@ core_ids! {
     Luxury => "luxury" => luxury,
     GrainSeed => "grain_seed" => grain_seed,
     Weapon => "weapon" => weapon,
+    Bow => "bow" => bow,
+    Sling => "sling" => sling,
     Armor => "armor" => armor,
     Shield => "shield" => shield,
     Skin => "skin" => skin,

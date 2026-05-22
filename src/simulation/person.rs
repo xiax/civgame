@@ -299,8 +299,40 @@ pub struct Person;
 pub struct Drafted;
 
 pub const INITIAL_POPULATION: u32 = 200;
-const GROUP_SIZE: u32 = 20;
+pub(crate) const GROUP_SIZE: u32 = 20;
 const SPAWN_RADIUS: i32 = 12;
+
+/// Number of rival factions spawned as full entity groups near the player at
+/// game start. The player faction plus this many rivals materialise in the
+/// pre-generated spawn window; every other faction slot lives abstractly on
+/// the world map (see `abstract_faction.rs`) until the player travels near it.
+pub(crate) const NEARBY_RIVAL_COUNT: u32 = 3;
+
+/// Inter-faction spacing reward saturates here (tiles). A candidate home this
+/// far (or farther) from every already-placed home scores full marks. Not a
+/// hard minimum — when the window can't satisfy it the scorer still spreads
+/// the near factions as far apart as geometry allows.
+const NEAR_FACTION_TARGET_SPACING: f32 = 280.0;
+
+/// Continuous farthest-point spacing reward for a candidate faction home tile.
+/// `0` when coincident with an existing home, saturating to `+100` once the
+/// candidate is `>= NEAR_FACTION_TARGET_SPACING` from every placed home.
+/// Empty `others` (the first faction placed) → full `+100`.
+///
+/// Replaces the former binary within-300-tiles `-100/+50` penalty, which
+/// silently degraded once placed exclusion circles tiled the spawn window and
+/// let later factions cluster.
+fn faction_spacing_score(tx: i32, ty: i32, others: &[(i32, i32)]) -> i32 {
+    let min_dist = others
+        .iter()
+        .map(|(hx, hy)| {
+            let dx = (tx - hx) as f32;
+            let dy = (ty - hy) as f32;
+            (dx * dx + dy * dy).sqrt()
+        })
+        .fold(f32::INFINITY, f32::min);
+    ((min_dist / NEAR_FACTION_TARGET_SPACING).min(1.0) * 100.0) as i32
+}
 
 pub fn spawn_population(
     mut commands: Commands,
@@ -344,37 +376,21 @@ pub fn spawn_population(
     let start_ty = start_cy * CHUNK_SIZE as i32;
 
     let num_groups = INITIAL_POPULATION / GROUP_SIZE;
+    // Only the player faction plus `NEARBY_RIVAL_COUNT` rivals spawn as full
+    // entity groups in the pre-generated window. The remaining slots are
+    // seeded abstractly on the world map by `seed_abstract_factions_system`.
+    let near_factions = (NEARBY_RIVAL_COUNT + 1).min(num_groups);
     let mut spawned = 0u32;
     let mut spawned_homes: Vec<(i32, i32)> = Vec::new();
 
-    // Helper: find a valid passable non-stone tile near (cx, cy) within radius, or anywhere in
-    // the spawn region as fallback.
-    let find_tile = |rng: &mut rand::rngs::ThreadRng, cx: i32, cy: i32| -> Option<(i32, i32)> {
-        for _ in 0..200 {
-            let tx = cx + rng.gen_range(-SPAWN_RADIUS..=SPAWN_RADIUS);
-            let ty = cy + rng.gen_range(-SPAWN_RADIUS..=SPAWN_RADIUS);
-            if chunk_map.is_passable(tx, ty)
-                && !matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone))
-            {
-                return Some((tx, ty));
-            }
-        }
-        None
-    };
-
     // Score a candidate home tile: positive = better. Combines river-proximity
-    // (riverside camps preferred over arid interior) with the existing
-    // 300-tile inter-faction spacing. Inside the channel itself is penalised
-    // (we don't want spawns on water tiles even though that's already
-    // rejected by the passability check — guards against future passable
-    // shallow-water variants).
+    // (riverside camps preferred over arid interior) with a continuous
+    // farthest-point inter-faction spacing reward (`faction_spacing_score`).
+    // Inside the channel itself is penalised (we don't want spawns on water
+    // tiles even though that's already rejected by the passability check —
+    // guards against future passable shallow-water variants).
     let score_home_candidate = |tx: i32, ty: i32, others: &[(i32, i32)]| -> i32 {
-        let too_close = others.iter().any(|(hx, hy)| {
-            let dx = (tx - hx) as f32;
-            let dy = (ty - hy) as f32;
-            (dx * dx + dy * dy).sqrt() < 300.0
-        });
-        let spacing = if too_close { -100 } else { 50 };
+        let spacing = faction_spacing_score(tx, ty, others);
         // Settlements need to fit on one bank — `base_r` for a 20-person band
         // is ~12 tiles, and bridges aren't available until Chalcolithic.
         let river_score = match chunk_map.river_distance_at(tx, ty) {
@@ -387,7 +403,7 @@ pub fn spawn_population(
         spacing + river_score
     };
 
-    for group_idx in 0..num_groups {
+    for group_idx in 0..near_factions {
         // The player faction (group_idx==0) is constrained to the selected
         // mega-chunk via the deterministic shared helper so the spawn-select
         // preview marker matches what actually spawns. AI factions keep the
@@ -493,31 +509,6 @@ pub fn spawn_population(
 
         let home_world = tile_to_world(home_tx, home_ty);
 
-        // Settled factions get a fixed storage tile at home. Nomadic factions
-        // skip this — their `FactionStorage.totals` are pooled across member /
-        // pack-animal / PackBundle inventories (Phase 4 backend split). The
-        // tile would be misleading: it'd accept deposits but not travel with
-        // the band on migration.
-        // Capability check: only `FactionTile` storage backends spawn a tile.
-        let storage_kind = registry
-            .factions
-            .get(&faction_id)
-            .map(|d| d.caps.storage)
-            .unwrap_or(crate::simulation::archetype::StorageBackendKind::FactionTile);
-        if matches!(
-            storage_kind,
-            crate::simulation::archetype::StorageBackendKind::FactionTile
-                | crate::simulation::archetype::StorageBackendKind::Hybrid
-        ) {
-            commands.spawn((
-                FactionStorageTile { faction_id },
-                Transform::from_xyz(home_world.x, home_world.y, 0.5),
-                GlobalTransform::default(),
-                Visibility::Hidden,
-                InheritedVisibility::default(),
-            ));
-        }
-
         if group_idx == 0 {
             player_faction.faction_id = faction_id;
 
@@ -544,156 +535,22 @@ pub fn spawn_population(
             GROUP_SIZE
         };
 
-        let mut first_member: Option<Entity> = None;
-        // M2 (Market-preset households): collect every spawned adult so we can
-        // form a one-member household per worker after the spawn loop. Each
-        // capitalist worker then has its own storage tile + seeded treasury
-        // at tick 0, so household contracts can post immediately rather than
-        // waiting on cosleep-bond formation (which takes a full game-week).
-        let mut spawned_members: Vec<Entity> = Vec::with_capacity(group_size as usize);
-        // Draw member spawn tiles from a flood outward from the home tile, so
-        // every member is reachable-from-home *by construction* instead of
-        // random-scatter-then-passability (which could strand a member in a
-        // passable pocket across a river/cliff from home). `find_tile` stays
-        // as a last-resort only if the connected area is genuinely tiny.
-        let reachable_pool = crate::simulation::placement_reachability::spawn_tiles_from(
+        // Spawn the band — home storage tile, members (drawn from a
+        // reachable flood out of the home tile), and chief designation.
+        // Shared verbatim with the runtime materialisation path
+        // (`abstract_faction::materialize_abstract_faction_system`).
+        let band = spawn_faction_band(
+            &mut commands,
             &chunk_map,
+            &mut registry,
+            &mut clock,
+            faction_id,
             (home_tx, home_ty),
-            group_size as usize,
+            group_size,
+            options.era,
         );
-        let mut pool_iter = reachable_pool.into_iter();
-        for _ in 0..group_size {
-            let Some((tx, ty)) = pool_iter
-                .next()
-                .or_else(|| find_tile(&mut rng, home_tx, home_ty))
-            else {
-                continue;
-            };
-            // Founder role assignment for realistic seeding:
-            //   - the first spawned member becomes the chief.
-            //   - every ~8th member is a Specialist (one workshop hand
-            //     per "family"). Index 1 is included so even small bands
-            //     get at least one specialist beyond the chief.
-            //   - everyone else carries the band's common knowledge.
-            // `derive_tech_adoption_system` then promotes era-prior
-            // techs to Adopted on the next tick via the broad-learning
-            // / small-band shortcuts.
-            let role = if spawned_members.is_empty() {
-                crate::simulation::knowledge::FounderRole::Chief
-            } else if spawned_members.len() == 1 || spawned_members.len() % 8 == 0 {
-                crate::simulation::knowledge::FounderRole::Specialist
-            } else {
-                crate::simulation::knowledge::FounderRole::Common
-            };
-
-            let world_pos = tile_to_world(tx, ty);
-            let sex = BiologicalSex::random();
-
-            let person_entity = commands
-                .spawn((
-                    (
-                        Person,
-                        Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
-                        GlobalTransform::default(),
-                        Visibility::Visible,
-                        InheritedVisibility::default(),
-                        Needs::new(30.0, 20.0, 10.0, 5.0, 40.0, 200.0),
-                        Mood::default(),
-                        Skills::default(),
-                        SkillPeaks::default(),
-                        SkillUseTicks::default(),
-                        SkillsLastSeen::default(),
-                        Stats::roll_3d6(),
-                        PersonAI {
-                            state: AiState::Idle,
-                            target_tile: (tx as i32, ty as i32),
-                            dest_tile: (tx as i32, ty as i32),
-                            current_z: chunk_map.surface_z_at(tx, ty) as i8,
-                            target_z: chunk_map.surface_z_at(tx, ty) as i8,
-                            ..PersonAI::default()
-                        },
-                        EconomicAgent::default(),
-                    ),
-                    (
-                        LodLevel::Full,
-                        BucketSlot(spawned),
-                        MovementState {
-                            wander_timer: (spawned % 100) as f32 * 0.025,
-                            ..Default::default()
-                        },
-                        sex,
-                        SkinTone::random(),
-                        HairColor::random(),
-                        Personality::random(),
-                        AgentGoal::default(),
-                        Profession::None,
-                        FactionMember {
-                            faction_id,
-                            ..Default::default()
-                        },
-                        Body::new_humanoid(),
-                        Equipment::default(),
-                        TargetItem::default(),
-                        CombatTarget::default(),
-                        CombatCooldown::default(),
-                    ),
-                    (
-                        AgentMemory::default(),
-                        RelationshipMemory::default(),
-                        MethodHistory::default(),
-                        crate::simulation::memory::CurrentVision::default(),
-                        Name::new(generate_person_name(sex)),
-                        PathFollow::default(),
-                        Carrier::default(),
-                        crate::simulation::reproduction::CoSleepTracker::default(),
-                        crate::simulation::reproduction::MaleConceptionCooldown::default(),
-                        Indexed::new(IndexedKind::Person),
-                        PersonKnowledge::seeded_realistic_through_era(
-                            options.era,
-                            role,
-                            clock.tick as u32,
-                        ),
-                        crate::simulation::typed_task::ActionQueue::idle(),
-                        crate::simulation::goal_scorers::AgentDecisionState::default(),
-                        // Phase 6 of wage-aware-labor-market-v2:
-                        // per-agent psychological profile. Scattered
-                        // by fastrand at spawn so populations have
-                        // heterogeneous goal preferences (the
-                        // `EarnIncomeScorer` multiplier among others).
-                        crate::simulation::goal_scorers::Disposition {
-                            entrepreneurial: fastrand::u8(..),
-                            gregariousness: fastrand::u8(..),
-                            curiosity: fastrand::u8(..),
-                            martial: fastrand::u8(..),
-                        },
-                    ),
-                    // Always-present (never insert/removed at runtime — see
-                    // social_contact.rs) so the Person archetype stays stable.
-                    (
-                        crate::simulation::social_contact::SecondarySocial::inactive(),
-                        crate::simulation::energy::Energy::default(),
-                    ),
-                ))
-                .id();
-
-            if first_member.is_none() {
-                first_member = Some(person_entity);
-            }
-            spawned_members.push(person_entity);
-            registry.add_member(faction_id);
-            spawned += 1;
-        }
-
-        // Designate the first spawned member as chief. Without this,
-        // chief-driven systems (chief_directive_system, chief_job_posting,
-        // chief_hunt_order, chief_tablet_posting) wait for a runtime
-        // bonding event that may never fire on freshly seeded factions.
-        if let Some(chief) = first_member {
-            if let Some(faction_data) = registry.factions.get_mut(&faction_id) {
-                faction_data.chief_entity = Some(chief);
-            }
-            commands.entity(chief).insert(FactionChief);
-        }
+        let spawned_members = band.members;
+        spawned += spawned_members.len() as u32;
 
         // M2: under Market preset, every spawned adult founds a one-person
         // household with its own home tile near the village center, its own
@@ -728,12 +585,236 @@ pub fn spawn_population(
     clock.current_end = clock.bucket_size.min(spawned);
 
     info!(
-        "Spawned {} people in {} factions of {} in {:?}",
+        "Spawned {} people in {} near factions of {} ({} faction slots reserved for the world map) in {:?}",
         spawned,
-        num_groups,
+        near_factions,
         GROUP_SIZE,
+        num_groups.saturating_sub(near_factions),
         now.elapsed()
     );
+}
+
+/// Result of [`spawn_faction_band`] — the spawned member entities and the
+/// designated chief (the first member, if any spawned).
+pub(crate) struct FactionBandSpawn {
+    pub members: Vec<Entity>,
+    pub chief: Option<Entity>,
+}
+
+/// Fallback member-spawn tile: a passable non-stone tile within `SPAWN_RADIUS`
+/// of `(cx, cy)`. Used only when the reachable flood pool is exhausted.
+fn fallback_member_tile(
+    rng: &mut rand::rngs::ThreadRng,
+    chunk_map: &ChunkMap,
+    cx: i32,
+    cy: i32,
+) -> Option<(i32, i32)> {
+    for _ in 0..200 {
+        let tx = cx + rng.gen_range(-SPAWN_RADIUS..=SPAWN_RADIUS);
+        let ty = cy + rng.gen_range(-SPAWN_RADIUS..=SPAWN_RADIUS);
+        if chunk_map.is_passable(tx, ty)
+            && !matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone))
+        {
+            return Some((tx, ty));
+        }
+    }
+    None
+}
+
+/// Spawn a faction's band: a home `FactionStorageTile` (FactionTile / Hybrid
+/// storage archetypes), `group_size` `Person` members drawn from a reachable
+/// flood out of `home_tile`, and chief designation on the first member.
+///
+/// Shared verbatim by `spawn_population` (game start) and
+/// `abstract_faction::materialize_abstract_faction_system` (runtime
+/// materialisation), so a faction the player travels to behaves identically to
+/// one that spawned beside them. `clock.population` / `bucket_size` advance per
+/// member exactly as `reproduction.rs` does for newborns, so the LOD bucket
+/// scheduler stays consistent whether the band spawns at tick 0 or mid-game.
+pub(crate) fn spawn_faction_band(
+    commands: &mut Commands,
+    chunk_map: &ChunkMap,
+    registry: &mut FactionRegistry,
+    clock: &mut SimClock,
+    faction_id: u32,
+    home_tile: (i32, i32),
+    group_size: u32,
+    era: crate::simulation::technology::Era,
+) -> FactionBandSpawn {
+    let (home_tx, home_ty) = home_tile;
+    let home_world = tile_to_world(home_tx, home_ty);
+
+    // Settled factions get a fixed storage tile at home; nomadic factions pool
+    // storage across member / pack-animal inventories instead. Capability
+    // check: only FactionTile / Hybrid storage backends spawn a tile.
+    let storage_kind = registry
+        .factions
+        .get(&faction_id)
+        .map(|d| d.caps.storage)
+        .unwrap_or(crate::simulation::archetype::StorageBackendKind::FactionTile);
+    if matches!(
+        storage_kind,
+        crate::simulation::archetype::StorageBackendKind::FactionTile
+            | crate::simulation::archetype::StorageBackendKind::Hybrid
+    ) {
+        commands.spawn((
+            FactionStorageTile { faction_id },
+            Transform::from_xyz(home_world.x, home_world.y, 0.5),
+            GlobalTransform::default(),
+            Visibility::Hidden,
+            InheritedVisibility::default(),
+        ));
+    }
+
+    let mut rng = rand::thread_rng();
+    let mut members: Vec<Entity> = Vec::with_capacity(group_size as usize);
+    let mut first_member: Option<Entity> = None;
+    // Draw member spawn tiles from a flood outward from the home tile, so
+    // every member is reachable-from-home *by construction* instead of
+    // random-scatter-then-passability (which could strand a member in a
+    // passable pocket across a river/cliff from home).
+    let reachable_pool = crate::simulation::placement_reachability::spawn_tiles_from(
+        chunk_map,
+        home_tile,
+        group_size as usize,
+    );
+    let mut pool_iter = reachable_pool.into_iter();
+    for _ in 0..group_size {
+        let Some((tx, ty)) = pool_iter
+            .next()
+            .or_else(|| fallback_member_tile(&mut rng, chunk_map, home_tx, home_ty))
+        else {
+            continue;
+        };
+        // Founder role assignment for realistic seeding:
+        //   - the first spawned member becomes the chief.
+        //   - index 1 and every ~8th member is a Specialist (one workshop
+        //     hand per "family"), so even small bands get one beyond the chief.
+        //   - everyone else carries the band's common knowledge.
+        let role = if members.is_empty() {
+            crate::simulation::knowledge::FounderRole::Chief
+        } else if members.len() == 1 || members.len() % 8 == 0 {
+            crate::simulation::knowledge::FounderRole::Specialist
+        } else {
+            crate::simulation::knowledge::FounderRole::Common
+        };
+
+        // LOD bucket slot — advance the clock exactly as `reproduction.rs`
+        // does for newborns, so runtime materialisation stays consistent.
+        let slot = clock.population;
+        clock.population += 1;
+        clock.bucket_size = clock.population.min(10_000);
+
+        let world_pos = tile_to_world(tx, ty);
+        let sex = BiologicalSex::random();
+
+        let person_entity = commands
+            .spawn((
+                (
+                    Person,
+                    Transform::from_xyz(world_pos.x, world_pos.y, 1.0),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                    Needs::new(30.0, 20.0, 10.0, 5.0, 40.0, 200.0),
+                    Mood::default(),
+                    Skills::default(),
+                    SkillPeaks::default(),
+                    SkillUseTicks::default(),
+                    SkillsLastSeen::default(),
+                    Stats::roll_3d6(),
+                    PersonAI {
+                        state: AiState::Idle,
+                        target_tile: (tx as i32, ty as i32),
+                        dest_tile: (tx as i32, ty as i32),
+                        current_z: chunk_map.surface_z_at(tx, ty) as i8,
+                        target_z: chunk_map.surface_z_at(tx, ty) as i8,
+                        ..PersonAI::default()
+                    },
+                    EconomicAgent::default(),
+                ),
+                (
+                    LodLevel::Full,
+                    BucketSlot(slot),
+                    MovementState {
+                        wander_timer: (slot % 100) as f32 * 0.025,
+                        ..Default::default()
+                    },
+                    sex,
+                    SkinTone::random(),
+                    HairColor::random(),
+                    Personality::random(),
+                    AgentGoal::default(),
+                    Profession::None,
+                    FactionMember {
+                        faction_id,
+                        ..Default::default()
+                    },
+                    Body::new_humanoid(),
+                    Equipment::default(),
+                    TargetItem::default(),
+                    CombatTarget::default(),
+                    CombatCooldown::default(),
+                ),
+                (
+                    AgentMemory::default(),
+                    RelationshipMemory::default(),
+                    MethodHistory::default(),
+                    crate::simulation::memory::CurrentVision::default(),
+                    Name::new(generate_person_name(sex)),
+                    PathFollow::default(),
+                    Carrier::default(),
+                    crate::simulation::reproduction::CoSleepTracker::default(),
+                    crate::simulation::reproduction::MaleConceptionCooldown::default(),
+                    Indexed::new(IndexedKind::Person),
+                    PersonKnowledge::seeded_realistic_through_era(
+                        era,
+                        role,
+                        clock.tick as u32,
+                    ),
+                    crate::simulation::typed_task::ActionQueue::idle(),
+                    crate::simulation::goal_scorers::AgentDecisionState::default(),
+                    // Phase 6 of wage-aware-labor-market-v2: per-agent
+                    // psychological profile. Scattered by fastrand at spawn so
+                    // populations have heterogeneous goal preferences.
+                    crate::simulation::goal_scorers::Disposition {
+                        entrepreneurial: fastrand::u8(..),
+                        gregariousness: fastrand::u8(..),
+                        curiosity: fastrand::u8(..),
+                        martial: fastrand::u8(..),
+                    },
+                ),
+                // Always-present (never insert/removed at runtime — see
+                // social_contact.rs) so the Person archetype stays stable.
+                (
+                    crate::simulation::social_contact::SecondarySocial::inactive(),
+                    crate::simulation::energy::Energy::default(),
+                ),
+            ))
+            .id();
+
+        if first_member.is_none() {
+            first_member = Some(person_entity);
+        }
+        members.push(person_entity);
+        registry.add_member(faction_id);
+    }
+
+    // Designate the first spawned member as chief. Without this, chief-driven
+    // systems (chief_directive_system, chief_job_posting, chief_hunt_order,
+    // chief_tablet_posting) wait for a runtime bonding event that may never
+    // fire on a freshly seeded faction.
+    if let Some(chief) = first_member {
+        if let Some(faction_data) = registry.factions.get_mut(&faction_id) {
+            faction_data.chief_entity = Some(chief);
+        }
+        commands.entity(chief).insert(FactionChief);
+    }
+
+    FactionBandSpawn {
+        members,
+        chief: first_member,
+    }
 }
 
 /// Form one household per spawned adult under the Market preset, each with
@@ -803,5 +884,89 @@ pub(crate) fn seed_market_households(
         commands
             .entity(member)
             .insert(crate::simulation::reproduction::HouseholdMember { household_id });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{faction_spacing_score, NEAR_FACTION_TARGET_SPACING};
+
+    #[test]
+    fn faction_spacing_score_empty_is_full() {
+        // First faction placed: nothing to space away from → full reward.
+        assert_eq!(faction_spacing_score(0, 0, &[]), 100);
+    }
+
+    #[test]
+    fn faction_spacing_score_coincident_is_zero() {
+        assert_eq!(faction_spacing_score(500, 500, &[(500, 500)]), 0);
+    }
+
+    #[test]
+    fn faction_spacing_score_saturates() {
+        // A candidate at or beyond the target spacing scores full marks.
+        let far = NEAR_FACTION_TARGET_SPACING as i32 + 50;
+        assert_eq!(faction_spacing_score(far, 0, &[(0, 0)]), 100);
+        assert_eq!(
+            faction_spacing_score(NEAR_FACTION_TARGET_SPACING as i32, 0, &[(0, 0)]),
+            100
+        );
+    }
+
+    #[test]
+    fn faction_spacing_score_is_monotonic() {
+        // Moving the candidate strictly farther from its nearest home never
+        // decreases the score.
+        let home = [(0, 0)];
+        let mut prev = -1;
+        for d in 0..=(NEAR_FACTION_TARGET_SPACING as i32 + 100) {
+            let s = faction_spacing_score(d, 0, &home);
+            assert!(s >= prev, "score dropped at d={d}: {s} < {prev}");
+            prev = s;
+        }
+    }
+
+    #[test]
+    fn faction_spacing_score_picks_nearest_home() {
+        // Score reflects the distance to the *closest* home (100), not the
+        // far one (400): 100 / 280 * 100 ≈ 35.
+        let s = faction_spacing_score(100, 0, &[(0, 0), (500, 0)]);
+        let expected = (100.0 / NEAR_FACTION_TARGET_SPACING * 100.0) as i32;
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn farthest_point_spreads_homes() {
+        // Behavioural regression: emulate the placement loop on the scorer
+        // alone (river score zeroed). From one fixed home, repeatedly pick the
+        // best of a deterministic grid of candidates in a 1024-tile window,
+        // append the winner, repeat. The result must be well separated — the
+        // old binary scorer would let later factions cluster.
+        let mut homes: Vec<(i32, i32)> = vec![(512, 512)];
+        for _ in 0..3 {
+            let mut best: Option<((i32, i32), i32)> = None;
+            let mut ty = 0;
+            while ty <= 1024 {
+                let mut tx = 0;
+                while tx <= 1024 {
+                    let score = faction_spacing_score(tx, ty, &homes);
+                    if best.map_or(true, |(_, s)| score > s) {
+                        best = Some(((tx, ty), score));
+                    }
+                    tx += 32;
+                }
+                ty += 32;
+            }
+            homes.push(best.unwrap().0);
+        }
+        // Every pair of placed homes is comfortably separated.
+        for i in 0..homes.len() {
+            for j in (i + 1)..homes.len() {
+                let (ax, ay) = homes[i];
+                let (bx, by) = homes[j];
+                let d = (((ax - bx) as f32).powi(2) + ((ay - by) as f32).powi(2)).sqrt();
+                assert!(d > 200.0, "homes {i} and {j} too close: {d}");
+            }
+        }
     }
 }

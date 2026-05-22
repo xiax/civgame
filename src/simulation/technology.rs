@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 pub type TechId = u16;
-pub const TECH_COUNT: usize = 47;
+pub const TECH_COUNT: usize = 50;
 pub const ACTIVITY_COUNT: usize = 14;
 
 // ── Tech ID constants ─────────────────────────────────────────────────────────
@@ -68,6 +68,14 @@ pub const WELL_DIGGING: TechId = 45;
 // from `BRIDGE_BUILDING` — impounding a watercourse is later, larger-
 // scale civil engineering than spanning one.
 pub const DAM_BUILDING: TechId = 46;
+// ── Siege & war-vehicle techs (see plans/vehicle-system-tanks.md) ──────────
+// All three sit in the Bronze-Age cap. `SIEGE_ENGINEERING` gates siege
+// templates + the `turret` vehicle part; `ARMOR_PLATING` gates the
+// `armor_plate` / `track` parts + the armored wagon; `POWERED_TRACTION`
+// gates the abstract `engine` part + the `tank` template.
+pub const SIEGE_ENGINEERING: TechId = 47;
+pub const ARMOR_PLATING: TechId = 48;
+pub const POWERED_TRACTION: TechId = 49;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -1176,6 +1184,42 @@ pub static TECH_TREE: [TechDef; TECH_COUNT] = [
         triggers: &[],
         bonus: TechBonus::ZERO,
     },
+    TechDef {
+        id: SIEGE_ENGINEERING,
+        era: Era::BronzeAge,
+        name: "Siege Engineering",
+        description: "Battering rams, siege towers, and torsion artillery — organised \
+             labour turns timber and rope into engines that breach fortifications.",
+        prerequisites: &[WAR_CHARIOT, MONUMENTAL_BUILDING],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::Combat,
+            per_unit_chance: 0.003,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: ARMOR_PLATING,
+        era: Era::BronzeAge,
+        name: "Armor Plating",
+        description: "Bronze-faced timber plating and continuous track shields a vehicle \
+             body — war wagons that shrug off arrows and roll over broken ground.",
+        prerequisites: &[SCALE_ARMOR, BRONZE_CASTING],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::Combat,
+            per_unit_chance: 0.003,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: POWERED_TRACTION,
+        era: Era::BronzeAge,
+        name: "Powered Traction",
+        description: "Abstract powered draft — a self-propelled vehicle that needs no \
+             draft team. The capstone of the war-vehicle line.",
+        prerequisites: &[SIEGE_ENGINEERING, BRONZE_CASTING],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
 ];
 
 // Discovery is now per-person and per-action; see
@@ -1212,6 +1256,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The siege / war-vehicle techs all sit in the Bronze-Age cap.
+    #[test]
+    fn siege_techs_are_bronze_age() {
+        for id in [SIEGE_ENGINEERING, ARMOR_PLATING, POWERED_TRACTION] {
+            assert_eq!(tech_def(id).era, Era::BronzeAge);
+        }
+        assert_eq!(TECH_COUNT, 50);
+        // POWERED_TRACTION caps the line — its prereqs precede it.
+        assert!(tech_def(POWERED_TRACTION)
+            .prerequisites
+            .contains(&SIEGE_ENGINEERING));
     }
 
     /// DAM_BUILDING is the dedicated Bronze-Age dam gate (split from

@@ -21,10 +21,10 @@ use crate::simulation::vehicle::{
     VehiclePartKind, VehiclePurpose, GRID_MAX_DEPTH, GRID_MAX_HEIGHT, GRID_MAX_WIDTH,
 };
 
-/// The parts the designer can place. The reserved tank/siege kinds
-/// (`Engine/Track/ArmorPlate/Turret`) are omitted — no `core.ron` part defs
-/// ship for them yet (`plans/vehicle-system-tanks.md`).
-const PALETTE: [VehiclePartKind; 10] = [
+/// The parts the designer can place. Includes the tank/siege kinds
+/// (`Engine/Track/ArmorPlate/Turret`) — they ship `core.ron` part defs
+/// ship `core.ron` part defs (`plans/vehicle-system-tanks.md`).
+const PALETTE: [VehiclePartKind; 14] = [
     VehiclePartKind::Frame,
     VehiclePartKind::Deck,
     VehiclePartKind::Wall,
@@ -35,6 +35,10 @@ const PALETTE: [VehiclePartKind; 10] = [
     VehiclePartKind::CargoBay,
     VehiclePartKind::CrewSeat,
     VehiclePartKind::WeaponMount,
+    VehiclePartKind::Engine,
+    VehiclePartKind::Track,
+    VehiclePartKind::ArmorPlate,
+    VehiclePartKind::Turret,
 ];
 
 /// In-progress design state for the vehicle designer window. UI-only.
@@ -120,7 +124,10 @@ fn part_color(kind: VehiclePartKind) -> egui::Color32 {
         VehiclePartKind::CargoBay => egui::Color32::from_rgb(90, 130, 90),
         VehiclePartKind::CrewSeat => egui::Color32::from_rgb(90, 110, 160),
         VehiclePartKind::WeaponMount => egui::Color32::from_rgb(160, 80, 80),
-        _ => egui::Color32::from_gray(80),
+        VehiclePartKind::Engine => egui::Color32::from_rgb(170, 120, 40),
+        VehiclePartKind::Track => egui::Color32::from_rgb(50, 50, 55),
+        VehiclePartKind::ArmorPlate => egui::Color32::from_rgb(130, 140, 150),
+        VehiclePartKind::Turret => egui::Color32::from_rgb(180, 70, 70),
     }
 }
 
@@ -142,6 +149,9 @@ fn describe_error(e: &DesignError) -> String {
             format!("Cargo cell ({},{},{}) is sealed in — can't load it.", p.x, p.y, p.z)
         }
         DesignError::ChariotRule => "A War vehicle needs a crew seat.".to_string(),
+        DesignError::UnderpoweredEngine => {
+            "Engine power can't move the loaded body — add engines or lighten it.".to_string()
+        }
     }
 }
 
@@ -286,7 +296,7 @@ pub fn vehicle_designer_system(
             let layer = state.layer;
             let place_kind = state.part;
             let place_mat = materials[state.material_idx].resource;
-            let place_dur = cell_durability(place_mat, &data);
+            let place_dur = cell_durability(place_kind, place_mat, &data);
             egui::Grid::new("vehicle_designer_grid")
                 .spacing([2.0, 2.0])
                 .show(ui, |ui| {

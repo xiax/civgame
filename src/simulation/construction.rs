@@ -320,12 +320,65 @@ impl WallMaterial {
             WallMaterial::CutStone => "Cut Stone",
         }
     }
+
+    /// Structural-integrity ceiling — how much damage the wall absorbs before
+    /// it falls. Scales with the construction tier (see
+    /// `plans/vehicle-system-tanks.md` Phase 1).
+    pub fn max_hp(self) -> u8 {
+        match self {
+            WallMaterial::Palisade => 40,
+            WallMaterial::WattleDaub => 60,
+            WallMaterial::Mudbrick => 90,
+            WallMaterial::Stone => 140,
+            WallMaterial::CutStone => 240,
+        }
+    }
+
+    /// Fraction of incoming damage the wall material deflects. CutStone
+    /// roughly halves an incoming hit; a Palisade absorbs everything raw.
+    pub fn damage_resist(self) -> f32 {
+        match self {
+            WallMaterial::Palisade => 0.0,
+            WallMaterial::WattleDaub => 0.10,
+            WallMaterial::Mudbrick => 0.20,
+            WallMaterial::Stone => 0.35,
+            WallMaterial::CutStone => 0.50,
+        }
+    }
 }
 
 /// Marker placed on completed wall entities.
 #[derive(Component)]
 pub struct Wall {
     pub material: WallMaterial,
+}
+
+/// Fired when a wall is destroyed (HP reaches zero). Carries the tile so
+/// pathing caches can invalidate any route that crossed it.
+#[derive(Event, Clone, Copy, Debug)]
+pub struct WallDestroyed {
+    pub tile: (i32, i32),
+}
+
+/// The single damage entry point for walls. Applies tier `damage_resist`
+/// mitigation, then a saturating subtraction on `Health`. Returns `true`
+/// when the hit destroys the wall (HP reaches zero).
+pub fn apply_wall_damage(
+    health: &mut crate::simulation::combat::Health,
+    raw_damage: u8,
+    material: WallMaterial,
+) -> bool {
+    let mitigated = (raw_damage as f32 * (1.0 - material.damage_resist())).round() as u32;
+    // Sub-resist hits still chip at least 1 HP so a CutStone wall can't be
+    // made effectively invulnerable by a stream of tiny hits — but only when
+    // the attack actually carried damage.
+    let mitigated = if raw_damage > 0 {
+        mitigated.max(1)
+    } else {
+        0
+    };
+    health.current = health.current.saturating_sub(mitigated.min(255) as u8);
+    health.is_dead()
 }
 
 /// Hearth tier. Open campfire vs. stone-lined hearth (better food yield once
@@ -5052,6 +5105,7 @@ fn seed_apply_wall_tile(
     let e = commands
         .spawn((
             Wall { material },
+            crate::simulation::combat::Health::new(material.max_hp()),
             StructureLabel(material.label()),
             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
             GlobalTransform::default(),
@@ -5121,6 +5175,47 @@ pub fn restamp_walls_on_chunk_load(
             },
         );
         tile_changed.send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
+    }
+}
+
+/// Despawns walls whose `Health` has reached zero: removes the `WallMap`
+/// entry, reverts the tile to passable `Grass` (mirroring the deconstruct
+/// path — `surface_z_at` reads the wall's own level), emits
+/// `TileChangedEvent` so pathing caches + sprites rebuild, and fires
+/// `WallDestroyed` for siege re-targeting. Runs in `Sequential` after the
+/// damage systems (`vehicle_siege_system`, `projectile_system`).
+pub fn wall_destruction_system(
+    mut commands: Commands,
+    mut wall_map: ResMut<WallMap>,
+    mut chunk_map: ResMut<ChunkMap>,
+    health_q: Query<&crate::simulation::combat::Health, With<Wall>>,
+    mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    mut destroyed: EventWriter<WallDestroyed>,
+) {
+    let dead: Vec<((i32, i32), Entity)> = wall_map
+        .0
+        .iter()
+        .filter(|(_, &e)| health_q.get(e).map(|h| h.is_dead()).unwrap_or(false))
+        .map(|(&t, &e)| (t, e))
+        .collect();
+    for (tile, entity) in dead {
+        wall_map.0.remove(&tile);
+        let surf_z = chunk_map.surface_z_at(tile.0, tile.1);
+        chunk_map.set_tile(
+            tile.0,
+            tile.1,
+            surf_z as i32,
+            TileData {
+                kind: TileKind::Grass,
+                ..Default::default()
+            },
+        );
+        tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
+            tx: tile.0,
+            ty: tile.1,
+        });
+        destroyed.send(WallDestroyed { tile });
+        commands.entity(entity).despawn_recursive();
     }
 }
 
@@ -6377,6 +6472,7 @@ pub fn construction_system(
                     let wall_entity = commands
                         .spawn((
                             Wall { material },
+                            crate::simulation::combat::Health::new(material.max_hp()),
                             StructureLabel(material.label()),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                             GlobalTransform::default(),
@@ -8545,6 +8641,7 @@ fn seed_walled_house_at(
                 let e = commands
                     .spawn((
                         Wall { material: *mat },
+                        crate::simulation::combat::Health::new(mat.max_hp()),
                         StructureLabel(mat.label()),
                         Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                         GlobalTransform::default(),
@@ -8975,6 +9072,42 @@ fn seed_paleo_beds_around_hearth(
 mod tests {
     use super::*;
     use crate::simulation::land::TileEdge;
+
+    // ── Wall durability (plans/vehicle-system-tanks.md Phase 1) ───────────
+
+    #[test]
+    fn wall_max_hp_scales_with_tier() {
+        assert!(WallMaterial::Palisade.max_hp() < WallMaterial::Stone.max_hp());
+        assert!(WallMaterial::Stone.max_hp() < WallMaterial::CutStone.max_hp());
+    }
+
+    #[test]
+    fn sub_resist_hit_still_chips_a_palisade() {
+        let mut h = crate::simulation::combat::Health::new(WallMaterial::Palisade.max_hp());
+        let dead = apply_wall_damage(&mut h, 5, WallMaterial::Palisade);
+        assert!(!dead);
+        assert_eq!(h.current, WallMaterial::Palisade.max_hp() - 5);
+    }
+
+    #[test]
+    fn cutstone_resists_more_than_palisade() {
+        let mut cut = crate::simulation::combat::Health::new(100);
+        let mut pal = crate::simulation::combat::Health::new(100);
+        apply_wall_damage(&mut cut, 20, WallMaterial::CutStone);
+        apply_wall_damage(&mut pal, 20, WallMaterial::Palisade);
+        assert!(
+            cut.current > pal.current,
+            "CutStone should take less damage from the same hit"
+        );
+    }
+
+    #[test]
+    fn wall_dies_when_health_drained() {
+        let mut h = crate::simulation::combat::Health::new(WallMaterial::Palisade.max_hp());
+        let dead = apply_wall_damage(&mut h, 255, WallMaterial::Palisade);
+        assert!(dead);
+        assert!(h.is_dead());
+    }
 
     #[test]
     fn entrance_cell_picks_centre_of_chosen_side() {

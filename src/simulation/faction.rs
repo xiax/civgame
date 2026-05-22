@@ -2495,6 +2495,15 @@ pub struct FactionData {
     pub storage: FactionStorage,
     pub home_tile: (i32, i32),
     pub member_count: u32,
+    /// `true` for factions spawned as full entity groups (player + nearby
+    /// rivals, materialised settlements). `false` for abstract world-map
+    /// factions that exist only as Globe-cell data (`faction_id` / population
+    /// / food on a `WorldCell`) with no `Person` / `Settlement` entities,
+    /// until the player travels near them. `world_sim_system` ticks abstract
+    /// factions; entity-driven systems (settlement founding, the entity raid
+    /// FSM) skip them. See `abstract_faction.rs` and
+    /// `plans/world-map-abstract-factions.md`.
+    pub materialized: bool,
     pub raid_target: Option<u32>,
     pub under_raid: bool,
     pub techs: FactionTechs,
@@ -2819,6 +2828,11 @@ impl FactionRegistry {
                 storage: FactionStorage::default(),
                 home_tile,
                 member_count: 0,
+                // Default to materialised: tests, bonding-formed households,
+                // and the near factions are all real entity groups.
+                // `seed_abstract_factions_system` flips this to `false` for
+                // the world-map factions it seeds.
+                materialized: true,
                 raid_target: None,
                 under_raid: false,
                 techs,

@@ -141,6 +141,11 @@ fn pick_raid_target(
         let Some(cand) = registry.factions.get(&snap.id) else {
             continue;
         };
+        // Abstract world-map factions are raided via `world_sim`, not the
+        // entity raid FSM — never target one with a marching party.
+        if !cand.materialized {
+            continue;
+        }
         // Kin: same root faction (covers parent/child household nesting).
         if registry.root_faction(snap.id) == attacker_root {
             continue;
@@ -276,6 +281,11 @@ pub fn faction_decision_system(
     let faction_ids: Vec<u32> = registry.factions.keys().copied().collect();
     for id in faction_ids {
         if id == SOLO {
+            continue;
+        }
+        // Abstract world-map factions run their raids through `world_sim`,
+        // not this entity-faction FSM.
+        if !registry.factions[&id].materialized {
             continue;
         }
         let (food, members) = {

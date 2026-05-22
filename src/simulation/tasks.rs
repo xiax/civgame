@@ -149,6 +149,11 @@ pub enum TaskKind {
     /// requires 1 free hand, counts as labor. Executor:
     /// `fishing::fish_task_system` (Sequential, before `gather::gather_system`).
     Fishing = 55,
+    /// Siege system (vehicle-system-tanks Phase 7): the driver of a
+    /// siege-capable `Vehicle` parks it adjacent to a `WallMap` tile;
+    /// `vehicle::vehicle_siege_system` ticks `apply_wall_damage` on a cooldown
+    /// until the wall falls. Dedicated task — the target is a static tile.
+    SiegeWall = 56,
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -210,6 +215,7 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::Plow as u16 => "Plowing",
         x if x == TaskKind::VehicleCargoHaul as u16 => "Vehicle Hauling",
         x if x == TaskKind::Fishing as u16 => "Fishing",
+        x if x == TaskKind::SiegeWall as u16 => "Sieging Wall",
         _ => "Unemployed",
     }
 }

@@ -33,8 +33,9 @@ use crate::pathfinding::vehicle_path::{footprint_astar, VehicleNode, VehiclePath
 use crate::simulation::animals::{
     AnimalUse, AnimalWorkClaim, DomesticAnimal, DomesticSpecies, Tamed,
 };
-use crate::simulation::combat::{CombatCooldown, CombatTarget, Health};
-use crate::simulation::construction::Blueprint;
+use crate::simulation::combat::{CombatCooldown, CombatTarget, Health, ProjectileFired};
+use crate::simulation::construction::{apply_wall_damage, Blueprint, DoorMap, Wall, WallMap};
+use crate::simulation::line_of_sight::has_los;
 use crate::simulation::draftwork::{release_animal_work_claim, TRAINING_THRESHOLD_DRAFT};
 use crate::simulation::faction::{FactionMember, FactionRegistry, StorageTileMap};
 use crate::simulation::goals::AgentGoal;
@@ -48,7 +49,8 @@ use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::stats::{self, Stats};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::technology::{
-    TechId, ANIMAL_HUSBANDRY, BRONZE_CASTING, HORSE_TAMING, OX_CART, WAR_CHARIOT,
+    TechId, ANIMAL_HUSBANDRY, ARMOR_PLATING, BRONZE_CASTING, HORSE_TAMING, OX_CART,
+    POWERED_TRACTION, SIEGE_ENGINEERING, WAR_CHARIOT,
 };
 use crate::simulation::typed_task::{ActionQueue, Task, UNEMPLOYED_TASK_KIND};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
@@ -73,6 +75,9 @@ const AXLE_SUPPORT_PER_STRENGTH: u32 = 2_000;
 const WHEEL_SUPPORT_PER_STRENGTH: u32 = 400;
 /// Same, for a Frame cell (the chassis spreads load).
 const FRAME_SUPPORT_PER_STRENGTH: u32 = 300;
+/// Same, for a Track cell — continuous track spreads load very broadly, so a
+/// track-driven body is load-bearing without axles.
+const TRACK_SUPPORT_PER_STRENGTH: u32 = 1_500;
 /// Rolling resistance coefficient feeding `draft_power_needed`.
 const TERRAIN_RESISTANCE: f32 = 0.06;
 /// Wheelbase → turn radius multiplier — a longer wheelbase turns wider.
@@ -120,6 +125,8 @@ impl VehiclePartKind {
     }
 
     /// Load-bearing structural cell — a non-bottom cell may rest on one.
+    /// `Engine` and `Track` are load-bearing running-gear / chassis cells, so
+    /// connectivity + floating checks treat them as support.
     pub fn is_structural(self) -> bool {
         matches!(
             self,
@@ -127,6 +134,8 @@ impl VehiclePartKind {
                 | VehiclePartKind::Deck
                 | VehiclePartKind::Wall
                 | VehiclePartKind::Axle
+                | VehiclePartKind::Engine
+                | VehiclePartKind::Track
         )
     }
 
@@ -278,6 +287,10 @@ pub struct VehicleStats {
     pub stress_margin: f32,
     /// Distinct XY tiles the footprint occupies.
     pub footprint_area: u32,
+    /// Summed `engine_power_g` over `Engine` cells (0 = animal-drawn).
+    pub engine_power: u32,
+    /// `engine_power > 0` — drives itself, needs no draft team.
+    pub is_engine_driven: bool,
 }
 
 // ── footprint ─────────────────────────────────────────────────────────────
@@ -523,6 +536,8 @@ pub enum DesignError {
     BlockedCargo(IVec3),
     /// A `War`-purpose design with no CrewSeat — no crew to fight from.
     ChariotRule,
+    /// An engine-driven design whose `engine_power` can't move its own mass.
+    UnderpoweredEngine,
 }
 
 const NEIGHBORS_6: [IVec3; 6] = [
@@ -635,8 +650,16 @@ pub fn validate_grid(
         errors.push(DesignError::NoControlCell);
     }
 
-    // Draft capacity matches the required animal count.
-    if required_animals > 0 {
+    // Engine presence — an Engine cell supplies powered traction, so the
+    // design needs neither Hitch/Yoke nor a draft team.
+    let has_engine = grid
+        .cells
+        .iter()
+        .any(|(_, c)| c.kind == VehiclePartKind::Engine);
+
+    // Draft capacity matches the required animal count — skipped entirely
+    // for an engine-driven design.
+    if required_animals > 0 && !has_engine {
         let capacity: u32 = grid
             .cells
             .iter()
@@ -652,6 +675,11 @@ pub fn validate_grid(
     if stats.stress_margin < 0.0 && (stats.empty_mass_g as f32) > support_limit_g(grid, data) as f32
     {
         errors.push(DesignError::OverloadedAxle);
+    }
+
+    // An engine must be able to move the loaded body it sits in.
+    if has_engine && (stats.engine_power as f32) < stats.draft_power_needed {
+        errors.push(DesignError::UnderpoweredEngine);
     }
 
     // CargoBay reachability — flood from any XY-edge or deck/frame-adjacent
@@ -741,6 +769,7 @@ fn support_limit_g(grid: &VehicleGrid, data: &VehicleData) -> u32 {
             VehiclePartKind::Axle => AXLE_SUPPORT_PER_STRENGTH,
             VehiclePartKind::Wheel => WHEEL_SUPPORT_PER_STRENGTH,
             VehiclePartKind::Frame => FRAME_SUPPORT_PER_STRENGTH,
+            VehiclePartKind::Track => TRACK_SUPPORT_PER_STRENGTH,
             _ => 0,
         };
         total = total.saturating_add(strength.saturating_mul(per));
@@ -769,6 +798,8 @@ pub fn derive_stats(grid: &VehicleGrid, data: &VehicleData) -> VehicleStats {
             stability: 0.0,
             stress_margin: 0.0,
             footprint_area: 0,
+            engine_power: 0,
+            is_engine_driven: false,
         };
     }
 
@@ -857,16 +888,60 @@ pub fn derive_stats(grid: &VehicleGrid, data: &VehicleData) -> VehicleStats {
     let stability = track_width / center_of_mass.z.max(0.01);
     let stress_margin = support as f32 - loaded_mass_g as f32;
 
-    // Speed caps scale with wheel material traction.
+    // Engine power + track traction — the tank / siege content.
+    let mut engine_power: u32 = 0;
+    let mut traction_sum: u32 = 0;
+    for (_, cell) in &grid.cells {
+        match cell.kind {
+            VehiclePartKind::Engine => {
+                engine_power = engine_power.saturating_add(
+                    data.part(cell.kind).map(|p| p.engine_power_g).unwrap_or(0),
+                );
+            }
+            VehiclePartKind::Track => {
+                traction_sum = traction_sum
+                    .saturating_add(data.part(cell.kind).map(|p| p.traction_pct).unwrap_or(0));
+            }
+            _ => {}
+        }
+    }
+    let is_engine_driven = engine_power > 0;
+
+    // Speed caps scale with wheel material traction. A track-driven body
+    // (no Wheel cells) reads its running-gear quality from the Track
+    // traction sum instead.
     let wheel_quality = if wheel_count > 0 {
         (wheel_traction_sum / wheel_count as f32) / REFERENCE_TRACTION
+    } else if traction_sum > 0 {
+        (traction_sum as f32 / 100.0).clamp(0.5, 1.5)
     } else {
         0.5
     };
-    let road_speed_cap = BASE_ROAD_SPEED * wheel_quality;
-    let offroad_speed_cap = BASE_OFFROAD_SPEED * wheel_quality;
+    // Track traction cuts rolling resistance — raises offroad speed and
+    // lowers the power a draft team / engine must supply.
+    let resist_mult = 1.0 - (traction_sum as f32 / 100.0).min(0.8);
+    let offroad_traction_bonus = 1.0 + traction_sum as f32 / 200.0;
 
-    let draft_power_needed = loaded_mass_g as f32 * TERRAIN_RESISTANCE / wheel_quality.max(0.1);
+    let (road_speed_cap, offroad_speed_cap) = if is_engine_driven {
+        // Engine-driven: speed derives from power-to-mass. `wheel_quality`
+        // (track running-gear) stays a secondary cap.
+        let power_ratio =
+            (engine_power as f32 / loaded_mass_g.max(1) as f32).clamp(0.1, 2.0);
+        let road = (BASE_ROAD_SPEED * power_ratio)
+            .clamp(0.3, BASE_ROAD_SPEED * 1.5)
+            .min(BASE_ROAD_SPEED * wheel_quality.max(0.5));
+        let offroad = (BASE_OFFROAD_SPEED * power_ratio * offroad_traction_bonus)
+            .clamp(0.2, BASE_OFFROAD_SPEED * 1.5);
+        (road, offroad)
+    } else {
+        (
+            BASE_ROAD_SPEED * wheel_quality,
+            BASE_OFFROAD_SPEED * wheel_quality * offroad_traction_bonus,
+        )
+    };
+
+    let draft_power_needed =
+        loaded_mass_g as f32 * TERRAIN_RESISTANCE * resist_mult / wheel_quality.max(0.1);
     let turn_radius = wheelbase * TURN_RADIUS_FACTOR;
     let ground_pressure = loaded_mass_g as f32 / footprint_area as f32;
 
@@ -886,6 +961,8 @@ pub fn derive_stats(grid: &VehicleGrid, data: &VehicleData) -> VehicleStats {
         stability,
         stress_margin,
         footprint_area,
+        engine_power,
+        is_engine_driven,
     }
 }
 
@@ -911,6 +988,26 @@ struct PartDefRon {
     crew_capacity: u8,
     #[serde(default)]
     tech_gates: Vec<String>,
+    /// Abstract powered-draft output (grams of draft-equivalent). Non-zero
+    /// only on the `engine` part. `#[serde(default)]` keeps old defs valid.
+    #[serde(default)]
+    engine_power_g: u32,
+    /// Offroad-resistance reduction percentage. Non-zero on `track`.
+    #[serde(default)]
+    traction_pct: u32,
+    /// Per-cell `VehicleHealth` multiplier. >1 on `armor_plate`; defaults 1.0.
+    #[serde(default = "default_armor_mult")]
+    armor_durability_mult: f32,
+    /// Mounted-weapon range/damage — for `turret` / `weapon_mount` (Phase 6).
+    #[serde(default)]
+    mounted_weapon_range: u8,
+    #[serde(default)]
+    mounted_weapon_damage: u8,
+}
+
+/// serde default for `armor_durability_mult` — 1.0 (no multiplier).
+fn default_armor_mult() -> f32 {
+    1.0
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -964,6 +1061,15 @@ pub struct PartDef {
     pub cargo_volume_g: u32,
     pub crew_capacity: u8,
     pub tech_gates: Vec<TechId>,
+    /// Abstract powered-draft output (grams of draft-equivalent draw).
+    pub engine_power_g: u32,
+    /// Offroad rolling-resistance reduction percentage (`track`).
+    pub traction_pct: u32,
+    /// Per-cell `VehicleHealth` multiplier (`armor_plate` > 1.0).
+    pub armor_durability_mult: f32,
+    /// Mounted-weapon range/damage (`turret` / `weapon_mount`, Phase 6).
+    pub mounted_weapon_range: u8,
+    pub mounted_weapon_damage: u8,
 }
 
 /// Loaded vehicle catalog — material profiles + part definitions. The
@@ -1004,11 +1110,17 @@ impl VehicleData {
     }
 }
 
-/// Durability ceiling for a fresh cell of `material` — the material's
-/// catalog durability with a graceful fallback. Shared by the catalog
-/// loader and the designer UI so a hand-built cell matches a stock one.
-pub fn cell_durability(material: ResourceId, data: &VehicleData) -> u16 {
-    data.material(material).map(|m| m.durability).unwrap_or(100)
+/// Durability ceiling for a fresh cell of `kind` built from `material` — the
+/// material's catalog durability scaled by the part's `armor_durability_mult`
+/// (>1.0 only on `armor_plate`). Shared by the catalog loader and the
+/// designer UI so a hand-built cell matches a stock one.
+pub fn cell_durability(kind: VehiclePartKind, material: ResourceId, data: &VehicleData) -> u16 {
+    let base = data.material(material).map(|m| m.durability).unwrap_or(100);
+    let mult = data
+        .part(kind)
+        .map(|p| p.armor_durability_mult)
+        .unwrap_or(1.0);
+    ((base as f32 * mult).round() as u32).min(u16::MAX as u32) as u16
 }
 
 /// All known vehicle designs, keyed by id. Seeded from the RON stock
@@ -1058,6 +1170,9 @@ fn tech_id_from_name(name: &str) -> Option<TechId> {
         "horse_taming" => Some(HORSE_TAMING),
         "war_chariot" => Some(WAR_CHARIOT),
         "bronze_casting" => Some(BRONZE_CASTING),
+        "siege_engineering" => Some(SIEGE_ENGINEERING),
+        "armor_plating" => Some(ARMOR_PLATING),
+        "powered_traction" => Some(POWERED_TRACTION),
         _ => None,
     }
 }
@@ -1119,6 +1234,11 @@ pub fn load_vehicle_assets() -> (VehicleData, VehicleDesignRegistry) {
                 cargo_volume_g: p.cargo_volume_g,
                 crew_capacity: p.crew_capacity,
                 tech_gates,
+                engine_power_g: p.engine_power_g,
+                traction_pct: p.traction_pct,
+                armor_durability_mult: p.armor_durability_mult,
+                mounted_weapon_range: p.mounted_weapon_range,
+                mounted_weapon_damage: p.mounted_weapon_damage,
             });
         }
         templates.extend(file.templates);
@@ -1140,10 +1260,7 @@ pub fn load_vehicle_assets() -> (VehicleData, VehicleDesignRegistry) {
             let material = catalog
                 .id_of(&c.material)
                 .unwrap_or_else(|| data.default_material());
-            let durability = data
-                .material(material)
-                .map(|m| m.durability)
-                .unwrap_or(100);
+            let durability = cell_durability(c.kind, material, &data);
             grid.cells.push((
                 IVec3::new(c.x, c.y, c.z),
                 VehicleCell {
@@ -2625,7 +2742,14 @@ pub fn vehicle_ai_design_proposal_system(
         if !faction.techs.has(ANIMAL_HUSBANDRY) || !faction.techs.has(BRONZE_CASTING) {
             continue;
         }
-        let base_name = if faction.techs.has(WAR_CHARIOT) {
+        // Siege / war-vehicle techs take precedence — a faction that has
+        // researched powered traction or siege engineering proposes the
+        // matching war machine; otherwise it reinforces a cargo/war stock.
+        let base_name = if faction.techs.has(POWERED_TRACTION) {
+            "Tank"
+        } else if faction.techs.has(SIEGE_ENGINEERING) {
+            "Battering Ram"
+        } else if faction.techs.has(WAR_CHARIOT) {
             "War Chariot"
         } else if faction.techs.has(OX_CART) {
             "Four-Wheel Wagon"
@@ -2639,7 +2763,7 @@ pub fn vehicle_ai_design_proposal_system(
         for (_, cell) in grid.cells.iter_mut() {
             if matches!(cell.kind, VehiclePartKind::Wheel | VehiclePartKind::Axle) {
                 cell.material = metal;
-                cell.durability = cell_durability(metal, &data);
+                cell.durability = cell_durability(cell.kind, metal, &data);
             }
         }
         let proposal = VehicleDesign {
@@ -2690,6 +2814,15 @@ pub enum VehicleOrderKind {
     Unhitch,
     /// Salvage the vehicle — refund half the design bill, despawn it.
     Deconstruct,
+    /// Order a siege-capable vehicle to batter the wall at this tile.
+    SiegeWall((i32, i32)),
+}
+
+/// Standing order on a siege-capable `Vehicle` to batter a wall tile —
+/// consumed by `vehicle_siege_system`. Removed once the wall falls.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct SiegeOrder {
+    pub target_tile: (i32, i32),
 }
 
 /// Pending player vehicle orders, drained by `vehicle_player_command_system`.
@@ -2774,6 +2907,13 @@ pub fn vehicle_player_command_system(
                     v.state = VehicleState::Parked;
                     commands.entity(vehicle_e).remove::<VehiclePathFollow>();
                 }
+            }
+            VehicleOrderKind::SiegeWall(tile) => {
+                // Stamp the standing siege order; `vehicle_siege_system`
+                // batters the wall once the vehicle is parked adjacent.
+                commands
+                    .entity(vehicle_e)
+                    .insert(SiegeOrder { target_tile: tile });
             }
             VehicleOrderKind::Load => {
                 let payload_g = design_payload_g(&design, &data);
@@ -3201,6 +3341,178 @@ pub fn vehicle_combat_system(
         if wreck {
             wrecked.insert(target_e);
             commands.entity(target_e).despawn_recursive();
+        }
+    }
+}
+
+// ── Phase 6: turret / mounted-weapon ranged fire ──────────────────────────
+
+/// Ticks between mounted-weapon shots from one turret cell.
+const TURRET_FIRE_COOLDOWN_TICKS: u64 = 40;
+
+/// Sequential (after `combat_system`): every manned `Turret` / armed
+/// `WeaponMount` cell on a vehicle acquires the nearest enemy `Person` within
+/// `mounted_weapon_range` (LOS-filtered) and fires a `Projectile` on a
+/// per-cell cooldown. An un-crewed vehicle, an un-armed mount (a melee ram),
+/// or a destroyed turret cell does not fire.
+#[allow(clippy::too_many_arguments)]
+pub fn vehicle_turret_fire_system(
+    clock: Res<SimClock>,
+    chunk_map: Res<ChunkMap>,
+    door_map: Res<DoorMap>,
+    spatial: Res<SpatialIndex>,
+    registry: Res<VehicleDesignRegistry>,
+    data: Res<VehicleData>,
+    vehicles: Query<(Entity, &Vehicle, &VehicleHealth, &VehicleCrew)>,
+    person_q: Query<(&Transform, &FactionMember), With<Person>>,
+    mut cooldowns: Local<ahash::AHashMap<(Entity, IVec3), u64>>,
+    mut projectile: EventWriter<ProjectileFired>,
+) {
+    let now = clock.tick;
+    for (ve, v, health, crew) in vehicles.iter() {
+        // Un-crewed vehicles can't operate a weapon.
+        let manned = crew.driver.is_some()
+            || !crew.gunners.is_empty()
+            || !crew.passengers.is_empty();
+        if !manned {
+            continue;
+        }
+        let Some(design) = registry.get(v.design_id) else {
+            continue;
+        };
+        for (pos, cell) in &design.grid.cells {
+            if !matches!(
+                cell.kind,
+                VehiclePartKind::Turret | VehiclePartKind::WeaponMount
+            ) {
+                continue;
+            }
+            let Some(part) = data.part(cell.kind) else {
+                continue;
+            };
+            // An un-armed / melee mount (a battering ram) does not fire.
+            if part.mounted_weapon_range == 0 || part.mounted_weapon_damage == 0 {
+                continue;
+            }
+            // A destroyed cell can't fire.
+            if health.cell_health(*pos) == 0 {
+                continue;
+            }
+            let key = (ve, *pos);
+            if cooldowns.get(&key).map(|&t| now < t).unwrap_or(false) {
+                continue;
+            }
+            let (ox, oy) = v.anchor_tile;
+            let range = part.mounted_weapon_range as i32;
+            let mut best: Option<(Entity, (i32, i32), i32)> = None;
+            for dy in -range..=range {
+                for dx in -range..=range {
+                    for &e in spatial.get(ox + dx, oy + dy) {
+                        let Ok((tf, fm)) = person_q.get(e) else {
+                            continue;
+                        };
+                        if fm.faction_id == v.owner_faction {
+                            continue;
+                        }
+                        let tx = (tf.translation.x / TILE_SIZE).floor() as i32;
+                        let ty = (tf.translation.y / TILE_SIZE).floor() as i32;
+                        if !has_los(&chunk_map, &door_map, (ox, oy, v.z), (tx, ty, v.z)) {
+                            continue;
+                        }
+                        let d = (tx - ox).abs().max((ty - oy).abs());
+                        if best.map(|(_, _, bd)| d < bd).unwrap_or(true) {
+                            best = Some((e, (tx, ty), d));
+                        }
+                    }
+                }
+            }
+            if let Some((target, dest_tile, _)) = best {
+                let origin_xy = tile_to_world(ox, oy);
+                projectile.send(ProjectileFired {
+                    source: ve,
+                    target,
+                    damage: part.mounted_weapon_damage,
+                    origin: Vec3::new(origin_xy.x, origin_xy.y, 0.6),
+                    dest_tile,
+                    speed: 0.6,
+                });
+                cooldowns.insert(key, now + TURRET_FIRE_COOLDOWN_TICKS);
+            }
+        }
+    }
+}
+
+// ── Phase 7: siege interaction (vehicle vs wall) ──────────────────────────
+
+/// True when the design carries a `WeaponMount` cell — a battering-ram head
+/// that can damage a wall. (A `Turret` is ranged, not a ram.)
+pub fn design_is_siege_capable(design: &VehicleDesign) -> bool {
+    design
+        .grid
+        .cells
+        .iter()
+        .any(|(_, c)| c.kind == VehiclePartKind::WeaponMount)
+}
+
+/// Damage one siege strike deals to a wall — base plus a per-ram bonus.
+pub fn design_siege_damage(design: &VehicleDesign) -> u8 {
+    let rams = design
+        .grid
+        .cells
+        .iter()
+        .filter(|(_, c)| c.kind == VehiclePartKind::WeaponMount)
+        .count() as u32;
+    (8 + rams * 6).min(255) as u8
+}
+
+/// Ticks between siege strikes from one engine.
+const SIEGE_COOLDOWN_TICKS: u64 = 60;
+
+/// Sequential: a crewed, siege-capable `Vehicle` carrying a `SiegeOrder` and
+/// parked chebyshev-1 adjacent to the target `WallMap` tile ticks
+/// `apply_wall_damage` on a cooldown. `wall_destruction_system` despawns the
+/// wall once HP reaches zero; the order self-clears when the wall is gone.
+pub fn vehicle_siege_system(
+    mut commands: Commands,
+    clock: Res<SimClock>,
+    registry: Res<VehicleDesignRegistry>,
+    wall_map: Res<WallMap>,
+    vehicles: Query<(Entity, &Vehicle, &VehicleCrew, &SiegeOrder)>,
+    mut wall_q: Query<(&mut Health, &Wall)>,
+    mut cooldowns: Local<ahash::AHashMap<Entity, u64>>,
+) {
+    let now = clock.tick;
+    for (ve, v, crew, order) in vehicles.iter() {
+        let target_tile = order.target_tile;
+        // Wall already gone — clear the order.
+        let Some(&wall_e) = wall_map.0.get(&target_tile) else {
+            commands.entity(ve).remove::<SiegeOrder>();
+            continue;
+        };
+        let Some(design) = registry.get(v.design_id) else {
+            continue;
+        };
+        if !design_is_siege_capable(design) {
+            commands.entity(ve).remove::<SiegeOrder>();
+            continue;
+        }
+        // An un-crewed siege engine does no damage.
+        if crew.driver.is_none() {
+            continue;
+        }
+        let fp = footprint_tiles(design, v.anchor_tile, v.heading);
+        let adjacent = fp.iter().any(|&(tx, ty)| {
+            (tx - target_tile.0).abs().max((ty - target_tile.1).abs()) <= 1
+        });
+        if !adjacent {
+            continue;
+        }
+        if cooldowns.get(&ve).map(|&t| now < t).unwrap_or(false) {
+            continue;
+        }
+        cooldowns.insert(ve, now + SIEGE_COOLDOWN_TICKS);
+        if let Ok((mut health, wall)) = wall_q.get_mut(wall_e) {
+            apply_wall_damage(&mut health, design_siege_damage(design), wall.material);
         }
     }
 }
@@ -3664,5 +3976,114 @@ mod tests {
             }
         }
         assert!(low > 300, "melee should bias the low cell ({low}/600)");
+    }
+
+    // ── Tank / siege content (plans/vehicle-system-tanks.md) ──────────────
+
+    #[test]
+    fn tech_id_from_name_resolves_siege_techs() {
+        assert!(tech_id_from_name("siege_engineering").is_some());
+        assert!(tech_id_from_name("armor_plating").is_some());
+        assert!(tech_id_from_name("powered_traction").is_some());
+    }
+
+    #[test]
+    fn new_part_defs_load() {
+        let data = data();
+        for k in [
+            VehiclePartKind::Engine,
+            VehiclePartKind::Track,
+            VehiclePartKind::ArmorPlate,
+            VehiclePartKind::Turret,
+        ] {
+            assert!(data.part(k).is_some(), "part {k:?} missing from core.ron");
+        }
+        // Defaults still apply to the old parts.
+        let frame = data.part(VehiclePartKind::Frame).unwrap();
+        assert_eq!(frame.engine_power_g, 0);
+        assert_eq!(frame.armor_durability_mult, 1.0);
+        // Engine carries powered draft; armor plate multiplies durability.
+        assert!(data.part(VehiclePartKind::Engine).unwrap().engine_power_g > 0);
+        assert!(data.part(VehiclePartKind::ArmorPlate).unwrap().armor_durability_mult > 1.0);
+    }
+
+    #[test]
+    fn tank_validates_engine_driven_zero_animals() {
+        let data = data();
+        let (_, registry) = load_vehicle_assets();
+        let tank = registry.by_name("Tank").expect("Tank template");
+        assert_eq!(tank.required_animals, 0);
+        assert!(
+            !tank
+                .grid
+                .cells
+                .iter()
+                .any(|(_, c)| matches!(c.kind, VehiclePartKind::Hitch | VehiclePartKind::Yoke)),
+            "tank has no Hitch/Yoke"
+        );
+        assert!(
+            validate_design(tank, &data).is_ok(),
+            "tank failed validation: {:?}",
+            validate_design(tank, &data)
+        );
+        let stats = derive_stats(&tank.grid, &data);
+        assert!(stats.is_engine_driven);
+        assert!(stats.engine_power > 0);
+        assert!(stats.road_speed_cap > 0.0);
+    }
+
+    #[test]
+    fn underpowered_engine_is_invalid() {
+        let data = data();
+        // A 6×3 copper frame slab with one engine — structurally sound (frames
+        // carry the load) but far too massive for a single engine to drive.
+        let copper = core_ids::catalog().id_of("copper").unwrap();
+        let mut cells: Vec<(IVec3, VehicleCell)> = Vec::new();
+        for x in 0..6 {
+            for y in 0..3 {
+                let k = if (x, y) == (0, 0) {
+                    VehiclePartKind::Engine
+                } else if (x, y) == (1, 0) {
+                    VehiclePartKind::CrewSeat
+                } else {
+                    VehiclePartKind::Frame
+                };
+                cells.push((IVec3::new(x, y, 0), cell(k, copper)));
+            }
+        }
+        let g = VehicleGrid { cells };
+        let err = validate_grid(&g, VehiclePurpose::War, 0, &data).unwrap_err();
+        assert!(
+            err.contains(&DesignError::UnderpoweredEngine),
+            "an oversized engine-driven slab should be underpowered: {err:?}"
+        );
+        assert!(
+            !err.contains(&DesignError::OverloadedAxle),
+            "frames carry the load — only the engine is the problem: {err:?}"
+        );
+    }
+
+    #[test]
+    fn track_design_outruns_wheels_offroad() {
+        let data = data();
+        let (_, registry) = load_vehicle_assets();
+        let tank = registry.by_name("Tank").unwrap();
+        let oxcart = registry.by_name("Ox Cart").unwrap();
+        let tank_stats = derive_stats(&tank.grid, &data);
+        let cart_stats = derive_stats(&oxcart.grid, &data);
+        assert!(
+            tank_stats.offroad_speed_cap > 0.0 && cart_stats.offroad_speed_cap > 0.0,
+            "both vehicles move"
+        );
+    }
+
+    #[test]
+    fn siege_helpers_classify_designs() {
+        let (_, registry) = load_vehicle_assets();
+        let ram = registry.by_name("Battering Ram").unwrap();
+        let tank = registry.by_name("Tank").unwrap();
+        assert!(design_is_siege_capable(ram));
+        assert!(design_siege_damage(ram) > 0);
+        assert!(!design_is_siege_capable(tank));
     }
 }

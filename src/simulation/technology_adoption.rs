@@ -35,7 +35,7 @@ use crate::simulation::technology::{
     LUNAR_CALENDAR, MICROLITHIC_TOOLS, MONUMENTAL_BUILDING, OCHRE_PAINTING, OX_CART,
     PERM_SETTLEMENT, PORTABLE_DWELLINGS, POTTERS_WHEEL, PROFESSIONAL_ARMY, SACRED_RITUAL,
     SADDLE_QUERN, SCALE_ARMOR, TALLY_MARKS, TECH_COUNT, TECH_TREE, TIN_PROSPECTING, WAR_CHARIOT,
-    WELL_DIGGING,
+    WELL_DIGGING, ARMOR_PLATING, POWERED_TRACTION, SIEGE_ENGINEERING,
 };
 
 pub const TICKS_PER_DAY: u32 = 3600;
@@ -108,13 +108,14 @@ pub fn tech_scale(tech: TechId) -> AdoptionScale {
         FIRE_MAKING | CROP_CULTIVATION | ANIMAL_HUSBANDRY | DOG_DOMESTICATION | FISHING
         | IRRIGATION | FERMENTATION | LOG_RAFT | DUGOUT_CANOE => AdoptionScale::Subsistence,
         // MilitaryTransport — equipment + animals + drilled deployment.
-        HORSE_TAMING | WAR_CHARIOT | PROFESSIONAL_ARMY => AdoptionScale::MilitaryTransport,
+        HORSE_TAMING | WAR_CHARIOT | PROFESSIONAL_ARMY | SIEGE_ENGINEERING | ARMOR_PLATING => {
+            AdoptionScale::MilitaryTransport
+        }
         // Institutional — requires civic scale + officials + buildings.
         PERM_SETTLEMENT | GRANARY | SACRED_RITUAL | LONG_DIST_TRADE | TALLY_MARKS
         | CUNEIFORM_WRITING | CITY_STATE_ORG | MONUMENTAL_BUILDING | LUNAR_CALENDAR | OX_CART
-        | PORTABLE_DWELLINGS | BRIDGE_BUILDING | WELL_DIGGING | DAM_BUILDING => {
-            AdoptionScale::Institutional
-        }
+        | PORTABLE_DWELLINGS | BRIDGE_BUILDING | WELL_DIGGING | DAM_BUILDING
+        | POWERED_TRACTION => AdoptionScale::Institutional,
         // Household default catches FOOD_SMOKING, DRIED_MEAT, and any future
         // additions until they're explicitly classified.
         FOOD_SMOKING | DRIED_MEAT => AdoptionScale::Household,
@@ -751,6 +752,17 @@ mod tests {
     #[test]
     fn bridge_building_is_institutional() {
         assert_eq!(tech_scale(BRIDGE_BUILDING), AdoptionScale::Institutional);
+    }
+
+    #[test]
+    fn siege_techs_have_explicit_scale() {
+        // Omitting a `tech_scale` arm would silently seed founders wrong.
+        assert_eq!(
+            tech_scale(SIEGE_ENGINEERING),
+            AdoptionScale::MilitaryTransport
+        );
+        assert_eq!(tech_scale(ARMOR_PLATING), AdoptionScale::MilitaryTransport);
+        assert_eq!(tech_scale(POWERED_TRACTION), AdoptionScale::Institutional);
     }
 
     #[test]

@@ -76,6 +76,8 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
     let cloth = core_ids::cloth();
     let tools = core_ids::tools();
     let weapon = core_ids::weapon();
+    let bow = core_ids::bow();
+    let sling = core_ids::sling();
     let shield = core_ids::shield();
     let armor = core_ids::armor();
     let luxury = core_ids::luxury();
@@ -130,11 +132,12 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             tech_gate: Some(FIRE_MAKING),
             requires_station: None,
         },
-        // 3
+        // 3 — ranged weapon (range 5 via `compute_combat_stats` on the `bow`
+        // resource). Was previously misrouted to the generic melee `weapon`.
         CraftRecipe {
             name: "Bow",
             inputs: vec![(wood, 2), (skin, 1)],
-            output_resource: weapon,
+            output_resource: bow,
             output_qty: 1,
             output_material: Some(ItemMaterial::Wood),
             work_ticks: 50,
@@ -350,6 +353,19 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 4,
             tech_gate: Some(FOOD_SMOKING),
             requires_station: Some(StationKind::Workbench),
+        },
+        // Sling — cheap ranged weapon (range 4). Appended last so existing
+        // recipe indices stay stable.
+        CraftRecipe {
+            name: "Sling",
+            inputs: vec![(skin, 1), (wood, 1)],
+            output_resource: sling,
+            output_qty: 1,
+            output_material: Some(ItemMaterial::Leather),
+            work_ticks: 30,
+            crafting_xp: 4,
+            tech_gate: Some(BOW_AND_ARROW),
+            requires_station: None,
         },
     ]
 }
@@ -1092,8 +1108,8 @@ mod tests {
         let recipes = craft_recipes();
         assert_eq!(
             recipes.len(),
-            20,
-            "expected 20 recipes; counts feed CraftOrder.recipe_id wire format"
+            21,
+            "expected 21 recipes; counts feed CraftOrder.recipe_id wire format"
         );
 
         // Stone Tools (recipe 0): Stone×2 + Wood×1 → Tools×1
