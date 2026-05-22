@@ -15,6 +15,7 @@ pub mod spatial;
 pub mod terrain;
 pub mod tile;
 pub mod water;
+pub mod water_current;
 pub mod water_runtime;
 
 pub use chunk::ChunkMap;
@@ -61,6 +62,7 @@ impl Plugin for WorldPlugin {
             .insert_resource(chunk_streaming::PendingTileRefreshes::default())
             .insert_resource(water_runtime::RuntimeWater::default())
             .insert_resource(water_runtime::WaterSim::default())
+            .insert_resource(water_current::WaterCurrentField::default())
             .init_resource::<crate::simulation::perf::PerfWorkBudget>()
             .init_resource::<crate::simulation::perf::BackgroundWorkDiagnostics>()
             .add_event::<chunk_streaming::TileChangedEvent>()
@@ -100,6 +102,9 @@ impl Plugin for WorldPlugin {
                     crate::simulation::well::restamp_wells_on_chunk_load,
                     crate::simulation::construction::restamp_walls_on_chunk_load,
                     water_runtime::restamp_runtime_water_on_chunk_load,
+                    // Phase 3 swimming: rebuild the per-tile current field
+                    // last, after the chunk's water state is finalised.
+                    water_current::water_current_field_system,
                 )
                     .chain()
                     .after(chunk_streaming::chunk_streaming_system)

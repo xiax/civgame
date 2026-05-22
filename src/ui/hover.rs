@@ -41,6 +41,17 @@ use crate::world::globe::Globe;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::{tile_at_3d, world_to_tile, WorldGen};
 
+/// 8-point compass label for a flow direction (`+y` = North). Returns
+/// `"—"` for a zero vector.
+fn compass_bearing(dir: bevy::math::Vec2) -> &'static str {
+    if dir == bevy::math::Vec2::ZERO {
+        return "—";
+    }
+    let ang = dir.y.atan2(dir.x);
+    let octant = (((ang / std::f32::consts::FRAC_PI_4).round() as i32) % 8 + 8) % 8;
+    ["E", "NE", "N", "NW", "W", "SW", "S", "SE"][octant as usize]
+}
+
 pub fn hover_info_system(
     mut cursor: crate::rendering::projection::CursorParams,
     chunk_map: Res<ChunkMap>,
@@ -85,6 +96,7 @@ pub fn hover_info_system(
     >,
     plot_index: Res<PlotIndex>,
     plot_query: Query<&Plot>,
+    current_field: Res<crate::world::water_current::WaterCurrentField>,
 ) {
     let Some(pick) = cursor.cursor_pick() else {
         return;
@@ -106,6 +118,27 @@ pub fn hover_info_system(
                 ui.label(format!("Kind: {:?}", tile.kind));
                 ui.label(format!("Z: {}", surf_z));
                 ui.label(format!("Fertility: {}", tile.fertility));
+                // Water column + current for wet tiles.
+                let depth = chunk_map.water_depth_at(tx, ty);
+                if depth > 0.0 {
+                    ui.label(format!("Water depth: {:.2} Z", depth));
+                    match current_field.at(tx, ty) {
+                        Some(cur)
+                            if cur.source
+                                == crate::world::water_current::CurrentSource::RiverChannel =>
+                        {
+                            let bearing = compass_bearing(cur.dir);
+                            ui.label(format!(
+                                "Current: {} ({:.0}%)",
+                                bearing,
+                                cur.speed * 100.0
+                            ));
+                        }
+                        _ => {
+                            ui.label("Current: still");
+                        }
+                    }
+                }
                 if tile.has_building() {
                     ui.label("Has Building");
                 }

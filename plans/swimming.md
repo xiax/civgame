@@ -162,7 +162,26 @@ Suite green (992).
 
 ---
 
-## Phase 3 — `WaterCurrentField` + visible currents
+## Phase 3 — `WaterCurrentField` + visible currents — ✅ SHIPPED
+
+`world/water_current.rs` (`WaterCurrentField` — derived per-tile current,
+`RiverChannel` flow direction from globe D8 `HydroCell.flow_to` + `discharge`
+speed, `StillWater` for lakes/marsh; rebuilt on chunk load/unload,
+deterministic). `swimming.rs` — current resist/assist scales swim energy
+drain ±50%, resisting a meaningful current grants bonus XP.
+`rendering/water_current_render.rs` — translucent flow-streak sprites on
+river tiles, rotated to the flow, indexed per chunk. `ui/hover.rs` — water
+depth + current bearing/speed on wet tiles. Suite green (1000).
+
+**v1 simplifications:** `RuntimeFlow` (dam-pool surface-gradient flow) not
+distinguished — dam pools read `StillWater`. Current affects the *swimmer*
+(energy/XP) but **not** pathfinding `step_cost_for` (the cost is computed in
+the async path worker — threading the field there is deferred) nor swim
+*displacement*. `TileChangedEvent` doesn't rebuild the field (only
+chunk load/unload) — a river bridged/dammed mid-session keeps a stale
+current cell until chunk reload.
+
+### Original Phase 3 spec (below — for the deferred refinements)
 
 ### Current field — new `src/world/water_current.rs`
 - `WaterCurrentField`: derived, non-persistent, keyed by world tile. Stores direction,

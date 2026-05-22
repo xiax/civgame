@@ -12,6 +12,7 @@ pub mod pixel_art;
 pub mod projection;
 pub mod sprite_library;
 pub mod tile_render;
+pub mod water_current_render;
 
 pub struct RenderingPlugin;
 
@@ -28,6 +29,7 @@ impl Plugin for RenderingPlugin {
             .insert_resource(fog::FogMap::default())
             .insert_resource(fog::FogTileMaterials::default())
             .insert_resource(pixel_art::AnimalTextures::default())
+            .insert_resource(water_current_render::CurrentStreakIndex::default())
             .add_systems(
                 Startup,
                 (
@@ -74,6 +76,8 @@ impl Plugin for RenderingPlugin {
                     path_debug::selected_agent_failures_gizmo_system,
                     projection::update_skirt_visibility_system,
                     day_night::update_day_night_overlay_system,
+                    water_current_render::water_current_render_system,
+                    water_current_render::animate_current_streaks_system,
                 )
                     .run_if(in_state(crate::GameState::Playing)),
             )
