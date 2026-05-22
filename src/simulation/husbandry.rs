@@ -191,9 +191,11 @@ pub fn assign_preferred_home_system(
     }
 }
 
-/// Reactively-emit `husbandry_intent_emitter_system`. v1 stub: emits one
-/// blueprint per faction per cadence when the census of owned domestic
-/// animals exceeds `existing_pen_capacity + existing_stable_capacity`.
+/// Emits one housing `Blueprint` per faction per cadence when owned animals
+/// outgrow their housing. The census is split by class: horses count against
+/// Stable capacity (a Stable is emitted when short), cattle / pig / dog count
+/// against Pen capacity (a Pen is emitted when short). Stable need wins ties —
+/// a horse with no stable is unhouseable. Cats have no housing and are ignored.
 /// Uses the existing chief-build pipeline by inserting a `Blueprint` directly
 /// (skipping `BuildIntent` so no `pressure_to_intent` plumbing needs to change).
 pub fn husbandry_intent_emitter_system(
@@ -211,45 +213,60 @@ pub fn husbandry_intent_emitter_system(
     if clock.tick % (TICKS_PER_DAY as u64) != 0 {
         return;
     }
-    // Per-faction census + existing capacity.
-    let mut owned: AHashMap<u32, u32> = AHashMap::new();
-    for (tamed, _) in domestic_q.iter() {
-        *owned.entry(tamed.owner_faction).or_insert(0) += 1;
+    // Per-faction census, split by housing class. Horses can only live in a
+    // Stable; cattle / pig / dog live in a Pen. (Cattle may overflow into a
+    // Stable in `assign_preferred_home_system`, but the emitter keeps the two
+    // pools separate — a faction that owns horses still needs its own
+    // Stable.) Cats have no housing structure, so they're ignored.
+    let mut horses: AHashMap<u32, u32> = AHashMap::new();
+    let mut pen_species: AHashMap<u32, u32> = AHashMap::new();
+    for (tamed, da) in domestic_q.iter() {
+        match da.species {
+            DomesticSpecies::Horse => *horses.entry(tamed.owner_faction).or_insert(0) += 1,
+            DomesticSpecies::Cattle | DomesticSpecies::Pig | DomesticSpecies::Dog => {
+                *pen_species.entry(tamed.owner_faction).or_insert(0) += 1;
+            }
+            DomesticSpecies::Cat => {}
+        }
     }
-    let mut capacity: AHashMap<u32, u32> = AHashMap::new();
+    let mut pen_cap: AHashMap<u32, u32> = AHashMap::new();
+    let mut stable_cap: AHashMap<u32, u32> = AHashMap::new();
     for p in pens.iter() {
-        *capacity.entry(p.faction_id).or_insert(0) += p.capacity as u32;
+        *pen_cap.entry(p.faction_id).or_insert(0) += p.capacity as u32;
     }
     for s in stables.iter() {
-        *capacity.entry(s.faction_id).or_insert(0) += s.capacity as u32;
+        *stable_cap.entry(s.faction_id).or_insert(0) += s.capacity as u32;
     }
-    let pending_pen = |fid: u32| -> bool {
+    let pending_bp = |fid: u32, want: crate::simulation::construction::BuildSiteKind| -> bool {
         bp_map.0.values().any(|&e| {
             bp_q.get(e)
-                .map(|bp| {
-                    bp.faction_id == fid
-                        && matches!(
-                            bp.kind,
-                            crate::simulation::construction::BuildSiteKind::Pen
-                                | crate::simulation::construction::BuildSiteKind::Stable
-                        )
-                })
+                .map(|bp| bp.faction_id == fid && bp.kind == want)
                 .unwrap_or(false)
         })
     };
-    for (&fid, &count) in owned.iter() {
+    // Deterministic iteration over the union of factions owning any
+    // housing-relevant animal.
+    let mut fids: Vec<u32> = horses.keys().chain(pen_species.keys()).copied().collect();
+    fids.sort_unstable();
+    fids.dedup();
+    for fid in fids {
         if fid == SOLO {
             continue;
         }
-        let cap = capacity.get(&fid).copied().unwrap_or(0);
-        // Emit when (owned > cap) OR (no housing exists and >=2 domestics).
-        let needs_housing = count > cap || (cap == 0 && count >= 2);
-        if !needs_housing {
+        use crate::simulation::construction::BuildSiteKind;
+        let horse_n = horses.get(&fid).copied().unwrap_or(0);
+        let pen_n = pen_species.get(&fid).copied().unwrap_or(0);
+        let stable_n = stable_cap.get(&fid).copied().unwrap_or(0);
+        let pen_c = pen_cap.get(&fid).copied().unwrap_or(0);
+        // Stable takes precedence: a horse with no stable is unhouseable,
+        // whereas pen animals at least tolerate over-capacity.
+        let want = if horse_n > stable_n && !pending_bp(fid, BuildSiteKind::Stable) {
+            BuildSiteKind::Stable
+        } else if pen_n > pen_c && !pending_bp(fid, BuildSiteKind::Pen) {
+            BuildSiteKind::Pen
+        } else {
             continue;
-        }
-        if pending_pen(fid) {
-            continue;
-        }
+        };
         let Some(faction) = faction_registry.factions.get(&fid) else {
             continue;
         };
@@ -285,8 +302,7 @@ pub fn husbandry_intent_emitter_system(
             continue;
         };
         let z = chunk_map.surface_z_at(tile.0, tile.1) as i8;
-        let kind = crate::simulation::construction::BuildSiteKind::Pen;
-        let bp = crate::simulation::construction::Blueprint::new(fid, None, kind, tile, z);
+        let bp = crate::simulation::construction::Blueprint::new(fid, None, want, tile, z);
         let world_pos = crate::world::terrain::tile_to_world(tile.0, tile.1);
         let e = commands
             .spawn((

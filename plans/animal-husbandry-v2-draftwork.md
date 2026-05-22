@@ -317,13 +317,18 @@ Cart half end-to-end via the standard `JobBoard` + `JobClaim` (`JobKind::Haul`) 
 - **Tests** — `cart::tests` (5 unit: capacity composition, iron-vs-wood wheels, size classification, capacity units, inventory roundtrip); `test_fixture::smoke::{cart_assembly_builds_cart_from_storage_timber, cart_haul_executor_loads_then_delivers_and_credits_posting}`. **905/905 tests pass.**
 - `src/simulation/CLAUDE.md` updated ("Animal husbandry v2.1 — carts").
 
-### Still deferred (v2.1+)
+### v2.2 — close-out (2026-05-22)
 
-- **4-wheel Wagon size** + **cart repair task** (durability decrements but never blocks).
-- **Adaptive plow routing (`decide_plow_route`)** — plow + plant stay two separate postings; inline plow+plant is unimplemented.
-- **`plant_in_plowed_plot_carries_tilled_marker` / `harvest_tilled_grain_yields_1_4x` fixture tests** — math pinned by unit tests; behavioural harvest-yield fixtures still unwritten.
-- **Stables-intent fix** (v1-flagged Stable-blueprint-needs-horse bug) — untouched.
-- **Player-direct hitch/unhitch UI command.**
+Remaining genuinely-actionable items finished; the plan's draft scope is complete.
+
+- **Stables-intent fix.** `husbandry_intent_emitter_system` (`husbandry.rs`) now splits the per-faction census by housing class: horses count against Stable capacity, cattle/pig/dog against Pen capacity (cats ignored — no housing structure exists). It emits a `Stable` when horses outgrow stables (Stable need wins ties — a horse with no stable is unhouseable) and a `Pen` when pen-species outgrow pens. Previously it emitted only `Pen`, so a horse-owning faction got a pen its horses could never list as `preferred_home`. Iteration is now deterministic (sorted faction ids).
+- **Behavioural fixture tests** (`test_fixture::smoke`): `plant_in_plowed_plot_carries_tilled_marker` (drives `production_system` — Grain sown in a `plowed_year == current_year` plot gets `Tilled`, un-plowed plot does not), `harvest_tilled_grain_yields_1_4x` (drives `gather_system` — a `Tilled` Grain plant harvests for 7 vs the un-tilled 5 at identical nutrients), `husbandry_emitter_queues_stable_for_horse_owner` (one tamed horse → a `Stable` blueprint, never a `Pen`). **1025/1025 tests pass.**
+
+### Resolved by design / superseded — not built
+
+- **Adaptive plow routing (`decide_plow_route`).** The Open question defaulted to the **two-posting** approach (chief posts `Plow`; planting blocks on `plowed_year`), and that is what shipped in v2.0. Inline plow+plant was the rejected alternative — there is no remaining work, only the unbuilt rejected branch.
+- **4-wheel Wagon + cart repair.** Superseded — `cart.rs` was deleted and the whole cargo-vehicle line moved to the Vehicle system (`vehicle.rs`), which ships the Four-Wheel Wagon and models per-cell durability. Cart repair is a vehicle-system concern, not draftwork.
+- **Player-direct hitch/unhitch UI command.** Also moved to the Vehicle system — `PlayerCommand::VehicleOrder { kind: Hitch/Unhitch }` exists there. No draftwork-specific UI is needed.
 
 ### Known follow-up gotchas
 

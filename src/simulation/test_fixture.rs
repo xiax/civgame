@@ -7607,6 +7607,260 @@ mod smoke {
         );
     }
 
+    /// Draftwork v2 behavioural: `production_system`'s Planter branch
+    /// attaches the `Tilled` marker to a Grain plant sown inside a plot
+    /// whose `plowed_year == current_year`, and leaves an un-plowed plot's
+    /// crop unmarked. Pins the planting half of the plow-yield wiring
+    /// (the harvest half is `harvest_tilled_grain_yields_1_4x`).
+    #[test]
+    fn plant_in_plowed_plot_carries_tilled_marker() {
+        use crate::economy::core_ids;
+        use crate::simulation::draftwork::Tilled;
+        use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
+        use crate::simulation::person::{AiState, PersonAI};
+        use crate::simulation::plants::PlantMap;
+        use crate::simulation::production::{production_system, TICKS_FARMER_PLANT};
+        use crate::simulation::settlement::{TileRect, ZoneKind};
+        use crate::simulation::typed_task::{ActionQueue, Task};
+        use crate::world::seasons::Calendar;
+
+        let mut sim = TestSim::new(0x711ED);
+        sim.flat_world(3, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        let year = sim.app.world().resource::<Calendar>().year as u16;
+
+        // Spawn one Agricultural plot with the given `plowed_year`, mapped
+        // into `PlotIndex.by_tile` for the single tile a worker will plant.
+        let mut spawn_plot = |sim: &mut TestSim, tile: (i32, i32), plowed: Option<u16>| {
+            let world = sim.app.world_mut();
+            let pid = world.resource_mut::<PlotIndex>().alloc_id();
+            let ent = world
+                .spawn(Plot {
+                    id: pid,
+                    settlement_id: 0,
+                    faction_id: fid,
+                    rect: TileRect::new(tile.0 - 2, tile.1 - 2, 4, 4),
+                    z: 0,
+                    zone_kind: ZoneKind::Agricultural,
+                    tenure: Tenure::StateOwned,
+                    holder: TenureHolder::State { faction_id: fid },
+                    base_value: 0.0,
+                    last_valued_tick: 0,
+                    missed_payments: 0,
+                    frontage_edge: None,
+                    access_tile: None,
+                    parent_plot: None,
+                    plowed_year: plowed,
+                })
+                .id();
+            let mut idx = world.resource_mut::<PlotIndex>();
+            idx.by_id.insert(pid, ent);
+            idx.by_tile.insert(tile, pid);
+        };
+        let tilled_tile = (41, 41);
+        let plain_tile = (51, 41);
+        spawn_plot(&mut sim, tilled_tile, Some(year));
+        spawn_plot(&mut sim, plain_tile, None);
+
+        let seed = core_ids::grain_seed();
+        let mut arm_planter = |sim: &mut TestSim, tile: (i32, i32)| -> Entity {
+            let worker = sim.spawn_person(fid, (0, 0), |b| {
+                b.add_inventory(seed, 1);
+            });
+            let world = sim.app.world_mut();
+            let mut ai = world.get_mut::<PersonAI>(worker).unwrap();
+            ai.state = AiState::Working;
+            ai.dest_tile = tile;
+            ai.work_progress = TICKS_FARMER_PLANT;
+            let mut aq = world.get_mut::<ActionQueue>(worker).unwrap();
+            aq.current = Task::Planter { tile };
+            worker
+        };
+        arm_planter(&mut sim, tilled_tile);
+        arm_planter(&mut sim, plain_tile);
+
+        let sys = sim.app.world_mut().register_system(production_system);
+        sim.app.world_mut().run_system(sys).unwrap();
+
+        let plant_at = |sim: &TestSim, tile: (i32, i32)| -> Entity {
+            *sim.app
+                .world()
+                .resource::<PlantMap>()
+                .0
+                .get(&tile)
+                .expect("a Grain plant was sown on the prepared tile")
+        };
+        let tilled_plant = plant_at(&sim, tilled_tile);
+        let plain_plant = plant_at(&sim, plain_tile);
+        assert!(
+            sim.app.world().get::<Tilled>(tilled_plant).is_some(),
+            "Grain sown in a plot plowed this year must carry the Tilled marker"
+        );
+        assert!(
+            sim.app.world().get::<Tilled>(plain_plant).is_none(),
+            "Grain sown in an un-plowed plot must not carry the Tilled marker"
+        );
+    }
+
+    /// Draftwork v2 behavioural: harvesting a `Tilled`-marked Grain plant
+    /// through `gather_system` yields `apply_plow_yield_bonus(base)` — a 1.4×
+    /// lift over an otherwise-identical un-tilled plant. Confirms the marker
+    /// actually routes through the harvest path (the `7/5` math itself is
+    /// pinned by `draftwork::tests::plow_yield_bonus_applies_seven_fifths`).
+    #[test]
+    fn harvest_tilled_grain_yields_1_4x() {
+        use crate::economy::core_ids;
+        use crate::simulation::draftwork::Tilled;
+        use crate::simulation::farm::FieldTileIndex;
+        use crate::simulation::gather::gather_system;
+        use crate::simulation::person::{AiState, PersonAI};
+        use crate::simulation::plants::{GrowthStage, Plant, PlantKind, PlantMap};
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(0x717ED);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+
+        // Two identical mature Grain plants; both tiles seeded with the same
+        // nutrient pool so `grain_yield_for_nutrients` returns the same base.
+        let mut spawn_grain = |sim: &mut TestSim, tile: (i32, i32)| -> Entity {
+            let w = tile_to_world(tile.0, tile.1);
+            let e = sim
+                .app
+                .world_mut()
+                .spawn((
+                    Plant {
+                        kind: PlantKind::Grain,
+                        stage: GrowthStage::Mature,
+                        growth: 0,
+                        tile_pos: tile,
+                    },
+                    Transform::from_xyz(w.x, w.y, 0.4),
+                    GlobalTransform::default(),
+                    Visibility::Hidden,
+                    InheritedVisibility::default(),
+                ))
+                .id();
+            sim.app
+                .world_mut()
+                .resource_mut::<PlantMap>()
+                .0
+                .insert(tile, e);
+            sim.app
+                .world_mut()
+                .resource_mut::<FieldTileIndex>()
+                .ensure_entry(tile, 0, 180);
+            e
+        };
+        let tilled_tile = (5, 0);
+        let plain_tile = (6, 0);
+        let tilled_plant = spawn_grain(&mut sim, tilled_tile);
+        let _plain_plant = spawn_grain(&mut sim, plain_tile);
+        sim.app.world_mut().entity_mut(tilled_plant).insert(Tilled);
+
+        let tilled_worker = sim.spawn_person(fid, (0, 0), |_| {});
+        // Each worker stands on its own tile so `route_yield`'s overflow
+        // spill (it drops at the *agent's* tile, not the crop tile) is
+        // attributable to one harvester.
+        let tilled_stand = (0, 0);
+        let plain_stand = (10, 0);
+        let plain_worker = sim.spawn_person(fid, plain_stand, |_| {});
+        for (worker, tile) in [(tilled_worker, tilled_tile), (plain_worker, plain_tile)] {
+            let world = sim.app.world_mut();
+            world.get_mut::<PersonAI>(worker).unwrap().state = AiState::Working;
+            world.get_mut::<ActionQueue>(worker).unwrap().current = Task::Gather { tile };
+        }
+
+        let sys = sim.app.world_mut().register_system(gather_system);
+        sim.app.world_mut().run_system(sys).unwrap();
+
+        let grain = core_ids::grain();
+        // Full harvested quantity = grain in the worker's hands + any
+        // overflow `route_yield` spilled as a `GroundItem` at the worker's
+        // own tile (a 7-unit haul exceeds hand capacity, so the surplus drops).
+        let harvested = |sim: &mut TestSim, worker: Entity, stand: (i32, i32)| -> u32 {
+            let in_hands = sim
+                .app
+                .world()
+                .get::<crate::simulation::carry::Carrier>(worker)
+                .map(|c| c.quantity_of_resource(grain))
+                .unwrap_or(0);
+            let mut on_ground = 0u32;
+            let mut q = sim
+                .app
+                .world_mut()
+                .query::<(&crate::simulation::items::GroundItem, &Transform)>();
+            for (gi, tf) in q.iter(sim.app.world()) {
+                let gt = crate::world::terrain::world_to_tile(tf.translation.truncate());
+                if gi.item.resource_id == grain && gt == stand {
+                    on_ground += gi.qty;
+                }
+            }
+            in_hands + on_ground
+        };
+        // nutrients 180 → base yield 5; tilled → apply_plow_yield_bonus(5) = 7.
+        assert_eq!(
+            harvested(&mut sim, plain_worker, plain_stand),
+            5,
+            "un-tilled Grain harvest yields the nutrient-tier base"
+        );
+        assert_eq!(
+            harvested(&mut sim, tilled_worker, tilled_stand),
+            7,
+            "Tilled Grain harvest yields the 1.4× plow-bonus base (5 → 7)"
+        );
+    }
+
+    /// Draftwork v2 (Stables-intent fix): a settled faction that owns a
+    /// horse with no Stable gets a `Stable` blueprint emitted — not a `Pen`,
+    /// which a horse cannot be housed in. Confirms the v1-flagged emitter
+    /// bug is fixed.
+    #[test]
+    fn husbandry_emitter_queues_stable_for_horse_owner() {
+        use crate::simulation::animals::{DomesticAnimal, DomesticSpecies, Tamed};
+        use crate::simulation::construction::{Blueprint, BuildSiteKind};
+        use crate::simulation::husbandry::husbandry_intent_emitter_system;
+
+        let mut sim = TestSim::new(0x57AB1E);
+        sim.flat_world(3, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+
+        // One tamed horse, owned by the faction, with no assigned home.
+        sim.app.world_mut().spawn((
+            Tamed { owner_faction: fid },
+            DomesticAnimal {
+                species: DomesticSpecies::Horse,
+                training: 0,
+                preferred_home: None,
+                last_cared_tick: 0,
+            },
+        ));
+
+        let sys = sim
+            .app
+            .world_mut()
+            .register_system(husbandry_intent_emitter_system);
+        sim.app.world_mut().run_system(sys).unwrap();
+
+        let mut bps = sim.app.world_mut().query::<&Blueprint>();
+        let (stables, pens) = bps.iter(sim.app.world()).fold((0, 0), |(s, p), b| {
+            if b.faction_id != fid {
+                (s, p)
+            } else {
+                match b.kind {
+                    BuildSiteKind::Stable => (s + 1, p),
+                    BuildSiteKind::Pen => (s, p + 1),
+                    _ => (s, p),
+                }
+            }
+        });
+        assert_eq!(stables, 1, "a horse-owning faction must get a Stable blueprint");
+        assert_eq!(
+            pens, 0,
+            "a horse cannot live in a Pen — the emitter must not queue one"
+        );
+    }
+
     /// `fallow_recovery_system` bumps nutrients +15 once per season-edge,
     /// capped at the world-gen `TileData.fertility` ceiling. Uses
     /// `register_system` + `run_system` so the system's
