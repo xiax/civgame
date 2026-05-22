@@ -133,6 +133,8 @@ core_ids! {
     Fruit => "fruit" => fruit,
     Meat => "meat" => meat,
     Grain => "grain" => grain,
+    Fish => "fish" => fish,
+    PreservedFish => "preserved_fish" => preserved_fish,
     Wood => "wood" => wood,
     Stone => "stone" => stone,
     Tools => "tools" => tools,

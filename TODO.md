@@ -102,7 +102,7 @@ Add initial food and resources and stone tools to spawn appropriate for each era
 
 Adjust work time and show progress bars. Cutting down trees should take way longer with initial stone tools
 
-Add a fishing system to the game that works well with existing systems and is robust and extensible and true to history. 
+X - Add a fishing system to the game that works well with existing systems and is robust and extensible and true to history. 
 
 Add swimming to the game.
 

@@ -295,6 +295,7 @@ pub fn activity_to_skill(activity: ActivityKind) -> SkillKind {
         ActivityKind::Combat => SkillKind::Combat,
         ActivityKind::Socializing => SkillKind::Social,
         ActivityKind::Trading => SkillKind::Trading,
+        ActivityKind::Fishing => SkillKind::Fishing,
     }
 }
 

@@ -1,5 +1,18 @@
 # Fishing System Plan
 
+**Status: shipped.** v1 (shore/bank/marsh/coast fishing) implemented end-to-end —
+`fishing.rs` module, `TaskKind::Fishing`, daily regen, `fish`/`preserved_fish`
+resources + recipe, `SkillKind`/`ActivityKind::Fishing`.
+HTN integration ships as proper **registry methods** — `FishForImmediateFoodMethod`
+(`AcquireFood`) and `FishForStorageMethod` (`StockpileFood`), competing at
+`UTIL_BASELINE` in the argmax against forage/scavenge/withdraw. `PlannerCtx`
+gained a `fish_spot_tile` field, populated by a `ChunkMap`-only scan in the two
+food dispatchers (gated on faction `FISHING`); depleted-spot avoidance is
+`MethodHistory` failure-biasing, so the dispatcher needs no `FishStock` and the
+param ceiling is a non-issue. `FISHING` tech keeps its `Foraging` discovery
+trigger (re-pointing it onto `Fishing` would deadlock discovery); `LOG_RAFT`
+re-pointed instead. Phase 8 (weirs/nets/boats) deferred as designed.
+
 ## Summary
 
 Add fishing as a terrain-based renewable food source gated on the existing

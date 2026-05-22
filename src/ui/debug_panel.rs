@@ -22,6 +22,7 @@ use crate::ui::selection::SelectedEntity;
 
 const SKILL_NAMES: [&str; SKILL_COUNT] = [
     "Farming", "Mining", "Building", "Trading", "Combat", "Crafting", "Social", "Medicine",
+    "Fishing",
 ];
 
 const ACTIVITY_KINDS: [ActivityKind; ACTIVITY_COUNT] = [
@@ -38,6 +39,7 @@ const ACTIVITY_KINDS: [ActivityKind; ACTIVITY_COUNT] = [
     ActivityKind::TinMining,
     ActivityKind::GoldMining,
     ActivityKind::SilverMining,
+    ActivityKind::Fishing,
 ];
 
 const ACTIVITY_NAMES: [&str; ACTIVITY_COUNT] = [
@@ -54,6 +56,7 @@ const ACTIVITY_NAMES: [&str; ACTIVITY_COUNT] = [
     "Tin Mining",
     "Gold Mining",
     "Silver Mining",
+    "Fishing",
 ];
 
 #[derive(Resource)]

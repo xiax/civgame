@@ -516,6 +516,20 @@ pub enum Task {
         blueprint: bevy::prelude::Entity,
         resource_id: ResourceId,
     },
+    /// Fishing system: harvest `fish` from the `FishStock` of a water
+    /// `spot_tile`. The worker stands on a passable chebyshev-adjacent
+    /// tile (the routing layer picks it — interacts-from-adjacent), works
+    /// `FISH_WORK_TICKS`, and `fish_task_system` deposits the catch into a
+    /// free hand (overflow spills as a `GroundItem`). `output_resource` is
+    /// always `core_ids::fish()`; carried on the variant so the trailing
+    /// `Eat` / `DepositToFactionStorage` leg can assert chain integrity.
+    /// Produced by `FishForImmediateFood` (→ `[Fish, Eat]`) and
+    /// `FishForStorage` (→ `[Fish, DepositToFactionStorage]`).
+    Fish {
+        spot_tile: (i32, i32),
+        method: crate::simulation::fishing::FishingMethod,
+        output_resource: ResourceId,
+    },
 }
 
 /// Source for a `Task::Drink`. Inventory drinks consume one `clean_water`
@@ -889,6 +903,7 @@ pub fn task_kind_for(task: Task) -> u16 {
         Task::PrepareField { .. } => TK::PrepareField,
         Task::Plow { .. } => TK::Plow,
         Task::VehicleCargoHaul { .. } => TK::VehicleCargoHaul,
+        Task::Fish { .. } => TK::Fishing,
     };
     kind as u16
 }
@@ -1287,6 +1302,21 @@ impl Task {
                 plot_entity,
                 animal,
             } => Some((plot_entity, animal)),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the Fish variant. Returns
+    /// `(spot_tile, method, output_resource)`.
+    pub fn as_fish(
+        &self,
+    ) -> Option<((i32, i32), crate::simulation::fishing::FishingMethod, ResourceId)> {
+        match *self {
+            Task::Fish {
+                spot_tile,
+                method,
+                output_resource,
+            } => Some((spot_tile, method, output_resource)),
             _ => None,
         }
     }

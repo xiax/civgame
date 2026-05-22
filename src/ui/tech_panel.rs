@@ -24,6 +24,7 @@ fn activity_name(kind: ActivityKind) -> &'static str {
         ActivityKind::TinMining => "Tin Mining",
         ActivityKind::GoldMining => "Gold Mining",
         ActivityKind::SilverMining => "Silver Mining",
+        ActivityKind::Fishing => "Fishing",
     }
 }
 

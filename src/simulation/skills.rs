@@ -3,7 +3,7 @@ use bevy::prelude::*;
 use crate::simulation::schedule::SimClock;
 use crate::world::seasons::TICKS_PER_DAY;
 
-pub const SKILL_COUNT: usize = 8;
+pub const SKILL_COUNT: usize = 9;
 /// Phase 1: per-skill ceiling. Previously skills grew without bound; the
 /// new EV-based profession choice path needs a normalised competence
 /// score, so we clamp.
@@ -36,6 +36,7 @@ pub enum SkillKind {
     Crafting = 5,
     Social = 6,
     Medicine = 7,
+    Fishing = 8,
 }
 
 impl SkillKind {
@@ -49,6 +50,7 @@ impl SkillKind {
             SkillKind::Crafting => "Crafting",
             SkillKind::Social => "Social",
             SkillKind::Medicine => "Medicine",
+            SkillKind::Fishing => "Fishing",
         }
     }
 }

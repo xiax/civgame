@@ -10096,17 +10096,18 @@ mod baseline_behaviour {
         );
         assert_eq!(
             registry.method_count(AbstractTaskKind::StockpileFood),
-            3,
+            4,
             "register_builtin_methods should register \
              ScavengeFoodForStorageMethod, ForageFromKnownForStorageMethod, \
-             and ExploreForFoodForStorageMethod under StockpileFood"
+             FishForStorageMethod, and ExploreForFoodForStorageMethod under StockpileFood"
         );
         assert_eq!(
             registry.method_count(AbstractTaskKind::AcquireFood),
-            4,
+            5,
             "register_builtin_methods should register \
              WithdrawFromStorageMethod, ScavengeFoodFromGroundMethod, \
-             ForageFromKnownMethod, and ExploreForFoodMethod under AcquireFood"
+             ForageFromKnownMethod, FishForImmediateFoodMethod, and \
+             ExploreForFoodMethod under AcquireFood"
         );
     }
 

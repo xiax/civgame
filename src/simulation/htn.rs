@@ -392,6 +392,9 @@ impl MethodId {
     /// registered method routes. Pushed onto `MethodHistory` so repeated
     /// terminal-explore failures escalate to Phase 6B force-reevaluate.
     pub const TERMINAL_EXPLORE: MethodId = MethodId(42);
+    /// Fishing system methods (`AcquireFood` / `StockpileFood`).
+    pub const FISH_FOR_IMMEDIATE_FOOD: MethodId = MethodId(43);
+    pub const FISH_FOR_STORAGE: MethodId = MethodId(44);
     /// Sentinel used when an executor cancels but `ai.active_method` was
     /// `None` (e.g. a chain leg that never stamped a method). `recently_failed_count`
     /// only matches concrete method ids, so UNKNOWN entries are harmless
@@ -447,6 +450,8 @@ impl MethodId {
             Self::GATHER_AND_HAUL_TO_PERSONAL_BLUEPRINT => "GatherAndHaulToPersonalBlueprint",
             Self::HARVEST_MATURE_PLANT_FOR_STORAGE => "HarvestMaturePlantForStorage",
             Self::TERMINAL_EXPLORE => "TerminalExplore",
+            Self::FISH_FOR_IMMEDIATE_FOOD => "FishForImmediateFood",
+            Self::FISH_FOR_STORAGE => "FishForStorage",
             Self::UNKNOWN => "Unknown",
             _ => "Unknown",
         }
@@ -1146,6 +1151,15 @@ pub struct PlannerCtx {
     /// `HarvestMaturePlantForStorageMethod::expand`. `None` everywhere else
     /// preserves the actor-faction default.
     pub deposit_target_faction_override: Option<u32>,
+    /// Fishing system: nearest fishable water tile (`River`/`Marsh`/`Water`
+    /// with a passable adjacent stand tile) within `FISHING_SEARCH_RADIUS`,
+    /// snapshot by the `AcquireFood` / `StockpileFood` dispatchers when the
+    /// faction knows `FISHING`. Read by `FishForImmediateFoodMethod` /
+    /// `FishForStorageMethod`. `None` for every other dispatcher. The scan is
+    /// `ChunkMap`-only — depleted-spot avoidance is handled by `MethodHistory`
+    /// failure-biasing (the executor records a failure on exhausted stock), so
+    /// the dispatcher does not need `FishStock`.
+    pub fish_spot_tile: Option<(i32, i32)>,
 }
 
 /// A single decomposition rule for an `AbstractTask`. Scoring (`utility`) and
@@ -1290,6 +1304,10 @@ pub fn register_builtin_methods(reg: &mut MethodRegistry) {
     );
     reg.register(
         AbstractTaskKind::AcquireFood,
+        Box::new(FishForImmediateFoodMethod),
+    );
+    reg.register(
+        AbstractTaskKind::AcquireFood,
         Box::new(ExploreForFoodMethod),
     );
     reg.register(
@@ -1303,6 +1321,10 @@ pub fn register_builtin_methods(reg: &mut MethodRegistry) {
     reg.register(
         AbstractTaskKind::StockpileFood,
         Box::new(ForageFromKnownForStorageMethod),
+    );
+    reg.register(
+        AbstractTaskKind::StockpileFood,
+        Box::new(FishForStorageMethod),
     );
     reg.register(
         AbstractTaskKind::StockpileFood,
@@ -2374,6 +2396,105 @@ impl Method for ForageFromKnownForStorageMethod {
 
     fn id(&self) -> MethodId {
         MethodId::FORAGE_FROM_KNOWN_FOR_STORAGE
+    }
+}
+
+/// Method for `AbstractTask::AcquireFood`: catch fish at a known water spot
+/// and eat in place. Sibling of `ForageFromKnownMethod` — same `UTIL_BASELINE`
+/// tier, so a hungry agent's choice between a berry bush and a riverbank is a
+/// genuine distance-discounted argmax (and `MethodHistory` biases fishing down
+/// when the executor keeps hitting a depleted stock).
+///
+/// `ctx.fish_spot_tile` is populated by `htn_acquire_food_dispatch_system`
+/// only when the faction knows `FISHING`, so the `is_some()` precondition
+/// doubles as the tech gate; `tech_gate()` is declared for documentation.
+pub struct FishForImmediateFoodMethod;
+
+impl Method for FishForImmediateFoodMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        matches!(abstract_task, AbstractTask::AcquireFood) && ctx.fish_spot_tile.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE - dist_penalty(ctx, ctx.fish_spot_tile)
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::AcquireFood) {
+            return Vec::new();
+        }
+        let Some(spot_tile) = ctx.fish_spot_tile else {
+            return Vec::new();
+        };
+        vec![
+            Task::Fish {
+                spot_tile,
+                method: crate::simulation::fishing::FishingMethod::Handline,
+                output_resource: crate::economy::core_ids::fish(),
+            },
+            Task::Eat,
+        ]
+    }
+
+    fn tech_gate(&self) -> Option<TechId> {
+        Some(crate::simulation::technology::FISHING)
+    }
+
+    fn name(&self) -> &'static str {
+        "FishForImmediateFood"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::FISH_FOR_IMMEDIATE_FOOD
+    }
+}
+
+/// Method for `AbstractTask::StockpileFood`: catch fish at a known water spot
+/// and deposit at faction storage. Chief/subsistence-driven counterpart to
+/// `FishForImmediateFoodMethod` — same `UTIL_BASELINE` tier as
+/// `ForageFromKnownForStorageMethod`. See that method's note for the
+/// `fish_spot_tile`/tech-gate relationship.
+pub struct FishForStorageMethod;
+
+impl Method for FishForStorageMethod {
+    fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
+        matches!(abstract_task, AbstractTask::StockpileFood) && ctx.fish_spot_tile.is_some()
+    }
+
+    fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
+        UTIL_BASELINE - dist_penalty(ctx, ctx.fish_spot_tile)
+    }
+
+    fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
+        if !matches!(abstract_task, AbstractTask::StockpileFood) {
+            return Vec::new();
+        }
+        let Some(spot_tile) = ctx.fish_spot_tile else {
+            return Vec::new();
+        };
+        vec![
+            Task::Fish {
+                spot_tile,
+                method: crate::simulation::fishing::FishingMethod::Handline,
+                output_resource: crate::economy::core_ids::fish(),
+            },
+            Task::DepositToFactionStorage {
+                resource_id: crate::economy::core_ids::fish(),
+                target_faction_id: None,
+            },
+        ]
+    }
+
+    fn tech_gate(&self) -> Option<TechId> {
+        Some(crate::simulation::technology::FISHING)
+    }
+
+    fn name(&self) -> &'static str {
+        "FishForStorage"
+    }
+
+    fn id(&self) -> MethodId {
+        MethodId::FISH_FOR_STORAGE
     }
 }
 
@@ -3518,6 +3639,7 @@ pub fn htn_dispatch_system(
                 personal_bp_resource: None,
                 agent_has_weapon: false,
                 deposit_target_faction_override: None,
+                fish_spot_tile: None,
             };
 
             // Argmax over applicable methods. f32 has no total order; ties
@@ -3766,6 +3888,7 @@ pub fn htn_eat_dispatch_system(
                 personal_bp_resource: None,
                 agent_has_weapon: false,
                 deposit_target_faction_override: None,
+                fish_spot_tile: None,
             };
 
             let abstract_task = AbstractTask::Eat;
@@ -4087,6 +4210,24 @@ pub fn htn_acquire_food_dispatch_system(
                 })
             });
 
+            // Fishing system: nearest fishable water (ChunkMap-only scan),
+            // populated only when the faction knows FISHING so the method's
+            // `fish_spot_tile.is_some()` precondition doubles as the tech gate.
+            let fish_spot = if faction_registry
+                .factions
+                .get(&member.faction_id)
+                .map(|f| f.techs.has(crate::simulation::technology::FISHING))
+                .unwrap_or(false)
+            {
+                crate::simulation::fishing::nearest_fishable_water(
+                    &chunk_map,
+                    (cur_tx, cur_ty),
+                    crate::simulation::fishing::FISHING_SEARCH_RADIUS,
+                )
+            } else {
+                None
+            };
+
             let ctx = PlannerCtx {
                 scope: context_aware_scope(&calendar, needs),
                 tile: (cur_tx, cur_ty),
@@ -4134,6 +4275,7 @@ pub fn htn_acquire_food_dispatch_system(
                 personal_bp_resource: None,
                 agent_has_weapon: false,
                 deposit_target_faction_override: None,
+                fish_spot_tile: fish_spot,
             };
 
             let abstract_task = AbstractTask::AcquireFood;
@@ -4359,9 +4501,42 @@ pub fn htn_acquire_food_dispatch_system(
                     ai.active_gather_claim = Some((gather_tile, kind));
                     aq.dispatch(Task::Gather { tile: gather_tile });
                 }
+                Task::Fish { spot_tile, .. } => {
+                    // Fishing dispatch under AcquireFood (`FishForImmediateFood`
+                    // → `[Fish, Eat]`). `task_interacts_from_adjacent(Fishing)`
+                    // is true, so routing picks a passable stand tile next to
+                    // the impassable water `spot_tile`. The trailing `Eat` is
+                    // primed by `fishing::finish_fish`.
+                    let dispatched = assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx, cur_ty),
+                        cur_chunk,
+                        spot_tile,
+                        TaskKind::Fishing,
+                        None,
+                        &chunk_graph,
+                        &chunk_router,
+                        &chunk_map,
+                        &chunk_connectivity,
+                    );
+                    if !dispatched {
+                        ai.active_method = None;
+                        history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                        return;
+                    }
+                    let kind = crate::simulation::fishing::fish_claim_kind();
+                    gather_claims.add(
+                        spot_tile,
+                        kind,
+                        actor,
+                        suggested_expiry(now, (cur_tx, cur_ty), spot_tile),
+                    );
+                    ai.active_gather_claim = Some((spot_tile, kind));
+                    aq.dispatch(head);
+                }
                 _ => {
                     // No registered AcquireFood method returns a non-WithdrawFood,
-                    // non-Scavenge, non-Explore, non-Gather head today.
+                    // non-Scavenge, non-Explore, non-Gather, non-Fish head today.
                     // Defensive fallthrough; future Hunt methods will land
                     // as new arms here.
                     ai.active_method = None;
@@ -4688,6 +4863,7 @@ pub fn htn_acquire_good_dispatch_system(
                     personal_bp_resource: None,
                     agent_has_weapon: false,
                     deposit_target_faction_override: None,
+                    fish_spot_tile: None,
                 };
 
                 let abstract_task = AbstractTask::AcquireGood {
@@ -5053,6 +5229,7 @@ pub fn htn_acquire_good_dispatch_system(
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         };
 
         let abstract_task = AbstractTask::AcquireGood { resource_id };
@@ -5430,6 +5607,25 @@ pub fn htn_stockpile_food_dispatch_system(
                 )
             });
 
+            // Fishing system: nearest fishable water (ChunkMap-only scan),
+            // populated only when the faction knows FISHING so
+            // `FishForStorageMethod`'s `fish_spot_tile.is_some()` precondition
+            // doubles as the tech gate.
+            let fish_spot = if faction_registry
+                .factions
+                .get(&member.faction_id)
+                .map(|f| f.techs.has(crate::simulation::technology::FISHING))
+                .unwrap_or(false)
+            {
+                crate::simulation::fishing::nearest_fishable_water(
+                    &chunk_map,
+                    (cur_tx, cur_ty),
+                    crate::simulation::fishing::FISHING_SEARCH_RADIUS,
+                )
+            } else {
+                None
+            };
+
             let ctx = PlannerCtx {
                 scope: ScoringScope::Geometric,
                 tile: (cur_tx, cur_ty),
@@ -5474,6 +5670,7 @@ pub fn htn_stockpile_food_dispatch_system(
                 personal_bp_resource: None,
                 agent_has_weapon: false,
                 deposit_target_faction_override: None,
+                fish_spot_tile: fish_spot,
             };
 
             let abstract_task = AbstractTask::StockpileFood;
@@ -5643,9 +5840,41 @@ pub fn htn_stockpile_food_dispatch_system(
                     ai.active_gather_claim = Some((gather_tile, kind));
                     aq.dispatch(Task::Gather { tile: gather_tile });
                 }
+                Task::Fish { spot_tile, .. } => {
+                    // Fishing dispatch under StockpileFood (`FishForStorage`
+                    // → `[Fish, DepositToFactionStorage]`). Routing picks a
+                    // passable stand tile next to the water `spot_tile`; the
+                    // trailing deposit is routed by `fishing::finish_fish`.
+                    let dispatched = assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx, cur_ty),
+                        cur_chunk,
+                        spot_tile,
+                        TaskKind::Fishing,
+                        None,
+                        &chunk_graph,
+                        &chunk_router,
+                        &chunk_map,
+                        &chunk_connectivity,
+                    );
+                    if !dispatched {
+                        ai.active_method = None;
+                        history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                        return;
+                    }
+                    let kind = crate::simulation::fishing::fish_claim_kind();
+                    gather_claims.add(
+                        spot_tile,
+                        kind,
+                        actor,
+                        suggested_expiry(now, (cur_tx, cur_ty), spot_tile),
+                    );
+                    ai.active_gather_claim = Some((spot_tile, kind));
+                    aq.dispatch(head);
+                }
                 _ => {
                     // No registered StockpileFood method returns a non-Scavenge,
-                    // non-Explore, non-Gather head today. Defensive fallthrough.
+                    // non-Explore, non-Gather, non-Fish head today. Defensive fallthrough.
                     ai.active_method = None;
                     return;
                 }
@@ -5851,6 +6080,7 @@ pub fn htn_equip_hunting_spear_dispatch_system(
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         };
 
         let abstract_task = AbstractTask::EquipHuntingSpear;
@@ -6050,6 +6280,7 @@ pub fn htn_scout_dispatch_system(
                 personal_bp_resource: None,
                 agent_has_weapon: false,
                 deposit_target_faction_override: None,
+                fish_spot_tile: None,
             };
 
             let abstract_task = AbstractTask::Scout;
@@ -6261,6 +6492,7 @@ pub fn htn_return_surplus_dispatch_system(
                 personal_bp_resource: None,
                 agent_has_weapon: false,
                 deposit_target_faction_override: None,
+                fish_spot_tile: None,
             };
 
             let abstract_task = AbstractTask::ReturnSurplus;
@@ -6501,6 +6733,7 @@ pub fn htn_tame_animal_dispatch_system(
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         };
 
         let abstract_task = AbstractTask::TameWildAnimal;
@@ -7074,6 +7307,7 @@ pub fn htn_plant_from_storage_dispatch_system(
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         };
 
         let abstract_task = AbstractTask::PlantFromStorage {
@@ -7610,6 +7844,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             personal_bp_resource,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         };
 
         let abstract_task = AbstractTask::ConstructBlueprint;
@@ -7845,6 +8080,7 @@ pub fn htn_deliver_hunt_kill_dispatch_system(
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         };
 
         let abstract_task = AbstractTask::DeliverHuntKill;
@@ -8164,6 +8400,7 @@ pub fn htn_engage_prey_dispatch_system(
                     .map(|eq| eq.has_resource(weapon_id))
                     .unwrap_or(false),
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         };
 
         let abstract_task = AbstractTask::EngagePrey;
@@ -8429,6 +8666,7 @@ pub fn htn_join_hunt_party_dispatch_system(
                     .map(|eq| eq.has_resource(weapon_id))
                     .unwrap_or(false),
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         };
 
         let abstract_task = AbstractTask::JoinHuntParty;
@@ -8644,6 +8882,7 @@ pub fn htn_socialize_dispatch_system(
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         };
 
         let disposition = disposition_opt.copied().unwrap_or_default();
@@ -8903,6 +9142,7 @@ pub fn htn_combat_faction_dispatch_system(
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         };
 
         let methods = method_registry.methods_for(abstract_kind);
@@ -9394,6 +9634,7 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         };
 
         let abstract_task = AbstractTask::DeliverMaterialToCraftOrder {
@@ -9658,6 +9899,7 @@ pub fn htn_work_on_craft_order_dispatch_system(
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         };
 
         let abstract_task = AbstractTask::WorkOnCraftOrder;
@@ -9983,6 +10225,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         };
 
         let abstract_task = AbstractTask::HarvestGrainForCraftOrder;
@@ -10318,6 +10561,7 @@ pub fn htn_harvest_plant_dispatch_system(
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: scope.deposit_override(),
+            fish_spot_tile: None,
         };
 
         let abstract_task = AbstractTask::HarvestPlant;
@@ -11012,6 +11256,7 @@ pub fn htn_play_dispatch_system(
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         };
 
         let abstract_task = AbstractTask::Play;
@@ -11479,6 +11724,7 @@ mod tests {
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         }
     }
 
@@ -11527,6 +11773,7 @@ mod tests {
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         }
     }
 
@@ -11575,6 +11822,7 @@ mod tests {
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         }
     }
 
@@ -11627,6 +11875,7 @@ mod tests {
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         }
     }
 
@@ -11678,6 +11927,7 @@ mod tests {
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         }
     }
 
@@ -11739,6 +11989,7 @@ mod tests {
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         }
     }
 
@@ -11831,12 +12082,12 @@ mod tests {
 
     #[test]
     fn registry_reports_four_acquire_food_methods() {
-        // Forage migration: `ForageFromKnownMethod` (utility 1.0) joins
         // `WithdrawFromStorageMethod` (1.0), `ScavengeFoodFromGroundMethod`
-        // (1.5), and `ExploreForFoodMethod` (0.3) under AcquireFood.
+        // (1.5), `ForageFromKnownMethod` (1.0), `FishForImmediateFoodMethod`
+        // (1.0), and `ExploreForFoodMethod` (0.3) under AcquireFood.
         let mut reg = MethodRegistry::default();
         register_builtin_methods(&mut reg);
-        assert_eq!(reg.method_count(AbstractTaskKind::AcquireFood), 4);
+        assert_eq!(reg.method_count(AbstractTaskKind::AcquireFood), 5);
     }
 
     #[test]
@@ -12094,6 +12345,7 @@ mod tests {
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         }
     }
 
@@ -12270,6 +12522,7 @@ mod tests {
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         }
     }
 
@@ -12482,6 +12735,7 @@ mod tests {
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         }
     }
 
@@ -12731,6 +12985,7 @@ mod tests {
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         }
     }
 
@@ -13392,17 +13647,18 @@ mod tests {
             personal_bp_resource: None,
             agent_has_weapon: false,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         }
     }
 
     #[test]
     fn registry_reports_three_stockpile_food_methods() {
-        // Forage migration: `ForageFromKnownForStorageMethod` (utility 1.0)
-        // joins `ScavengeFoodForStorageMethod` (1.5) and
-        // `ExploreForFoodForStorageMethod` (0.3) under StockpileFood.
+        // `ScavengeFoodForStorageMethod` (1.5), `ForageFromKnownForStorageMethod`
+        // (1.0), `FishForStorageMethod` (1.0), and `ExploreForFoodForStorageMethod`
+        // (0.3) under StockpileFood.
         let mut reg = MethodRegistry::default();
         register_builtin_methods(&mut reg);
-        assert_eq!(reg.method_count(AbstractTaskKind::StockpileFood), 3);
+        assert_eq!(reg.method_count(AbstractTaskKind::StockpileFood), 4);
     }
 
     #[test]
@@ -14024,6 +14280,7 @@ mod tests {
             personal_bp_resource: None,
             agent_has_weapon: true,
             deposit_target_faction_override: None,
+            fish_spot_tile: None,
         }
     }
 

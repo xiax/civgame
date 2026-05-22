@@ -2,7 +2,7 @@ use bevy::prelude::*;
 
 pub type TechId = u16;
 pub const TECH_COUNT: usize = 47;
-pub const ACTIVITY_COUNT: usize = 13;
+pub const ACTIVITY_COUNT: usize = 14;
 
 // ── Tech ID constants ─────────────────────────────────────────────────────────
 
@@ -110,6 +110,7 @@ pub enum ActivityKind {
     TinMining = 10,
     GoldMining = 11,
     SilverMining = 12,
+    Fishing = 13,
 }
 
 /// A single activity/probability pair that drives tech discovery.
@@ -427,9 +428,11 @@ pub static TECH_TREE: [TechDef; TECH_COUNT] = [
                 activity: ActivityKind::WoodGathering,
                 per_unit_chance: 0.005,
             },
+            // Rafts are discovered by people working the water — fishing
+            // drives the urge to range farther downstream.
             TechTrigger {
-                activity: ActivityKind::Foraging,
-                per_unit_chance: 0.001,
+                activity: ActivityKind::Fishing,
+                per_unit_chance: 0.002,
             },
         ],
         bonus: TechBonus {

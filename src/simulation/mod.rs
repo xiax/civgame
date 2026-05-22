@@ -22,6 +22,7 @@ pub mod draftwork;
 pub mod drink;
 pub mod faction;
 pub mod farm;
+pub mod fishing;
 pub mod gather;
 pub mod gather_claims;
 pub mod goal_contract;
@@ -276,6 +277,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(land::LandListings::default())
             .insert_resource(farm::FarmPlotAssignments::default())
             .insert_resource(farm::FieldTileIndex::default())
+            .insert_resource(fishing::FishStock::default())
             .insert_resource(military::ActiveRallyPoints::default())
             .insert_resource(military::MilitaryFormationGroupGen::default())
             .insert_resource(military::PendingFormationSlots::default())
@@ -1147,6 +1149,20 @@ impl Plugin for SimulationPlugin {
                 // pass. Reads `JobClaim::Plow`, picks the next un-plowed
                 // tile, dispatches `Task::Plow`.
                 (draftwork::htn_plow_dispatch_system,).in_set(SimulationSet::ParallelB),
+            )
+            // Fishing system: executor (Sequential, before gather so the two
+            // adjacent-work tasks don't race) + daily stock regeneration
+            // (Economy). The HTN methods (`FishForImmediateFood` /
+            // `FishForStorage`) are registered in `register_builtin_methods`
+            // and dispatched by the `AcquireFood` / `StockpileFood` systems.
+            .add_systems(
+                FixedUpdate,
+                (fishing::fish_task_system.before(gather::gather_system),)
+                    .in_set(SimulationSet::Sequential),
+            )
+            .add_systems(
+                FixedUpdate,
+                (fishing::fish_regen_system,).in_set(SimulationSet::Economy),
             )
             // Vehicle system (Phase 4): vehicle-leads cargo-haul pipeline.
             // Dispatcher (ParallelB) claims a vehicle + routes the worker to

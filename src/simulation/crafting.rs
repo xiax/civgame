@@ -83,6 +83,8 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
     let book = core_ids::book();
     let meat = core_ids::meat();
     let preserved_meat = core_ids::preserved_meat();
+    let fish = core_ids::fish();
+    let preserved_fish = core_ids::preserved_fish();
     let raw_water = core_ids::raw_water();
     let clean_water = core_ids::clean_water();
     let ard_plow = core_ids::ard_plow();
@@ -333,6 +335,20 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             work_ticks: 120,
             crafting_xp: 10,
             tech_gate: Some(OX_CART),
+            requires_station: Some(StationKind::Workbench),
+        },
+        // 19 — Smoke/dried fish. Mirrors Preserved Meat (recipe 12): the
+        // ration doesn't perish and weighs less per food-unit, so bands
+        // bank it for migration. `FOOD_SMOKING`-gated, Workbench-bound.
+        CraftRecipe {
+            name: "Preserved Fish",
+            inputs: vec![(fish, 2), (wood, 1)],
+            output_resource: preserved_fish,
+            output_qty: 3,
+            output_material: None,
+            work_ticks: 60,
+            crafting_xp: 4,
+            tech_gate: Some(FOOD_SMOKING),
             requires_station: Some(StationKind::Workbench),
         },
     ]
@@ -1076,8 +1092,8 @@ mod tests {
         let recipes = craft_recipes();
         assert_eq!(
             recipes.len(),
-            19,
-            "expected 19 recipes; counts feed CraftOrder.recipe_id wire format"
+            20,
+            "expected 20 recipes; counts feed CraftOrder.recipe_id wire format"
         );
 
         // Stone Tools (recipe 0): Stone×2 + Wood×1 → Tools×1

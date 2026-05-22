@@ -51,6 +51,22 @@ ResourceFile(
             tags: ["food", "edible", "crop_yield"],
             sprite_key: Some("resource_wheat"),
         ),
+        // Fresh fish — caught from rivers, lakes, marshes, and coastal
+        // water by `TaskKind::Fishing`. Edible food, perishable, counted by
+        // `FactionStorage::food_total()` like any other catalog edible.
+        ResourceDef(
+            key: "fish",
+            display_name: "Fish",
+            class: food,
+            bulk: small,
+            weight_g: 600,
+            edible_calories: Some(120),
+            entertainment_value: 3,
+            storage_class: granary,
+            trade_base_value: 9,
+            tags: ["food", "edible", "perishable", "animal_product"],
+            sprite_key: Some("resource_fish"),
+        ),
 
         // ── Seeds ─────────────────────────────────────────────────────
         ResourceDef(
@@ -446,6 +462,22 @@ ResourceFile(
             trade_base_value: 8,
             tags: ["food", "edible", "preserved", "ration"],
             sprite_key: Some("resource_meat"),
+        ),
+        // Smoke/dried fish. Like preserved meat: lighter per food-unit,
+        // doesn't perish, banked for migration. Produced by the
+        // `FOOD_SMOKING`-gated "Preserved Fish" recipe.
+        ResourceDef(
+            key: "preserved_fish",
+            display_name: "Preserved Fish",
+            class: food,
+            bulk: small,
+            weight_g: 180,
+            edible_calories: Some(110),
+            entertainment_value: 2,
+            storage_class: granary,
+            trade_base_value: 7,
+            tags: ["food", "edible", "preserved", "ration"],
+            sprite_key: Some("resource_fish"),
         ),
     ],
 )

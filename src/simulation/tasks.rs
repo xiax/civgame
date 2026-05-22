@@ -142,6 +142,13 @@ pub enum TaskKind {
     /// storage → deliver at blueprint). Interacts-from-adjacent, counts as
     /// labor. Executor: `vehicle::vehicle_cargo_haul_task_system`.
     VehicleCargoHaul = 54,
+    /// Fishing system: worker stands on a passable tile chebyshev-adjacent
+    /// to a fishable water `spot_tile` (`River`/`Marsh`/`Water`) and works
+    /// `FISH_WORK_TICKS` to harvest `fish` from the tile's `FishStock`.
+    /// Interacts-from-adjacent (the routing layer picks the stand tile),
+    /// requires 1 free hand, counts as labor. Executor:
+    /// `fishing::fish_task_system` (Sequential, before `gather::gather_system`).
+    Fishing = 55,
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -202,6 +209,7 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::PrepareField as u16 => "Preparing Field",
         x if x == TaskKind::Plow as u16 => "Plowing",
         x if x == TaskKind::VehicleCargoHaul as u16 => "Vehicle Hauling",
+        x if x == TaskKind::Fishing as u16 => "Fishing",
         _ => "Unemployed",
     }
 }
@@ -228,7 +236,8 @@ pub fn task_requires_free_hands(task_id: u16) -> u8 {
             || x == TaskKind::TameAnimal as u16
             || x == TaskKind::ClearObstacle as u16
             || x == TaskKind::PrepareField as u16
-            || x == TaskKind::Plow as u16 =>
+            || x == TaskKind::Plow as u16
+            || x == TaskKind::Fishing as u16 =>
         {
             1
         }
@@ -280,6 +289,7 @@ pub fn task_interacts_from_adjacent(task_id: u16) -> bool {
         || task_id == TaskKind::PrepareField as u16
         || task_id == TaskKind::Plow as u16
         || task_id == TaskKind::VehicleCargoHaul as u16
+        || task_id == TaskKind::Fishing as u16
 }
 
 /// Tasks that count as productive labor — these drain willpower over time
@@ -312,6 +322,7 @@ pub fn task_is_labor(task_id: u16) -> bool {
         || task_id == TaskKind::PrepareField as u16
         || task_id == TaskKind::Plow as u16
         || task_id == TaskKind::VehicleCargoHaul as u16
+        || task_id == TaskKind::Fishing as u16
 }
 
 /// Spiral search outward from `target` for the closest tile that is passable
@@ -1115,6 +1126,22 @@ pub fn goal_dispatch_system(
                             if aq.current_task_kind() == TaskKind::Scavenge as u16 =>
                         {
                             Some(TaskKind::Scavenge as u16)
+                        }
+                        // Fishing system: the `FishForStorage` / `FishForImmediateFood`
+                        // chains run without an ActivePlan. The Fish leg
+                        // (walk + adjacency work) must survive across
+                        // goal-dispatch ticks until `fish_task_system`
+                        // completes or external preempt; the trailing
+                        // Deposit / Eat legs are covered by the arms above.
+                        AgentGoal::GatherFood
+                            if aq.current_task_kind() == TaskKind::Fishing as u16 =>
+                        {
+                            Some(TaskKind::Fishing as u16)
+                        }
+                        AgentGoal::Survive
+                            if aq.current_task_kind() == TaskKind::Fishing as u16 =>
+                        {
+                            Some(TaskKind::Fishing as u16)
                         }
                         AgentGoal::GatherFood
                             if aq.current_task_kind() == TaskKind::DepositResource as u16 =>
