@@ -1,5 +1,11 @@
 # Vehicle Designer V2: Large-Scale Builder + Multi-Cell Weapons
 
+> **SUPERSEDED & SHIPPED.** This draft was evaluated, revised, and implemented as
+> `plans/evaluate-the-users-xiao1-civgame-plans-v-silly-lobster.md` (variants as
+> `Option`, modules carrying their concrete cell list, full firing arcs, tech-gate
+> enforcement at the designer + `vehicle_assembly_system`). See `src/simulation/CLAUDE.md`
+> → Vehicle system for the shipped behaviour. Kept for history.
+
 ## Summary
 - Expand custom vehicle design from `6×4×4` to `10×8×6`.
 - Rework the designer into a larger workbench UI with hover explanations for every part, material, stat, validation issue, and cell.

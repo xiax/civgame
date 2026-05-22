@@ -61,11 +61,12 @@ use crate::world::tile::TileKind;
 
 // ── grid bounds ───────────────────────────────────────────────────────────
 
-/// Maximum design grid extent. v1 ancient vehicles are 1 cell tall; the 4-tall
-/// ceiling reserves headroom for the deferred tank / siege content.
-pub const GRID_MAX_WIDTH: i32 = 6;
-pub const GRID_MAX_DEPTH: i32 = 4;
-pub const GRID_MAX_HEIGHT: i32 = 4;
+/// Maximum design grid extent. The `10×8×6` ceiling (v2) is large enough for
+/// multi-cell siege engines and big war machines; real designs stay far
+/// sparser, so the O(n²) validation / stat passes are still cheap.
+pub const GRID_MAX_WIDTH: i32 = 10;
+pub const GRID_MAX_DEPTH: i32 = 8;
+pub const GRID_MAX_HEIGHT: i32 = 6;
 
 // ── stat tunables ─────────────────────────────────────────────────────────
 
@@ -197,20 +198,81 @@ impl VehicleDisableFlags {
 
 // ── grid + cells ──────────────────────────────────────────────────────────
 
+/// Stable identity of a `PartVariantDef` within `VehicleData::variants` —
+/// the load-order index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VehiclePartVariantId(pub u16);
+
+/// Stable identity of a `VehicleModuleDef` within `VehicleData::modules`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VehicleModuleDefId(pub u16);
+
+/// Identity of one placed module *instance* within a single `VehicleGrid`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VehicleModuleId(pub u16);
+
+/// Firing arc of a weapon module. `Front90` weapons fire only within ±45° of
+/// the module's facing; `Full360` weapons fire in any direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FiringArc {
+    /// Not a firing weapon (a ram).
+    #[default]
+    None,
+    /// Fixed forward weapon — ±45° of facing.
+    Front90,
+    /// Rotating mount — any direction.
+    Full360,
+}
+
 /// One cell of a vehicle design. `material` is an existing catalog
-/// `ResourceId`; `durability` is the cell's health ceiling.
+/// `ResourceId`; `durability` is the cell's health ceiling. `variant` is an
+/// optional behavioural variant (`None` = pure part-base behaviour);
+/// `module_id` back-references the weapon module the cell belongs to.
 #[derive(Clone, Copy, Debug)]
 pub struct VehicleCell {
     pub kind: VehiclePartKind,
     pub material: ResourceId,
     pub durability: u16,
+    /// Behavioural variant — `None` is the standard part with no modifiers.
+    pub variant: Option<VehiclePartVariantId>,
+    /// Weapon-module membership — `None` for a plain cell.
+    pub module_id: Option<VehicleModuleId>,
+}
+
+impl VehicleCell {
+    /// A plain cell — no variant, no module membership.
+    pub fn plain(kind: VehiclePartKind, material: ResourceId, durability: u16) -> VehicleCell {
+        VehicleCell {
+            kind,
+            material,
+            durability,
+            variant: None,
+            module_id: None,
+        }
+    }
+}
+
+/// One placed weapon-module instance within a `VehicleGrid`. `cells` is the
+/// concrete occupied-cell list (the authoritative grouping — not re-derived
+/// from an anchor + rotation); `facing` is the module's heading offset.
+#[derive(Clone, Debug)]
+pub struct VehicleModuleInstance {
+    pub id: VehicleModuleId,
+    pub def: VehicleModuleDefId,
+    pub cells: Vec<IVec3>,
+    /// Heading offset (`0..4`) added to the vehicle heading for the arc.
+    pub facing: u8,
 }
 
 /// A freeform vehicle body — a sparse set of cells over the bounded 3D grid.
 /// One grid Z-cell maps to one world Z-level (clearance is load-bearing).
+/// `modules` is grouping metadata only; `cells` stays the single source for
+/// footprint / mass / health / pathing / rendering.
 #[derive(Clone, Debug, Default)]
 pub struct VehicleGrid {
     pub cells: Vec<(IVec3, VehicleCell)>,
+    pub modules: Vec<VehicleModuleInstance>,
 }
 
 impl VehicleGrid {
@@ -224,6 +286,30 @@ impl VehicleGrid {
 
     pub fn contains(&self, pos: IVec3) -> bool {
         self.cells.iter().any(|(p, _)| *p == pos)
+    }
+
+    /// The module instance occupying `pos`, if any.
+    pub fn module_at(&self, pos: IVec3) -> Option<&VehicleModuleInstance> {
+        let id = self.get(pos)?.module_id?;
+        self.modules.iter().find(|m| m.id == id)
+    }
+
+    /// A fresh `VehicleModuleId` not in use by any current module.
+    pub fn next_module_id(&self) -> VehicleModuleId {
+        let next = self
+            .modules
+            .iter()
+            .map(|m| m.id.0)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        VehicleModuleId(next)
+    }
+
+    /// Remove a module instance and every cell it owns.
+    pub fn remove_module(&mut self, id: VehicleModuleId) {
+        self.cells.retain(|(_, c)| c.module_id != Some(id));
+        self.modules.retain(|m| m.id != id);
     }
 
     /// Inclusive `(min, max)` bounding box of occupied cells, or `None` when
@@ -538,6 +624,14 @@ pub enum DesignError {
     ChariotRule,
     /// An engine-driven design whose `engine_power` can't move its own mass.
     UnderpoweredEngine,
+    /// A weapon module has a cell outside the bounded design grid.
+    ModuleOutOfBounds(VehicleModuleId),
+    /// A weapon module overlaps a cell owned by a different module.
+    ModuleOverlap(VehicleModuleId),
+    /// A weapon module needs more support cells beneath it than it has.
+    UnsupportedModule(VehicleModuleId),
+    /// A forward-facing weapon module is not on the body's front edge.
+    BadModuleFacing(VehicleModuleId),
 }
 
 const NEIGHBORS_6: [IVec3; 6] = [
@@ -573,6 +667,10 @@ pub fn validate_grid(
         return Err(vec![DesignError::Empty]);
     }
 
+    // Occupancy set — O(1) membership for the connectivity / module passes
+    // (the grid's own `get`/`contains` are linear).
+    let occupied: ahash::AHashSet<IVec3> = grid.cells.iter().map(|(p, _)| *p).collect();
+
     // Bounds.
     for (p, _) in &grid.cells {
         if p.x < 0
@@ -588,21 +686,20 @@ pub fn validate_grid(
 
     // Connectivity — flood fill over 6-neighbours from the first cell.
     {
-        let mut seen: Vec<IVec3> = Vec::with_capacity(grid.cells.len());
+        let mut seen: ahash::AHashSet<IVec3> = ahash::AHashSet::default();
         let mut stack: Vec<IVec3> = vec![grid.cells[0].0];
         while let Some(p) = stack.pop() {
-            if seen.contains(&p) {
+            if !seen.insert(p) {
                 continue;
             }
-            seen.push(p);
             for d in NEIGHBORS_6 {
                 let n = p + d;
-                if grid.contains(n) && !seen.contains(&n) {
+                if occupied.contains(&n) && !seen.contains(&n) {
                     stack.push(n);
                 }
             }
         }
-        if seen.len() != grid.cells.len() {
+        if seen.len() != occupied.len() {
             errors.push(DesignError::Disconnected);
         }
     }
@@ -734,6 +831,55 @@ pub fn validate_grid(
         errors.push(DesignError::ChariotRule);
     }
 
+    // ── Weapon-module checks ──────────────────────────────────────────────
+    let hi_y = grid.bounds().map(|(_, hi)| hi.y).unwrap_or(0);
+    for inst in &grid.modules {
+        // Every module cell must be a real, in-bounds cell owned by *this*
+        // module (the cell's `module_id` back-reference must agree).
+        for &c in &inst.cells {
+            let in_bounds = c.x >= 0
+                && c.y >= 0
+                && c.z >= 0
+                && c.x < GRID_MAX_WIDTH
+                && c.y < GRID_MAX_DEPTH
+                && c.z < GRID_MAX_HEIGHT;
+            if !in_bounds || !occupied.contains(&c) {
+                errors.push(DesignError::ModuleOutOfBounds(inst.id));
+                continue;
+            }
+            match grid.get(c).and_then(|cell| cell.module_id) {
+                Some(owner) if owner == inst.id => {}
+                Some(_) => errors.push(DesignError::ModuleOverlap(inst.id)),
+                None => errors.push(DesignError::ModuleOutOfBounds(inst.id)),
+            }
+        }
+
+        let Some(def) = data.module_def(inst.def) else {
+            continue;
+        };
+
+        // Heavy modules off the bottom layer need support cells beneath them.
+        if def.required_support > 0 {
+            let supported = inst
+                .cells
+                .iter()
+                .filter(|c| c.z > min_z && occupied.contains(&(**c + IVec3::new(0, 0, -1))))
+                .count() as u8;
+            let on_bottom = inst.cells.iter().all(|c| c.z <= min_z);
+            if !on_bottom && supported < def.required_support {
+                errors.push(DesignError::UnsupportedModule(inst.id));
+            }
+        }
+
+        // A forward-facing weapon must sit on the body's front edge so it can
+        // actually fire over the hull.
+        if def.firing_arc == FiringArc::Front90
+            && !inst.cells.iter().any(|c| c.y == hi_y)
+        {
+            errors.push(DesignError::BadModuleFacing(inst.id));
+        }
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -743,8 +889,13 @@ pub fn validate_grid(
 
 // ── stat derivation ───────────────────────────────────────────────────────
 
+/// Resolve a cell's behavioural variant — `None` for a standard cell.
+fn variant_of<'a>(cell: &VehicleCell, data: &'a VehicleData) -> Option<&'a PartVariantDef> {
+    cell.variant.and_then(|v| data.variant(v))
+}
+
 /// Per-cell structural mass (grams) — part reference mass scaled by the
-/// material's density.
+/// material's density and the variant's `mass_mult`.
 fn cell_mass_g(cell: &VehicleCell, data: &VehicleData) -> u32 {
     let base = data
         .part(cell.kind)
@@ -754,10 +905,13 @@ fn cell_mass_g(cell: &VehicleCell, data: &VehicleData) -> u32 {
         .material(cell.material)
         .map(|m| m.density_pct)
         .unwrap_or(100);
-    ((base as u64 * density as u64) / 100) as u32
+    let mass_mult = variant_of(cell, data).map(|v| v.mass_mult).unwrap_or(1.0);
+    let raw = (base as u64 * density as u64) / 100;
+    (raw as f32 * mass_mult.max(0.0)) as u32
 }
 
-/// Total structural support (grams) from axle + wheel + frame cells.
+/// Total structural support (grams) from axle + wheel + frame + track cells,
+/// each scaled by the variant's `support_mult`.
 fn support_limit_g(grid: &VehicleGrid, data: &VehicleData) -> u32 {
     let mut total: u32 = 0;
     for (_, cell) in &grid.cells {
@@ -772,7 +926,10 @@ fn support_limit_g(grid: &VehicleGrid, data: &VehicleData) -> u32 {
             VehiclePartKind::Track => TRACK_SUPPORT_PER_STRENGTH,
             _ => 0,
         };
-        total = total.saturating_add(strength.saturating_mul(per));
+        let support_mult = variant_of(cell, data).map(|v| v.support_mult).unwrap_or(1.0);
+        let cell_support =
+            (strength.saturating_mul(per) as f32 * support_mult.max(0.0)) as u32;
+        total = total.saturating_add(cell_support);
     }
     total
 }
@@ -836,16 +993,25 @@ pub fn derive_stats(grid: &VehicleGrid, data: &VehicleData) -> VehicleStats {
     let mut axle_y: Vec<i32> = Vec::new();
     let mut wheel_traction_sum: f32 = 0.0;
     let mut wheel_count: u32 = 0;
+    // Turn radius — the product of every cell's `turn_radius_mult`, so a
+    // steering axle tightens it while large off-road wheels widen it.
+    let mut turn_radius_mult: f32 = 1.0;
     for (p, cell) in &grid.cells {
+        if let Some(v) = variant_of(cell, data) {
+            turn_radius_mult *= v.turn_radius_mult.max(0.0);
+        }
         match cell.kind {
             VehiclePartKind::Wheel => {
                 if !wheel_x.contains(&p.x) {
                     wheel_x.push(p.x);
                 }
+                let traction_mult =
+                    variant_of(cell, data).map(|v| v.traction_mult).unwrap_or(1.0);
                 wheel_traction_sum += data
                     .material(cell.material)
                     .map(|m| m.traction as f32)
-                    .unwrap_or(40.0);
+                    .unwrap_or(40.0)
+                    * traction_mult.max(0.0);
                 wheel_count += 1;
             }
             VehiclePartKind::Axle => {
@@ -876,9 +1042,9 @@ pub fn derive_stats(grid: &VehicleGrid, data: &VehicleData) -> VehicleStats {
         .iter()
         .filter(|(_, c)| c.kind == VehiclePartKind::CargoBay)
         .map(|(_, c)| {
-            data.part(c.kind)
-                .map(|p| p.cargo_volume_g)
-                .unwrap_or(0)
+            let base = data.part(c.kind).map(|p| p.cargo_volume_g).unwrap_or(0);
+            let mult = variant_of(c, data).map(|v| v.cargo_volume_mult).unwrap_or(1.0);
+            (base as f32 * mult.max(0.0)) as u32
         })
         .sum();
     let max_payload_g = cargo_volume.min(support.saturating_sub(empty_mass_g));
@@ -894,9 +1060,12 @@ pub fn derive_stats(grid: &VehicleGrid, data: &VehicleData) -> VehicleStats {
     for (_, cell) in &grid.cells {
         match cell.kind {
             VehiclePartKind::Engine => {
-                engine_power = engine_power.saturating_add(
-                    data.part(cell.kind).map(|p| p.engine_power_g).unwrap_or(0),
-                );
+                let base = data.part(cell.kind).map(|p| p.engine_power_g).unwrap_or(0);
+                let mult = variant_of(cell, data)
+                    .map(|v| v.engine_power_mult)
+                    .unwrap_or(1.0);
+                engine_power =
+                    engine_power.saturating_add((base as f32 * mult.max(0.0)) as u32);
             }
             VehiclePartKind::Track => {
                 traction_sum = traction_sum
@@ -942,7 +1111,7 @@ pub fn derive_stats(grid: &VehicleGrid, data: &VehicleData) -> VehicleStats {
 
     let draft_power_needed =
         loaded_mass_g as f32 * TERRAIN_RESISTANCE * resist_mult / wheel_quality.max(0.1);
-    let turn_radius = wheelbase * TURN_RADIUS_FACTOR;
+    let turn_radius = wheelbase * TURN_RADIUS_FACTOR * turn_radius_mult;
     let ground_pressure = loaded_mass_g as f32 / footprint_area as f32;
 
     VehicleStats {
@@ -1010,6 +1179,76 @@ fn default_armor_mult() -> f32 {
     1.0
 }
 
+/// serde default for variant / module multipliers — 1.0 (no modifier).
+fn default_one_f32() -> f32 {
+    1.0
+}
+
+/// serde default for a module cooldown — matches the legacy turret cadence.
+fn default_module_cooldown() -> u64 {
+    40
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename = "PartVariantDef")]
+struct PartVariantDefRon {
+    label: String,
+    part_kind: VehiclePartKind,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    tech_gates: Vec<String>,
+    #[serde(default = "default_one_f32")]
+    mass_mult: f32,
+    #[serde(default = "default_one_f32")]
+    support_mult: f32,
+    #[serde(default = "default_one_f32")]
+    traction_mult: f32,
+    #[serde(default = "default_one_f32")]
+    turn_radius_mult: f32,
+    #[serde(default = "default_one_f32")]
+    cargo_volume_mult: f32,
+    #[serde(default = "default_one_f32")]
+    durability_mult: f32,
+    #[serde(default = "default_one_f32")]
+    engine_power_mult: f32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename = "VehicleModuleDef")]
+struct VehicleModuleDefRon {
+    label: String,
+    #[serde(default)]
+    description: String,
+    part_kind: VehiclePartKind,
+    /// Footprint cell offsets `(x, y, z)` at rotation 0.
+    footprint: Vec<(i32, i32, i32)>,
+    #[serde(default)]
+    allowed_rotations: Vec<u8>,
+    #[serde(default)]
+    muzzle_offset: (i32, i32),
+    #[serde(default)]
+    crew_required: u8,
+    #[serde(default)]
+    gunner_required: u8,
+    #[serde(default)]
+    firing_arc: FiringArc,
+    #[serde(default)]
+    range: u8,
+    #[serde(default)]
+    damage: u8,
+    #[serde(default)]
+    siege_damage: u8,
+    #[serde(default = "default_module_cooldown")]
+    cooldown_ticks: u64,
+    #[serde(default)]
+    required_support: u8,
+    #[serde(default)]
+    tech_gates: Vec<String>,
+    #[serde(default)]
+    extra_bill: Vec<(String, u32)>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename = "CellDef")]
 struct CellDefRon {
@@ -1018,6 +1257,20 @@ struct CellDefRon {
     z: i32,
     kind: VehiclePartKind,
     material: String,
+    /// Optional behavioural variant — looked up by `PartVariantDef::label`.
+    #[serde(default)]
+    variant: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename = "TemplateModule")]
+struct TemplateModuleRon {
+    /// `VehicleModuleDef::label`.
+    def: String,
+    /// The cells `(x, y, z)` this module occupies (must exist in `cells`).
+    cells: Vec<(i32, i32, i32)>,
+    #[serde(default)]
+    facing: u8,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1029,6 +1282,8 @@ struct TemplateDefRon {
     #[serde(default)]
     tech_gates: Vec<String>,
     cells: Vec<CellDefRon>,
+    #[serde(default)]
+    modules: Vec<TemplateModuleRon>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1038,6 +1293,10 @@ struct VehicleDataFile {
     materials: Vec<MaterialProfileRon>,
     #[serde(default)]
     parts: Vec<PartDefRon>,
+    #[serde(default)]
+    variants: Vec<PartVariantDefRon>,
+    #[serde(default)]
+    modules: Vec<VehicleModuleDefRon>,
     #[serde(default)]
     templates: Vec<TemplateDefRon>,
 }
@@ -1072,13 +1331,62 @@ pub struct PartDef {
     pub mounted_weapon_damage: u8,
 }
 
-/// Loaded vehicle catalog — material profiles + part definitions. The
-/// physics surface every later phase reads. Inserted as a Bevy resource at
-/// `WorldPlugin::build`.
+/// Resolved part-variant definition — a behavioural identity for a part kind
+/// (e.g. a `spoked_wheel` vs an `iron_rim_wheel`). Multipliers fold into the
+/// stat derivation; `1.0` is the identity.
+#[derive(Clone, Debug)]
+pub struct PartVariantDef {
+    pub id: VehiclePartVariantId,
+    pub label: String,
+    pub description: String,
+    pub part_kind: VehiclePartKind,
+    pub tech_gates: Vec<TechId>,
+    pub mass_mult: f32,
+    pub support_mult: f32,
+    pub traction_mult: f32,
+    pub turn_radius_mult: f32,
+    pub cargo_volume_mult: f32,
+    pub durability_mult: f32,
+    pub engine_power_mult: f32,
+}
+
+/// Resolved multi-cell weapon-module definition — a ram / ballista / turret
+/// occupying several cells but firing or striking once per module.
+#[derive(Clone, Debug)]
+pub struct VehicleModuleDef {
+    pub id: VehicleModuleDefId,
+    pub label: String,
+    pub description: String,
+    pub part_kind: VehiclePartKind,
+    /// Footprint cell offsets at rotation 0.
+    pub footprint: Vec<IVec3>,
+    /// Headings (`0..4`) the module may be stamped at.
+    pub allowed_rotations: Vec<u8>,
+    /// Cell the projectile launches from (XY offset, rotation 0).
+    pub muzzle_offset: IVec2,
+    pub crew_required: u8,
+    pub gunner_required: u8,
+    pub firing_arc: FiringArc,
+    pub range: u8,
+    pub damage: u8,
+    pub siege_damage: u8,
+    pub cooldown_ticks: u64,
+    /// Cells that must be supported from below when the module is off `min_z`.
+    pub required_support: u8,
+    pub tech_gates: Vec<TechId>,
+    /// Extra resources beyond the per-cell bill.
+    pub extra_bill: Vec<(ResourceId, u32)>,
+}
+
+/// Loaded vehicle catalog — material profiles, part definitions, behavioural
+/// variants, and weapon modules. The physics surface every later phase reads.
+/// Inserted as a Bevy resource at `WorldPlugin::build`.
 #[derive(Resource, Clone, Debug, Default)]
 pub struct VehicleData {
     materials: Vec<MaterialProfile>,
     parts: Vec<PartDef>,
+    variants: Vec<PartVariantDef>,
+    modules: Vec<VehicleModuleDef>,
 }
 
 impl VehicleData {
@@ -1108,19 +1416,67 @@ impl VehicleData {
     pub fn parts(&self) -> &[PartDef] {
         &self.parts
     }
+
+    /// Resolve a variant by id.
+    pub fn variant(&self, id: VehiclePartVariantId) -> Option<&PartVariantDef> {
+        self.variants.get(id.0 as usize)
+    }
+
+    /// Resolve a variant by its `label`.
+    pub fn variant_by_label(&self, label: &str) -> Option<&PartVariantDef> {
+        self.variants.iter().find(|v| v.label == label)
+    }
+
+    /// All variants applicable to one part kind.
+    pub fn variants_for(
+        &self,
+        kind: VehiclePartKind,
+    ) -> impl Iterator<Item = &PartVariantDef> {
+        self.variants.iter().filter(move |v| v.part_kind == kind)
+    }
+
+    /// All loaded variants.
+    pub fn variants(&self) -> &[PartVariantDef] {
+        &self.variants
+    }
+
+    /// Resolve a module definition by id.
+    pub fn module_def(&self, id: VehicleModuleDefId) -> Option<&VehicleModuleDef> {
+        self.modules.get(id.0 as usize)
+    }
+
+    /// Resolve a module definition by its `label`.
+    pub fn module_by_label(&self, label: &str) -> Option<&VehicleModuleDef> {
+        self.modules.iter().find(|m| m.label == label)
+    }
+
+    /// All loaded weapon modules — the designer UI's module palette.
+    pub fn modules(&self) -> &[VehicleModuleDef] {
+        &self.modules
+    }
 }
 
-/// Durability ceiling for a fresh cell of `kind` built from `material` — the
-/// material's catalog durability scaled by the part's `armor_durability_mult`
-/// (>1.0 only on `armor_plate`). Shared by the catalog loader and the
-/// designer UI so a hand-built cell matches a stock one.
-pub fn cell_durability(kind: VehiclePartKind, material: ResourceId, data: &VehicleData) -> u16 {
+/// Durability ceiling for a fresh cell of `kind` built from `material` and an
+/// optional `variant` — the material's catalog durability scaled by the
+/// part's `armor_durability_mult` (>1.0 only on `armor_plate`) and the
+/// variant's `durability_mult`. Shared by the catalog loader and the designer
+/// UI so a hand-built cell matches a stock one.
+pub fn cell_durability(
+    kind: VehiclePartKind,
+    material: ResourceId,
+    variant: Option<VehiclePartVariantId>,
+    data: &VehicleData,
+) -> u16 {
     let base = data.material(material).map(|m| m.durability).unwrap_or(100);
     let mult = data
         .part(kind)
         .map(|p| p.armor_durability_mult)
         .unwrap_or(1.0);
-    ((base as f32 * mult).round() as u32).min(u16::MAX as u32) as u16
+    let var_mult = variant
+        .and_then(|v| data.variant(v))
+        .map(|v| v.durability_mult)
+        .unwrap_or(1.0);
+    ((base as f32 * mult * var_mult).round() as u32).min(u16::MAX as u32) as u16
 }
 
 /// All known vehicle designs, keyed by id. Seeded from the RON stock
@@ -1241,6 +1597,68 @@ pub fn load_vehicle_assets() -> (VehicleData, VehicleDesignRegistry) {
                 mounted_weapon_damage: p.mounted_weapon_damage,
             });
         }
+        for v in file.variants {
+            let id = VehiclePartVariantId(data.variants.len() as u16);
+            let tech_gates = v
+                .tech_gates
+                .iter()
+                .filter_map(|n| tech_id_from_name(n))
+                .collect();
+            data.variants.push(PartVariantDef {
+                id,
+                label: v.label,
+                description: v.description,
+                part_kind: v.part_kind,
+                tech_gates,
+                mass_mult: v.mass_mult,
+                support_mult: v.support_mult,
+                traction_mult: v.traction_mult,
+                turn_radius_mult: v.turn_radius_mult,
+                cargo_volume_mult: v.cargo_volume_mult,
+                durability_mult: v.durability_mult,
+                engine_power_mult: v.engine_power_mult,
+            });
+        }
+        for m in file.modules {
+            let id = VehicleModuleDefId(data.modules.len() as u16);
+            let tech_gates = m
+                .tech_gates
+                .iter()
+                .filter_map(|n| tech_id_from_name(n))
+                .collect();
+            let mut allowed_rotations = m.allowed_rotations.clone();
+            if allowed_rotations.is_empty() {
+                allowed_rotations.push(0);
+            }
+            let extra_bill = m
+                .extra_bill
+                .iter()
+                .filter_map(|(name, qty)| catalog.id_of(name).map(|rid| (rid, *qty)))
+                .collect();
+            data.modules.push(VehicleModuleDef {
+                id,
+                label: m.label,
+                description: m.description,
+                part_kind: m.part_kind,
+                footprint: m
+                    .footprint
+                    .iter()
+                    .map(|&(x, y, z)| IVec3::new(x, y, z))
+                    .collect(),
+                allowed_rotations,
+                muzzle_offset: IVec2::new(m.muzzle_offset.0, m.muzzle_offset.1),
+                crew_required: m.crew_required,
+                gunner_required: m.gunner_required,
+                firing_arc: m.firing_arc,
+                range: m.range,
+                damage: m.damage,
+                siege_damage: m.siege_damage,
+                cooldown_ticks: m.cooldown_ticks,
+                required_support: m.required_support,
+                tech_gates,
+                extra_bill,
+            });
+        }
         templates.extend(file.templates);
     }
 
@@ -1260,21 +1678,65 @@ pub fn load_vehicle_assets() -> (VehicleData, VehicleDesignRegistry) {
             let material = catalog
                 .id_of(&c.material)
                 .unwrap_or_else(|| data.default_material());
-            let durability = cell_durability(c.kind, material, &data);
+            let variant = c
+                .variant
+                .as_deref()
+                .and_then(|label| data.variant_by_label(label))
+                .map(|v| v.id);
+            if c.variant.is_some() && variant.is_none() {
+                eprintln!(
+                    "VehicleData: template {:?} cell references unknown variant {:?}.",
+                    t.name, c.variant
+                );
+            }
+            let durability = cell_durability(c.kind, material, variant, &data);
             grid.cells.push((
                 IVec3::new(c.x, c.y, c.z),
                 VehicleCell {
                     kind: c.kind,
                     material,
                     durability,
+                    variant,
+                    module_id: None,
                 },
             ));
         }
-        let tech_gates = t
-            .tech_gates
-            .iter()
-            .filter_map(|n| tech_id_from_name(n))
-            .collect();
+        // Resolve module placements — stamp `module_id` on the owned cells.
+        for (mi, m) in t.modules.iter().enumerate() {
+            let Some(def) = data.module_by_label(&m.def) else {
+                eprintln!(
+                    "VehicleData: template {:?} references unknown module {:?}.",
+                    t.name, m.def
+                );
+                continue;
+            };
+            let module_id = VehicleModuleId(mi as u16);
+            let cells: Vec<IVec3> = m
+                .cells
+                .iter()
+                .map(|&(x, y, z)| IVec3::new(x, y, z))
+                .collect();
+            for cell_pos in &cells {
+                if let Some((_, c)) =
+                    grid.cells.iter_mut().find(|(p, _)| p == cell_pos)
+                {
+                    c.module_id = Some(module_id);
+                }
+            }
+            grid.modules.push(VehicleModuleInstance {
+                id: module_id,
+                def: def.id,
+                cells,
+                facing: m.facing,
+            });
+        }
+        // Tech gates = the template's own gates ∪ every placed variant's and
+        // module's gates.
+        let tech_gates = collect_design_tech_gates(
+            &grid,
+            t.tech_gates.iter().filter_map(|n| tech_id_from_name(n)),
+            &data,
+        );
         registry.insert(VehicleDesign {
             id: VehicleDesignId(0), // reassigned by `insert`
             name: t.name,
@@ -1288,6 +1750,43 @@ pub fn load_vehicle_assets() -> (VehicleData, VehicleDesignRegistry) {
     }
 
     (data, registry)
+}
+
+/// Tech gates a design requires: a `base` set unioned with the `tech_gates`
+/// of every placed cell variant and every weapon module. Custom designs use
+/// `base = []`; stock templates pass their RON-declared gates.
+pub fn collect_design_tech_gates(
+    grid: &VehicleGrid,
+    base: impl Iterator<Item = TechId>,
+    data: &VehicleData,
+) -> Vec<TechId> {
+    let mut gates: Vec<TechId> = base.collect();
+    let mut add = |t: TechId| {
+        if !gates.contains(&t) {
+            gates.push(t);
+        }
+    };
+    for (_, cell) in &grid.cells {
+        // Part-kind gates (e.g. `weapon_mount` → war_chariot).
+        if let Some(part) = data.part(cell.kind) {
+            for &t in &part.tech_gates {
+                add(t);
+            }
+        }
+        if let Some(v) = variant_of(cell, data) {
+            for &t in &v.tech_gates {
+                add(t);
+            }
+        }
+    }
+    for inst in &grid.modules {
+        if let Some(def) = data.module_def(inst.def) {
+            for &t in &def.tech_gates {
+                add(t);
+            }
+        }
+    }
+    gates
 }
 
 // ── Phase 2: VehicleYard, assembly queue, assembly system ─────────────────
@@ -1347,12 +1846,15 @@ pub struct VehicleAssemblyQueue {
 
 /// Compute the raw-resource bill to assemble a design: one unit of each
 /// cell's material plus one `tools` per mechanical cell (Wheel / Axle /
-/// WeaponMount). Grouped per `ResourceId` — never explodes the catalog
-/// (every material is an existing catalog resource).
-pub fn design_bill(design: &VehicleDesign) -> Vec<(ResourceId, u32)> {
+/// WeaponMount), plus every weapon module's `extra_bill`. Grouped per
+/// `ResourceId` — never explodes the catalog.
+pub fn design_bill(design: &VehicleDesign, data: &VehicleData) -> Vec<(ResourceId, u32)> {
     let tools = core_ids::tools();
     let mut bill: Vec<(ResourceId, u32)> = Vec::new();
     let mut add = |rid: ResourceId, n: u32| {
+        if n == 0 {
+            return;
+        }
         if let Some(slot) = bill.iter_mut().find(|(r, _)| *r == rid) {
             slot.1 += n;
         } else {
@@ -1366,6 +1868,13 @@ pub fn design_bill(design: &VehicleDesign) -> Vec<(ResourceId, u32)> {
             VehiclePartKind::Wheel | VehiclePartKind::Axle | VehiclePartKind::WeaponMount
         ) {
             add(tools, 1);
+        }
+    }
+    for inst in &design.grid.modules {
+        if let Some(def) = data.module_def(inst.def) {
+            for &(rid, qty) in &def.extra_bill {
+                add(rid, qty);
+            }
         }
     }
     bill
@@ -1477,11 +1986,14 @@ fn spawn_vehicle(
 /// bill against faction storage, and on success consumes the bill and spawns
 /// a parked `Vehicle`. Orders whose faction has no yard are dropped; orders
 /// short of resources stay queued for a later pass.
+#[allow(clippy::too_many_arguments)]
 pub fn vehicle_assembly_system(
     mut commands: Commands,
     clock: Res<SimClock>,
     mut queue: ResMut<VehicleAssemblyQueue>,
     registry: Res<VehicleDesignRegistry>,
+    data: Res<VehicleData>,
+    factions: Res<FactionRegistry>,
     storage_tile_map: Res<StorageTileMap>,
     spatial: Res<SpatialIndex>,
     mut ground_items: Query<&mut GroundItem>,
@@ -1498,7 +2010,19 @@ pub fn vehicle_assembly_system(
         let Some(yard) = yards.iter().find(|y| y.faction_id == faction_id).copied() else {
             continue; // no yard — drop the order
         };
-        let bill = design_bill(&design);
+        // Tech-gate enforcement — the faction must know every tech the
+        // design's variants / modules / parts require. Unmet gates keep the
+        // order queued so it assembles once the research lands.
+        let techs_ok = factions
+            .factions
+            .get(&faction_id)
+            .map(|f| design.tech_gates.iter().all(|t| f.techs.has(*t)))
+            .unwrap_or(false);
+        if !techs_ok {
+            keep.push((faction_id, design_id));
+            continue;
+        }
+        let bill = design_bill(&design, &data);
         let affordable = bill.iter().all(|&(rid, need)| {
             faction_storage_stock(faction_id, rid, &storage_tile_map, &spatial, &ground_items)
                 >= need
@@ -2763,7 +3287,7 @@ pub fn vehicle_ai_design_proposal_system(
         for (_, cell) in grid.cells.iter_mut() {
             if matches!(cell.kind, VehiclePartKind::Wheel | VehiclePartKind::Axle) {
                 cell.material = metal;
-                cell.durability = cell_durability(cell.kind, metal, &data);
+                cell.durability = cell_durability(cell.kind, metal, cell.variant, &data);
             }
         }
         let proposal = VehicleDesign {
@@ -3019,7 +3543,7 @@ pub fn vehicle_player_command_system(
             }
             VehicleOrderKind::Deconstruct => {
                 // Refund half the design bill onto the vehicle's tile.
-                for (rid, qty) in design_bill(&design) {
+                for (rid, qty) in design_bill(&design, &data) {
                     let refund = qty.saturating_mul(SALVAGE_REFUND_NUM) / SALVAGE_REFUND_DEN;
                     if refund > 0 {
                         crate::simulation::items::spawn_or_merge_ground_item(
@@ -3345,16 +3869,87 @@ pub fn vehicle_combat_system(
     }
 }
 
-// ── Phase 6: turret / mounted-weapon ranged fire ──────────────────────────
+// ── Phase 6 / v2: turret / module ranged fire ─────────────────────────────
 
-/// Ticks between mounted-weapon shots from one turret cell.
+/// Ticks between mounted-weapon shots from one legacy single-cell mount.
 const TURRET_FIRE_COOLDOWN_TICKS: u64 = 40;
 
-/// Sequential (after `combat_system`): every manned `Turret` / armed
-/// `WeaponMount` cell on a vehicle acquires the nearest enemy `Person` within
-/// `mounted_weapon_range` (LOS-filtered) and fires a `Projectile` on a
-/// per-cell cooldown. An un-crewed vehicle, an un-armed mount (a melee ram),
-/// or a destroyed turret cell does not fire.
+/// Unit vector of a cardinal heading. Heading `0` is the design's `+y`
+/// (forward / depth) axis; each step is one 90° CCW rotation, matching
+/// [`VehicleFootprint::from_grid`].
+pub fn heading_vec(heading: u8) -> (i32, i32) {
+    match heading % 4 {
+        0 => (0, 1),
+        1 => (-1, 0),
+        2 => (0, -1),
+        _ => (1, 0),
+    }
+}
+
+/// True when `target` lies within a ±45° front cone of a weapon facing
+/// `facing` from `origin` — the `FiringArc::Front90` test.
+pub fn target_in_arc(facing: (i32, i32), origin: (i32, i32), target: (i32, i32)) -> bool {
+    let dx = target.0 - origin.0;
+    let dy = target.1 - origin.1;
+    let dot = dx * facing.0 + dy * facing.1;
+    if dot <= 0 {
+        return false;
+    }
+    let cross = dx * facing.1 - dy * facing.0;
+    dot >= cross.abs()
+}
+
+/// Acquire the nearest enemy `Person` within `range` of `origin` (LOS-filtered;
+/// optionally arc-filtered). Returns `(entity, tile, chebyshev distance)`.
+#[allow(clippy::too_many_arguments)]
+fn acquire_weapon_target(
+    origin: (i32, i32),
+    z: i8,
+    range: i32,
+    arc_facing: Option<(i32, i32)>,
+    owner_faction: u32,
+    spatial: &SpatialIndex,
+    chunk_map: &ChunkMap,
+    door_map: &DoorMap,
+    person_q: &Query<(&Transform, &FactionMember), With<Person>>,
+) -> Option<(Entity, (i32, i32), i32)> {
+    let (ox, oy) = origin;
+    let mut best: Option<(Entity, (i32, i32), i32)> = None;
+    for dy in -range..=range {
+        for dx in -range..=range {
+            for &e in spatial.get(ox + dx, oy + dy) {
+                let Ok((tf, fm)) = person_q.get(e) else {
+                    continue;
+                };
+                if fm.faction_id == owner_faction {
+                    continue;
+                }
+                let tx = (tf.translation.x / TILE_SIZE).floor() as i32;
+                let ty = (tf.translation.y / TILE_SIZE).floor() as i32;
+                if let Some(facing) = arc_facing {
+                    if !target_in_arc(facing, origin, (tx, ty)) {
+                        continue;
+                    }
+                }
+                if !has_los(chunk_map, door_map, (ox, oy, z), (tx, ty, z)) {
+                    continue;
+                }
+                let d = (tx - ox).abs().max((ty - oy).abs());
+                if best.map(|(_, _, bd)| d < bd).unwrap_or(true) {
+                    best = Some((e, (tx, ty), d));
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Sequential (after `combat_system`): vehicle ranged fire. Iterates weapon
+/// **modules** first — a multi-cell ballista / turret fires **one** projectile
+/// per `cooldown_ticks`, gated on its gunner requirement, arc, and the health
+/// of every required cell. Then a legacy fallback fires any single-cell
+/// `Turret` / `WeaponMount` *not* owned by a module on the old per-cell
+/// cooldown. An un-crewed vehicle does not fire.
 #[allow(clippy::too_many_arguments)]
 pub fn vehicle_turret_fire_system(
     clock: Res<SimClock>,
@@ -3365,7 +3960,8 @@ pub fn vehicle_turret_fire_system(
     data: Res<VehicleData>,
     vehicles: Query<(Entity, &Vehicle, &VehicleHealth, &VehicleCrew)>,
     person_q: Query<(&Transform, &FactionMember), With<Person>>,
-    mut cooldowns: Local<ahash::AHashMap<(Entity, IVec3), u64>>,
+    mut cell_cooldowns: Local<ahash::AHashMap<(Entity, IVec3), u64>>,
+    mut module_cooldowns: Local<ahash::AHashMap<(Entity, VehicleModuleId), u64>>,
     mut projectile: EventWriter<ProjectileFired>,
 ) {
     let now = clock.tick;
@@ -3380,7 +3976,67 @@ pub fn vehicle_turret_fire_system(
         let Some(design) = registry.get(v.design_id) else {
             continue;
         };
+        let (ox, oy) = v.anchor_tile;
+
+        // ── Weapon modules — one shot per module per cooldown ─────────────
+        for inst in &design.grid.modules {
+            let Some(def) = data.module_def(inst.def) else {
+                continue;
+            };
+            // A ram (no range) is not a ranged weapon.
+            if def.range == 0 || def.damage == 0 {
+                continue;
+            }
+            // Every required cell must still stand.
+            if inst.cells.iter().any(|c| health.cell_health(*c) == 0) {
+                continue;
+            }
+            // Gunner requirement (global pool — no per-module seating in v2).
+            if (crew.gunners.len() as u8) < def.gunner_required {
+                continue;
+            }
+            let key = (ve, inst.id);
+            if module_cooldowns.get(&key).map(|&t| now < t).unwrap_or(false) {
+                continue;
+            }
+            let world_facing = heading_vec((v.heading + inst.facing) % 4);
+            let arc = match def.firing_arc {
+                FiringArc::Front90 => Some(world_facing),
+                FiringArc::Full360 | FiringArc::None => None,
+            };
+            let target = acquire_weapon_target(
+                (ox, oy),
+                v.z,
+                def.range as i32,
+                arc,
+                v.owner_faction,
+                &spatial,
+                &chunk_map,
+                &door_map,
+                &person_q,
+            );
+            if let Some((target, dest_tile, _)) = target {
+                // Muzzle sits one tile toward the module facing.
+                let mx = ox + world_facing.0;
+                let my = oy + world_facing.1;
+                let origin_xy = tile_to_world(mx, my);
+                projectile.send(ProjectileFired {
+                    source: ve,
+                    target,
+                    damage: def.damage,
+                    origin: Vec3::new(origin_xy.x, origin_xy.y, 0.6),
+                    dest_tile,
+                    speed: 0.6,
+                });
+                module_cooldowns.insert(key, now + def.cooldown_ticks);
+            }
+        }
+
+        // ── Legacy single-cell mounts (no module) ─────────────────────────
         for (pos, cell) in &design.grid.cells {
+            if cell.module_id.is_some() {
+                continue;
+            }
             if !matches!(
                 cell.kind,
                 VehiclePartKind::Turret | VehiclePartKind::WeaponMount
@@ -3390,43 +4046,28 @@ pub fn vehicle_turret_fire_system(
             let Some(part) = data.part(cell.kind) else {
                 continue;
             };
-            // An un-armed / melee mount (a battering ram) does not fire.
             if part.mounted_weapon_range == 0 || part.mounted_weapon_damage == 0 {
                 continue;
             }
-            // A destroyed cell can't fire.
             if health.cell_health(*pos) == 0 {
                 continue;
             }
             let key = (ve, *pos);
-            if cooldowns.get(&key).map(|&t| now < t).unwrap_or(false) {
+            if cell_cooldowns.get(&key).map(|&t| now < t).unwrap_or(false) {
                 continue;
             }
-            let (ox, oy) = v.anchor_tile;
-            let range = part.mounted_weapon_range as i32;
-            let mut best: Option<(Entity, (i32, i32), i32)> = None;
-            for dy in -range..=range {
-                for dx in -range..=range {
-                    for &e in spatial.get(ox + dx, oy + dy) {
-                        let Ok((tf, fm)) = person_q.get(e) else {
-                            continue;
-                        };
-                        if fm.faction_id == v.owner_faction {
-                            continue;
-                        }
-                        let tx = (tf.translation.x / TILE_SIZE).floor() as i32;
-                        let ty = (tf.translation.y / TILE_SIZE).floor() as i32;
-                        if !has_los(&chunk_map, &door_map, (ox, oy, v.z), (tx, ty, v.z)) {
-                            continue;
-                        }
-                        let d = (tx - ox).abs().max((ty - oy).abs());
-                        if best.map(|(_, _, bd)| d < bd).unwrap_or(true) {
-                            best = Some((e, (tx, ty), d));
-                        }
-                    }
-                }
-            }
-            if let Some((target, dest_tile, _)) = best {
+            let target = acquire_weapon_target(
+                (ox, oy),
+                v.z,
+                part.mounted_weapon_range as i32,
+                None,
+                v.owner_faction,
+                &spatial,
+                &chunk_map,
+                &door_map,
+                &person_q,
+            );
+            if let Some((target, dest_tile, _)) = target {
                 let origin_xy = tile_to_world(ox, oy);
                 projectile.send(ProjectileFired {
                     source: ve,
@@ -3436,7 +4077,7 @@ pub fn vehicle_turret_fire_system(
                     dest_tile,
                     speed: 0.6,
                 });
-                cooldowns.insert(key, now + TURRET_FIRE_COOLDOWN_TICKS);
+                cell_cooldowns.insert(key, now + TURRET_FIRE_COOLDOWN_TICKS);
             }
         }
     }
@@ -3444,25 +4085,24 @@ pub fn vehicle_turret_fire_system(
 
 // ── Phase 7: siege interaction (vehicle vs wall) ──────────────────────────
 
-/// True when the design carries a `WeaponMount` cell — a battering-ram head
-/// that can damage a wall. (A `Turret` is ranged, not a ram.)
-pub fn design_is_siege_capable(design: &VehicleDesign) -> bool {
-    design
-        .grid
-        .cells
-        .iter()
-        .any(|(_, c)| c.kind == VehiclePartKind::WeaponMount)
+/// True when the design carries a weapon module with non-zero `siege_damage`
+/// — a battering ram. A bare `WeaponMount` cell (a light weapon platform) no
+/// longer makes a design siege-capable, so a War Chariot is not a siege engine.
+pub fn design_is_siege_capable(design: &VehicleDesign, data: &VehicleData) -> bool {
+    design_siege_damage(design, data) > 0
 }
 
-/// Damage one siege strike deals to a wall — base plus a per-ram bonus.
-pub fn design_siege_damage(design: &VehicleDesign) -> u8 {
-    let rams = design
+/// Damage one siege strike deals to a wall — the summed `siege_damage` of
+/// every ram module on the design.
+pub fn design_siege_damage(design: &VehicleDesign, data: &VehicleData) -> u8 {
+    let total: u32 = design
         .grid
-        .cells
+        .modules
         .iter()
-        .filter(|(_, c)| c.kind == VehiclePartKind::WeaponMount)
-        .count() as u32;
-    (8 + rams * 6).min(255) as u8
+        .filter_map(|inst| data.module_def(inst.def))
+        .map(|def| def.siege_damage as u32)
+        .sum();
+    total.min(255) as u8
 }
 
 /// Ticks between siege strikes from one engine.
@@ -3476,6 +4116,7 @@ pub fn vehicle_siege_system(
     mut commands: Commands,
     clock: Res<SimClock>,
     registry: Res<VehicleDesignRegistry>,
+    data: Res<VehicleData>,
     wall_map: Res<WallMap>,
     vehicles: Query<(Entity, &Vehicle, &VehicleCrew, &SiegeOrder)>,
     mut wall_q: Query<(&mut Health, &Wall)>,
@@ -3492,7 +4133,7 @@ pub fn vehicle_siege_system(
         let Some(design) = registry.get(v.design_id) else {
             continue;
         };
-        if !design_is_siege_capable(design) {
+        if !design_is_siege_capable(design, &data) {
             commands.entity(ve).remove::<SiegeOrder>();
             continue;
         }
@@ -3512,7 +4153,7 @@ pub fn vehicle_siege_system(
         }
         cooldowns.insert(ve, now + SIEGE_COOLDOWN_TICKS);
         if let Ok((mut health, wall)) = wall_q.get_mut(wall_e) {
-            apply_wall_damage(&mut health, design_siege_damage(design), wall.material);
+            apply_wall_damage(&mut health, design_siege_damage(design, &data), wall.material);
         }
     }
 }
@@ -3526,11 +4167,7 @@ mod tests {
     }
 
     fn cell(kind: VehiclePartKind, material: ResourceId) -> VehicleCell {
-        VehicleCell {
-            kind,
-            material,
-            durability: 100,
-        }
+        VehicleCell::plain(kind, material, 100)
     }
 
     /// Build a 1-tall rectangular pad of Frame cells plus the given extra
@@ -3542,6 +4179,7 @@ mod tests {
                 .iter()
                 .map(|&(x, y, z, k)| (IVec3::new(x, y, z), cell(k, wood)))
                 .collect(),
+            modules: Vec::new(),
         }
     }
 
@@ -3665,6 +4303,7 @@ mod tests {
                 (IVec3::new(2, 2, 0), cell(VehiclePartKind::Wall, stone)),
                 (IVec3::new(0, 3, 0), cell(VehiclePartKind::Hitch, skin)),
             ],
+            modules: Vec::new(),
         };
         let err = validate_grid(&g, VehiclePurpose::Cargo, 0, &data).unwrap_err();
         assert!(err.contains(&DesignError::OverloadedAxle));
@@ -3695,6 +4334,7 @@ mod tests {
                 (IVec3::new(0, 2, 0), cell(VehiclePartKind::CargoBay, wood)),
                 (IVec3::new(1, 2, 0), cell(VehiclePartKind::Hitch, wood)),
             ],
+            modules: Vec::new(),
         };
         let s_wood = derive_stats(&base(wood), &data);
         let s_iron = derive_stats(&base(iron), &data);
@@ -3779,9 +4419,9 @@ mod tests {
 
     #[test]
     fn design_bill_counts_cells_and_tools() {
-        let (_, registry) = load_vehicle_assets();
+        let (data, registry) = load_vehicle_assets();
         let handcart = registry.by_name("Handcart").unwrap();
-        let bill = design_bill(handcart);
+        let bill = design_bill(handcart, &data);
         let wood = core_ids::wood();
         let tools = core_ids::tools();
         let wood_qty = bill.iter().find(|(r, _)| *r == wood).map(|(_, q)| *q);
@@ -3793,9 +4433,9 @@ mod tests {
 
     #[test]
     fn war_chariot_bill_includes_copper() {
-        let (_, registry) = load_vehicle_assets();
+        let (data, registry) = load_vehicle_assets();
         let war = registry.by_name("War Chariot").unwrap();
-        let bill = design_bill(war);
+        let bill = design_bill(war, &data);
         let copper = core_ids::copper();
         // Two copper axles → 2 copper in the bill.
         assert_eq!(
@@ -4051,7 +4691,7 @@ mod tests {
                 cells.push((IVec3::new(x, y, 0), cell(k, copper)));
             }
         }
-        let g = VehicleGrid { cells };
+        let g = VehicleGrid { cells, modules: Vec::new() };
         let err = validate_grid(&g, VehiclePurpose::War, 0, &data).unwrap_err();
         assert!(
             err.contains(&DesignError::UnderpoweredEngine),
@@ -4079,11 +4719,155 @@ mod tests {
 
     #[test]
     fn siege_helpers_classify_designs() {
-        let (_, registry) = load_vehicle_assets();
+        let (data, registry) = load_vehicle_assets();
         let ram = registry.by_name("Battering Ram").unwrap();
         let tank = registry.by_name("Tank").unwrap();
-        assert!(design_is_siege_capable(ram));
-        assert!(design_siege_damage(ram) > 0);
-        assert!(!design_is_siege_capable(tank));
+        let chariot = registry.by_name("War Chariot").unwrap();
+        // The Battering Ram carries a ram module — it is siege-capable.
+        assert!(design_is_siege_capable(ram, &data));
+        assert!(design_siege_damage(ram, &data) > 0);
+        // The Tank is ranged, not a ram; the War Chariot has only a bare
+        // weapon platform — neither is a siege engine.
+        assert!(!design_is_siege_capable(tank, &data));
+        assert!(!design_is_siege_capable(chariot, &data));
+    }
+
+    // ── v2: variants, modules, arcs ───────────────────────────────────────
+
+    #[test]
+    fn variant_and_module_defs_load() {
+        let data = data();
+        assert!(
+            data.variants().len() >= 14,
+            "expected the v2 variant set, got {}",
+            data.variants().len()
+        );
+        assert!(
+            data.module_by_label("ballista_2x2").is_some(),
+            "ballista module must parse"
+        );
+        assert!(data.module_by_label("heavy_turret_3x3").is_some());
+        // A cell with no `variant` field loads as `None`; a cell with one
+        // resolves to a real variant id.
+        let (_, registry) = load_vehicle_assets();
+        let handcart = registry.by_name("Handcart").unwrap();
+        assert!(handcart
+            .grid
+            .cells
+            .iter()
+            .any(|(_, c)| c.kind == VehiclePartKind::Wheel && c.variant.is_some()));
+        assert!(handcart
+            .grid
+            .cells
+            .iter()
+            .any(|(_, c)| c.kind == VehiclePartKind::Frame && c.variant.is_none()));
+    }
+
+    #[test]
+    fn variant_changes_derived_stats() {
+        let data = data();
+        let wood = core_ids::wood();
+        let spoked = data.variant_by_label("spoked_wheel").unwrap().id;
+        let iron_rim = data.variant_by_label("iron_rim_wheel").unwrap().id;
+        let make = |v: VehiclePartVariantId| {
+            let mut g = grid_from(&[
+                (0, 0, 0, VehiclePartKind::Wheel),
+                (1, 0, 0, VehiclePartKind::Wheel),
+                (0, 1, 0, VehiclePartKind::Axle),
+                (1, 1, 0, VehiclePartKind::Axle),
+                (0, 2, 0, VehiclePartKind::CargoBay),
+                (1, 2, 0, VehiclePartKind::Hitch),
+            ]);
+            for (_, c) in g.cells.iter_mut() {
+                if c.kind == VehiclePartKind::Wheel {
+                    c.material = wood;
+                    c.variant = Some(v);
+                }
+            }
+            g
+        };
+        let s_spoked = derive_stats(&make(spoked), &data);
+        let s_iron = derive_stats(&make(iron_rim), &data);
+        assert!(
+            s_iron.empty_mass_g > s_spoked.empty_mass_g,
+            "iron-rim wheels are heavier than spoked"
+        );
+        assert!(
+            s_iron.road_speed_cap > s_spoked.road_speed_cap,
+            "iron-rim wheels grip harder → faster"
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_heavy_turret_module() {
+        let data = data();
+        // A 3×3 turret floating at z=1 with no cells beneath any of it.
+        let wood = core_ids::wood();
+        let mut g = grid_from(&[
+            (0, 0, 0, VehiclePartKind::Frame),
+            (0, 1, 0, VehiclePartKind::Hitch),
+        ]);
+        let mid = VehicleModuleId(0);
+        for x in 0..3 {
+            for y in 0..3 {
+                g.cells.push((
+                    IVec3::new(x + 4, y, 1),
+                    VehicleCell {
+                        kind: VehiclePartKind::Turret,
+                        material: wood,
+                        durability: 100,
+                        variant: None,
+                        module_id: Some(mid),
+                    },
+                ));
+            }
+        }
+        let def = data.module_by_label("heavy_turret_3x3").unwrap().id;
+        g.modules.push(VehicleModuleInstance {
+            id: mid,
+            def,
+            cells: (0..3)
+                .flat_map(|x| (0..3).map(move |y| IVec3::new(x + 4, y, 1)))
+                .collect(),
+            facing: 0,
+        });
+        let err = validate_grid(&g, VehiclePurpose::War, 0, &data).unwrap_err();
+        assert!(
+            err.iter().any(|e| matches!(e, DesignError::UnsupportedModule(_)))
+                || err.iter().any(|e| matches!(e, DesignError::Disconnected)),
+            "an unsupported / disconnected heavy turret must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn front_arc_excludes_rear_targets() {
+        // A weapon facing +y (heading 0) does not hit a target behind it.
+        let facing = heading_vec(0);
+        assert!(target_in_arc(facing, (0, 0), (0, 5)), "front target hit");
+        assert!(target_in_arc(facing, (0, 0), (2, 4)), "front-diagonal hit");
+        assert!(!target_in_arc(facing, (0, 0), (0, -5)), "rear target missed");
+        assert!(!target_in_arc(facing, (0, 0), (5, 0)), "flank target missed");
+    }
+
+    #[test]
+    fn stock_templates_validate_with_modules() {
+        let data = data();
+        let (_, registry) = load_vehicle_assets();
+        for d in registry.iter() {
+            assert!(
+                validate_design(d, &data).is_ok(),
+                "stock template {:?} failed validation: {:?}",
+                d.name,
+                validate_design(d, &data)
+            );
+        }
+        // The module-bearing templates actually carry modules.
+        for name in ["Battering Ram", "Ballista Vehicle", "Tank", "Heavy Tank"] {
+            let d = registry.by_name(name).unwrap();
+            assert!(
+                !d.grid.modules.is_empty(),
+                "{name} should carry a weapon module"
+            );
+        }
     }
 }

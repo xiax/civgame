@@ -6436,7 +6436,8 @@ mod smoke {
         use crate::economy::core_ids;
         use crate::simulation::schedule::SimClock;
         use crate::simulation::vehicle::{
-            design_bill, Vehicle, VehicleAssemblyQueue, VehicleDesignRegistry, VehicleYard,
+            design_bill, Vehicle, VehicleAssemblyQueue, VehicleData, VehicleDesignRegistry,
+            VehicleYard,
         };
 
         let mut sim = TestSim::new(0xCA27A);
@@ -6446,9 +6447,10 @@ mod smoke {
 
         // Resolve the Handcart design + its raw bill, stock it into storage.
         let (design_id, bill) = {
+            let data = sim.app.world().resource::<VehicleData>().clone();
             let registry = sim.app.world().resource::<VehicleDesignRegistry>();
             let hc = registry.by_name("Handcart").unwrap();
-            (hc.id, design_bill(hc))
+            (hc.id, design_bill(hc, &data))
         };
         for (rid, qty) in &bill {
             sim.spawn_ground_item((0, 0), *rid, *qty);
@@ -6458,6 +6460,15 @@ mod smoke {
             faction_id: fid,
             tile: (2, 0),
         });
+
+        // The assembly system tech-gates the Handcart on `animal_husbandry`.
+        {
+            use crate::simulation::faction::FactionRegistry;
+            let mut reg = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            if let Some(f) = reg.factions.get_mut(&fid) {
+                f.techs.unlock(crate::simulation::technology::ANIMAL_HUSBANDRY);
+            }
+        }
         sim.app
             .world_mut()
             .resource_mut::<VehicleAssemblyQueue>()

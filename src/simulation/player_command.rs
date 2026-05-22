@@ -267,6 +267,7 @@ pub fn drain_player_command_events_system(
     player_faction: Res<crate::simulation::faction::PlayerFaction>,
     mut vehicle_queue: ResMut<crate::simulation::vehicle::VehicleAssemblyQueue>,
     mut vehicle_registry: ResMut<crate::simulation::vehicle::VehicleDesignRegistry>,
+    vehicle_data: Res<crate::simulation::vehicle::VehicleData>,
     mut pending_vehicle_ops: ResMut<crate::simulation::vehicle::PendingVehicleOps>,
 ) {
     let now = clock.tick as u32;
@@ -292,14 +293,24 @@ pub fn drain_player_command_events_system(
                     purpose,
                     required_animals,
                 } => {
-                    use crate::simulation::vehicle::{VehicleDesign, VehicleDesignId};
+                    use crate::simulation::vehicle::{
+                        collect_design_tech_gates, VehicleDesign, VehicleDesignId,
+                    };
+                    // Tech gates are derived from every placed variant /
+                    // module / part — a custom design is gated like a stock
+                    // template so `vehicle_assembly_system` can enforce them.
+                    let tech_gates = collect_design_tech_gates(
+                        grid,
+                        std::iter::empty(),
+                        &vehicle_data,
+                    );
                     let id = vehicle_registry.insert(VehicleDesign {
                         id: VehicleDesignId(0), // reassigned by `insert`
                         name: name.clone(),
                         grid: grid.clone(),
                         allowed_purpose: purpose,
                         required_animals,
-                        tech_gates: Vec::new(),
+                        tech_gates,
                         author_faction: Some(player_faction.faction_id),
                         revision: 0,
                     });

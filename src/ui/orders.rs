@@ -310,6 +310,7 @@ pub struct RoutingResources<'w, 's> {
     // "Assemble Vehicle" submenu.
     pub vehicle_yard_map: Res<'w, crate::simulation::vehicle::VehicleYardMap>,
     pub vehicle_registry: Res<'w, crate::simulation::vehicle::VehicleDesignRegistry>,
+    pub vehicle_data: Res<'w, crate::simulation::vehicle::VehicleData>,
     pub vehicle_occupancy: Res<'w, crate::simulation::vehicle::VehicleOccupancyIndex>,
     // Siege (vehicle-system-tanks Phase 7): wall lookup for the
     // "Siege Wall Here" vehicle order.
@@ -379,7 +380,10 @@ pub fn right_click_context_menu_system(
                             .ok()
                             .and_then(|v| routing.vehicle_registry.get(v.design_id))
                             .filter(|d| {
-                                crate::simulation::vehicle::design_is_siege_capable(d)
+                                crate::simulation::vehicle::design_is_siege_capable(
+                                    d,
+                                    &routing.vehicle_data,
+                                )
                             })
                             .map(|_| pick.tile)
                     } else {

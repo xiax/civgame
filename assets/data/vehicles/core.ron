@@ -1,12 +1,16 @@
-// Vehicle system — core data file (Phase 1).
+// Vehicle system — core data file.
 //
 // `materials` profiles are keyed by an existing catalog resource key; a
 // material whose resource is absent from the catalog is skipped (tolerant
-// loader). `parts` define per-cell structural mass + capacities. `templates`
-// are the stock freeform designs assembled on a 3D cell grid.
+// loader). `parts` define per-cell structural mass + capacities. `variants`
+// are behavioural identities for a part kind (a `spoked_wheel` vs an
+// `iron_rim_wheel`) folded into the stat derivation via multipliers.
+// `modules` are multi-cell weapon groups (rams / ballistae / turrets) that
+// fire or strike once per module. `templates` are the stock freeform designs.
 //
 // Grid axes: x = width (right), y = depth (forward), z = up. One grid
-// Z-cell = one world Z-level. Bounds: 6 wide x 4 deep x 4 tall.
+// Z-cell = one world Z-level. Bounds: 10 wide x 8 deep x 6 tall.
+#![enable(implicit_some)]
 VehicleDataFile(
     materials: [
         MaterialProfile(resource: "wood",   density_pct: 100, strength: 40,  friction: 50, traction: 55, durability: 200),
@@ -27,17 +31,127 @@ VehicleDataFile(
         PartDef(kind: cargo_bay,    base_mass_g: 2000, cargo_volume_g: 80000, crew_capacity: 0, tech_gates: []),
         PartDef(kind: crew_seat,    base_mass_g: 1200, cargo_volume_g: 0,     crew_capacity: 1, tech_gates: []),
         PartDef(kind: weapon_mount, base_mass_g: 2500, cargo_volume_g: 0,     crew_capacity: 0, tech_gates: ["war_chariot"]),
-        // ── Tank / siege parts (plans/vehicle-system-tanks.md) ────────────
+        // ── Tank / siege parts ────────────────────────────────────────────
         // Abstract "powered traction" — a non-zero engine_power_g lets a
         // design skip draft animals entirely.
         PartDef(kind: engine,      base_mass_g: 8000, cargo_volume_g: 0,     crew_capacity: 0, tech_gates: ["powered_traction"], engine_power_g: 12000),
         // Continuous track — high traction_pct cuts offroad resistance and
-        // (Phase 5) spreads load like a broad axle.
+        // spreads load like a broad axle.
         PartDef(kind: track,       base_mass_g: 6000, cargo_volume_g: 0,     crew_capacity: 0, tech_gates: ["armor_plating"], traction_pct: 50),
         // Bronze-faced plating — heavy, durable, may cantilever off a frame.
         PartDef(kind: armor_plate, base_mass_g: 7000, cargo_volume_g: 0,     crew_capacity: 0, tech_gates: ["armor_plating"], armor_durability_mult: 2.5),
         // Crewed weapon ring — one gunner, mounted ranged weapon.
         PartDef(kind: turret,      base_mass_g: 4000, cargo_volume_g: 0,     crew_capacity: 1, tech_gates: ["siege_engineering"], mounted_weapon_range: 6, mounted_weapon_damage: 12),
+    ],
+    // ── Part variants (v2) ────────────────────────────────────────────────
+    // A variant gives a part kind a behavioural identity beyond its material.
+    // Multipliers fold into the stat derivation; `1.0` (the default) is the
+    // identity. A cell with no variant behaves as the bare part.
+    variants: [
+        // Frame
+        PartVariantDef(label: "light_chassis", part_kind: frame,
+            description: "A pared-down frame — light and quick, but it carries less.",
+            mass_mult: 0.7, support_mult: 0.7),
+        PartVariantDef(label: "heavy_chassis", part_kind: frame,
+            description: "A massive frame — heavy, but it carries far more load.",
+            mass_mult: 1.4, support_mult: 1.5),
+        PartVariantDef(label: "truss_chassis", part_kind: frame,
+            description: "A braced truss — barely heavier than standard, very strong. Good for tall siege builds.",
+            mass_mult: 1.05, support_mult: 1.7),
+        // Wheel
+        PartVariantDef(label: "solid_wheel", part_kind: wheel,
+            description: "A solid disc wheel — durable and dependable.",
+            durability_mult: 1.15),
+        PartVariantDef(label: "spoked_wheel", part_kind: wheel,
+            description: "A spoked wheel — light and fast, but it breaks more easily.",
+            mass_mult: 0.65, traction_mult: 1.05, durability_mult: 0.7),
+        PartVariantDef(label: "iron_rim_wheel", part_kind: wheel,
+            description: "An iron-shod wheel — heavy, but high grip and very tough. Needs metalworking.",
+            mass_mult: 1.25, traction_mult: 1.3, durability_mult: 1.5, tech_gates: ["bronze_casting"]),
+        PartVariantDef(label: "large_offroad_wheel", part_kind: wheel,
+            description: "An oversized wheel — better grip off-road, but it turns wider.",
+            mass_mult: 1.35, traction_mult: 1.15, turn_radius_mult: 1.08),
+        // Axle
+        PartVariantDef(label: "fixed_axle", part_kind: axle,
+            description: "A plain fixed axle."),
+        PartVariantDef(label: "reinforced_axle", part_kind: axle,
+            description: "A reinforced axle — heavy, but it bears far more load.",
+            mass_mult: 1.4, support_mult: 1.6),
+        PartVariantDef(label: "steering_axle", part_kind: axle,
+            description: "A pivoting axle — turns the vehicle much tighter.",
+            mass_mult: 1.15, support_mult: 1.1, turn_radius_mult: 0.6),
+        // Track
+        PartVariantDef(label: "wooden_track", part_kind: track,
+            description: "An early wooden track — armored/siege traction without metal."),
+        PartVariantDef(label: "metal_track", part_kind: track,
+            description: "A metal-plated track — heavy, but strong support and grip. Needs metalworking.",
+            mass_mult: 1.5, support_mult: 1.4, traction_mult: 1.3, durability_mult: 1.6, tech_gates: ["bronze_casting"]),
+        // Weapon mount
+        PartVariantDef(label: "weapon_platform", part_kind: weapon_mount,
+            description: "A light weapon platform — crew fight from it. Not a siege weapon on its own."),
+        PartVariantDef(label: "ram_head", part_kind: weapon_mount,
+            description: "A reinforced ram head — heavy and tough. Part of a battering-ram module.",
+            mass_mult: 1.3, durability_mult: 1.5),
+        PartVariantDef(label: "fixed_ballista", part_kind: weapon_mount,
+            description: "A ballista bed — part of a forward-facing ranged weapon module.",
+            mass_mult: 1.1),
+        // Turret
+        PartVariantDef(label: "light_turret_ring", part_kind: turret,
+            description: "A light rotating ring — lighter than a standard turret.",
+            mass_mult: 0.8),
+        PartVariantDef(label: "heavy_turret_ring", part_kind: turret,
+            description: "A heavy rotating ring — massive, but very durable.",
+            mass_mult: 1.5, durability_mult: 1.3),
+    ],
+    // ── Weapon modules (v2) ───────────────────────────────────────────────
+    // A module is a multi-cell weapon. It fires or strikes ONCE per module
+    // (per cooldown), not once per occupied cell. `footprint` is the cell
+    // shape at rotation 0; templates list the actual placed cells.
+    modules: [
+        VehicleModuleDef(
+            label: "ram_head_1x2", part_kind: weapon_mount,
+            description: "A small battering ram — strikes an adjacent wall. No ranged fire.",
+            footprint: [(0, 0, 0), (0, 1, 0)],
+            firing_arc: none, siege_damage: 14, cooldown_ticks: 60,
+            crew_required: 1, tech_gates: ["siege_engineering"],
+        ),
+        VehicleModuleDef(
+            label: "battering_ram_2x3", part_kind: weapon_mount,
+            description: "A full battering ram — heavy bracing plus a ram head. Smashes walls; cannot fire.",
+            footprint: [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0), (0, 2, 0), (1, 2, 0)],
+            firing_arc: none, siege_damage: 26, cooldown_ticks: 60,
+            crew_required: 2, tech_gates: ["siege_engineering"],
+            extra_bill: [("tools", 2)],
+        ),
+        VehicleModuleDef(
+            label: "ballista_2x2", part_kind: weapon_mount,
+            description: "A fixed ballista — long range, hits hard, but only fires in a 90-degree front arc. One gunner.",
+            footprint: [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0)],
+            muzzle_offset: (0, 1),
+            firing_arc: front90, range: 6, damage: 16, cooldown_ticks: 60,
+            crew_required: 1, gunner_required: 1, tech_gates: ["siege_engineering"],
+            extra_bill: [("tools", 1)],
+        ),
+        VehicleModuleDef(
+            label: "light_turret_2x2", part_kind: turret,
+            description: "A light rotating turret — fires in any direction. One gunner.",
+            footprint: [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0)],
+            allowed_rotations: [0, 1, 2, 3],
+            firing_arc: full360, range: 6, damage: 14, cooldown_ticks: 50,
+            crew_required: 1, gunner_required: 1, required_support: 1,
+            tech_gates: ["siege_engineering"],
+            extra_bill: [("tools", 1)],
+        ),
+        VehicleModuleDef(
+            label: "heavy_turret_3x3", part_kind: turret,
+            description: "A heavy rotating turret — long range, heavy damage, 360-degree arc. Needs two gunners.",
+            footprint: [(0, 0, 0), (1, 0, 0), (2, 0, 0), (0, 1, 0), (1, 1, 0), (2, 1, 0), (0, 2, 0), (1, 2, 0), (2, 2, 0)],
+            allowed_rotations: [0, 1, 2, 3],
+            firing_arc: full360, range: 8, damage: 22, cooldown_ticks: 70,
+            crew_required: 2, gunner_required: 2, required_support: 3,
+            tech_gates: ["siege_engineering"],
+            extra_bill: [("tools", 3)],
+        ),
     ],
     templates: [
         TemplateDef(
@@ -46,10 +160,10 @@ VehicleDataFile(
             required_animals: 0,
             tech_gates: ["animal_husbandry"],
             cells: [
-                CellDef(x: 0, y: 0, z: 0, kind: wheel,     material: "wood"),
-                CellDef(x: 1, y: 0, z: 0, kind: wheel,     material: "wood"),
-                CellDef(x: 0, y: 1, z: 0, kind: axle,      material: "wood"),
-                CellDef(x: 1, y: 1, z: 0, kind: axle,      material: "wood"),
+                CellDef(x: 0, y: 0, z: 0, kind: wheel,     material: "wood", variant: "solid_wheel"),
+                CellDef(x: 1, y: 0, z: 0, kind: wheel,     material: "wood", variant: "solid_wheel"),
+                CellDef(x: 0, y: 1, z: 0, kind: axle,      material: "wood", variant: "fixed_axle"),
+                CellDef(x: 1, y: 1, z: 0, kind: axle,      material: "wood", variant: "fixed_axle"),
                 CellDef(x: 0, y: 2, z: 0, kind: frame,     material: "wood"),
                 CellDef(x: 1, y: 2, z: 0, kind: cargo_bay, material: "wood"),
                 CellDef(x: 0, y: 3, z: 0, kind: hitch,     material: "wood"),
@@ -61,10 +175,10 @@ VehicleDataFile(
             required_animals: 2,
             tech_gates: ["ox_cart"],
             cells: [
-                CellDef(x: 0, y: 0, z: 0, kind: wheel,     material: "wood"),
-                CellDef(x: 1, y: 0, z: 0, kind: wheel,     material: "wood"),
-                CellDef(x: 0, y: 1, z: 0, kind: axle,      material: "wood"),
-                CellDef(x: 1, y: 1, z: 0, kind: axle,      material: "wood"),
+                CellDef(x: 0, y: 0, z: 0, kind: wheel,     material: "wood", variant: "solid_wheel"),
+                CellDef(x: 1, y: 0, z: 0, kind: wheel,     material: "wood", variant: "solid_wheel"),
+                CellDef(x: 0, y: 1, z: 0, kind: axle,      material: "wood", variant: "fixed_axle"),
+                CellDef(x: 1, y: 1, z: 0, kind: axle,      material: "wood", variant: "fixed_axle"),
                 CellDef(x: 0, y: 2, z: 0, kind: cargo_bay, material: "wood"),
                 CellDef(x: 1, y: 2, z: 0, kind: cargo_bay, material: "wood"),
                 CellDef(x: 0, y: 3, z: 0, kind: yoke,      material: "wood"),
@@ -78,15 +192,15 @@ VehicleDataFile(
             tech_gates: ["ox_cart"],
             cells: [
                 CellDef(x: 1, y: 0, z: 0, kind: yoke,      material: "wood"),
-                CellDef(x: 0, y: 1, z: 0, kind: wheel,     material: "wood"),
-                CellDef(x: 1, y: 1, z: 0, kind: axle,      material: "wood"),
-                CellDef(x: 2, y: 1, z: 0, kind: wheel,     material: "wood"),
+                CellDef(x: 0, y: 1, z: 0, kind: wheel,     material: "wood", variant: "solid_wheel"),
+                CellDef(x: 1, y: 1, z: 0, kind: axle,      material: "wood", variant: "fixed_axle"),
+                CellDef(x: 2, y: 1, z: 0, kind: wheel,     material: "wood", variant: "solid_wheel"),
                 CellDef(x: 0, y: 2, z: 0, kind: cargo_bay, material: "wood"),
                 CellDef(x: 1, y: 2, z: 0, kind: cargo_bay, material: "wood"),
                 CellDef(x: 2, y: 2, z: 0, kind: cargo_bay, material: "wood"),
-                CellDef(x: 0, y: 3, z: 0, kind: wheel,     material: "wood"),
-                CellDef(x: 1, y: 3, z: 0, kind: axle,      material: "wood"),
-                CellDef(x: 2, y: 3, z: 0, kind: wheel,     material: "wood"),
+                CellDef(x: 0, y: 3, z: 0, kind: wheel,     material: "wood", variant: "solid_wheel"),
+                CellDef(x: 1, y: 3, z: 0, kind: axle,      material: "wood", variant: "fixed_axle"),
+                CellDef(x: 2, y: 3, z: 0, kind: wheel,     material: "wood", variant: "solid_wheel"),
             ],
         ),
         TemplateDef(
@@ -95,11 +209,11 @@ VehicleDataFile(
             required_animals: 1,
             tech_gates: ["horse_taming"],
             cells: [
-                CellDef(x: 0, y: 0, z: 0, kind: wheel,     material: "wood"),
-                CellDef(x: 1, y: 0, z: 0, kind: wheel,     material: "wood"),
-                CellDef(x: 0, y: 1, z: 0, kind: axle,      material: "wood"),
-                CellDef(x: 1, y: 1, z: 0, kind: axle,      material: "wood"),
-                CellDef(x: 0, y: 2, z: 0, kind: frame,     material: "wood"),
+                CellDef(x: 0, y: 0, z: 0, kind: wheel,     material: "wood", variant: "spoked_wheel"),
+                CellDef(x: 1, y: 0, z: 0, kind: wheel,     material: "wood", variant: "spoked_wheel"),
+                CellDef(x: 0, y: 1, z: 0, kind: axle,      material: "wood", variant: "fixed_axle"),
+                CellDef(x: 1, y: 1, z: 0, kind: axle,      material: "wood", variant: "fixed_axle"),
+                CellDef(x: 0, y: 2, z: 0, kind: frame,     material: "wood", variant: "light_chassis"),
                 CellDef(x: 1, y: 2, z: 0, kind: crew_seat, material: "wood"),
                 CellDef(x: 0, y: 3, z: 0, kind: hitch,     material: "wood"),
             ],
@@ -110,30 +224,41 @@ VehicleDataFile(
             required_animals: 2,
             tech_gates: ["war_chariot"],
             cells: [
-                CellDef(x: 0, y: 0, z: 0, kind: wheel,        material: "wood"),
-                CellDef(x: 1, y: 0, z: 0, kind: wheel,        material: "wood"),
-                CellDef(x: 0, y: 1, z: 0, kind: axle,         material: "copper"),
-                CellDef(x: 1, y: 1, z: 0, kind: axle,         material: "copper"),
+                CellDef(x: 0, y: 0, z: 0, kind: wheel,        material: "wood",   variant: "spoked_wheel"),
+                CellDef(x: 1, y: 0, z: 0, kind: wheel,        material: "wood",   variant: "spoked_wheel"),
+                CellDef(x: 0, y: 1, z: 0, kind: axle,         material: "copper", variant: "fixed_axle"),
+                CellDef(x: 1, y: 1, z: 0, kind: axle,         material: "copper", variant: "fixed_axle"),
                 CellDef(x: 0, y: 2, z: 0, kind: crew_seat,    material: "wood"),
-                CellDef(x: 1, y: 2, z: 0, kind: weapon_mount, material: "wood"),
+                CellDef(x: 1, y: 2, z: 0, kind: weapon_mount, material: "wood",   variant: "weapon_platform"),
                 CellDef(x: 0, y: 3, z: 0, kind: yoke,         material: "wood"),
             ],
         ),
-        // ── Siege & war vehicles (plans/vehicle-system-tanks.md) ──────────
+        // ── Siege & war vehicles ──────────────────────────────────────────
         TemplateDef(
             name: "Battering Ram",
             purpose: war,
             required_animals: 1,
             tech_gates: ["siege_engineering"],
             cells: [
-                CellDef(x: 0, y: 0, z: 0, kind: wheel,        material: "wood"),
-                CellDef(x: 1, y: 0, z: 0, kind: wheel,        material: "wood"),
-                CellDef(x: 0, y: 1, z: 0, kind: axle,         material: "copper"),
-                CellDef(x: 1, y: 1, z: 0, kind: axle,         material: "copper"),
-                CellDef(x: 0, y: 2, z: 0, kind: crew_seat,    material: "wood"),
-                CellDef(x: 1, y: 2, z: 0, kind: weapon_mount, material: "copper"),
-                CellDef(x: 0, y: 3, z: 0, kind: hitch,        material: "wood"),
-                CellDef(x: 1, y: 3, z: 0, kind: frame,        material: "wood"),
+                CellDef(x: 0, y: 0, z: 0, kind: hitch,        material: "wood"),
+                CellDef(x: 1, y: 0, z: 0, kind: frame,        material: "wood"),
+                CellDef(x: 0, y: 1, z: 0, kind: wheel,        material: "wood",   variant: "solid_wheel"),
+                CellDef(x: 1, y: 1, z: 0, kind: wheel,        material: "wood",   variant: "solid_wheel"),
+                CellDef(x: 0, y: 2, z: 0, kind: axle,         material: "copper", variant: "reinforced_axle"),
+                CellDef(x: 1, y: 2, z: 0, kind: axle,         material: "copper", variant: "reinforced_axle"),
+                CellDef(x: 0, y: 3, z: 0, kind: crew_seat,    material: "wood"),
+                CellDef(x: 1, y: 3, z: 0, kind: crew_seat,    material: "wood"),
+                CellDef(x: 0, y: 4, z: 0, kind: weapon_mount, material: "copper", variant: "ram_head"),
+                CellDef(x: 1, y: 4, z: 0, kind: weapon_mount, material: "copper", variant: "ram_head"),
+                CellDef(x: 0, y: 5, z: 0, kind: weapon_mount, material: "copper", variant: "ram_head"),
+                CellDef(x: 1, y: 5, z: 0, kind: weapon_mount, material: "copper", variant: "ram_head"),
+                CellDef(x: 0, y: 6, z: 0, kind: weapon_mount, material: "copper", variant: "ram_head"),
+                CellDef(x: 1, y: 6, z: 0, kind: weapon_mount, material: "copper", variant: "ram_head"),
+            ],
+            modules: [
+                TemplateModule(def: "battering_ram_2x3", facing: 0, cells: [
+                    (0, 4, 0), (1, 4, 0), (0, 5, 0), (1, 5, 0), (0, 6, 0), (1, 6, 0),
+                ]),
             ],
         ),
         TemplateDef(
@@ -142,14 +267,14 @@ VehicleDataFile(
             required_animals: 2,
             tech_gates: ["siege_engineering"],
             cells: [
-                CellDef(x: 0, y: 0, z: 0, kind: wheel,     material: "wood"),
-                CellDef(x: 1, y: 0, z: 0, kind: wheel,     material: "wood"),
-                CellDef(x: 0, y: 1, z: 0, kind: axle,      material: "copper"),
-                CellDef(x: 1, y: 1, z: 0, kind: axle,      material: "copper"),
+                CellDef(x: 0, y: 0, z: 0, kind: wheel,     material: "wood", variant: "solid_wheel"),
+                CellDef(x: 1, y: 0, z: 0, kind: wheel,     material: "wood", variant: "solid_wheel"),
+                CellDef(x: 0, y: 1, z: 0, kind: axle,      material: "copper", variant: "reinforced_axle"),
+                CellDef(x: 1, y: 1, z: 0, kind: axle,      material: "copper", variant: "reinforced_axle"),
                 CellDef(x: 0, y: 2, z: 0, kind: yoke,      material: "wood"),
-                CellDef(x: 1, y: 2, z: 0, kind: frame,     material: "wood"),
-                CellDef(x: 0, y: 0, z: 1, kind: frame,     material: "wood"),
-                CellDef(x: 1, y: 0, z: 1, kind: frame,     material: "wood"),
+                CellDef(x: 1, y: 2, z: 0, kind: frame,     material: "wood", variant: "truss_chassis"),
+                CellDef(x: 0, y: 0, z: 1, kind: frame,     material: "wood", variant: "truss_chassis"),
+                CellDef(x: 1, y: 0, z: 1, kind: frame,     material: "wood", variant: "truss_chassis"),
                 CellDef(x: 0, y: 1, z: 1, kind: deck,      material: "wood"),
                 CellDef(x: 1, y: 1, z: 1, kind: deck,      material: "wood"),
                 CellDef(x: 0, y: 0, z: 2, kind: wall,      material: "wood"),
@@ -164,10 +289,10 @@ VehicleDataFile(
             required_animals: 2,
             tech_gates: ["armor_plating"],
             cells: [
-                CellDef(x: 0, y: 0, z: 0, kind: wheel,       material: "wood"),
-                CellDef(x: 1, y: 0, z: 0, kind: wheel,       material: "wood"),
-                CellDef(x: 0, y: 1, z: 0, kind: axle,        material: "copper"),
-                CellDef(x: 1, y: 1, z: 0, kind: axle,        material: "copper"),
+                CellDef(x: 0, y: 0, z: 0, kind: wheel,       material: "wood",   variant: "iron_rim_wheel"),
+                CellDef(x: 1, y: 0, z: 0, kind: wheel,       material: "wood",   variant: "iron_rim_wheel"),
+                CellDef(x: 0, y: 1, z: 0, kind: axle,        material: "copper", variant: "reinforced_axle"),
+                CellDef(x: 1, y: 1, z: 0, kind: axle,        material: "copper", variant: "reinforced_axle"),
                 CellDef(x: 0, y: 2, z: 0, kind: armor_plate, material: "copper"),
                 CellDef(x: 1, y: 2, z: 0, kind: cargo_bay,   material: "wood"),
                 CellDef(x: 0, y: 3, z: 0, kind: yoke,        material: "wood"),
@@ -180,14 +305,23 @@ VehicleDataFile(
             required_animals: 1,
             tech_gates: ["siege_engineering"],
             cells: [
-                CellDef(x: 0, y: 0, z: 0, kind: wheel,     material: "wood"),
-                CellDef(x: 1, y: 0, z: 0, kind: wheel,     material: "wood"),
-                CellDef(x: 0, y: 1, z: 0, kind: axle,      material: "copper"),
-                CellDef(x: 1, y: 1, z: 0, kind: axle,      material: "copper"),
-                CellDef(x: 0, y: 2, z: 0, kind: frame,     material: "wood"),
-                CellDef(x: 1, y: 2, z: 0, kind: crew_seat, material: "wood"),
-                CellDef(x: 0, y: 3, z: 0, kind: hitch,     material: "wood"),
-                CellDef(x: 1, y: 3, z: 0, kind: turret,    material: "copper"),
+                CellDef(x: 0, y: 0, z: 0, kind: hitch,        material: "wood"),
+                CellDef(x: 1, y: 0, z: 0, kind: frame,        material: "wood"),
+                CellDef(x: 0, y: 1, z: 0, kind: wheel,        material: "wood",   variant: "solid_wheel"),
+                CellDef(x: 1, y: 1, z: 0, kind: wheel,        material: "wood",   variant: "solid_wheel"),
+                CellDef(x: 0, y: 2, z: 0, kind: axle,         material: "copper", variant: "reinforced_axle"),
+                CellDef(x: 1, y: 2, z: 0, kind: axle,         material: "copper", variant: "reinforced_axle"),
+                CellDef(x: 0, y: 3, z: 0, kind: crew_seat,    material: "wood"),
+                CellDef(x: 1, y: 3, z: 0, kind: crew_seat,    material: "wood"),
+                CellDef(x: 0, y: 4, z: 0, kind: weapon_mount, material: "copper", variant: "fixed_ballista"),
+                CellDef(x: 1, y: 4, z: 0, kind: weapon_mount, material: "copper", variant: "fixed_ballista"),
+                CellDef(x: 0, y: 5, z: 0, kind: weapon_mount, material: "copper", variant: "fixed_ballista"),
+                CellDef(x: 1, y: 5, z: 0, kind: weapon_mount, material: "copper", variant: "fixed_ballista"),
+            ],
+            modules: [
+                TemplateModule(def: "ballista_2x2", facing: 0, cells: [
+                    (0, 4, 0), (1, 4, 0), (0, 5, 0), (1, 5, 0),
+                ]),
             ],
         ),
         TemplateDef(
@@ -196,18 +330,71 @@ VehicleDataFile(
             required_animals: 0,
             tech_gates: ["powered_traction"],
             cells: [
-                CellDef(x: 0, y: 0, z: 0, kind: track,       material: "wood"),
-                CellDef(x: 1, y: 0, z: 0, kind: track,       material: "wood"),
-                CellDef(x: 2, y: 0, z: 0, kind: track,       material: "wood"),
-                CellDef(x: 3, y: 0, z: 0, kind: track,       material: "wood"),
+                CellDef(x: 0, y: 0, z: 0, kind: track,       material: "wood",   variant: "wooden_track"),
+                CellDef(x: 1, y: 0, z: 0, kind: track,       material: "wood",   variant: "wooden_track"),
+                CellDef(x: 2, y: 0, z: 0, kind: track,       material: "wood",   variant: "wooden_track"),
+                CellDef(x: 3, y: 0, z: 0, kind: track,       material: "wood",   variant: "wooden_track"),
                 CellDef(x: 0, y: 1, z: 0, kind: frame,       material: "copper"),
                 CellDef(x: 1, y: 1, z: 0, kind: engine,      material: "copper"),
-                CellDef(x: 2, y: 1, z: 0, kind: frame,       material: "copper"),
+                CellDef(x: 2, y: 1, z: 0, kind: engine,      material: "copper"),
                 CellDef(x: 3, y: 1, z: 0, kind: frame,       material: "copper"),
-                CellDef(x: 0, y: 2, z: 0, kind: armor_plate, material: "copper"),
-                CellDef(x: 1, y: 2, z: 0, kind: crew_seat,   material: "wood"),
-                CellDef(x: 2, y: 2, z: 0, kind: turret,      material: "copper"),
-                CellDef(x: 3, y: 2, z: 0, kind: armor_plate, material: "copper"),
+                CellDef(x: 0, y: 2, z: 0, kind: crew_seat,   material: "wood"),
+                CellDef(x: 1, y: 2, z: 0, kind: turret,      material: "copper", variant: "light_turret_ring"),
+                CellDef(x: 2, y: 2, z: 0, kind: turret,      material: "copper", variant: "light_turret_ring"),
+                CellDef(x: 3, y: 2, z: 0, kind: crew_seat,   material: "wood"),
+                CellDef(x: 0, y: 3, z: 0, kind: armor_plate, material: "copper"),
+                CellDef(x: 1, y: 3, z: 0, kind: turret,      material: "copper", variant: "light_turret_ring"),
+                CellDef(x: 2, y: 3, z: 0, kind: turret,      material: "copper", variant: "light_turret_ring"),
+                CellDef(x: 3, y: 3, z: 0, kind: armor_plate, material: "copper"),
+            ],
+            modules: [
+                TemplateModule(def: "light_turret_2x2", facing: 0, cells: [
+                    (1, 2, 0), (2, 2, 0), (1, 3, 0), (2, 3, 0),
+                ]),
+            ],
+        ),
+        TemplateDef(
+            name: "Heavy Tank",
+            purpose: war,
+            required_animals: 0,
+            tech_gates: ["powered_traction"],
+            cells: [
+                CellDef(x: 0, y: 0, z: 0, kind: track,       material: "wood",   variant: "wooden_track"),
+                CellDef(x: 1, y: 0, z: 0, kind: track,       material: "wood",   variant: "wooden_track"),
+                CellDef(x: 2, y: 0, z: 0, kind: track,       material: "wood",   variant: "wooden_track"),
+                CellDef(x: 3, y: 0, z: 0, kind: track,       material: "wood",   variant: "wooden_track"),
+                CellDef(x: 4, y: 0, z: 0, kind: track,       material: "wood",   variant: "wooden_track"),
+                CellDef(x: 0, y: 1, z: 0, kind: frame,       material: "copper", variant: "heavy_chassis"),
+                CellDef(x: 1, y: 1, z: 0, kind: engine,      material: "copper"),
+                CellDef(x: 2, y: 1, z: 0, kind: engine,      material: "copper"),
+                CellDef(x: 3, y: 1, z: 0, kind: engine,      material: "copper"),
+                CellDef(x: 4, y: 1, z: 0, kind: frame,       material: "copper", variant: "heavy_chassis"),
+                CellDef(x: 0, y: 2, z: 0, kind: frame,       material: "copper", variant: "heavy_chassis"),
+                CellDef(x: 1, y: 2, z: 0, kind: frame,       material: "copper", variant: "heavy_chassis"),
+                CellDef(x: 2, y: 2, z: 0, kind: frame,       material: "copper", variant: "heavy_chassis"),
+                CellDef(x: 3, y: 2, z: 0, kind: frame,       material: "copper", variant: "heavy_chassis"),
+                CellDef(x: 4, y: 2, z: 0, kind: frame,       material: "copper", variant: "heavy_chassis"),
+                CellDef(x: 0, y: 3, z: 0, kind: crew_seat,   material: "wood"),
+                CellDef(x: 1, y: 3, z: 0, kind: crew_seat,   material: "wood"),
+                CellDef(x: 2, y: 3, z: 0, kind: crew_seat,   material: "wood"),
+                CellDef(x: 3, y: 3, z: 0, kind: frame,       material: "copper", variant: "heavy_chassis"),
+                CellDef(x: 4, y: 3, z: 0, kind: armor_plate, material: "copper"),
+                CellDef(x: 1, y: 1, z: 1, kind: turret,      material: "copper", variant: "heavy_turret_ring"),
+                CellDef(x: 2, y: 1, z: 1, kind: turret,      material: "copper", variant: "heavy_turret_ring"),
+                CellDef(x: 3, y: 1, z: 1, kind: turret,      material: "copper", variant: "heavy_turret_ring"),
+                CellDef(x: 1, y: 2, z: 1, kind: turret,      material: "copper", variant: "heavy_turret_ring"),
+                CellDef(x: 2, y: 2, z: 1, kind: turret,      material: "copper", variant: "heavy_turret_ring"),
+                CellDef(x: 3, y: 2, z: 1, kind: turret,      material: "copper", variant: "heavy_turret_ring"),
+                CellDef(x: 1, y: 3, z: 1, kind: turret,      material: "copper", variant: "heavy_turret_ring"),
+                CellDef(x: 2, y: 3, z: 1, kind: turret,      material: "copper", variant: "heavy_turret_ring"),
+                CellDef(x: 3, y: 3, z: 1, kind: turret,      material: "copper", variant: "heavy_turret_ring"),
+            ],
+            modules: [
+                TemplateModule(def: "heavy_turret_3x3", facing: 0, cells: [
+                    (1, 1, 1), (2, 1, 1), (3, 1, 1),
+                    (1, 2, 1), (2, 2, 1), (3, 2, 1),
+                    (1, 3, 1), (2, 3, 1), (3, 3, 1),
+                ]),
             ],
         ),
     ],
