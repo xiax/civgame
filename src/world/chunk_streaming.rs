@@ -475,6 +475,15 @@ pub fn setup_tile_materials(
 }
 
 /// Spawn tile sprites for a single chunk; populates both by_chunk and by_tile.
+/// Despawn `entity` recursively only if it still exists. A stale index
+/// entry (e.g. a `WallMap` id whose entity was despawned elsewhere) must
+/// fail closed rather than panic inside `Commands` application.
+fn despawn_entity_if_present(commands: &mut Commands, entity: Entity) {
+    if let Some(ec) = commands.get_entity(entity) {
+        ec.despawn_recursive();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_chunk_sprites(
     commands: &mut Commands,
@@ -516,6 +525,11 @@ pub fn spawn_chunk_sprites(
             let tile_pos = (global_tx as i32, global_ty as i32);
 
             if kind == TileKind::Wall {
+                // Wall entities are durable across chunk streaming — they are
+                // deliberately NOT registered in `TileSpriteIndex.by_chunk`
+                // (chunk unload despawns that list, but `WallMap` is kept), so
+                // their lifetime stays in sync with `WallMap`. Spawn only when
+                // `WallMap` lacks an entry; a present entry is reused as-is.
                 if !wall_map.0.contains_key(&tile_pos) {
                     let entity = commands
                         .spawn((
@@ -534,9 +548,6 @@ pub fn spawn_chunk_sprites(
                         ))
                         .id();
                     wall_map.0.insert(tile_pos, entity);
-                    entities.push(entity);
-                } else if let Some(&entity) = wall_map.0.get(&tile_pos) {
-                    entities.push(entity);
                 }
                 continue;
             }
@@ -1154,7 +1165,7 @@ pub fn chunk_streaming_system(
 
         if let Some(entities) = sprite_index.by_chunk.remove(&coord) {
             for e in entities {
-                commands.entity(e).despawn_recursive();
+                despawn_entity_if_present(&mut commands, e);
             }
         }
         if let Some(plant_entries) = plant_params.plant_sprite_index.by_chunk.remove(&coord) {
@@ -1246,7 +1257,7 @@ pub fn refresh_changed_tiles_system(
                 if let Some(chunk_entities) = sprite_index.by_chunk.get_mut(&coord) {
                     chunk_entities.retain(|&e| e != wall_entity);
                 }
-                commands.entity(wall_entity).despawn_recursive();
+                despawn_entity_if_present(&mut commands, wall_entity);
             }
         }
 
@@ -1279,10 +1290,9 @@ pub fn refresh_changed_tiles_system(
                         ProjectionState::default(),
                     ))
                     .id();
+                // Wall entities stay durable across streaming — never
+                // registered in `by_chunk` (see `spawn_chunk_sprites`).
                 wall_map.0.insert((tx, ty), new_entity);
-                if let Some(chunk_entities) = sprite_index.by_chunk.get_mut(&coord) {
-                    chunk_entities.push(new_entity);
-                }
             }
         } else {
             let (render_kind, render_ore, render_z, base_vis) = resolve_render_tile(
@@ -1427,6 +1437,36 @@ mod tests {
         let batch = drain_prioritized_chunks(&mut set, &priority, 2);
         assert_eq!(batch, vec![ChunkCoord(10, 0), ChunkCoord(0, 0)]);
         assert!(set.contains(&ChunkCoord(2, 0)));
+    }
+
+    #[test]
+    fn despawn_entity_if_present_tolerates_stale_id() {
+        // `WallMap` ↔ wall-entity lifetimes are kept in sync, but the
+        // guard is the structural backstop: a stale entity id must fail
+        // closed, never panic inside `Commands` application.
+        #[derive(Resource)]
+        struct Targets {
+            stale: Entity,
+            live: Entity,
+        }
+
+        let mut app = App::new();
+        let stale = app.world_mut().spawn_empty().id();
+        let live = app.world_mut().spawn_empty().id();
+        app.world_mut().despawn(stale); // `stale` id now dangling
+        app.insert_resource(Targets { stale, live });
+
+        app.add_systems(Update, |mut commands: Commands, t: Res<Targets>| {
+            // Would panic with a bare `commands.entity(t.stale)`.
+            despawn_entity_if_present(&mut commands, t.stale);
+            despawn_entity_if_present(&mut commands, t.live);
+        });
+        app.update();
+
+        assert!(
+            app.world().get_entity(live).is_err(),
+            "live entity should have been despawned"
+        );
     }
 
     #[test]

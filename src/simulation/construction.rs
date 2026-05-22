@@ -5068,6 +5068,62 @@ fn seed_apply_wall_tile(
     true
 }
 
+/// Re-stamp `TileKind::Wall` for every `WallMap` tile in a freshly-loaded
+/// chunk. Chunks regenerate from `Globe + seed` on stream-in, so a
+/// constructed wall's tile delta is lost — only the durable `Wall` entity
+/// in `WallMap` survives (the same Phase-0 gap `restamp_runtime_water` /
+/// `restamp_wells` fix for Bridge/Dam/well geometry). Without this, the
+/// tile under a reloaded built wall reverts to natural terrain and becomes
+/// wrongly passable while the wall entity + sprite still float there.
+///
+/// Mirrors the Bridge/Dam `stamp` closure: skip tiles already `Wall`
+/// (natural exposed bedrock regenerates as `Wall` on its own; an untouched
+/// constructed wall in a resident chunk is also already `Wall`), skip
+/// chunks that did not fire `ChunkLoadedEvent` this tick. Stamps one Z
+/// above the regenerated surface — every construction wall path writes the
+/// wall at `surface_z + 1` — and emits `TileChangedEvent` so the renderer +
+/// chunk graph rebuild.
+pub fn restamp_walls_on_chunk_load(
+    mut events: EventReader<crate::world::chunk_streaming::ChunkLoadedEvent>,
+    mut chunk_map: ResMut<ChunkMap>,
+    wall_map: Res<WallMap>,
+    mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+) {
+    let loaded: AHashSet<ChunkCoord> = events.read().map(|e| e.coord).collect();
+    if loaded.is_empty() {
+        return;
+    }
+    for &(tx, ty) in wall_map.0.keys() {
+        let coord = ChunkCoord(
+            tx.div_euclid(CHUNK_SIZE as i32),
+            ty.div_euclid(CHUNK_SIZE as i32),
+        );
+        if !loaded.contains(&coord) {
+            continue;
+        }
+        if chunk_map.tile_kind_at(tx, ty) == Some(TileKind::Wall) {
+            continue;
+        }
+        let surf_z = chunk_map.surface_z_at(tx, ty);
+        if surf_z < Z_MIN || surf_z >= Z_MAX {
+            continue;
+        }
+        chunk_map.set_tile(
+            tx,
+            ty,
+            surf_z + 1,
+            TileData {
+                kind: TileKind::Wall,
+                elevation: 0,
+                fertility: 0,
+                flags: 0b0001,
+                ore: 0,
+            },
+        );
+        tile_changed.send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
+    }
+}
+
 /// Place wall / door / bed blueprints over an arbitrary shape mask. Perimeter
 /// tiles (any cardinal neighbour outside the mask) become Wall; the one
 /// perimeter tile closest to the door cardinal becomes Door; interior tiles
@@ -9755,5 +9811,121 @@ mod tests {
             StartSettlementMaturity::Established,
             true,
         ));
+    }
+
+    // ── restamp_walls_on_chunk_load ─────────────────────────────────────
+    //
+    // A constructed wall writes `TileKind::Wall` as a chunk delta; chunk
+    // regen on stream-in loses the delta while the `Wall` entity in
+    // `WallMap` persists. The restamp re-projects the tile so a reloaded
+    // built wall stays impassable.
+
+    use crate::world::chunk::Chunk;
+
+    type ChunkLoadedEvent = crate::world::chunk_streaming::ChunkLoadedEvent;
+    type TileChangedEvent = crate::world::chunk_streaming::TileChangedEvent;
+
+    /// `App` with the wall restamp system + one freshly-regenerated chunk
+    /// at (0,0) whose surface is `surf_kind` at `surf_z`.
+    fn wall_restamp_harness(surf_kind: TileKind, surf_z: i8) -> App {
+        let mut app = App::new();
+        app.add_event::<ChunkLoadedEvent>()
+            .add_event::<TileChangedEvent>()
+            .insert_resource(WallMap::default());
+
+        let mut chunk_map = ChunkMap::default();
+        let z = Box::new([[surf_z; CHUNK_SIZE]; CHUNK_SIZE]);
+        let kind = Box::new([[surf_kind; CHUNK_SIZE]; CHUNK_SIZE]);
+        let fert = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
+        chunk_map
+            .0
+            .insert(ChunkCoord(0, 0), Chunk::new(z, kind, fert));
+        app.insert_resource(chunk_map);
+
+        app.add_systems(Update, restamp_walls_on_chunk_load);
+        app
+    }
+
+    fn drain_wall_changed(app: &mut App) -> Vec<(i32, i32)> {
+        app.world_mut()
+            .resource_mut::<Events<TileChangedEvent>>()
+            .drain()
+            .map(|e| (e.tx, e.ty))
+            .collect()
+    }
+
+    #[test]
+    fn reverted_constructed_wall_is_restamped() {
+        // Regenerated chunk shows natural Grass; the durable Wall entity
+        // persisted in WallMap (the chunk-delta-not-reapplied gap).
+        let mut app = wall_restamp_harness(TileKind::Grass, 3);
+        let e = app.world_mut().spawn_empty().id();
+        app.world_mut().resource_mut::<WallMap>().0.insert((5, 3), e);
+
+        app.world_mut()
+            .resource_mut::<Events<ChunkLoadedEvent>>()
+            .send(ChunkLoadedEvent {
+                coord: ChunkCoord(0, 0),
+            });
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<ChunkMap>().tile_kind_at(5, 3),
+            Some(TileKind::Wall),
+            "wall tile must be re-stamped from WallMap on reload"
+        );
+        assert!(
+            drain_wall_changed(&mut app).contains(&(5, 3)),
+            "restamp must emit TileChangedEvent so pathing/sprites rebuild"
+        );
+
+        // Second load (chunk already correct) is a no-op — no event churn.
+        app.world_mut()
+            .resource_mut::<Events<ChunkLoadedEvent>>()
+            .send(ChunkLoadedEvent {
+                coord: ChunkCoord(0, 0),
+            });
+        app.update();
+        assert!(drain_wall_changed(&mut app).is_empty());
+    }
+
+    #[test]
+    fn natural_wall_restamp_is_idempotent() {
+        // Natural exposed bedrock regenerates as Wall on its own — the
+        // restamp must skip it and emit nothing.
+        let mut app = wall_restamp_harness(TileKind::Wall, 4);
+        let e = app.world_mut().spawn_empty().id();
+        app.world_mut().resource_mut::<WallMap>().0.insert((2, 6), e);
+
+        app.world_mut()
+            .resource_mut::<Events<ChunkLoadedEvent>>()
+            .send(ChunkLoadedEvent {
+                coord: ChunkCoord(0, 0),
+            });
+        app.update();
+
+        assert!(
+            drain_wall_changed(&mut app).is_empty(),
+            "already-Wall tile must not be restamped"
+        );
+    }
+
+    #[test]
+    fn wall_restamp_skips_chunks_that_did_not_load() {
+        // A WallMap entry in a chunk that fired no ChunkLoadedEvent must
+        // be left untouched.
+        let mut app = wall_restamp_harness(TileKind::Grass, 3);
+        let e = app.world_mut().spawn_empty().id();
+        app.world_mut().resource_mut::<WallMap>().0.insert((5, 3), e);
+
+        // No ChunkLoadedEvent sent.
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<ChunkMap>().tile_kind_at(5, 3),
+            Some(TileKind::Grass),
+            "tile in an unloaded chunk must not be restamped"
+        );
+        assert!(drain_wall_changed(&mut app).is_empty());
     }
 }

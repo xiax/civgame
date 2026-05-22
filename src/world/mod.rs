@@ -90,10 +90,15 @@ impl Plugin for WorldPlugin {
                 FixedUpdate,
                 (
                     // Re-carve dug well stepwell geometry (shaft + helix) lost
-                    // when a footprint chunk regenerated, then re-apply the
+                    // when a footprint chunk regenerated, re-stamp constructed
+                    // Wall tiles (the delta is lost on regen; the `Wall` entity
+                    // in `WallMap` is the durable truth), then re-apply the
                     // `RuntimeWater` columns + Bridge/Dam tiles. Chained so the
-                    // water restamp stamps onto the just-re-carved shaft.
+                    // water restamp stamps onto the just-re-carved shaft, and
+                    // the wall restamp runs after wells so re-carved well-rim
+                    // walls already read `Wall` and are skipped.
                     crate::simulation::well::restamp_wells_on_chunk_load,
+                    crate::simulation::construction::restamp_walls_on_chunk_load,
                     water_runtime::restamp_runtime_water_on_chunk_load,
                 )
                     .chain()
