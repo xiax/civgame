@@ -154,6 +154,10 @@ pub enum TaskKind {
     /// `vehicle::vehicle_siege_system` ticks `apply_wall_damage` on a cooldown
     /// until the wall falls. Dedicated task — the target is a static tile.
     SiegeWall = 56,
+    /// Realistic Tool Overhaul: in-place follow-up of a tool withdraw — move
+    /// the just-withdrawn tool `Item` from inventory into the worker's
+    /// `ToolKit`. Executor: `tools::stow_toolkit_task_system`.
+    StowToolKit = 57,
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -216,6 +220,7 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::VehicleCargoHaul as u16 => "Vehicle Hauling",
         x if x == TaskKind::Fishing as u16 => "Fishing",
         x if x == TaskKind::SiegeWall as u16 => "Sieging Wall",
+        x if x == TaskKind::StowToolKit as u16 => "Stowing Tool",
         _ => "Unemployed",
     }
 }
@@ -947,6 +952,23 @@ pub fn goal_dispatch_system(
                                 == Some(crate::economy::core_ids::weapon()) =>
                         {
                             Some(TaskKind::Equip as u16)
+                        }
+                        // Realistic Tool Overhaul: tool-acquisition chain
+                        // (`tools::htn_acquire_tool_dispatch_system`) is also
+                        // goal-agnostic — a Crafter mid-Craft and a forester
+                        // mid-GatherWood both transit the same
+                        // `[WithdrawTool → StowToolKit]` legs. Preserve via
+                        // the typed variant (`WithdrawTool` shares the
+                        // `WithdrawMaterial` task kind, so we narrow by the
+                        // `as_withdraw_tool()` payload check) and the
+                        // dedicated `StowToolKit` task kind.
+                        _ if aq.current_task_kind() == TaskKind::WithdrawMaterial as u16
+                            && aq.current.as_withdraw_tool().is_some() =>
+                        {
+                            Some(TaskKind::WithdrawMaterial as u16)
+                        }
+                        _ if aq.current_task_kind() == TaskKind::StowToolKit as u16 => {
+                            Some(TaskKind::StowToolKit as u16)
                         }
                         // Phase 5e-iii: HTN-driven ReturnSurplus chain runs without
                         // an ActivePlan under ReturnCamp. The DepositResource walk

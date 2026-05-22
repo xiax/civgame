@@ -419,6 +419,7 @@ pub fn gather_system(
         &AgentGoal,
         &mut MethodHistory,
         Option<&crate::simulation::jobs::JobClaim>,
+        Option<&crate::simulation::tools::ToolKit>,
     )>,
 ) {
     use crate::simulation::shared_knowledge::KnowledgeTier;
@@ -437,6 +438,7 @@ pub fn gather_system(
         _goal,
         mut method_history,
         job_claim,
+        toolkit,
     ) in agent_query.iter_mut()
     {
         // Resolve the finest tier the agent writes to — same rule as
@@ -585,9 +587,65 @@ pub fn gather_system(
             let mut plant = plant_query.get_mut(entity).unwrap();
 
             let kind = plant.kind;
-            let has_tool = agent.has_tool();
 
-            if ai.work_progress < kind.harvest_work_ticks() {
+            // ── Realistic Tool Overhaul: per-plant tool gate ──────────────
+            // Tree → Axe (Chop). Grain → Sickle (HarvestCrop). BerryBush is
+            // hand-gatherable. A worker with NO `ToolKit` at all (fixture /
+            // pre-tool agents) is treated as satisfied so the gate degrades
+            // gracefully; an *empty* kit blocks/degrades.
+            use crate::simulation::tools::{ToolRequirement, ToolUseKind};
+            let plant_tool_req: Option<ToolRequirement> = match kind {
+                PlantKind::Tree => Some(ToolRequirement::any(ToolUseKind::Chop)),
+                PlantKind::Grain => Some(ToolRequirement::any(ToolUseKind::HarvestCrop)),
+                PlantKind::BerryBush => None,
+            };
+            let has_tool_for_plant = plant_tool_req
+                .map(|req| toolkit.map(|tk| tk.satisfies(&req)).unwrap_or(true))
+                .unwrap_or(true);
+            // Best matching tool tier → work-speed multiplier (faster tools
+            // shorten the work threshold). No tool / no kit ⇒ Stone baseline.
+            let tool_speed = plant_tool_req
+                .and_then(|req| toolkit.and_then(|tk| tk.best_for(&req)))
+                .map(|it| {
+                    crate::simulation::tools::work_speed_mult(
+                        crate::simulation::tools::item_tool_tier(it),
+                    )
+                })
+                .unwrap_or(1.0);
+
+            // Mature Grain with no Sickle: the worker simply cannot reap it.
+            // Abort the gather (FailedTarget) — berries / loose items stay
+            // hand-gatherable, but standing grain needs a sickle.
+            if matches!(kind, PlantKind::Grain) && !has_tool_for_plant {
+                if let Some(method_id) = ai.active_method.take() {
+                    method_history.push(method_id, MethodOutcome::FailedTarget, clock.tick);
+                }
+                finish_gather(
+                    &mut ai,
+                    &mut aq,
+                    actor,
+                    cur_tile,
+                    cur_chunk,
+                    faction_id,
+                    &chunk_map,
+                    &routing,
+                    &mut method_history,
+                    clock.tick,
+                    FinishGatherOutcome::TargetInvalid,
+                );
+                continue;
+            }
+            // `has_tool` doubles tree-felling yield as before; the Axe gate
+            // below additionally degrades a no-Axe fell to deadwood.
+            let has_tool = agent.has_tool() && has_tool_for_plant;
+
+            // A faster tool shortens the work threshold. `harvest_work_ticks`
+            // is 0 for every plant today (gather pacing lives in movement);
+            // the `clamp(0, 255)` keeps that 0 → instant-on-arrival behaviour
+            // intact rather than forcing a spurious one-tick floor.
+            let work_threshold = ((kind.harvest_work_ticks() as f32 / tool_speed).ceil() as i32)
+                .clamp(0, 255) as u8;
+            if ai.work_progress < work_threshold {
                 continue;
             }
             ai.work_progress = 0;
@@ -714,7 +772,12 @@ pub fn gather_system(
                 spawn_ground_drop(&mut commands, tx, ty, drop_id, drop_qty);
             }
 
-            if kind.harvest_despawns(has_tool) {
+            // Realistic Tool Overhaul: felling a Tree requires an Axe. With
+            // no Axe the worker only collects fallen deadwood — the standing
+            // tree is NOT despawned so it can be felled later with a real
+            // axe. Berries / Grain keep their normal despawn rule.
+            let tree_fell_blocked = matches!(kind, PlantKind::Tree) && !has_tool_for_plant;
+            if kind.harvest_despawns(has_tool) && !tree_fell_blocked {
                 despawn_plant_internals(
                     &mut commands,
                     entity,
@@ -729,6 +792,10 @@ pub fn gather_system(
                     PlantKind::Tree => MemoryKind::wood(),
                 };
                 shared.report_depleted(agent_tier, (tx, ty), depleted_kind);
+            } else if tree_fell_blocked {
+                // No-Axe deadwood collection — leave the tree standing and
+                // Mature so it can be properly felled later. The cluster
+                // entry is NOT depleted (the wood is still there).
             } else {
                 plant.stage = GrowthStage::Harvested;
                 plant.growth = 0;
@@ -781,15 +848,61 @@ pub fn gather_system(
                 Some(TileKind::Wall) | Some(TileKind::Stone) | Some(TileKind::Ore)
             ) {
                 // ── Mineable rock: Wall, Stone, or Ore.
-                // Same carve operation; per-block (ResourceId, qty) drops come from
-                // `carve_tile` which reads the actual material via tile_at_3d.
-                if ai.work_progress < STONE.work_ticks {
+                // Realistic Tool Overhaul: breaking rock from a tile needs a
+                // Pick. With no Pick the worker can only prise loose surface
+                // stone — a small trickle yield — and the tile is NOT carved.
+                // No `ToolKit` at all degrades gracefully (treated as armed).
+                use crate::simulation::tools::{ToolRequirement, ToolUseKind};
+                let pick_req = ToolRequirement::any(ToolUseKind::Mine);
+                let has_pick = toolkit.map(|tk| tk.satisfies(&pick_req)).unwrap_or(true);
+                let pick_speed = toolkit
+                    .and_then(|tk| tk.best_for(&pick_req))
+                    .map(|it| {
+                        crate::simulation::tools::work_speed_mult(
+                            crate::simulation::tools::item_tool_tier(it),
+                        )
+                    })
+                    .unwrap_or(1.0);
+                let mine_threshold = ((STONE.work_ticks as f32 / pick_speed).ceil() as i32)
+                    .clamp(0, 255) as u8;
+                if ai.work_progress < mine_threshold {
                     continue;
                 }
                 ai.work_progress = 0;
 
                 let target_floor_z = ai.current_z as i32;
                 let was_wall = tile_kind == Some(TileKind::Wall);
+
+                // No-Pick trickle: skip the carve, hand out a small loose-stone
+                // yield, leave the tile intact. Bootstrap-safe — a faction can
+                // still scrape together stone for the first picks.
+                if !has_pick {
+                    let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
+                    route_yield(
+                        &mut commands,
+                        &mut carrier,
+                        &mut agent,
+                        core_ids::stone(),
+                        1,
+                        agent_tx,
+                        agent_ty,
+                    );
+                    skills.gain_xp(SkillKind::Mining, STONE.xp / 4);
+                    finish_gather(
+                        &mut ai,
+                        &mut aq,
+                        actor,
+                        cur_tile,
+                        cur_chunk,
+                        faction_id,
+                        &chunk_map,
+                        &routing,
+                        &mut method_history,
+                        clock.tick,
+                        FinishGatherOutcome::Completed,
+                    );
+                    continue;
+                }
 
                 let drops = carve_tile(
                     &mut chunk_map,

@@ -64,17 +64,19 @@ impl CorpseMap {
     }
 }
 
-/// Yields a corpse drops when butchered. Mirrors the legacy `death_system`
-/// drops for Wolf and Deer (Wolf: 3 Meat + 1 Skin; Deer: 5 Meat + 2 Skin).
+/// Yields a corpse drops when butchered. Wolf: 3 Meat + 1 Skin + 1 Bone;
+/// Deer: 5 Meat + 2 Skin + 2 Bone. Bone is the crudest tool stock (Realistic
+/// Tool Overhaul) — Bone Awl / Bone Fishing Kit.
 pub fn species_yield(
     species: CorpseSpecies,
-) -> [(crate::economy::resource_catalog::ResourceId, u32); 2] {
+) -> [(crate::economy::resource_catalog::ResourceId, u32); 3] {
     use crate::economy::core_ids;
     let meat = core_ids::meat();
     let skin = core_ids::skin();
+    let bone = core_ids::bone();
     match species {
-        CorpseSpecies::Wolf => [(meat, 3), (skin, 1)],
-        CorpseSpecies::Deer => [(meat, 5), (skin, 2)],
+        CorpseSpecies::Wolf => [(meat, 3), (skin, 1), (bone, 1)],
+        CorpseSpecies::Deer => [(meat, 5), (skin, 2), (bone, 2)],
     }
 }
 

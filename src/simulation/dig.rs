@@ -32,9 +32,10 @@ pub fn dig_system(
         &mut Skills,
         &BucketSlot,
         &LodLevel,
+        Option<&crate::simulation::tools::ToolKit>,
     )>,
 ) {
-    for (mut ai, mut aq, mut carrier, mut skills, slot, lod) in agent_query.iter_mut() {
+    for (mut ai, mut aq, mut carrier, mut skills, slot, lod, toolkit) in agent_query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -69,6 +70,22 @@ pub fn dig_system(
         // The current surface tile at surf_z becomes Air (headspace), the tile
         // at surf_z - 1 becomes Dirt (the new floor). Surface drops by one.
         let target_floor_z = surf_z - 1;
+
+        // Realistic Tool Overhaul: breaking rock needs a Pick. Soil stays
+        // hand-diggable. A stone-like floor tile with no Pick is a failed /
+        // no-target outcome — the worker idles without carving. No `ToolKit`
+        // component at all degrades gracefully (treated as armed).
+        let floor_kind = chunk_map.tile_at(tx, ty, target_floor_z).kind;
+        if floor_kind.is_stone_like() {
+            use crate::simulation::tools::{ToolRequirement, ToolUseKind};
+            let pick_req = ToolRequirement::any(ToolUseKind::Mine);
+            let has_pick = toolkit.map(|tk| tk.satisfies(&pick_req)).unwrap_or(true);
+            if !has_pick {
+                ai.state = AiState::Idle;
+                aq.advance();
+                continue;
+            }
+        }
         let drops = carve_tile(
             &mut chunk_map,
             &gen,

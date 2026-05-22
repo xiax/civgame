@@ -532,6 +532,12 @@ impl PersonBuilder {
                 (
                     crate::simulation::social_contact::SecondarySocial::inactive(),
                     crate::simulation::energy::Energy::new(self.energy),
+                    // Fixture agents carry a fully-stocked stone toolkit so
+                    // baseline-behaviour tests (gather/dig/fish/craft) aren't
+                    // blocked by the Realistic Tool Overhaul gates. Tool-gate
+                    // tests insert an explicit empty/partial `ToolKit` to
+                    // override this.
+                    fixture_full_toolkit(),
                 ),
             ))
             .id();
@@ -540,6 +546,19 @@ impl PersonBuilder {
         }
         entity
     }
+}
+
+/// A `ToolKit` pre-stocked with one stone tool of every form, with capacity
+/// to hold them all. Fixture agents carry this so the tool-gate executors
+/// (gather/dig/fish/craft) don't block baseline-behaviour tests. Tool-gate
+/// tests override it with an explicit empty/partial `ToolKit`.
+pub fn fixture_full_toolkit() -> crate::simulation::tools::ToolKit {
+    use crate::simulation::tools::{tool_item_of, ToolForm, ToolKit, ToolTier};
+    let mut kit = ToolKit::new(ToolForm::ALL.len() as u8);
+    for form in ToolForm::ALL {
+        kit.stow(tool_item_of(form, ToolTier::Stone));
+    }
+    kit
 }
 
 /// Build a single chunk where every (lx, ly) reads as `surface_z` of
@@ -8002,6 +8021,336 @@ mod smoke {
             harvested(&mut sim, tilled_worker, tilled_stand),
             7,
             "Tilled Grain harvest yields the 1.4× plow-bonus base (5 → 7)"
+        );
+    }
+
+    /// Realistic Tool Overhaul executor gates: spawn a mature Grain plant and
+    /// a worker with an *empty* `ToolKit` (no Sickle) — the harvest aborts
+    /// and the worker yields no grain. With a Sickle the same harvest yields.
+    #[test]
+    fn no_sickle_blocks_grain_harvest() {
+        use crate::economy::core_ids;
+        use crate::simulation::gather::gather_system;
+        use crate::simulation::person::{AiState, PersonAI};
+        use crate::simulation::plants::{GrowthStage, Plant, PlantKind, PlantMap};
+        use crate::simulation::tools::{tool_item_of, ToolForm, ToolKit, ToolTier};
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let run_harvest = |with_sickle: bool| -> u32 {
+            let mut sim = TestSim::new(0x5C1C1E);
+            sim.flat_world(2, 0, TileKind::Grass);
+            let fid = sim.player_faction_id;
+            let tile = (5, 0);
+            let w = tile_to_world(tile.0, tile.1);
+            let plant = sim
+                .app
+                .world_mut()
+                .spawn((
+                    Plant {
+                        kind: PlantKind::Grain,
+                        stage: GrowthStage::Mature,
+                        growth: 0,
+                        tile_pos: tile,
+                    },
+                    Transform::from_xyz(w.x, w.y, 0.4),
+                    GlobalTransform::default(),
+                    Visibility::Hidden,
+                    InheritedVisibility::default(),
+                ))
+                .id();
+            sim.app
+                .world_mut()
+                .resource_mut::<PlantMap>()
+                .0
+                .insert(tile, plant);
+            let worker = sim.spawn_person(fid, (0, 0), |_| {});
+            {
+                let world = sim.app.world_mut();
+                world.get_mut::<PersonAI>(worker).unwrap().state = AiState::Working;
+                world.get_mut::<ActionQueue>(worker).unwrap().current =
+                    Task::Gather { tile };
+                // Override the fixture's full kit with an explicit one.
+                let mut kit = ToolKit::new(3);
+                if with_sickle {
+                    kit.stow(tool_item_of(ToolForm::Sickle, ToolTier::Stone));
+                }
+                world.entity_mut(worker).insert(kit);
+            }
+            let sys = sim.app.world_mut().register_system(gather_system);
+            sim.app.world_mut().run_system(sys).unwrap();
+            let grain = core_ids::grain();
+            let mut q = sim
+                .app
+                .world_mut()
+                .query::<&crate::simulation::items::GroundItem>();
+            let mut total = 0;
+            for gi in q.iter(sim.app.world()) {
+                if gi.item.resource_id == grain {
+                    total += gi.qty;
+                }
+            }
+            let carried = sim
+                .app
+                .world()
+                .get::<crate::simulation::carry::Carrier>(worker)
+                .map(|c| c.quantity_of_resource(grain))
+                .unwrap_or(0);
+            total + carried
+        };
+        assert_eq!(run_harvest(false), 0, "no Sickle ⇒ no grain harvested");
+        assert!(run_harvest(true) > 0, "Sickle ⇒ grain harvested");
+    }
+
+    /// No-Axe tree harvest collects only low-yield deadwood and the standing
+    /// tree is NOT despawned (it can be felled later with a real axe).
+    #[test]
+    fn no_axe_leaves_tree_standing() {
+        use crate::simulation::gather::gather_system;
+        use crate::simulation::person::{AiState, PersonAI};
+        use crate::simulation::plants::{GrowthStage, Plant, PlantKind, PlantMap};
+        use crate::simulation::tools::ToolKit;
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(0x7BEE);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        let tile = (5, 0);
+        let w = tile_to_world(tile.0, tile.1);
+        let plant = sim
+            .app
+            .world_mut()
+            .spawn((
+                Plant {
+                    kind: PlantKind::Tree,
+                    stage: GrowthStage::Mature,
+                    growth: 0,
+                    tile_pos: tile,
+                },
+                Transform::from_xyz(w.x, w.y, 0.4),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        sim.app
+            .world_mut()
+            .resource_mut::<PlantMap>()
+            .0
+            .insert(tile, plant);
+        let worker = sim.spawn_person(fid, (0, 0), |_| {});
+        {
+            let world = sim.app.world_mut();
+            world.get_mut::<PersonAI>(worker).unwrap().state = AiState::Working;
+            world.get_mut::<ActionQueue>(worker).unwrap().current = Task::Gather { tile };
+            // Empty kit — no Axe.
+            world.entity_mut(worker).insert(ToolKit::new(3));
+        }
+        let sys = sim.app.world_mut().register_system(gather_system);
+        sim.app.world_mut().run_system(sys).unwrap();
+        // The tree entity must still exist (not felled).
+        assert!(
+            sim.app.world().get::<Plant>(plant).is_some(),
+            "no-Axe harvest must leave the tree standing"
+        );
+        assert!(
+            sim.app
+                .world()
+                .resource::<PlantMap>()
+                .0
+                .contains_key(&tile),
+            "PlantMap entry survives a no-Axe deadwood harvest"
+        );
+    }
+
+    /// `StowToolKit` moves a withdrawn tool from the worker's hands into the
+    /// `ToolKit`, evicting the lowest-tier resident when full.
+    #[test]
+    fn stow_toolkit_moves_hand_tool_into_kit() {
+        use crate::simulation::carry::Carrier;
+        use crate::simulation::person::{AiState, PersonAI};
+        use crate::simulation::tools::{
+            stow_toolkit_task_system, tool_item_of, ToolForm, ToolKit, ToolRequirement, ToolTier,
+            ToolUseKind,
+        };
+        use crate::simulation::typed_task::{ActionQueue, Task};
+
+        let mut sim = TestSim::new(0x5704);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        let worker = sim.spawn_person(fid, (0, 0), |_| {});
+        let bronze_axe = tool_item_of(ToolForm::Axe, ToolTier::Bronze);
+        {
+            let world = sim.app.world_mut();
+            world.get_mut::<PersonAI>(worker).unwrap().state = AiState::Working;
+            world.get_mut::<ActionQueue>(worker).unwrap().current = Task::StowToolKit {
+                req: ToolRequirement::any(ToolUseKind::Chop),
+            };
+            // Worker holds a bronze axe in hands; kit holds a stone axe.
+            world
+                .get_mut::<Carrier>(worker)
+                .unwrap()
+                .try_pick_up(bronze_axe, 1);
+            let mut kit = ToolKit::new(1);
+            kit.stow(tool_item_of(ToolForm::Axe, ToolTier::Stone));
+            world.entity_mut(worker).insert(kit);
+        }
+        let sys = sim
+            .app
+            .world_mut()
+            .register_system(stow_toolkit_task_system);
+        sim.app.world_mut().run_system(sys).unwrap();
+        // Kit now holds the bronze axe; the stone axe was evicted to ground.
+        let kit = sim.app.world().get::<ToolKit>(worker).unwrap();
+        assert_eq!(
+            kit.best_of_form(ToolForm::Axe)
+                .map(crate::simulation::tools::item_tool_tier),
+            Some(ToolTier::Bronze),
+            "kit upgraded to the bronze axe"
+        );
+        // Worker's hands are now empty of the axe.
+        let carrier = sim.app.world().get::<Carrier>(worker).unwrap();
+        assert_eq!(carrier.quantity_of(bronze_axe), 0, "hand tool consumed");
+    }
+
+    /// `htn_acquire_tool_dispatch_system`: an idle worker carrying an empty
+    /// `ToolKit` whose `AgentGoal` requires an Axe (GatherWood) and whose
+    /// faction storage holds an axe gets a `[WithdrawTool → StowToolKit]`
+    /// chain dispatched. After a few ticks the axe has migrated from
+    /// storage into the worker's kit.
+    #[test]
+    fn tool_dispatcher_prepends_withdraw_and_stow_for_gather_wood() {
+        use crate::economy::core_ids;
+        use crate::economy::item::ItemMaterial;
+        use crate::simulation::faction::{FactionRegistry, FactionStorage, StorageTileMap};
+        use crate::simulation::goals::AgentGoal;
+        use crate::simulation::items::GroundItem;
+        use crate::simulation::tools::{
+            item_tool_tier, tool_item_of, ToolForm, ToolKit, ToolTier,
+        };
+        use crate::simulation::typed_task::ActionQueue;
+
+        use crate::simulation::person::{AiState, PersonAI};
+        use crate::simulation::tools::htn_acquire_tool_dispatch_system;
+        use crate::simulation::typed_task::Task;
+
+        let mut sim = TestSim::new(0x700_AC1);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+
+        // Storage tile at (0,0); seed it with one stone axe Item.
+        let storage_tile = (0, 0);
+        sim.spawn_storage_tile(fid, storage_tile);
+        let axe_id = core_ids::axe();
+        let axe_world = tile_to_world(storage_tile.0, storage_tile.1);
+        let stone_axe = tool_item_of(ToolForm::Axe, ToolTier::Stone);
+        let axe_entity = sim
+            .app
+            .world_mut()
+            .spawn((
+                GroundItem {
+                    item: stone_axe,
+                    qty: 1,
+                },
+                Transform::from_xyz(axe_world.x, axe_world.y, 0.4),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+                Indexed::new(IndexedKind::GroundItem),
+            ))
+            .id();
+        // Direct insert so the dispatcher's tile-walk discovers the axe
+        // without waiting for the SpatialIndex sync system to fire.
+        sim.app
+            .world_mut()
+            .resource_mut::<crate::world::spatial::SpatialIndex>()
+            .insert(storage_tile.0, storage_tile.1, axe_entity);
+        // Faction stock short-circuit + StorageTileMap wiring.
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            let f = registry.factions.get_mut(&fid).unwrap();
+            f.storage = FactionStorage::default();
+            f.storage.totals.insert(axe_id, 1);
+        }
+        {
+            let mut map = sim.app.world_mut().resource_mut::<StorageTileMap>();
+            map.by_faction
+                .entry(fid)
+                .or_default()
+                .push(storage_tile);
+        }
+
+        // Worker with an *empty* ToolKit and GatherWood goal, parked Idle
+        // with no current task so the dispatcher's gate passes.
+        let worker = sim.spawn_person(fid, (2, 2), |_| {});
+        {
+            let world = sim.app.world_mut();
+            world.get_mut::<PersonAI>(worker).unwrap().state = AiState::Idle;
+            world.entity_mut(worker).insert(ToolKit::new(3));
+            world.entity_mut(worker).insert(AgentGoal::GatherWood);
+            world
+                .get_mut::<ActionQueue>(worker)
+                .unwrap()
+                .current = Task::Idle;
+        }
+
+        // Run the dispatcher directly so the test isolates the prepend
+        // contract from the broader scheduler.
+        let dispatch_sys = sim
+            .app
+            .world_mut()
+            .register_system(htn_acquire_tool_dispatch_system);
+        sim.app.world_mut().run_system(dispatch_sys).unwrap();
+
+        // Dispatcher should have produced `Task::WithdrawTool { req: Chop }`
+        // as the head and queued `StowToolKit` as the tail.
+        let aq = sim.app.world().get::<ActionQueue>(worker).unwrap();
+        let req = aq
+            .current
+            .as_withdraw_tool()
+            .expect("dispatcher should install Task::WithdrawTool as head");
+        assert_eq!(
+            req.use_kind.form(),
+            ToolForm::Axe,
+            "GatherWood ⇒ Axe (Chop) requirement"
+        );
+        assert!(
+            matches!(aq.peek_next(), Some(Task::StowToolKit { .. })),
+            "stow leg must be queued behind the withdraw head"
+        );
+
+        // Simulate the worker walking onto the storage tile (the
+        // production executor reads from `ai.dest_tile`, which the
+        // routing call already populated). The fastest robust path is
+        // to teleport + flip to Working, then run the executor pair.
+        {
+            let world = sim.app.world_mut();
+            let mut ai = world.get_mut::<PersonAI>(worker).unwrap();
+            ai.state = AiState::Working;
+            ai.dest_tile = storage_tile;
+            ai.current_z = 0;
+            let dest = tile_to_world(storage_tile.0, storage_tile.1);
+            world.get_mut::<Transform>(worker).unwrap().translation.x = dest.x;
+            world.get_mut::<Transform>(worker).unwrap().translation.y = dest.y;
+        }
+        sim.tick_n(3);
+
+        let kit = sim
+            .app
+            .world()
+            .get::<ToolKit>(worker)
+            .expect("ToolKit missing");
+        let has_axe = kit
+            .best_of_form(ToolForm::Axe)
+            .map(|it| {
+                it.material == Some(ItemMaterial::Stone)
+                    && item_tool_tier(it) == ToolTier::Stone
+            })
+            .unwrap_or(false);
+        assert!(
+            has_axe,
+            "worker should have stowed the stone axe into ToolKit; \
+             kit contents = {:?}",
+            kit.items
         );
     }
 

@@ -166,4 +166,12 @@ core_ids! {
     CartFrameMedium => "cart_frame_medium" => cart_frame_medium,
     CartWheelWood => "cart_wheel_wood" => cart_wheel_wood,
     CartWheelIronrim => "cart_wheel_ironrim" => cart_wheel_ironrim,
+    Knife => "knife" => knife,
+    Axe => "axe" => axe,
+    Pick => "pick" => pick,
+    Hammer => "hammer" => hammer,
+    Sickle => "sickle" => sickle,
+    Awl => "awl" => awl,
+    FishingKit => "fishing_kit" => fishing_kit,
+    Bone => "bone" => bone,
 }

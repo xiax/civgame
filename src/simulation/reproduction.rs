@@ -568,6 +568,7 @@ pub fn pregnancy_system(
                     crate::simulation::goal_scorers::Disposition::default(),
                     crate::simulation::social_contact::SecondarySocial::inactive(),
                     crate::simulation::energy::Energy::default(),
+                    crate::simulation::tools::ToolKit::default(),
                 ),
             ))
             .id();

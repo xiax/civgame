@@ -493,6 +493,7 @@ pub fn fish_task_system(
         &Transform,
         Option<&FactionMember>,
         &mut MethodHistory,
+        Option<&crate::simulation::tools::ToolKit>,
     )>,
 ) {
     let fish_id = core_ids::fish();
@@ -507,6 +508,7 @@ pub fn fish_task_system(
         transform,
         faction_member,
         mut method_history,
+        toolkit,
     ) in agent_query.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -549,6 +551,31 @@ pub fn fish_task_system(
             );
             continue;
         };
+
+        // Realistic Tool Overhaul: fishing requires a Fishing Kit. No kit ⇒
+        // failed outcome. A worker with NO `ToolKit` component at all (fixture
+        // agents) degrades gracefully — treated as equipped.
+        {
+            use crate::simulation::tools::{ToolRequirement, ToolUseKind};
+            let kit_req = ToolRequirement::any(ToolUseKind::Fish);
+            let has_kit = toolkit.map(|tk| tk.satisfies(&kit_req)).unwrap_or(true);
+            if !has_kit {
+                finish_fish(
+                    &mut ai,
+                    &mut aq,
+                    actor,
+                    cur_tile,
+                    cur_chunk,
+                    faction_id,
+                    &chunk_map,
+                    &routing,
+                    &mut method_history,
+                    clock.tick,
+                    false,
+                );
+                continue;
+            }
+        }
 
         // Accumulate work.
         if ai.work_progress < method.work_ticks() {

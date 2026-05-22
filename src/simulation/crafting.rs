@@ -45,13 +45,71 @@ pub struct CraftRecipe {
     pub tech_gate: Option<TechId>,
     /// If Some, the agent must be within 1 tile of an entity of this kind to craft.
     pub requires_station: Option<StationKind>,
+    /// Realistic Tool Overhaul: tools a worker must hold (in their `ToolKit`)
+    /// before `WorkOnCraftOrder` can advance. Empty for bootstrap-safe recipes.
+    pub tool_requirements: Vec<crate::simulation::tools::ToolRequirement>,
+    /// Minimum craft quality the output is guaranteed — microlithic / polished
+    /// recipes floor at `Fine` so a low-skill crafter still produces the tier.
+    pub quality_floor: Option<ItemQuality>,
+    /// Minimum `WorkbenchTier` the station must be (copper/bronze recipes need
+    /// a copper/bronze workbench). `None` = any workbench (when station-bound).
+    pub min_station_tier: Option<crate::simulation::construction::WorkbenchTier>,
+}
+
+impl CraftRecipe {
+    /// Effective output quality given a crafter's skill-derived quality —
+    /// never below the recipe's `quality_floor`.
+    pub fn effective_quality(&self, skill_quality: ItemQuality) -> ItemQuality {
+        match self.quality_floor {
+            Some(floor) if quality_rank(floor) > quality_rank(skill_quality) => floor,
+            _ => skill_quality,
+        }
+    }
+}
+
+/// Ordinal rank of an `ItemQuality` (Poor < Normal < Fine < Masterwork).
+pub fn quality_rank(q: ItemQuality) -> u8 {
+    match q {
+        ItemQuality::Poor => 0,
+        ItemQuality::Normal => 1,
+        ItemQuality::Fine => 2,
+        ItemQuality::Masterwork => 3,
+    }
 }
 
 use crate::simulation::technology::{
-    ANIMAL_HUSBANDRY, ARD_PLOW, BOW_AND_ARROW, BRONZE_CASTING, BRONZE_WEAPONS, COPPER_TOOLS,
-    CUNEIFORM_WRITING, FIRED_POTTERY, FIRE_MAKING, FLINT_KNAPPING, FOOD_SMOKING, HUNTING_SPEAR,
-    LOOM_WEAVING, OX_CART,
+    ANIMAL_HUSBANDRY, ARD_PLOW, BONE_TOOLS, BOW_AND_ARROW, BRONZE_CASTING, BRONZE_TOOLS,
+    BRONZE_WEAPONS, COPPER_TOOLS, CROP_CULTIVATION, CUNEIFORM_WRITING, FIRED_POTTERY, FIRE_MAKING,
+    FISHING, FLINT_KNAPPING, FOOD_SMOKING, HUNTING_SPEAR, LOOM_WEAVING, MICROLITHIC_TOOLS, OX_CART,
 };
+use crate::simulation::construction::WorkbenchTier;
+use crate::simulation::tools::{
+    item_tool_tier, work_speed_mult, ToolKit, ToolRequirement, ToolTier, ToolUseKind,
+};
+
+/// Average work-speed multiplier the worker's carried tools grant for a
+/// recipe. Recipes with no tool requirement run at the `1.0` baseline.
+fn craft_tool_speed(recipe: &CraftRecipe, kit: Option<&ToolKit>) -> f32 {
+    if recipe.tool_requirements.is_empty() {
+        return 1.0;
+    }
+    let Some(kit) = kit else {
+        return 1.0;
+    };
+    let mut sum = 0.0f32;
+    let mut n = 0.0f32;
+    for req in &recipe.tool_requirements {
+        if let Some(item) = kit.best_for(req) {
+            sum += work_speed_mult(item_tool_tier(item));
+            n += 1.0;
+        }
+    }
+    if n > 0.0 {
+        sum / n
+    } else {
+        1.0
+    }
+}
 
 /// Lazily-built recipe table. Phase 2d migrated `CraftRecipe` from a
 /// `static &[...]` to a `OnceLock<Vec<...>>` so the inputs/outputs can
@@ -62,6 +120,37 @@ use crate::simulation::technology::{
 /// notice the lazy-init since `core_ids::catalog()` (which feeds the
 /// resolution) is also lazy. First call out of any test or system
 /// triggers both inits in the right order.
+/// Terse constructor for the Realistic Tool Overhaul tool recipes — all
+/// produce one unit and are Workbench-bound.
+#[allow(clippy::too_many_arguments)]
+fn tool_recipe(
+    name: &'static str,
+    inputs: Vec<(ResourceId, u32)>,
+    output_resource: ResourceId,
+    output_material: ItemMaterial,
+    work_ticks: u8,
+    crafting_xp: u32,
+    tech_gate: TechId,
+    tool_requirements: Vec<ToolRequirement>,
+    quality_floor: Option<ItemQuality>,
+    min_station_tier: Option<WorkbenchTier>,
+) -> CraftRecipe {
+    CraftRecipe {
+        name,
+        inputs,
+        output_resource,
+        output_qty: 1,
+        output_material: Some(output_material),
+        work_ticks,
+        crafting_xp,
+        tech_gate: Some(tech_gate),
+        requires_station: Some(StationKind::Workbench),
+        tool_requirements,
+        quality_floor,
+        min_station_tier,
+    }
+}
+
 fn build_craft_recipes() -> Vec<CraftRecipe> {
     // Force catalog/core_ids init so the `*.get().copied().unwrap()` calls
     // below are safe.
@@ -94,6 +183,24 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
     let cart_frame_medium = core_ids::cart_frame_medium();
     let cart_wheel_wood = core_ids::cart_wheel_wood();
     let cart_wheel_ironrim = core_ids::cart_wheel_ironrim();
+    let copper = core_ids::copper();
+    let tin = core_ids::tin();
+    let bone = core_ids::bone();
+    let knife = core_ids::knife();
+    let axe = core_ids::axe();
+    let pick = core_ids::pick();
+    let hammer = core_ids::hammer();
+    let sickle = core_ids::sickle();
+    let awl = core_ids::awl();
+    let fishing_kit = core_ids::fishing_kit();
+    // Realistic Tool Overhaul tool-requirement shorthands.
+    let cut = ToolRequirement::any(ToolUseKind::Cut);
+    let chop = ToolRequirement::any(ToolUseKind::Chop);
+    let shape = ToolRequirement::any(ToolUseKind::Shape);
+    let smith = ToolRequirement::any(ToolUseKind::Smith);
+    let stitch = ToolRequirement::any(ToolUseKind::Stitch);
+    let hammer_stone = ToolRequirement::at_least(ToolUseKind::Smith, ToolTier::Stone);
+    let hammer_copper = ToolRequirement::at_least(ToolUseKind::Smith, ToolTier::Copper);
 
     vec![
         // 0
@@ -107,6 +214,9 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 5,
             tech_gate: Some(FLINT_KNAPPING),
             requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 1
         CraftRecipe {
@@ -119,6 +229,9 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 5,
             tech_gate: Some(HUNTING_SPEAR),
             requires_station: None,
+            tool_requirements: vec![cut],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 2
         CraftRecipe {
@@ -131,6 +244,9 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 3,
             tech_gate: Some(FIRE_MAKING),
             requires_station: None,
+            tool_requirements: vec![],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 3 — ranged weapon (range 5 via `compute_combat_stats` on the `bow`
         // resource). Was previously misrouted to the generic melee `weapon`.
@@ -144,6 +260,9 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 6,
             tech_gate: Some(BOW_AND_ARROW),
             requires_station: None,
+            tool_requirements: vec![cut],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 4
         CraftRecipe {
@@ -156,6 +275,9 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 6,
             tech_gate: Some(LOOM_WEAVING),
             requires_station: Some(StationKind::Loom),
+            tool_requirements: vec![],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 5
         CraftRecipe {
@@ -168,6 +290,9 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 5,
             tech_gate: Some(FIRED_POTTERY),
             requires_station: None,
+            tool_requirements: vec![],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 6
         CraftRecipe {
@@ -180,6 +305,9 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 4,
             tech_gate: None,
             requires_station: None,
+            tool_requirements: vec![shape],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 7
         CraftRecipe {
@@ -192,6 +320,9 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 6,
             tech_gate: None,
             requires_station: None,
+            tool_requirements: vec![stitch],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 8
         CraftRecipe {
@@ -204,6 +335,9 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 8,
             tech_gate: Some(COPPER_TOOLS),
             requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 9
         CraftRecipe {
@@ -216,6 +350,9 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 10,
             tech_gate: Some(BRONZE_WEAPONS),
             requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![smith],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 10
         CraftRecipe {
@@ -228,6 +365,9 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 8,
             tech_gate: Some(CUNEIFORM_WRITING),
             requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 11
         CraftRecipe {
@@ -240,6 +380,9 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 12,
             tech_gate: Some(CUNEIFORM_WRITING),
             requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![stitch],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 12 — P7: Smoke 2 fresh meat into 3 preserved (lighter, banked
         // for migration). Workbench gating keeps this off the wild trail
@@ -254,6 +397,9 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 4,
             tech_gate: Some(FOOD_SMOKING),
             requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![cut],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 13 — Boiling raw water into clean drinking water at a hearth /
         // workbench. Requires `FIRE_MAKING`; consumes 2 raw_water and a
@@ -271,6 +417,9 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 2,
             tech_gate: Some(FIRE_MAKING),
             requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 14 — Draftwork v2: wooden ard plow. Gated on `ARD_PLOW` tech;
         // 3 wood + 1 tools at a Workbench. The plow is durable — the
@@ -280,7 +429,7 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
         // v2.1 follow-up).
         CraftRecipe {
             name: "Ard Plow",
-            inputs: vec![(wood, 3), (tools, 1)],
+            inputs: vec![(wood, 4)],
             output_resource: ard_plow,
             output_qty: 1,
             output_material: Some(ItemMaterial::Wood),
@@ -288,12 +437,15 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 6,
             tech_gate: Some(ARD_PLOW),
             requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![shape],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 15 — Cart Wheel (Wood). Legacy composable cart part — retained as a
         // catalog resource; vehicle assembly now uses the `design_bill` path.
         CraftRecipe {
             name: "Cart Wheel (Wood)",
-            inputs: vec![(wood, 3), (tools, 1)],
+            inputs: vec![(wood, 4)],
             output_resource: cart_wheel_wood,
             output_qty: 1,
             output_material: Some(ItemMaterial::Wood),
@@ -301,12 +453,15 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 5,
             tech_gate: Some(ANIMAL_HUSBANDRY),
             requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![shape],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 16 — Cart Wheel (Iron-Rimmed). An iron tyre removes the wooden
         // wheel's drag penalty; gated on metallurgy.
         CraftRecipe {
             name: "Cart Wheel (Iron-Rimmed)",
-            inputs: vec![(wood, 3), (tools, 1), (iron, 1)],
+            inputs: vec![(wood, 4), (iron, 1)],
             output_resource: cart_wheel_ironrim,
             output_qty: 1,
             output_material: Some(ItemMaterial::Wood),
@@ -314,11 +469,14 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 8,
             tech_gate: Some(BRONZE_CASTING),
             requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![smith],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 17 — Cart Frame (Small). Light frame → Handcart on assembly.
         CraftRecipe {
             name: "Cart Frame (Small)",
-            inputs: vec![(wood, 5), (tools, 1)],
+            inputs: vec![(wood, 6)],
             output_resource: cart_frame_small,
             output_qty: 1,
             output_material: Some(ItemMaterial::Wood),
@@ -326,12 +484,15 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 6,
             tech_gate: Some(ANIMAL_HUSBANDRY),
             requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![shape],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 18 — Cart Frame (Medium). Heavy frame → OxCart on assembly;
         // gated on `OX_CART` tech.
         CraftRecipe {
             name: "Cart Frame (Medium)",
-            inputs: vec![(wood, 10), (tools, 2), (skin, 2)],
+            inputs: vec![(wood, 12), (skin, 2)],
             output_resource: cart_frame_medium,
             output_qty: 1,
             output_material: Some(ItemMaterial::Wood),
@@ -339,6 +500,9 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 10,
             tech_gate: Some(OX_CART),
             requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![shape],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // 19 — Smoke/dried fish. Mirrors Preserved Meat (recipe 12): the
         // ration doesn't perish and weighs less per food-unit, so bands
@@ -353,6 +517,9 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 4,
             tech_gate: Some(FOOD_SMOKING),
             requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![cut],
+            quality_floor: None,
+            min_station_tier: None,
         },
         // Sling — cheap ranged weapon (range 4). Appended last so existing
         // recipe indices stay stable.
@@ -366,7 +533,108 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             crafting_xp: 4,
             tech_gate: Some(BOW_AND_ARROW),
             requires_station: None,
+            tool_requirements: vec![],
+            quality_floor: None,
+            min_station_tier: None,
         },
+        // ── Realistic Tool Overhaul: functional tool recipes (21+) ────
+        // Paleolithic — bootstrap-safe stone tools (loose stone + wood,
+        // no tool requirement). FLINT_KNAPPING is a Paleolithic personal
+        // tech every founder is seeded Aware of.
+        // 21
+        tool_recipe("Stone Knife", vec![(stone, 1), (wood, 1)], knife,
+            ItemMaterial::Stone, 30, 4, FLINT_KNAPPING, vec![], None, None),
+        // 22
+        tool_recipe("Stone Axe", vec![(stone, 2), (wood, 1)], axe,
+            ItemMaterial::Stone, 40, 5, FLINT_KNAPPING, vec![], None, None),
+        // 23
+        tool_recipe("Stone Pick", vec![(stone, 2), (wood, 1)], pick,
+            ItemMaterial::Stone, 45, 5, FLINT_KNAPPING, vec![], None, None),
+        // 24
+        tool_recipe("Stone Hammer", vec![(stone, 2), (wood, 1)], hammer,
+            ItemMaterial::Stone, 40, 5, FLINT_KNAPPING, vec![], None, None),
+        // 25 — Bone Awl: needs a Knife to work the bone, gated BONE_TOOLS.
+        tool_recipe("Bone Awl", vec![(bone, 1), (stone, 1)], awl,
+            ItemMaterial::Bone, 25, 4, BONE_TOOLS, vec![cut], None, None),
+        // Mesolithic — microlithic stone (Fine quality floor).
+        // 26
+        tool_recipe("Microlithic Knife", vec![(stone, 1), (wood, 1)], knife,
+            ItemMaterial::Stone, 35, 6, MICROLITHIC_TOOLS, vec![], Some(ItemQuality::Fine), None),
+        // 27
+        tool_recipe("Microlithic Axe", vec![(stone, 2), (wood, 1)], axe,
+            ItemMaterial::Stone, 45, 7, MICROLITHIC_TOOLS, vec![], Some(ItemQuality::Fine), None),
+        // 28
+        tool_recipe("Microlithic Pick", vec![(stone, 2), (wood, 1)], pick,
+            ItemMaterial::Stone, 50, 7, MICROLITHIC_TOOLS, vec![], Some(ItemQuality::Fine), None),
+        // 29 — Bone Fishing Kit: needs a Knife, gated FISHING.
+        tool_recipe("Bone Fishing Kit", vec![(bone, 1), (skin, 1)], fishing_kit,
+            ItemMaterial::Bone, 45, 5, FISHING, vec![cut], None, None),
+        // Neolithic — polished stone + the first sickle.
+        // 30
+        tool_recipe("Polished Stone Axe", vec![(stone, 2), (wood, 1), (skin, 1)], axe,
+            ItemMaterial::Stone, 50, 8, CROP_CULTIVATION, vec![smith], Some(ItemQuality::Fine), None),
+        // 31
+        tool_recipe("Polished Stone Hammer", vec![(stone, 2), (wood, 1)], hammer,
+            ItemMaterial::Stone, 50, 8, CROP_CULTIVATION, vec![smith], Some(ItemQuality::Fine), None),
+        // 32
+        tool_recipe("Stone Sickle", vec![(stone, 2), (wood, 1), (skin, 1)], sickle,
+            ItemMaterial::Stone, 45, 7, CROP_CULTIVATION, vec![cut], None, None),
+        // Chalcolithic — copper working set (needs a stone+ hammer + a
+        // copper-tier workbench).
+        // 33
+        tool_recipe("Copper Knife", vec![(copper, 1), (wood, 1)], knife,
+            ItemMaterial::Copper, 40, 8, COPPER_TOOLS, vec![hammer_stone], None,
+            Some(WorkbenchTier::Copper)),
+        // 34
+        tool_recipe("Copper Axe", vec![(copper, 2), (wood, 1)], axe,
+            ItemMaterial::Copper, 50, 9, COPPER_TOOLS, vec![hammer_stone], None,
+            Some(WorkbenchTier::Copper)),
+        // 35
+        tool_recipe("Copper Pick", vec![(copper, 2), (wood, 1)], pick,
+            ItemMaterial::Copper, 55, 9, COPPER_TOOLS, vec![hammer_stone], None,
+            Some(WorkbenchTier::Copper)),
+        // 36
+        tool_recipe("Copper Hammer", vec![(copper, 2), (wood, 1)], hammer,
+            ItemMaterial::Copper, 50, 9, COPPER_TOOLS, vec![hammer_stone], None,
+            Some(WorkbenchTier::Copper)),
+        // 37
+        tool_recipe("Copper Sickle", vec![(copper, 1), (wood, 1), (skin, 1)], sickle,
+            ItemMaterial::Copper, 48, 8, COPPER_TOOLS, vec![hammer_stone], None,
+            Some(WorkbenchTier::Copper)),
+        // 38
+        tool_recipe("Copper Awl", vec![(copper, 1), (skin, 1)], awl,
+            ItemMaterial::Copper, 35, 7, COPPER_TOOLS, vec![hammer_stone], None,
+            Some(WorkbenchTier::Copper)),
+        // Bronze Age — bronze working set (copper + tin, copper+ hammer,
+        // a bronze-tier workbench).
+        // 39
+        tool_recipe("Bronze Knife", vec![(copper, 1), (tin, 1), (wood, 1)], knife,
+            ItemMaterial::Bronze, 45, 10, BRONZE_TOOLS, vec![hammer_copper], None,
+            Some(WorkbenchTier::Bronze)),
+        // 40
+        tool_recipe("Bronze Axe", vec![(copper, 2), (tin, 1), (wood, 1)], axe,
+            ItemMaterial::Bronze, 55, 11, BRONZE_TOOLS, vec![hammer_copper], None,
+            Some(WorkbenchTier::Bronze)),
+        // 41
+        tool_recipe("Bronze Pick", vec![(copper, 2), (tin, 1), (wood, 1)], pick,
+            ItemMaterial::Bronze, 60, 11, BRONZE_TOOLS, vec![hammer_copper], None,
+            Some(WorkbenchTier::Bronze)),
+        // 42
+        tool_recipe("Bronze Hammer", vec![(copper, 2), (tin, 1), (wood, 1)], hammer,
+            ItemMaterial::Bronze, 55, 11, BRONZE_TOOLS, vec![hammer_copper], None,
+            Some(WorkbenchTier::Bronze)),
+        // 43
+        tool_recipe("Bronze Sickle", vec![(copper, 1), (tin, 1), (wood, 1), (skin, 1)], sickle,
+            ItemMaterial::Bronze, 52, 10, BRONZE_TOOLS, vec![hammer_copper], None,
+            Some(WorkbenchTier::Bronze)),
+        // 44
+        tool_recipe("Bronze Awl", vec![(copper, 1), (tin, 1), (skin, 1)], awl,
+            ItemMaterial::Bronze, 40, 9, BRONZE_TOOLS, vec![hammer_copper], None,
+            Some(WorkbenchTier::Bronze)),
+        // 45
+        tool_recipe("Bronze Fishing Kit", vec![(copper, 1), (tin, 1), (skin, 1)], fishing_kit,
+            ItemMaterial::Bronze, 50, 10, BRONZE_TOOLS, vec![hammer_copper], None,
+            Some(WorkbenchTier::Bronze)),
     ]
 }
 
@@ -492,6 +760,7 @@ pub fn faction_craft_order_system(
     loom_map: Res<LoomMap>,
     mut order_map: ResMut<CraftOrderMap>,
     order_query: Query<&CraftOrder>,
+    workbench_query: Query<&crate::simulation::construction::Workbench>,
     agent_query: Query<(&FactionMember, &EconomicAgent, &LodLevel)>,
 ) {
     if clock.tick % 60 != 0 {
@@ -622,6 +891,15 @@ pub fn faction_craft_order_system(
                             let dy = (*ty as i32 - faction.home_tile.1 as i32).abs();
                             dx <= 16 && dy <= 16
                         })
+                        // Realistic Tool Overhaul: copper/bronze recipes need
+                        // a workbench of at least that tier.
+                        .filter(|(_, &e)| match recipe_def.min_station_tier {
+                            Some(min) => workbench_query
+                                .get(e)
+                                .map(|wb| wb.tier.rank() >= min.rank())
+                                .unwrap_or(true),
+                            None => true,
+                        })
                         .map(|(&pos, _)| (pos, Some(pos)))
                         .next(),
                     Some(crate::simulation::crafting::StationKind::Loom) => loom_map
@@ -714,11 +992,14 @@ pub fn craft_order_system(
         &Transform,
         Option<&JobClaim>,
         Option<&crate::simulation::apprenticeship::ApprenticeOf>,
+        Option<&crate::simulation::tools::ToolKit>,
     )>,
 ) {
     let mut order_haulers: AHashMap<Entity, Vec<(Entity, [u32; MAX_CRAFT_INPUTS])>> =
         AHashMap::new();
-    let mut order_workers: AHashMap<Entity, Vec<Entity>> = AHashMap::new();
+    // Realistic Tool Overhaul: each worker carries a per-tick work-speed
+    // multiplier derived from the tier of the tools they hold.
+    let mut order_workers: AHashMap<Entity, Vec<(Entity, f32)>> = AHashMap::new();
 
     for (
         entity,
@@ -733,6 +1014,7 @@ pub fn craft_order_system(
         _transform,
         _claim,
         _apprentice,
+        toolkit,
     ) in agent_query.iter_mut()
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -792,7 +1074,33 @@ pub fn craft_order_system(
                 .or_default()
                 .push((entity, snap));
         } else {
-            order_workers.entry(order_entity).or_default().push(entity);
+            // Realistic Tool Overhaul: a worker must hold every tool the
+            // recipe requires (in their `ToolKit`) before they can advance
+            // the order. A stale plan that lost its tool cancels here so it
+            // can't silently spin.
+            let speed = if let Some(recipe) = craft_recipes().get(order.recipe_id as usize) {
+                if !recipe.tool_requirements.is_empty() {
+                    // A worker with no `ToolKit` at all predates the tool
+                    // system (or is a fixture agent) — treat as satisfied so
+                    // the gate degrades gracefully; an *empty* kit blocks.
+                    let satisfied = recipe
+                        .tool_requirements
+                        .iter()
+                        .all(|req| toolkit.map(|tk| tk.satisfies(req)).unwrap_or(true));
+                    if !satisfied {
+                        aq.cancel_chain(&mut ai);
+                        ai.target_entity = None;
+                        continue;
+                    }
+                }
+                craft_tool_speed(recipe, toolkit)
+            } else {
+                1.0
+            };
+            order_workers
+                .entry(order_entity)
+                .or_default()
+                .push((entity, speed));
         }
     }
 
@@ -830,7 +1138,7 @@ pub fn craft_order_system(
                 orphaned_agents.extend(haulers.iter().map(|(e, _)| *e));
             }
             if let Some(workers) = order_workers.get(&order_entity) {
-                orphaned_agents.extend(workers.iter().copied());
+                orphaned_agents.extend(workers.iter().map(|(e, _)| *e));
             }
             continue;
         };
@@ -857,7 +1165,7 @@ pub fn craft_order_system(
         let Some(recipe) = craft_recipes().get(order.recipe_id as usize) else {
             // Unknown recipe — clean up.
             if let Some(workers) = order_workers.get(&order_entity) {
-                orphaned_agents.extend(workers.iter().copied());
+                orphaned_agents.extend(workers.iter().map(|(e, _)| *e));
             }
             if let Some(haulers) = order_haulers.get(&order_entity) {
                 orphaned_agents.extend(haulers.iter().map(|(e, _)| *e));
@@ -869,14 +1177,22 @@ pub fn craft_order_system(
 
         if order.is_satisfied() {
             if let Some(workers) = order_workers.get(&order_entity) {
-                let advance = workers.len() as u8;
+                // Realistic Tool Overhaul: each worker advances the order by
+                // their tool-tier work-speed multiplier (≥1 tick total so a
+                // crew never stalls).
+                let advance = workers
+                    .iter()
+                    .map(|(_, s)| *s)
+                    .sum::<f32>()
+                    .round()
+                    .max(1.0) as u8;
                 order.work_progress = order
                     .work_progress
                     .saturating_add(advance)
                     .min(recipe.work_ticks);
-                xp_grants.extend(workers.iter().copied());
+                xp_grants.extend(workers.iter().map(|(e, _)| *e));
                 if order.work_progress < recipe.work_ticks {
-                    slice_candidates.extend(workers.iter().copied());
+                    slice_candidates.extend(workers.iter().map(|(e, _)| *e));
                 }
             }
         }
@@ -887,7 +1203,7 @@ pub fn craft_order_system(
             // to a specific tile.
             let lead = order_workers
                 .get(&order_entity)
-                .and_then(|v| v.first().copied());
+                .and_then(|v| v.first().map(|(e, _)| *e));
             if let Some(lead_e) = lead {
                 output_grants.push((lead_e, order.recipe_id, order.tech_payload));
                 order_completion_credits.push((lead_e, order.recipe_id, recipe.output_qty));
@@ -904,7 +1220,7 @@ pub fn craft_order_system(
             commands.entity(order_entity).despawn_recursive();
 
             if let Some(workers) = order_workers.get(&order_entity) {
-                completed_agents.extend(workers.iter().copied());
+                completed_agents.extend(workers.iter().map(|(e, _)| *e));
             }
             if let Some(haulers) = order_haulers.get(&order_entity) {
                 completed_agents.extend(haulers.iter().map(|(e, _)| *e));
@@ -935,6 +1251,7 @@ pub fn craft_order_system(
         transform,
         claim,
         apprentice,
+        _toolkit,
     ) in agent_query.iter_mut()
     {
         for &(ae, id, qty) in &good_removals {
@@ -964,7 +1281,10 @@ pub fn craft_order_system(
             let Some(recipe) = craft_recipes().get(recipe_id as usize) else {
                 continue;
             };
-            let quality = quality_for_skill(skills.get(SkillKind::Crafting));
+            // Realistic Tool Overhaul: microlithic / polished recipes floor
+            // the output quality so a low-skill crafter still hits the tier.
+            let quality =
+                recipe.effective_quality(quality_for_skill(skills.get(SkillKind::Crafting)));
             let mut output_item = if let Some(mat) = recipe.output_material {
                 Item::new_manufactured(recipe.output_resource, mat, quality)
             } else {
@@ -1108,8 +1428,9 @@ mod tests {
         let recipes = craft_recipes();
         assert_eq!(
             recipes.len(),
-            21,
-            "expected 21 recipes; counts feed CraftOrder.recipe_id wire format"
+            46,
+            "expected 46 recipes (21 legacy + 25 Realistic Tool Overhaul); \
+             counts feed CraftOrder.recipe_id wire format"
         );
 
         // Stone Tools (recipe 0): Stone×2 + Wood×1 → Tools×1
@@ -1131,13 +1452,13 @@ mod tests {
         );
         assert_eq!(book.output_resource, core_ids::book());
 
-        // Ard Plow (recipe 14): Wood×3 + Tools×1 → ard_plow×1, gated on ARD_PLOW.
+        // Ard Plow (recipe 14): Wood×4 → ard_plow×1, gated on ARD_PLOW.
+        // Realistic Tool Overhaul dropped the `tools` ingredient in favour
+        // of a held-tool requirement (`Shape`).
         let ard_plow = &recipes[14];
         assert_eq!(ard_plow.name, "Ard Plow");
-        assert_eq!(
-            ard_plow.inputs,
-            vec![(core_ids::wood(), 3), (core_ids::tools(), 1)]
-        );
+        assert_eq!(ard_plow.inputs, vec![(core_ids::wood(), 4)]);
+        assert!(!ard_plow.tool_requirements.is_empty());
         assert_eq!(ard_plow.output_resource, core_ids::ard_plow());
         assert_eq!(ard_plow.output_qty, 1);
         assert_eq!(
@@ -1150,7 +1471,7 @@ mod tests {
         assert_eq!(recipes[15].output_resource, core_ids::cart_wheel_wood());
         assert_eq!(recipes[16].name, "Cart Wheel (Iron-Rimmed)");
         assert_eq!(recipes[16].output_resource, core_ids::cart_wheel_ironrim());
-        assert_eq!(recipes[16].inputs.len(), 3);
+        assert_eq!(recipes[16].inputs.len(), 2);
         assert_eq!(recipes[17].name, "Cart Frame (Small)");
         assert_eq!(recipes[17].output_resource, core_ids::cart_frame_small());
         assert_eq!(recipes[18].name, "Cart Frame (Medium)");
@@ -1158,6 +1479,64 @@ mod tests {
         assert_eq!(
             recipes[18].tech_gate,
             Some(crate::simulation::technology::OX_CART)
+        );
+    }
+
+    /// Realistic Tool Overhaul: the 25 appended tool recipes resolve to the
+    /// tool catalog resources, gate on the right tech, and the bronze set
+    /// carries a copper-hammer requirement + bronze-workbench tier.
+    #[test]
+    fn tool_recipes_are_well_formed() {
+        use crate::economy::core_ids;
+        use crate::simulation::tools::{ToolForm, ToolTier};
+        let recipes = craft_recipes();
+
+        // Stone Knife (21) — bootstrap-safe: no tool requirement.
+        let stone_knife = &recipes[21];
+        assert_eq!(stone_knife.name, "Stone Knife");
+        assert_eq!(stone_knife.output_resource, core_ids::knife());
+        assert!(stone_knife.tool_requirements.is_empty());
+
+        // Microlithic Knife (26) — Fine quality floor.
+        let micro = &recipes[26];
+        assert_eq!(micro.name, "Microlithic Knife");
+        assert_eq!(micro.quality_floor, Some(ItemQuality::Fine));
+
+        // Bronze Axe (40) — copper+tin output, copper-hammer floor,
+        // bronze-tier workbench.
+        let bronze_axe = &recipes[40];
+        assert_eq!(bronze_axe.name, "Bronze Axe");
+        assert_eq!(bronze_axe.output_resource, core_ids::axe());
+        assert_eq!(bronze_axe.output_material, Some(ItemMaterial::Bronze));
+        assert_eq!(bronze_axe.min_station_tier, Some(WorkbenchTier::Bronze));
+        assert_eq!(bronze_axe.tool_requirements.len(), 1);
+        assert_eq!(bronze_axe.tool_requirements[0].min_tier, ToolTier::Copper);
+
+        // Every appended recipe (21..) outputs a known tool form.
+        for r in &recipes[21..] {
+            assert!(
+                ToolForm::from_resource_id(r.output_resource).is_some(),
+                "recipe {} should output a tool form",
+                r.name
+            );
+        }
+    }
+
+    /// `effective_quality` lifts a low skill result up to the recipe floor
+    /// but never lowers a better one.
+    #[test]
+    fn quality_floor_lifts_low_skill_output() {
+        let recipes = craft_recipes();
+        let micro = &recipes[26]; // floor = Fine
+        assert_eq!(micro.effective_quality(ItemQuality::Poor), ItemQuality::Fine);
+        assert_eq!(
+            micro.effective_quality(ItemQuality::Masterwork),
+            ItemQuality::Masterwork
+        );
+        let stone_knife = &recipes[21]; // no floor
+        assert_eq!(
+            stone_knife.effective_quality(ItemQuality::Poor),
+            ItemQuality::Poor
         );
     }
 }

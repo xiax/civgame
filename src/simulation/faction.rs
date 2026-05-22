@@ -3834,6 +3834,7 @@ pub fn resource_demand_system(
         &crate::simulation::person::Profession,
         &crate::simulation::items::Equipment,
         &crate::simulation::carry::Carrier,
+        Option<&crate::simulation::tools::ToolKit>,
     )>,
     bp_map: Res<crate::simulation::construction::BlueprintMap>,
     bp_query: Query<&crate::simulation::construction::Blueprint>,
@@ -3909,9 +3910,26 @@ pub fn resource_demand_system(
     let mut unarmored: ahash::AHashMap<u32, u32> = ahash::AHashMap::default();
     let mut unshielded: ahash::AHashMap<u32, u32> = ahash::AHashMap::default();
     let mut unclothed: ahash::AHashMap<u32, u32> = ahash::AHashMap::default();
-    for (entity, member, agent, profession, equipment, carrier) in agent_query.iter() {
+    // Realistic Tool Overhaul: per-faction per-form tool tally (member kits +
+    // hands + inventory). Feeds `compute_faction_tool_deficits`.
+    let mut tool_have: ahash::AHashMap<
+        u32,
+        ahash::AHashMap<crate::simulation::tools::ToolForm, u32>,
+    > = ahash::AHashMap::default();
+    for (entity, member, agent, profession, equipment, carrier, toolkit) in agent_query.iter() {
         if member.faction_id == SOLO {
             continue;
+        }
+        // Tally this member's stowed tools by form.
+        if let Some(kit) = toolkit {
+            let entry = tool_have.entry(member.faction_id).or_default();
+            for item in &kit.items {
+                if let Some(form) =
+                    crate::simulation::tools::ToolForm::from_resource_id(item.resource_id)
+                {
+                    *entry.entry(form).or_insert(0) += 1;
+                }
+            }
         }
         if let Some(faction) = registry.factions.get_mut(&member.faction_id) {
             for (item, qty) in &agent.inventory {
@@ -4065,6 +4083,30 @@ pub fn resource_demand_system(
             cloth,
             ard_plow,
             tools,
+            tool_form_deficits: {
+                // Member-kit tally + faction storage stacks (storage rollup
+                // keys by resource_id, so each tool form's stock is exact)
+                // + in-flight tool crafts.
+                let mut have = tool_have.get(&fid).cloned().unwrap_or_default();
+                let f = &registry.factions[&fid];
+                for form in crate::simulation::tools::ToolForm::ALL {
+                    let rid = form.resource_id();
+                    let extra = f.storage.stock_of(rid)
+                        + in_flight.get(&(fid, rid)).copied().unwrap_or(0);
+                    if extra > 0 {
+                        *have.entry(form).or_insert(0) += extra;
+                    }
+                }
+                let era = crate::simulation::technology::current_era(&f.techs);
+                crate::simulation::jobs::compute_faction_tool_deficits(
+                    era,
+                    f.member_count,
+                    f.techs.has(crate::simulation::technology::BONE_TOOLS),
+                    f.techs.has(crate::simulation::technology::FISHING),
+                    f.techs.has(crate::simulation::technology::CROP_CULTIVATION),
+                    &have,
+                )
+            },
         };
         let demand = crate::simulation::jobs::compute_craft_demand(&inputs);
         if let Some(f) = registry.factions.get_mut(&fid) {

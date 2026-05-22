@@ -8,6 +8,12 @@ pub enum ItemMaterial {
     Iron,
     Steel,
     Leather,
+    /// Tool materials (Realistic Tool Overhaul). `Bone` is the crudest tool
+    /// stock; `Copper`/`Bronze` are the Chalcolithic/Bronze-Age metals. Iron/
+    /// Steel remain for legacy/future weapon recipes.
+    Bone,
+    Copper,
+    Bronze,
 }
 
 impl ItemMaterial {
@@ -18,6 +24,9 @@ impl ItemMaterial {
             ItemMaterial::Iron => 3.0,
             ItemMaterial::Steel => 6.0,
             ItemMaterial::Leather => 2.5,
+            ItemMaterial::Bone => 1.2,
+            ItemMaterial::Copper => 2.2,
+            ItemMaterial::Bronze => 2.8,
         }
     }
 
@@ -28,6 +37,9 @@ impl ItemMaterial {
             ItemMaterial::Iron => 1.6,
             ItemMaterial::Steel => 1.5,
             ItemMaterial::Leather => 0.8,
+            ItemMaterial::Bone => 0.5,
+            ItemMaterial::Copper => 1.5,
+            ItemMaterial::Bronze => 1.5,
         }
     }
 }

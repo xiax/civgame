@@ -538,6 +538,21 @@ pub enum Task {
     SiegeWall {
         target_tile: (i32, i32),
     },
+    /// Realistic Tool Overhaul: withdraw the best matching tool `Item` from a
+    /// faction storage tile (routed via `ai.dest_tile`). Unlike
+    /// `WithdrawMaterial` (a bare resource + count), this selects the
+    /// highest-tier full `Item` satisfying `req`. The withdrawn tool lands in
+    /// the worker's `EconomicAgent.inventory` and the chain continues into the
+    /// trailing `StowToolKit` leg.
+    WithdrawTool {
+        req: crate::simulation::tools::ToolRequirement,
+    },
+    /// In-place follow-up of `WithdrawTool`: move the just-withdrawn tool out
+    /// of inventory and into the worker's `ToolKit`, evicting the lowest-tier
+    /// resident tool back to storage/ground if the kit is full.
+    StowToolKit {
+        req: crate::simulation::tools::ToolRequirement,
+    },
 }
 
 /// Source for a `Task::Drink`. Inventory drinks consume one `clean_water`
@@ -913,6 +928,9 @@ pub fn task_kind_for(task: Task) -> u16 {
         Task::VehicleCargoHaul { .. } => TK::VehicleCargoHaul,
         Task::Fish { .. } => TK::Fishing,
         Task::SiegeWall { .. } => TK::SiegeWall,
+        // A tool withdraw shares the WithdrawMaterial executor + gate.
+        Task::WithdrawTool { .. } => TK::WithdrawMaterial,
+        Task::StowToolKit { .. } => TK::StowToolKit,
     };
     kind as u16
 }
@@ -950,6 +968,22 @@ impl Task {
     pub fn as_withdraw_material(&self) -> Option<(ResourceId, u8)> {
         match *self {
             Task::WithdrawMaterial { resource_id, qty } => Some((resource_id, qty)),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the WithdrawTool variant.
+    pub fn as_withdraw_tool(&self) -> Option<crate::simulation::tools::ToolRequirement> {
+        match *self {
+            Task::WithdrawTool { req } => Some(req),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the StowToolKit variant.
+    pub fn as_stow_toolkit(&self) -> Option<crate::simulation::tools::ToolRequirement> {
+        match *self {
+            Task::StowToolKit { req } => Some(req),
             _ => None,
         }
     }

@@ -487,6 +487,74 @@ pub fn withdraw_material_task_system(
                 .div_euclid(crate::world::chunk::CHUNK_SIZE as i32),
         );
 
+        // Realistic Tool Overhaul: a `WithdrawTool` shares this executor +
+        // gate. It selects the best full tool `Item` (material + quality
+        // preserved) satisfying the requirement, picks it into `Carrier`
+        // hands, then the chain continues into the in-place `StowToolKit`
+        // leg. Distinct from `WithdrawMaterial`, which moves bare counts.
+        if let Some(req) = aq.current.as_withdraw_tool() {
+            let (tx, ty) = ai.dest_tile;
+            let mut took = false;
+            if member.faction_id != SOLO
+                && storage_tile_map.tiles.get(&(tx, ty)) == Some(&member.faction_id)
+            {
+                // Pick the highest-tier matching tool stack on the tile.
+                let mut best: Option<(bevy::prelude::Entity, Item)> = None;
+                for &gi_entity in spatial.get(tx as i32, ty as i32) {
+                    if let Ok(gi) = ground_items.get(gi_entity) {
+                        if gi.qty == 0 || !req.satisfied_by(&gi.item) {
+                            continue;
+                        }
+                        let better = best
+                            .as_ref()
+                            .map(|(_, it)| {
+                                crate::simulation::tools::item_tool_tier(&gi.item)
+                                    > crate::simulation::tools::item_tool_tier(it)
+                            })
+                            .unwrap_or(true);
+                        if better {
+                            best = Some((gi_entity, gi.item));
+                        }
+                    }
+                }
+                if let Some((gi_entity, item)) = best {
+                    let leftover = carrier.try_pick_up(item, 1);
+                    if leftover == 0 {
+                        if let Ok(mut gi) = ground_items.get_mut(gi_entity) {
+                            if gi.qty <= 1 {
+                                commands.entity(gi_entity).despawn_recursive();
+                            } else {
+                                gi.qty -= 1;
+                            }
+                            took = true;
+                        }
+                    }
+                }
+            }
+            release_reservation(&storage_reservations, &mut ai);
+            ai.work_progress = 0;
+            aq.advance();
+            // The trailing `StowToolKit` leg is in-place — prime the worker so
+            // `stow_toolkit_task_system` fires next tick. If nothing was
+            // withdrawn, the stow leg degrades to a no-op self-advance.
+            let _ = took;
+            if matches!(aq.current, Task::StowToolKit { .. }) {
+                ai.state = AiState::Working;
+                ai.work_progress = 0;
+            } else {
+                ai.state = AiState::Idle;
+                ai.target_entity = None;
+                if !took {
+                    crate::simulation::htn::record_target_failure(
+                        &mut method_history,
+                        &mut ai,
+                        clock.tick,
+                    );
+                }
+            }
+            continue;
+        }
+
         // Phase 3b-ii: target good + qty come from the typed variant. If the
         // typed task disagrees with task_id, the dispatcher forgot to populate
         // it — bail rather than fall back to stale legacy intent.

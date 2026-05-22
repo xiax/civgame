@@ -87,6 +87,7 @@ pub mod technology_adoption;
 pub mod terraform;
 #[cfg(test)]
 pub mod test_fixture;
+pub mod tools;
 pub mod trader;
 pub mod typed_task;
 pub mod utility_curves;
@@ -471,17 +472,28 @@ impl Plugin for SimulationPlugin {
                         .after(animals::spawn_animals)
                         .after(faction::sync_faction_techs_from_chief_system)
                         .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
-                    // Flip the warmup gate now that the initial survey +
-                    // seed have applied. Future systems can opt in via
-                    // `.run_if(in_state(SimulationState::Active))`.
-                    mark_warmup_complete_system
-                        .after(clear_obstacle::clear_obstacles_under_seeded_structures)
-                        .after(farm::seed_starting_farms_system)
-                        .after(seed_reservation::populate_seed_reservation_system)
-                        .after(settlement_bootstrap::seed_starting_relationships_system)
-                        .after(settlement_bootstrap::relocate_stranded_members_system)
-                        .after(animals::seed_starting_tamed_animals_system)
-                        .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    (
+                        // Realistic Tool Overhaul: seed era-appropriate tool
+                        // loadouts into member `ToolKit`s + faction storage
+                        // so the gather / dig / fish / craft tool gates are
+                        // satisfiable from tick 0.
+                        tools::seed_starting_tools_system
+                            .after(farm::seed_starting_farms_system)
+                            .after(construction::seed_starting_buildings_system)
+                            .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                        // Flip the warmup gate now that the initial survey +
+                        // seed have applied. Future systems can opt in via
+                        // `.run_if(in_state(SimulationState::Active))`.
+                        mark_warmup_complete_system
+                            .after(clear_obstacle::clear_obstacles_under_seeded_structures)
+                            .after(farm::seed_starting_farms_system)
+                            .after(seed_reservation::populate_seed_reservation_system)
+                            .after(settlement_bootstrap::seed_starting_relationships_system)
+                            .after(settlement_bootstrap::relocate_stranded_members_system)
+                            .after(animals::seed_starting_tamed_animals_system)
+                            .after(tools::seed_starting_tools_system)
+                            .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
+                    ),
                 ),
             )
             .add_systems(
@@ -639,12 +651,30 @@ impl Plugin for SimulationPlugin {
                 )
                     .in_set(SimulationSet::ParallelB),
             )
+            // Realistic Tool Overhaul: tool-acquisition dispatcher in its own
+            // add_systems call to dodge the 20-element ParallelB tuple
+            // ceiling. Goal-agnostic — runs ahead of every work dispatcher
+            // (`htn_acquire_good`, `htn_plant_from_storage`,
+            // `htn_build_claimed_blueprint`, etc.) so a worker about to
+            // Gather/Fish/Dig/Craft picks up the right tool first.
+            .add_systems(
+                FixedUpdate,
+                (tools::htn_acquire_tool_dispatch_system
+                    .after(htn::htn_equip_hunting_spear_dispatch_system)
+                    .before(htn::htn_acquire_food_dispatch_system)
+                    .before(htn::htn_acquire_good_dispatch_system)
+                    .before(htn::htn_plant_from_storage_dispatch_system)
+                    .before(htn::htn_build_claimed_blueprint_dispatch_system)
+                    .before(htn::htn_stockpile_food_dispatch_system),)
+                    .in_set(SimulationSet::ParallelB),
+            )
             .add_systems(
                 FixedUpdate,
                 (terraform::terraform_dispatch_system
                     .after(tasks::goal_dispatch_system)
                     .after(htn::htn_dispatch_system)
                     .after(htn::htn_equip_hunting_spear_dispatch_system)
+                    .after(tools::htn_acquire_tool_dispatch_system)
                     .after(htn::htn_eat_dispatch_system)
                     .after(htn::htn_acquire_food_dispatch_system)
                     .after(htn::htn_acquire_good_dispatch_system)
@@ -1048,6 +1078,11 @@ impl Plugin for SimulationPlugin {
                         // keep the Sequential tuple within Bevy's 20-arity
                         // `IntoSystemConfigs` limit.
                         production::buy_material_task_system.after(movement::movement_system),
+                        // Realistic Tool Overhaul: in-place follow-up of a
+                        // `WithdrawTool` leg — moves the withdrawn tool from
+                        // hands into the worker's `ToolKit`.
+                        tools::stow_toolkit_task_system
+                            .after(production::withdraw_material_task_system),
                     ),
                     production::take_from_member_task_system.after(movement::movement_system),
                     production::withdraw_good_task_system.after(movement::movement_system),

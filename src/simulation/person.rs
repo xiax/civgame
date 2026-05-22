@@ -789,6 +789,9 @@ pub(crate) fn spawn_faction_band(
                 (
                     crate::simulation::social_contact::SecondarySocial::inactive(),
                     crate::simulation::energy::Energy::default(),
+                    crate::simulation::tools::ToolKit::new(
+                        crate::simulation::tools::capacity_for_era(era),
+                    ),
                 ),
             ))
             .id();

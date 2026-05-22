@@ -3501,6 +3501,45 @@ pub struct CraftDemandInputs {
     pub cloth: crate::economy::resource_catalog::ResourceId,
     pub ard_plow: crate::economy::resource_catalog::ResourceId,
     pub tools: crate::economy::resource_catalog::ResourceId,
+    /// Realistic Tool Overhaul: per-form tool deficits the faction needs
+    /// crafted — `(tool resource_id, missing count)`. Computed by
+    /// `compute_faction_tool_summary` from member `ToolKit`s + storage.
+    /// Replaces the generic `tools` demand path for functional tools (the
+    /// `tools` commodity stays only as the Ard-Plow recipe ingredient).
+    pub tool_form_deficits: Vec<(crate::economy::resource_catalog::ResourceId, u32)>,
+}
+
+/// Realistic Tool Overhaul: per-faction tool inventory summary. Counts how
+/// many tools of each [`ToolForm`] the faction holds (member `ToolKit`s +
+/// faction-storage tool stacks) and computes the deficit against the era
+/// baseline — at minimum one of every form the faction's tech unlocks, plus
+/// roughly one core tool per two members so the gather/dig gates aren't
+/// starved. Returns `(tool resource_id, missing count)` pairs.
+pub fn compute_faction_tool_deficits(
+    era: crate::simulation::technology::Era,
+    member_count: u32,
+    has_bone_tools: bool,
+    has_fishing: bool,
+    has_crop_cultivation: bool,
+    have_by_form: &AHashMap<crate::simulation::tools::ToolForm, u32>,
+) -> Vec<(crate::economy::resource_catalog::ResourceId, u32)> {
+    use crate::simulation::tools::starting_tool_loadout;
+    let mut out = Vec::new();
+    // Reuse the seeding loadout as the "want" baseline — same era scaling.
+    for (form, _tier, want) in starting_tool_loadout(
+        era,
+        member_count,
+        has_bone_tools,
+        has_fishing,
+        has_crop_cultivation,
+    ) {
+        let have = have_by_form.get(&form).copied().unwrap_or(0);
+        let deficit = want.saturating_sub(have);
+        if deficit > 0 {
+            out.push((form.resource_id(), deficit));
+        }
+    }
+    out
 }
 
 /// Pure functional craft-demand computation. Returns a per-output netted
@@ -3550,6 +3589,14 @@ pub fn compute_craft_demand(
         }
     }
 
+    // Realistic Tool Overhaul: functional per-form tool demand. Replaces the
+    // generic `tools` commodity demand for actual working tools.
+    for (rid, deficit) in &inp.tool_form_deficits {
+        if *deficit > 0 {
+            out.insert(*rid, *deficit);
+        }
+    }
+
     out
 }
 
@@ -3563,9 +3610,12 @@ pub fn craft_priority(rid: crate::economy::resource_catalog::ResourceId) -> u8 {
     use crate::economy::core_ids;
     if rid == core_ids::weapon() {
         4
-    } else if rid == core_ids::tools() {
-        // Above Ard Plow so the plow's derived Tools ingredient is crafted
-        // first; below Weapon (the hard hunt/raid gate).
+    } else if rid == core_ids::tools()
+        || crate::simulation::tools::ToolForm::from_resource_id(rid).is_some()
+    {
+        // Functional tools (and the legacy `tools` ingredient) sit above Ard
+        // Plow / armor — a faction with no Pick can't even gather stone, so
+        // tools gate most other production. Below Weapon (hunt/raid gate).
         3
     } else if rid == core_ids::armor() || rid == core_ids::shield() {
         2
@@ -3611,6 +3661,7 @@ mod craft_demand_tests {
             cloth: CLOTH,
             ard_plow: ARD_PLOW,
             tools: TOOLS,
+            tool_form_deficits: Vec::new(),
         }
     }
 
