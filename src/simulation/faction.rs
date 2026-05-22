@@ -3860,6 +3860,9 @@ pub fn resource_demand_system(
     let grain = crate::economy::core_ids::grain();
     let tools = crate::economy::core_ids::tools();
     let weapon = crate::economy::core_ids::weapon();
+    let armor = crate::economy::core_ids::armor();
+    let shield = crate::economy::core_ids::shield();
+    let cloth = crate::economy::core_ids::cloth();
     let ard_plow = crate::economy::core_ids::ard_plow();
 
     // ── In-flight craft tally — units already being crafted, keyed
@@ -3893,10 +3896,19 @@ pub fn resource_demand_system(
     }
 
     // 1. Tally supply (agents' inventories + faction stocks) and, in the same
-    // pass, count unarmed combatants (Hunters + active raiders without a
-    // weapon equipped, carried, or in inventory).
+    // pass, count combatants (Hunters + active raiders) lacking a weapon /
+    // armor / shield, and members with a bare torso. Each `holds` check spans
+    // equipment + carrier hands + inventory — an item in any of those satisfies
+    // its holder, so it lowers the deficit count rather than feeding a spare
+    // pool (spare = storage + in-flight only, computed below).
     let is_weapon = |rid: ResourceId| rid.class() == Some(ResourceClass::Weapon);
+    let is_armor = |rid: ResourceId| rid.class() == Some(ResourceClass::Armor);
+    let is_shield = |rid: ResourceId| rid.class() == Some(ResourceClass::Shield);
+    let is_cloth = |rid: ResourceId| rid.class() == Some(ResourceClass::Cloth);
     let mut unarmed: ahash::AHashMap<u32, u32> = ahash::AHashMap::default();
+    let mut unarmored: ahash::AHashMap<u32, u32> = ahash::AHashMap::default();
+    let mut unshielded: ahash::AHashMap<u32, u32> = ahash::AHashMap::default();
+    let mut unclothed: ahash::AHashMap<u32, u32> = ahash::AHashMap::default();
     for (entity, member, agent, profession, equipment, carrier) in agent_query.iter() {
         if member.faction_id == SOLO {
             continue;
@@ -3908,25 +3920,44 @@ pub fn resource_demand_system(
                 }
             }
         }
-        let is_combatant = *profession == crate::simulation::person::Profession::Hunter
-            || registry.is_raid_party_member(member.faction_id, entity);
-        if is_combatant {
-            let armed = equipment.items.values().any(|it| is_weapon(it.resource_id))
+        // True when the agent holds (equips/carries/stows) any resource the
+        // class predicate accepts.
+        let holds = |class: &dyn Fn(ResourceId) -> bool| -> bool {
+            equipment.items.values().any(|it| class(it.resource_id))
                 || carrier
                     .left
                     .as_ref()
-                    .map_or(false, |s| is_weapon(s.item.resource_id))
+                    .map_or(false, |s| class(s.item.resource_id))
                 || carrier
                     .right
                     .as_ref()
-                    .map_or(false, |s| is_weapon(s.item.resource_id))
+                    .map_or(false, |s| class(s.item.resource_id))
                 || agent
                     .inventory
                     .iter()
-                    .any(|(it, q)| *q > 0 && is_weapon(it.resource_id));
-            if !armed {
+                    .any(|(it, q)| *q > 0 && class(it.resource_id))
+        };
+        let is_combatant = *profession == crate::simulation::person::Profession::Hunter
+            || registry.is_raid_party_member(member.faction_id, entity);
+        if is_combatant {
+            if !holds(&is_weapon) {
                 *unarmed.entry(member.faction_id).or_insert(0) += 1;
             }
+            if !holds(&is_armor) {
+                *unarmored.entry(member.faction_id).or_insert(0) += 1;
+            }
+            if !holds(&is_shield) {
+                *unshielded.entry(member.faction_id).or_insert(0) += 1;
+            }
+        }
+        // Bare torso: no cloth or armor in the TorsoArmor slot, no cloth stowed.
+        // Armor counts as clothing here — it covers the torso.
+        let clothed = equipment
+            .items
+            .contains_key(&crate::simulation::items::EquipmentSlot::TorsoArmor)
+            || holds(&is_cloth);
+        if !clothed {
+            *unclothed.entry(member.faction_id).or_insert(0) += 1;
         }
     }
 
@@ -3978,13 +4009,26 @@ pub fn resource_demand_system(
 
     let faction_ids: Vec<u32> = registry.factions.keys().copied().collect();
     for fid in faction_ids {
-        let (has_ard_plow_tech, ard_in_storage, weapon_in_storage, tools_in_storage) = {
+        let (
+            has_ard_plow_tech,
+            can_weave,
+            ard_in_storage,
+            weapon_in_storage,
+            tools_in_storage,
+            armor_in_storage,
+            shield_in_storage,
+            cloth_in_storage,
+        ) = {
             let f = &registry.factions[&fid];
             (
                 f.techs.has(crate::simulation::technology::ARD_PLOW),
+                f.techs.has(crate::simulation::technology::LOOM_WEAVING),
                 f.storage.stock_of(ard_plow),
                 f.storage.stock_of(weapon),
                 f.storage.stock_of(tools),
+                f.storage.stock_of(armor),
+                f.storage.stock_of(shield),
+                f.storage.stock_of(cloth),
             )
         };
         let has_ag_plot = !crate::simulation::farm::state_owned_ag_plots_for_faction(
@@ -4002,10 +4046,23 @@ pub fn resource_demand_system(
             unarmed_combatants: unarmed.get(&fid).copied().unwrap_or(0),
             spare_weapons: weapon_in_storage
                 + in_flight.get(&(fid, weapon)).copied().unwrap_or(0),
+            unarmored_combatants: unarmored.get(&fid).copied().unwrap_or(0),
+            unshielded_combatants: unshielded.get(&fid).copied().unwrap_or(0),
+            unclothed_members: unclothed.get(&fid).copied().unwrap_or(0),
+            can_weave,
+            spare_armor: armor_in_storage
+                + in_flight.get(&(fid, armor)).copied().unwrap_or(0),
+            spare_shield: shield_in_storage
+                + in_flight.get(&(fid, shield)).copied().unwrap_or(0),
+            spare_cloth: cloth_in_storage
+                + in_flight.get(&(fid, cloth)).copied().unwrap_or(0),
             wants_ard_plow,
             spare_tools: tools_in_storage + in_flight.get(&(fid, tools)).copied().unwrap_or(0),
             ard_plow_tools_input,
             weapon,
+            armor,
+            shield,
+            cloth,
             ard_plow,
             tools,
         };

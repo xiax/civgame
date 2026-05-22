@@ -3271,12 +3271,16 @@ pub fn chief_job_posting_system(
                 // immediate Craft posting) and, in parallel, the best
                 // ingredient-blocked recipe (used to drive pull-posting of the
                 // missing Stockpile inputs).
-                let mut best: Option<(u8, u32, Option<Entity>)> = None;
+                // `best` / `best_blocked` are ranked priority-major: the
+                // `(priority, deficit)` lexicographic key keeps a hard combat
+                // gate (Weapon/Armor/Shield) ahead of a comfort good (Cloth)
+                // even when the comfort good has the larger raw deficit.
+                let mut best: Option<(u8, u8, u32, Option<Entity>)> = None;
                 let mut blocked_demand: AHashMap<
                     crate::economy::resource_catalog::ResourceId,
                     u32,
                 > = AHashMap::new();
-                let mut best_blocked_deficit: u32 = 0;
+                let mut best_blocked_key: (u8, u32) = (0, 0);
                 for (idx, recipe) in crate::simulation::crafting::craft_recipes()
                     .iter()
                     .enumerate()
@@ -3336,14 +3340,15 @@ pub fn chief_job_posting_system(
                             missing.push((id, qty - stocked));
                         }
                     }
+                    let priority = craft_priority(recipe.output_resource);
                     if missing.is_empty() {
-                        if best.map_or(true, |(_, d, _)| deficit > d) {
-                            best = Some((idx as u8, deficit, bench_ref));
+                        if best.map_or(true, |(_, bp, bd, _)| (priority, deficit) > (bp, bd)) {
+                            best = Some((idx as u8, priority, deficit, bench_ref));
                         }
-                    } else if deficit > best_blocked_deficit {
-                        // Track the most-demanded blocked recipe; its missing
+                    } else if (priority, deficit) > best_blocked_key {
+                        // Track the highest-priority blocked recipe; its missing
                         // inputs become the chief's pull demand below.
-                        best_blocked_deficit = deficit;
+                        best_blocked_key = (priority, deficit);
                         blocked_demand.clear();
                         for (id, qty) in missing {
                             blocked_demand.insert(id, qty);
@@ -3351,7 +3356,7 @@ pub fn chief_job_posting_system(
                     }
                 }
 
-                if let Some((recipe_id, deficit, bench_ref)) = best {
+                if let Some((recipe_id, _priority, deficit, bench_ref)) = best {
                     let target = deficit.min(5);
                     let id = board.alloc_id();
                     let progress = JobProgress::Crafting {
@@ -3454,8 +3459,9 @@ pub fn chief_job_posting_system(
 }
 
 /// Pure snapshot of one faction's functional craft needs — input to
-/// [`compute_craft_demand`]. See `plans/...curried-dewdrop.md`: autonomous
-/// crafting requires a concrete functional deficit, never a population quota.
+/// [`compute_craft_demand`]. See `plans/...curried-dewdrop.md` (Weapon/Ard Plow)
+/// and `plans/...purrfect-rose.md` (Armor/Shield/Cloth): autonomous crafting
+/// requires a concrete functional deficit, never a population quota.
 pub struct CraftDemandInputs {
     /// Hunters + active raid-party members with no weapon equipped, carried,
     /// or in inventory.
@@ -3465,6 +3471,22 @@ pub struct CraftDemandInputs {
     /// counted here — they satisfy their holder (lowering `unarmed_combatants`),
     /// not a spare pool.
     pub spare_weapons: u32,
+    /// Combatants with no armor equipped/carried/in inventory. Armor mitigates
+    /// real combat damage (`combat.rs`), so an unarmored combatant is a genuine
+    /// functional deficit.
+    pub unarmored_combatants: u32,
+    /// Combatants with no shield equipped/carried/in inventory.
+    pub unshielded_combatants: u32,
+    /// Members whose torso is bare (no cloth or armor equipped, no cloth in
+    /// inventory). Drives Cloth demand only when `can_weave`.
+    pub unclothed_members: u32,
+    /// True when the faction is Aware of `LOOM_WEAVING` — the Cloth gate.
+    pub can_weave: bool,
+    /// Spare supply for each good (faction storage + in-flight crafts/orders).
+    /// Equipped/carried items satisfy their holder, not this pool.
+    pub spare_armor: u32,
+    pub spare_shield: u32,
+    pub spare_cloth: u32,
     /// True when the faction is Aware of `ARD_PLOW`, owns ≥1 state-owned
     /// Agricultural plot, and has no Ard Plow in storage or in flight.
     pub wants_ard_plow: bool,
@@ -3474,15 +3496,20 @@ pub struct CraftDemandInputs {
     /// Tools the Ard Plow recipe consumes per unit.
     pub ard_plow_tools_input: u32,
     pub weapon: crate::economy::resource_catalog::ResourceId,
+    pub armor: crate::economy::resource_catalog::ResourceId,
+    pub shield: crate::economy::resource_catalog::ResourceId,
+    pub cloth: crate::economy::resource_catalog::ResourceId,
     pub ard_plow: crate::economy::resource_catalog::ResourceId,
     pub tools: crate::economy::resource_catalog::ResourceId,
 }
 
 /// Pure functional craft-demand computation. Returns a per-output netted
 /// deficit map; an absent key means zero demand (that good is never
-/// autonomously crafted). Only Weapon, Ard Plow, and Tools-as-an-Ard-Plow-
-/// ingredient are modelled — Cloth/Luxury/Shield/Armor/cart-parts have no
-/// hard functional consumer, so autonomous posting for them is dropped.
+/// autonomously crafted). Modelled goods: Weapon (unarmed combatants), Armor /
+/// Shield (combatants lacking combat mitigation), Cloth (bare-torso members
+/// when the faction can weave), Ard Plow, and Tools-as-an-Ard-Plow-ingredient.
+/// Luxury / cart-parts have no hard functional consumer, so autonomous posting
+/// for them is still dropped.
 pub fn compute_craft_demand(
     inp: &CraftDemandInputs,
 ) -> AHashMap<crate::economy::resource_catalog::ResourceId, u32> {
@@ -3491,6 +3518,25 @@ pub fn compute_craft_demand(
     let weapon_deficit = inp.unarmed_combatants.saturating_sub(inp.spare_weapons);
     if weapon_deficit > 0 {
         out.insert(inp.weapon, weapon_deficit);
+    }
+
+    let armor_deficit = inp.unarmored_combatants.saturating_sub(inp.spare_armor);
+    if armor_deficit > 0 {
+        out.insert(inp.armor, armor_deficit);
+    }
+
+    let shield_deficit = inp
+        .unshielded_combatants
+        .saturating_sub(inp.spare_shield);
+    if shield_deficit > 0 {
+        out.insert(inp.shield, shield_deficit);
+    }
+
+    if inp.can_weave {
+        let cloth_deficit = inp.unclothed_members.saturating_sub(inp.spare_cloth);
+        if cloth_deficit > 0 {
+            out.insert(inp.cloth, cloth_deficit);
+        }
     }
 
     if inp.wants_ard_plow {
@@ -3507,25 +3553,62 @@ pub fn compute_craft_demand(
     out
 }
 
+/// Static posting-priority rank for a craft-demand output. The chief Craft
+/// branch selects the highest `(priority, deficit)` recipe, so a hard combat
+/// gate is always crafted before a comfort good even when the comfort good has
+/// the larger raw deficit (e.g. a 20-member cloth deficit must not starve a
+/// 5-hunter weapon deficit). Keyed by `ResourceId` because Tools and Ard Plow
+/// share `ResourceClass::Tool`.
+pub fn craft_priority(rid: crate::economy::resource_catalog::ResourceId) -> u8 {
+    use crate::economy::core_ids;
+    if rid == core_ids::weapon() {
+        4
+    } else if rid == core_ids::tools() {
+        // Above Ard Plow so the plow's derived Tools ingredient is crafted
+        // first; below Weapon (the hard hunt/raid gate).
+        3
+    } else if rid == core_ids::armor() || rid == core_ids::shield() {
+        2
+    } else if rid == core_ids::ard_plow() {
+        1
+    } else {
+        // Cloth and anything else — comfort-tier, crafted last.
+        0
+    }
+}
+
 #[cfg(test)]
 mod craft_demand_tests {
     use super::*;
     use crate::economy::resource_catalog::ResourceId;
 
     // Synthetic ids — `compute_craft_demand` only uses them as map keys, so
-    // these need no catalog. (weapon, ard_plow, tools).
+    // these need no catalog.
     const WEAPON: ResourceId = ResourceId(1);
     const ARD_PLOW: ResourceId = ResourceId(2);
     const TOOLS: ResourceId = ResourceId(3);
+    const ARMOR: ResourceId = ResourceId(4);
+    const SHIELD: ResourceId = ResourceId(5);
+    const CLOTH: ResourceId = ResourceId(6);
 
     fn base() -> CraftDemandInputs {
         CraftDemandInputs {
             unarmed_combatants: 0,
             spare_weapons: 0,
+            unarmored_combatants: 0,
+            unshielded_combatants: 0,
+            unclothed_members: 0,
+            can_weave: false,
+            spare_armor: 0,
+            spare_shield: 0,
+            spare_cloth: 0,
             wants_ard_plow: false,
             spare_tools: 0,
             ard_plow_tools_input: 1,
             weapon: WEAPON,
+            armor: ARMOR,
+            shield: SHIELD,
+            cloth: CLOTH,
             ard_plow: ARD_PLOW,
             tools: TOOLS,
         }
@@ -3569,6 +3652,56 @@ mod craft_demand_tests {
         let out = compute_craft_demand(&base());
         assert!(out.get(&ARD_PLOW).is_none());
         assert!(out.get(&TOOLS).is_none());
+    }
+
+    #[test]
+    fn unarmored_combatants_drive_armor_demand() {
+        let mut inp = base();
+        inp.unarmored_combatants = 3;
+        assert_eq!(compute_craft_demand(&inp).get(&ARMOR).copied(), Some(3));
+        inp.spare_armor = 1;
+        assert_eq!(compute_craft_demand(&inp).get(&ARMOR).copied(), Some(2));
+        inp.spare_armor = 3;
+        assert!(compute_craft_demand(&inp).get(&ARMOR).is_none());
+    }
+
+    #[test]
+    fn unshielded_combatants_drive_shield_demand() {
+        let mut inp = base();
+        inp.unshielded_combatants = 2;
+        assert_eq!(compute_craft_demand(&inp).get(&SHIELD).copied(), Some(2));
+        inp.spare_shield = 2;
+        assert!(compute_craft_demand(&inp).get(&SHIELD).is_none());
+    }
+
+    #[test]
+    fn cloth_demand_gated_on_weaving_tech() {
+        let mut inp = base();
+        inp.unclothed_members = 5;
+        // No `LOOM_WEAVING` ⇒ no cloth demand regardless of bare torsos.
+        assert!(compute_craft_demand(&inp).get(&CLOTH).is_none());
+        inp.can_weave = true;
+        assert_eq!(compute_craft_demand(&inp).get(&CLOTH).copied(), Some(5));
+        // Spare cloth (storage + in-flight) nets the deficit down.
+        inp.spare_cloth = 2;
+        assert_eq!(compute_craft_demand(&inp).get(&CLOTH).copied(), Some(3));
+        inp.spare_cloth = 5;
+        assert!(compute_craft_demand(&inp).get(&CLOTH).is_none());
+    }
+
+    #[test]
+    fn craft_priority_orders_combat_before_comfort() {
+        use crate::economy::core_ids;
+        // Weapon (hard hunt/raid gate) > Tools > Armor = Shield > Ard Plow >
+        // Cloth (comfort).
+        assert!(craft_priority(core_ids::weapon()) > craft_priority(core_ids::tools()));
+        assert!(craft_priority(core_ids::tools()) > craft_priority(core_ids::armor()));
+        assert_eq!(
+            craft_priority(core_ids::armor()),
+            craft_priority(core_ids::shield())
+        );
+        assert!(craft_priority(core_ids::shield()) > craft_priority(core_ids::ard_plow()));
+        assert!(craft_priority(core_ids::ard_plow()) > craft_priority(core_ids::cloth()));
     }
 }
 

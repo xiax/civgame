@@ -36,3 +36,25 @@ population-scaled quota. Player craft requests (`JobSource::Player`) untouched.
 Side fix: Ard Plows are now auto-craftable (were never in the old quota).
 Docs: `src/simulation/CLAUDE.md`. Full design rationale:
 `~/.claude/plans/evaluate-the-users-xiao1-civgame-plans-c-curried-dewdrop.md`.
+
+## Extended — Armor / Shield / Cloth + priority
+
+The deferred goods that *do* have a hard functional consumer are now modelled
+(`~/.claude/plans/evaluate-the-users-xiao1-civgame-plans-c-purrfect-rose.md`):
+
+- **Armor / Shield** — `compute_craft_demand` gains `unarmored_combatants` /
+  `unshielded_combatants` (the same Hunter + raid-party set as Weapon), netted
+  vs storage + in-flight. Armor/Shield mitigate real combat damage
+  (`combat.rs` reads `armor_stats`), so an unequipped combatant is a genuine
+  deficit.
+- **Cloth** — `unclothed_members` (bare TorsoArmor slot) drives demand when the
+  faction is Aware of `LOOM_WEAVING`. The functional consumer is a flat
+  `mood::CLOTHING_MOOD_PENALTY` (12) in `derive_mood_system` for a bare torso
+  in a weaving faction — no clothing/temperature `Need`.
+- **`jobs::craft_priority`** — the chief Craft branch now selects by
+  `(priority, deficit)`: Weapon 4 > Tools 3 > Armor/Shield 2 > Ard Plow 1 >
+  Cloth 0, so a hard combat gate always crafts before the large-N comfort good.
+- The household Belonging→Cloth contract is untouched (Market-mode paid path);
+  it self-dedups against chief cloth demand via the `in_flight` scan.
+
+Still deferred: cart parts (no vehicle haul-throughput demand model), Luxury.

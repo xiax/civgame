@@ -1802,6 +1802,189 @@ mod smoke {
     }
 
     #[test]
+    fn unarmored_combatant_drives_armor_craft_demand() {
+        // Armor mitigates real combat damage, so an unarmored combatant is a
+        // functional deficit — mirrors the weapon path. Armor in inventory
+        // nets it back to zero.
+        use crate::economy::core_ids;
+        use crate::simulation::faction::FactionRegistry;
+
+        let armor = core_ids::armor();
+
+        // Case A: unarmored hunter ⇒ armor demand.
+        {
+            let mut sim = TestSim::new(0xC0FFEE);
+            sim.flat_world(1, 0, TileKind::Grass);
+            sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+                b.profession(Profession::Hunter);
+            });
+            {
+                let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+                registry.add_member(sim.player_faction_id);
+            }
+            sim.tick_n(65);
+            let registry = sim.app.world().resource::<FactionRegistry>();
+            let f = &registry.factions[&sim.player_faction_id];
+            assert!(
+                f.craft_demand.get(&armor).copied().unwrap_or(0) >= 1,
+                "unarmored combatant must drive armor demand: {:?}",
+                f.craft_demand
+            );
+        }
+
+        // Case B: hunter wearing armor ⇒ no armor demand.
+        {
+            use crate::economy::item::Item;
+            use crate::simulation::items::{Equipment, EquipmentSlot};
+
+            let mut sim = TestSim::new(0xC0FFEE);
+            sim.flat_world(1, 0, TileKind::Grass);
+            let hunter = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+                b.profession(Profession::Hunter);
+            });
+            sim.app
+                .world_mut()
+                .get_mut::<Equipment>(hunter)
+                .unwrap()
+                .items
+                .insert(EquipmentSlot::TorsoArmor, Item::new_commodity(armor));
+            {
+                let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+                registry.add_member(sim.player_faction_id);
+            }
+            sim.tick_n(65);
+            let registry = sim.app.world().resource::<FactionRegistry>();
+            let f = &registry.factions[&sim.player_faction_id];
+            assert_eq!(
+                f.craft_demand.get(&armor).copied().unwrap_or(0),
+                0,
+                "armored combatant must not drive armor demand: {:?}",
+                f.craft_demand
+            );
+        }
+    }
+
+    #[test]
+    fn cloth_craft_demand_gated_on_weaving_tech() {
+        // A bare-torso member drives Cloth demand only when the faction can
+        // weave — without `LOOM_WEAVING` there is no functional cloth path.
+        use crate::economy::core_ids;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::technology::LOOM_WEAVING;
+
+        let cloth = core_ids::cloth();
+
+        // Case A: no weaving tech ⇒ no cloth demand.
+        {
+            let mut sim = TestSim::new(0xC0FFEE);
+            sim.flat_world(1, 0, TileKind::Grass);
+            sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+                b.profession(Profession::None);
+            });
+            {
+                let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+                registry.add_member(sim.player_faction_id);
+            }
+            sim.tick_n(65);
+            let registry = sim.app.world().resource::<FactionRegistry>();
+            let f = &registry.factions[&sim.player_faction_id];
+            assert_eq!(
+                f.craft_demand.get(&cloth).copied().unwrap_or(0),
+                0,
+                "no LOOM_WEAVING ⇒ no cloth demand: {:?}",
+                f.craft_demand
+            );
+        }
+
+        // Case B: faction knows weaving ⇒ bare-torso member drives demand.
+        // A chief Aware of LOOM_WEAVING keeps `faction.techs` set through the
+        // tech-sync system.
+        {
+            let mut sim = TestSim::new(0xC0FFEE);
+            sim.flat_world(1, 0, TileKind::Grass);
+            let chief = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+                b.profession(Profession::None);
+            });
+            {
+                let world = sim.app.world_mut();
+                let mut k = world.get_mut::<PersonKnowledge>(chief).unwrap();
+                k.aware |= 1u64 << LOOM_WEAVING;
+                k.learned |= 1u64 << LOOM_WEAVING;
+            }
+            {
+                let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+                registry.add_member(sim.player_faction_id);
+                let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
+                f.chief_entity = Some(chief);
+                f.techs.unlock(LOOM_WEAVING);
+            }
+            sim.tick_n(65);
+            let registry = sim.app.world().resource::<FactionRegistry>();
+            let f = &registry.factions[&sim.player_faction_id];
+            assert!(
+                f.craft_demand.get(&cloth).copied().unwrap_or(0) >= 1,
+                "bare-torso member in a weaving faction must drive cloth demand: {:?}",
+                f.craft_demand
+            );
+        }
+    }
+
+    #[test]
+    fn bare_torso_lowers_mood_when_faction_can_weave() {
+        // Workers want to wear clothes once the tech exists: a bare TorsoArmor
+        // slot in a weaving faction is a flat mood penalty. Two identically-fed
+        // members in the same weaving faction differ in mood only by whether
+        // they wear cloth.
+        use crate::economy::core_ids;
+        use crate::economy::item::Item;
+        use crate::simulation::faction::FactionRegistry;
+        use crate::simulation::items::{Equipment, EquipmentSlot};
+        use crate::simulation::mood::Mood;
+        use crate::simulation::technology::LOOM_WEAVING;
+
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let bare = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
+            b.profession(Profession::None);
+        });
+        let clothed = sim.spawn_person(sim.player_faction_id, (1, 0), |b| {
+            b.profession(Profession::None);
+        });
+        {
+            let world = sim.app.world_mut();
+            world
+                .get_mut::<Equipment>(clothed)
+                .unwrap()
+                .items
+                .insert(
+                    EquipmentSlot::TorsoArmor,
+                    Item::new_commodity(core_ids::cloth()),
+                );
+            let mut k = world.get_mut::<PersonKnowledge>(bare).unwrap();
+            k.aware |= 1u64 << LOOM_WEAVING;
+            k.learned |= 1u64 << LOOM_WEAVING;
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.add_member(sim.player_faction_id);
+            registry.add_member(sim.player_faction_id);
+            let f = registry.factions.get_mut(&sim.player_faction_id).unwrap();
+            f.chief_entity = Some(bare);
+            f.techs.unlock(LOOM_WEAVING);
+        }
+        sim.tick_n(40);
+
+        let mood_bare = sim.app.world().get::<Mood>(bare).unwrap().0;
+        let mood_clothed = sim.app.world().get::<Mood>(clothed).unwrap().0;
+        assert!(
+            mood_clothed > mood_bare,
+            "bare torso in a weaving faction must lower mood: bare {} vs clothed {}",
+            mood_bare,
+            mood_clothed
+        );
+    }
+
+    #[test]
     fn chief_still_posts_food_stockpile_under_default_policy() {
         // Companion: default (all-communist) policy must still post
         // Stockpile{Calories} when food is low. Pins R6-a's
