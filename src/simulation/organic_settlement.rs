@@ -666,7 +666,7 @@ fn compute_settlement_survey_core<F: SurveyFactionView>(
     brain.road_segments = build_road_network(faction, &brain, chunk_map, member_offsets);
     brain.road_tiles = road_tiles_for_segments(&brain.road_segments);
     brain.frontier = build_frontier(faction, &brain, chunk_map, maps);
-    brain.parcels = build_parcels(faction, settlement, &brain, chunk_map);
+    brain.parcels = build_parcels(faction, settlement, &brain, chunk_map, maps);
     brain.layout_hash = layout_hash(faction, &brain);
 
     let road_pushes = desire_path_push(
@@ -1883,6 +1883,7 @@ fn build_parcels<F: SurveyFactionView>(
     settlement: &Settlement,
     brain: &SettlementBrain,
     chunk_map: &ChunkMap,
+    maps: &SurveyStructureSnapshot,
 ) -> Vec<Parcel> {
     // Permanent settlements with a road skeleton: sweep road tiles for
     // road-fronted parcel candidates. Camps & nomadic factions (no
@@ -1905,45 +1906,102 @@ fn build_parcels<F: SurveyFactionView>(
             faction, settlement, brain, chunk_map, &occupied, next_id, budget,
         );
         parcels.extend(belt);
-        // Per-residential kitchen-garden pass: emit a small (4×4) Agricultural
-        // parcel behind every Residential parcel that has no belt parcel
-        // within `KITCHEN_PROXIMITY` tiles. The 12-tile child-claim path in
-        // `land_listing_system` then binds it as the household's child plot
-        // when the household acquires the Residential plot. Carving still
-        // flows through `carve_plots_system`; no new Plot construction path.
-        append_kitchen_gardens(faction, settlement, brain, chunk_map, &mut parcels);
+        // Per-dwelling kitchen-garden pass: emit a house-sized Agricultural
+        // parcel beside every walled dwelling that has no belt parcel within
+        // `KITCHEN_PROXIMITY` tiles. Keyed on actual built dwellings (detected
+        // from the wall snapshot) so garden geometry matches the house. The
+        // 12-tile child-claim path in `land_listing_system` then binds it as
+        // the household's child plot; carving still flows through
+        // `carve_plots_system` — no new Plot construction path.
+        append_dwelling_gardens(faction, settlement, brain, chunk_map, &maps.walls, &mut parcels);
         parcels
     } else {
         build_parcels_frontier_driven(faction, settlement, brain, chunk_map)
     }
 }
 
-/// Emits a 4×4 Agricultural parcel behind every Residential parcel that has
-/// no belt parcel within `KITCHEN_PROXIMITY` chebyshev tiles. The kitchen
-/// rect is centred on the parcel's back-edge midpoint and abuts the rear of
-/// the residence; side edges are tried as fallbacks when the rear is
-/// blocked. Gated on the same passability / reachability / footprint
-/// constraints as the belt.
-fn append_kitchen_gardens<F: SurveyFactionView>(
+/// A walled dwelling detected from the survey wall snapshot.
+struct DetectedDwelling {
+    /// Full wall-ring footprint (3×3 hut / 5×3 or 3×5 longhouse).
+    rect: TileRect,
+    is_longhouse: bool,
+}
+
+/// Rectangle perimeter (wall-ring) tiles.
+fn rect_perimeter_tiles(r: TileRect) -> Vec<(i32, i32)> {
+    let (w, h) = (r.w as i32, r.h as i32);
+    let mut v = Vec::new();
+    for y in r.y0..r.y0 + h {
+        for x in r.x0..r.x0 + w {
+            if x == r.x0 || x == r.x0 + w - 1 || y == r.y0 || y == r.y0 + h - 1 {
+                v.push((x, y));
+            }
+        }
+    }
+    v
+}
+
+/// Detect Hut (3×3) and Longhouse (5×3 / 3×5) walled houses from the wall
+/// snapshot: an axis-aligned ring of wall tiles with a single door gap and a
+/// wall-free interior. Palisades and civic structures don't form such rings.
+fn detect_dwellings(walls: &AHashSet<(i32, i32)>) -> Vec<DetectedDwelling> {
+    // Longhouse shapes first so a longhouse corner isn't mis-claimed as a hut.
+    const SHAPES: [(u16, u16, bool); 3] = [(5, 3, true), (3, 5, true), (3, 3, false)];
+    let mut sorted: Vec<(i32, i32)> = walls.iter().copied().collect();
+    sorted.sort_unstable();
+    let mut found: Vec<DetectedDwelling> = Vec::new();
+    let mut claimed: AHashSet<(i32, i32)> = AHashSet::default();
+    for (x0, y0) in sorted {
+        for (w, h, is_long) in SHAPES {
+            let rect = TileRect::new(x0, y0, w, h);
+            let perim = rect_perimeter_tiles(rect);
+            if perim.iter().any(|t| claimed.contains(t)) {
+                continue;
+            }
+            let wall_hits = perim.iter().filter(|t| walls.contains(t)).count();
+            // A single door gap is allowed; everything else must be wall.
+            if wall_hits + 1 < perim.len() {
+                continue;
+            }
+            let interior_clear = (y0 + 1..y0 + h as i32 - 1)
+                .all(|y| (x0 + 1..x0 + w as i32 - 1).all(|x| !walls.contains(&(x, y))));
+            if !interior_clear {
+                continue;
+            }
+            for t in &perim {
+                claimed.insert(*t);
+            }
+            found.push(DetectedDwelling {
+                rect,
+                is_longhouse: is_long,
+            });
+            break;
+        }
+    }
+    found
+}
+
+/// Emits a personal kitchen-garden Agricultural parcel beside every walled
+/// dwelling with no belt parcel within `KITCHEN_PROXIMITY` chebyshev tiles.
+/// Garden geometry matches the dwelling: a 3×3 Hut garden attaches to any
+/// clear edge; a 3×4 Longhouse garden attaches only to a 3-tile short wall
+/// (never the 5-tile long wall) and is skipped if neither short side is clear
+/// and reachable. The 12-tile child-claim path in `land_listing_system` then
+/// binds the parcel as the household's child plot; carving still flows
+/// through `carve_plots_system` — no new Plot construction path.
+fn append_dwelling_gardens<F: SurveyFactionView>(
     faction: &F,
     settlement: &Settlement,
     brain: &SettlementBrain,
     chunk_map: &ChunkMap,
+    walls: &AHashSet<(i32, i32)>,
     parcels: &mut Vec<Parcel>,
 ) {
     const KITCHEN_PROXIMITY: i32 = 12;
-    const KITCHEN_SIZE: u16 = 4;
     const BELT_CLEARANCE: i32 = 3;
 
-    if parcels.is_empty() {
-        return;
-    }
-    let residential: Vec<(TileRect, Option<TileEdge>)> = parcels
-        .iter()
-        .filter(|p| p.district_hint == Some(DistrictKind::Residential))
-        .map(|p| (p.rect(), p.frontage_edge))
-        .collect();
-    if residential.is_empty() {
+    let dwellings = detect_dwellings(walls);
+    if dwellings.is_empty() {
         return;
     }
     let belt_centres: Vec<(i32, i32)> = parcels
@@ -1960,12 +2018,19 @@ fn append_kitchen_gardens<F: SurveyFactionView>(
             r.h + 2 * BELT_CLEARANCE as u16,
         )
     };
-    let mut footprint: Vec<TileRect> = parcels.iter().map(|p| inflate(p.rect())).collect();
+    // Overlap keep-out: every NON-residential parcel plus Civic/Crafting
+    // district discs, inflated. Residential parcels and the Residential
+    // district disc are deliberately excluded — a personal garden belongs in
+    // the residential area and may abut its owning dwelling's wall.
+    // `rect_clear_for_parcel` still rejects wall tiles, so a garden can never
+    // overlap a built neighbour house.
+    let mut footprint: Vec<TileRect> = parcels
+        .iter()
+        .filter(|p| p.district_hint != Some(DistrictKind::Residential))
+        .map(|p| inflate(p.rect()))
+        .collect();
     for d in &brain.districts {
-        if matches!(
-            d.kind,
-            DistrictKind::Civic | DistrictKind::Residential | DistrictKind::Crafting
-        ) {
+        if matches!(d.kind, DistrictKind::Civic | DistrictKind::Crafting) {
             let r = d.radius as i32;
             footprint.push(inflate(TileRect::new(
                 d.centre.0 - r,
@@ -1986,29 +2051,39 @@ fn append_kitchen_gardens<F: SurveyFactionView>(
     let budget = MAX_PARCELS.saturating_sub(parcels.len());
     let mut emitted = 0usize;
 
-    for (r_rect, frontage) in residential {
+    for dwelling in dwellings {
         if emitted >= budget {
             break;
         }
-        let centre = r_rect.center();
+        let centre = dwelling.rect.center();
         let near_belt = belt_centres
             .iter()
             .any(|b| cheb(*b, centre) <= KITCHEN_PROXIMITY);
         if near_belt {
             continue;
         }
-        let back_edge = frontage
-            .map(opposite_edge)
-            .unwrap_or_else(|| opposite_edge(TileEdge::toward(centre, home)));
-        // Try back edge first; sides fall back when the rear is blocked.
-        let candidates = [
-            back_edge,
-            rotate_edge_cw(back_edge),
-            rotate_edge_ccw(back_edge),
-        ];
+        // Prefer the side away from home / the settlement core.
+        let away = opposite_edge(TileEdge::toward(centre, home));
+        let candidates: Vec<TileEdge> = if dwelling.is_longhouse {
+            // Short walls are the pair perpendicular to the long axis.
+            let pair = if dwelling.rect.w >= dwelling.rect.h {
+                [TileEdge::East, TileEdge::West]
+            } else {
+                [TileEdge::North, TileEdge::South]
+            };
+            if pair.contains(&away) {
+                vec![away, opposite_edge(away)]
+            } else {
+                pair.to_vec()
+            }
+        } else {
+            vec![away, rotate_edge_cw(away), rotate_edge_ccw(away)]
+        };
+        let depth: u16 = if dwelling.is_longhouse { 4 } else { 3 };
+
         let mut chosen: Option<TileRect> = None;
-        for &edge in &candidates {
-            let rect = kitchen_rect_for_edge(r_rect, edge, KITCHEN_SIZE);
+        for edge in candidates {
+            let rect = kitchen_rect_for_edge(dwelling.rect, edge, depth);
             if !rect_clear_for_parcel(chunk_map, rect, &brain.road_tiles) {
                 continue;
             }
@@ -2040,8 +2115,7 @@ fn append_kitchen_gardens<F: SurveyFactionView>(
             district_hint: Some(DistrictKind::Agricultural),
             suitability,
         });
-        // Add to local footprint so a later residential parcel doesn't
-        // place its kitchen overlapping this one.
+        // Track so a later dwelling's garden doesn't overlap this one.
         footprint.push(inflate(rect));
         next_id = next_id.wrapping_add(1);
         emitted += 1;
@@ -2075,17 +2149,19 @@ fn rotate_edge_ccw(e: TileEdge) -> TileEdge {
     }
 }
 
-fn kitchen_rect_for_edge(parcel: TileRect, back: TileEdge, size: u16) -> TileRect {
-    let pw = parcel.w as i32;
-    let ph = parcel.h as i32;
-    let s = size as i32;
-    let (rx0, ry0) = match back {
-        TileEdge::North => (parcel.x0 + pw / 2 - s / 2, parcel.y0 + ph),
-        TileEdge::South => (parcel.x0 + pw / 2 - s / 2, parcel.y0 - s),
-        TileEdge::East => (parcel.x0 + pw, parcel.y0 + ph / 2 - s / 2),
-        TileEdge::West => (parcel.x0 - s, parcel.y0 + ph / 2 - s / 2),
-    };
-    TileRect::new(rx0, ry0, size, size)
+/// Garden rect flush against `house`'s `edge`, extending `depth` tiles
+/// outward. The wall-parallel dimension equals the house wall's length so the
+/// shared edge runs 1:1 with the wall — no centring offset.
+fn kitchen_rect_for_edge(house: TileRect, edge: TileEdge, depth: u16) -> TileRect {
+    let hw = house.w;
+    let hh = house.h;
+    let d = depth as i32;
+    match edge {
+        TileEdge::North => TileRect::new(house.x0, house.y0 + hh as i32, hw, depth),
+        TileEdge::South => TileRect::new(house.x0, house.y0 - d, hw, depth),
+        TileEdge::East => TileRect::new(house.x0 + hw as i32, house.y0, depth, hh),
+        TileEdge::West => TileRect::new(house.x0 - d, house.y0, depth, hh),
+    }
 }
 
 /// Frontier-first parcel allocation. Used for camps and nomadic factions
@@ -4370,7 +4446,13 @@ mod tests {
             peak_population: 30,
         };
 
-        let parcels = build_parcels(&faction, &settlement, &brain, &map);
+        let parcels = build_parcels(
+            &faction,
+            &settlement,
+            &brain,
+            &map,
+            &SurveyStructureSnapshot::default(),
+        );
         let residential: Vec<_> = parcels
             .iter()
             .filter(|p| p.district_hint == Some(DistrictKind::Residential))
@@ -4666,6 +4748,59 @@ mod tests {
             target,
             secondaries.iter().map(|s| s.end).collect::<Vec<_>>()
         );
+    }
+
+    // ── Kitchen gardens: dwelling detection + garden geometry ─────────
+
+    #[test]
+    fn detect_dwellings_classifies_hut_and_longhouse() {
+        let mut walls: AHashSet<(i32, i32)> = AHashSet::default();
+        // 3×3 hut wall ring at (0,0) with a single door gap.
+        for t in rect_perimeter_tiles(TileRect::new(0, 0, 3, 3)) {
+            if t != (1, 0) {
+                walls.insert(t);
+            }
+        }
+        // 5×3 longhouse wall ring at (20,0) with a single door gap.
+        for t in rect_perimeter_tiles(TileRect::new(20, 0, 5, 3)) {
+            if t != (22, 0) {
+                walls.insert(t);
+            }
+        }
+        let mut found = detect_dwellings(&walls);
+        found.sort_by_key(|d| d.rect.x0);
+        assert_eq!(found.len(), 2, "expected one hut + one longhouse");
+        assert_eq!((found[0].rect.x0, found[0].rect.y0, found[0].rect.w, found[0].rect.h), (0, 0, 3, 3));
+        assert!(!found[0].is_longhouse, "3×3 ring is a hut");
+        assert_eq!((found[1].rect.x0, found[1].rect.y0, found[1].rect.w, found[1].rect.h), (20, 0, 5, 3));
+        assert!(found[1].is_longhouse, "5×3 ring is a longhouse");
+    }
+
+    #[test]
+    fn kitchen_rect_for_edge_is_flush_to_wall() {
+        let dims = |r: TileRect| (r.x0, r.y0, r.w, r.h);
+        // Hut 3×3 → garden flush against the wall, 3 wide on every edge.
+        let hut = TileRect::new(0, 0, 3, 3);
+        assert_eq!(
+            dims(kitchen_rect_for_edge(hut, TileEdge::North, 3)),
+            (0, 3, 3, 3),
+            "hut north garden flush at y0+h"
+        );
+        assert_eq!(
+            dims(kitchen_rect_for_edge(hut, TileEdge::East, 3)),
+            (3, 0, 3, 3),
+            "hut east garden flush at x0+w"
+        );
+        // Longhouse 5×3 → a short-wall (E/W) garden runs 3 tiles parallel to
+        // the wall (= short-wall length) and `depth` deep; never the 5-wide
+        // long wall.
+        let longhouse = TileRect::new(0, 0, 5, 3);
+        let east = kitchen_rect_for_edge(longhouse, TileEdge::East, 4);
+        assert_eq!(dims(east), (5, 0, 4, 3));
+        assert_eq!(east.h, 3, "longhouse short-wall garden runs 1:1 with the 3-tile wall");
+        let west = kitchen_rect_for_edge(longhouse, TileEdge::West, 4);
+        assert_eq!(dims(west), (-4, 0, 4, 3));
+        assert_eq!(west.h, 3);
     }
 }
 

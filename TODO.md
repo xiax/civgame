@@ -157,9 +157,9 @@ X - Farming doesn't need the technology to be adopted by the faction, if either 
 
 X - Fix gap in survive goal for hunger and drink when no tasks under the goal meet requirements
 
-Not making a tile cropland when seeding because its fertility doesn't meet some arbitrary requirement doesn't make sense from a realism perspective. Why would people just leave some land in the middle of their farm empty? I'm also seeing cropland being seeded that isn't actually in an agriculture zone.
+X - Not making a tile cropland when seeding because its fertility doesn't meet some arbitrary requirement doesn't make sense from a realism perspective. Why would people just leave some land in the middle of their farm empty? I'm also seeing cropland being seeded that isn't actually in an agriculture zone.
 
-Import new animal sprites
+X - Import new animal sprites
 
-
+Faction queues way too many crafting jobs for stuff the faction doesn't even need.
 

@@ -1,0 +1,36 @@
+{
+  "group_id": null,
+  "states": [
+    {
+      "character": {
+        "id": "bb072285-dfc7-4ea2-8f10-44fa98dcc9fd",
+        "name": "cat",
+        "prompt": "cat",
+        "size": {
+          "width": 36,
+          "height": 36
+        },
+        "template_id": "cat",
+        "directions": 8,
+        "view": "side",
+        "created_at": "2026-05-17T14:52:35.26519+00:00"
+      },
+      "folder": "bb072285",
+      "frames": {
+        "rotations": {
+          "south": "bb072285/rotations/south.png",
+          "south-east": "bb072285/rotations/south-east.png",
+          "east": "bb072285/rotations/east.png",
+          "north-east": "bb072285/rotations/north-east.png",
+          "north": "bb072285/rotations/north.png",
+          "north-west": "bb072285/rotations/north-west.png",
+          "west": "bb072285/rotations/west.png",
+          "south-west": "bb072285/rotations/south-west.png"
+        },
+        "animations": {}
+      }
+    }
+  ],
+  "export_version": "3.0",
+  "export_date": "2026-05-17T19:40:05.154464"
+}

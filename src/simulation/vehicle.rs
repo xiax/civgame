@@ -33,18 +33,19 @@ use crate::pathfinding::vehicle_path::{footprint_astar, VehicleNode, VehiclePath
 use crate::simulation::animals::{
     AnimalUse, AnimalWorkClaim, DomesticAnimal, DomesticSpecies, Tamed,
 };
-use crate::simulation::combat::Health;
+use crate::simulation::combat::{CombatCooldown, CombatTarget, Health};
 use crate::simulation::construction::Blueprint;
 use crate::simulation::draftwork::{release_animal_work_claim, TRAINING_THRESHOLD_DRAFT};
 use crate::simulation::faction::{FactionMember, FactionRegistry, StorageTileMap};
 use crate::simulation::goals::AgentGoal;
-use crate::simulation::items::GroundItem;
+use crate::simulation::items::{Equipment, EquipmentSlot, GroundItem};
 use crate::simulation::jobs::{
     record_progress_filtered, JobBoard, JobClaim, JobCompletedEvent, JobKind, JobProgress,
 };
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::{AiState, Drafted, Person, PersonAI};
 use crate::simulation::schedule::{BucketSlot, SimClock};
+use crate::simulation::stats::{self, Stats};
 use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::technology::{
     TechId, ANIMAL_HUSBANDRY, BRONZE_CASTING, HORSE_TAMING, OX_CART, WAR_CHARIOT,
@@ -437,6 +438,63 @@ pub struct VehicleCrew {
 pub struct VehicleDraft {
     pub hitched: Vec<Entity>,
     pub required_animals: u8,
+}
+
+/// Per-cell live health mirror + runtime disable bitset (Phase 6). Inserted on
+/// every spawned `Vehicle`; combat (`vehicle_combat_system`) resolves attacks
+/// against individual cells. `cells` is parallel to the design grid at spawn —
+/// each entry starts at the cell material's `durability`.
+#[derive(Component, Clone, Debug, Default)]
+pub struct VehicleHealth {
+    /// `(cell pos, current health)`.
+    pub cells: Vec<(IVec3, u16)>,
+    /// Combat-driven disable bits (`MOVEMENT` / `CARGO` / `STEERING`).
+    pub disabled: VehicleDisableFlags,
+}
+
+impl VehicleHealth {
+    /// Fresh health block — every cell at its material's durability ceiling.
+    pub fn from_design(design: &VehicleDesign) -> Self {
+        VehicleHealth {
+            cells: design
+                .grid
+                .cells
+                .iter()
+                .map(|(p, c)| (*p, c.durability))
+                .collect(),
+            disabled: VehicleDisableFlags::default(),
+        }
+    }
+
+    /// Live health of the cell at `pos` (`0` if absent / destroyed).
+    pub fn cell_health(&self, pos: IVec3) -> u16 {
+        self.cells
+            .iter()
+            .find(|(p, _)| *p == pos)
+            .map(|(_, h)| *h)
+            .unwrap_or(0)
+    }
+
+    /// Count of cells still standing (`health > 0`).
+    pub fn intact_cells(&self) -> usize {
+        self.cells.iter().filter(|(_, h)| *h > 0).count()
+    }
+
+    /// True once a wheel/axle hit has set the movement-disable bit.
+    pub fn movement_disabled(&self) -> bool {
+        self.disabled.has(VehicleDisableFlags::MOVEMENT)
+    }
+}
+
+/// Number of `CrewSeat` cells in a design — the crew capacity.
+pub fn crew_seat_count(design: &VehicleDesign) -> u8 {
+    design
+        .grid
+        .cells
+        .iter()
+        .filter(|(_, c)| c.kind == VehiclePartKind::CrewSeat)
+        .count()
+        .min(255) as u8
 }
 
 // ── design validation ─────────────────────────────────────────────────────
@@ -1288,6 +1346,7 @@ fn spawn_vehicle(
                 hitched: Vec::new(),
                 required_animals: design.required_animals,
             },
+            VehicleHealth::from_design(design),
             Transform::from_xyz(wp.x, wp.y, 0.25),
             GlobalTransform::default(),
             Visibility::Visible,
@@ -2240,6 +2299,7 @@ pub fn vehicle_rollover_system(
         &mut Vehicle,
         &mut VehicleInventory,
         &mut VehicleDraft,
+        &mut VehicleCrew,
         &VehiclePathFollow,
     )>,
     mut workers: Query<
@@ -2247,7 +2307,7 @@ pub fn vehicle_rollover_system(
         (With<Person>, Without<Vehicle>),
     >,
 ) {
-    for (mut v, mut inv, mut draft, pf) in vehicles.iter_mut() {
+    for (mut v, mut inv, mut draft, mut crew, pf) in vehicles.iter_mut() {
         if v.state == VehicleState::Overturned {
             continue;
         }
@@ -2297,24 +2357,55 @@ pub fn vehicle_rollover_system(
             release_animal_work_claim(&mut commands, a);
         }
         draft.hitched.clear();
+        // Eject the seated combat crew — an overturned hulk carries no one.
+        for rider in eject_all_crew(&mut crew) {
+            commands.entity(rider).remove::<BoardedVehicle>();
+        }
     }
 }
 
-/// Sequential (after `vehicle_rollover_system`): snap the boarded driver and
-/// every hitched draft animal to the vehicle's position each tick — the
-/// vehicle leads, the crew ride it.
+/// Drain every crew slot (driver / passengers / gunners), returning the
+/// ejected entities. The caller strips `BoardedVehicle` from each.
+fn eject_all_crew(crew: &mut VehicleCrew) -> Vec<Entity> {
+    let mut out: Vec<Entity> = Vec::new();
+    out.extend(crew.driver.take());
+    out.extend(crew.passengers.drain(..));
+    out.extend(crew.gunners.drain(..));
+    out
+}
+
+/// Sequential (after `vehicle_rollover_system`): snap the boarded driver, the
+/// seated combat crew (driver / passengers / gunners), and every hitched draft
+/// animal to the vehicle's position each tick — the vehicle leads, the crew
+/// ride it. A chariot is a *mobile crew platform*: its seated crew fight
+/// through the normal `combat_system` rules from wherever the vehicle is.
 pub fn vehicle_crew_sync_system(
-    vehicles: Query<(&Vehicle, &VehicleDraft, &Transform)>,
+    vehicles: Query<(&Vehicle, &VehicleDraft, &VehicleCrew, &Transform)>,
     mut crew: Query<&mut Transform, Without<Vehicle>>,
     mut crew_ai: Query<&mut PersonAI>,
 ) {
-    for (v, draft, vtf) in vehicles.iter() {
-        if let Some(hauler) = v.hauler {
-            if let Ok(mut tr) = crew.get_mut(hauler) {
+    for (v, draft, vcrew, vtf) in vehicles.iter() {
+        // Every rider (cargo hauler + every combat-crew slot) snaps to the
+        // vehicle. De-duped so an entity seated *and* hauling is only moved
+        // once (idempotent regardless).
+        let mut riders: Vec<Entity> = Vec::new();
+        for r in v
+            .hauler
+            .into_iter()
+            .chain(vcrew.driver)
+            .chain(vcrew.passengers.iter().copied())
+            .chain(vcrew.gunners.iter().copied())
+        {
+            if !riders.contains(&r) {
+                riders.push(r);
+            }
+        }
+        for rider in riders {
+            if let Ok(mut tr) = crew.get_mut(rider) {
                 tr.translation.x = vtf.translation.x;
                 tr.translation.y = vtf.translation.y;
             }
-            if let Ok(mut ai) = crew_ai.get_mut(hauler) {
+            if let Ok(mut ai) = crew_ai.get_mut(rider) {
                 ai.current_z = v.z;
             }
         }
@@ -2640,6 +2731,7 @@ pub fn vehicle_player_command_system(
     }
     let now = clock.tick as u32;
     let mut claimed_this_pass: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut crew_claimed: ahash::AHashSet<Entity> = ahash::AHashSet::default();
 
     for (vehicle_e, kind) in std::mem::take(&mut pending.ops) {
         let Ok((mut v, mut inv, mut crew, mut draft)) = vehicles_q.get_mut(vehicle_e) else {
@@ -2735,14 +2827,31 @@ pub fn vehicle_player_command_system(
                 }
             }
             VehicleOrderKind::AssignCrew => {
-                if crew.driver.is_some() {
-                    continue;
-                }
-                if let Some((person, _)) = members_q
-                    .iter()
-                    .find(|(_, fm)| fm.faction_id == v.owner_faction)
-                {
-                    crew.driver = Some(person);
+                // Seat idle faction members onto the vehicle: the first fills
+                // the driver slot, the rest become passengers up to the crew
+                // capacity (count of `CrewSeat` cells; a Cargo design with no
+                // seats still gets a single driver). Each boards via
+                // `BoardedVehicle` so `vehicle_crew_sync_system` rides them
+                // and `combat_system` fights through them.
+                let capacity = (crew_seat_count(&design) as usize).max(1);
+                let mut seated = crew.driver.iter().count() + crew.passengers.len();
+                for (person, fm) in members_q.iter() {
+                    if seated >= capacity {
+                        break;
+                    }
+                    if fm.faction_id != v.owner_faction || crew_claimed.contains(&person) {
+                        continue;
+                    }
+                    crew_claimed.insert(person);
+                    if crew.driver.is_none() {
+                        crew.driver = Some(person);
+                    } else {
+                        crew.passengers.push(person);
+                    }
+                    commands
+                        .entity(person)
+                        .insert(BoardedVehicle { vehicle: vehicle_e });
+                    seated += 1;
                 }
             }
             VehicleOrderKind::Hitch => {
@@ -2801,8 +2910,297 @@ pub fn vehicle_player_command_system(
                 for &a in &draft.hitched {
                     release_animal_work_claim(&mut commands, a);
                 }
+                for rider in eject_all_crew(&mut crew) {
+                    commands.entity(rider).remove::<BoardedVehicle>();
+                }
                 commands.entity(vehicle_e).despawn_recursive();
             }
+        }
+    }
+}
+
+// ── Phase 6: chariot crew, draft & combat ─────────────────────────────────
+//
+// A `Vehicle` is a destructible multi-cell body. Attacks aimed at the vehicle
+// resolve against individual `VehicleHealth` cells via a height-aware
+// hit-location roll: melee biases the low cells (wheels / axles), and
+// destroying a cell drives a concrete failure —
+//
+// - **Wheel / Axle** → movement-disabled (`VehicleDisableFlags::MOVEMENT`);
+//   the route is dropped and the vehicle parks. The intended ancient
+//   counterplay: cripple the wheels and the chariot is out of the fight.
+// - **CargoBay** → the load spills as `GroundItem`s.
+// - **Hitch / Yoke** → the draft team is released.
+// - **CrewSeat** → an occupant is ejected (exposed).
+// - A destroyed low support cell (Frame / Deck / Axle on the bottom Z) drops
+//   the chassis and overturns the vehicle outright.
+// - When the last cell falls the vehicle is **wrecked** — cargo + animals +
+//   crew are released and the hulk despawns.
+//
+// Crew offence needs no new code: a seated crew member rides the vehicle
+// (`vehicle_crew_sync_system`) and fights any adjacent foe through the normal
+// `combat_system` rules — a chariot is just a mobile crew platform.
+
+/// What a resolved hit on a vehicle cell triggered. The combat system reads
+/// this to apply the world-side effects (spilling cargo, ejecting crew, …).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VehicleHitOutcome {
+    pub cell_destroyed: bool,
+    pub movement_disabled: bool,
+    pub spill_cargo: bool,
+    pub release_animals: bool,
+    pub eject_crew: bool,
+    pub force_overturn: bool,
+}
+
+/// Pick a target cell for a melee hit. Among the still-standing cells the roll
+/// is **height-weighted toward the low cells** — a foot soldier's spear, axe
+/// or club reaches the wheels and axles far more readily than a high crew
+/// platform. Returns `None` only when every cell is already destroyed.
+pub fn pick_hit_cell(health: &VehicleHealth) -> Option<IVec3> {
+    let live: Vec<IVec3> = health
+        .cells
+        .iter()
+        .filter(|(_, h)| *h > 0)
+        .map(|(p, _)| *p)
+        .collect();
+    if live.is_empty() {
+        return None;
+    }
+    let max_z = live.iter().map(|p| p.z).max().unwrap();
+    // Weight = (max_z - z + 1): the bottom row outweighs the top.
+    let weights: Vec<u32> = live.iter().map(|p| (max_z - p.z + 1) as u32).collect();
+    let total: u32 = weights.iter().sum();
+    let mut roll = fastrand::u32(0..total.max(1));
+    for (i, &w) in weights.iter().enumerate() {
+        if roll < w {
+            return Some(live[i]);
+        }
+        roll -= w;
+    }
+    live.last().copied()
+}
+
+/// Apply `dmg` to the cell at `pos`. On destruction, sets the matching
+/// `VehicleHealth.disabled` bit and returns the world-side effects to apply.
+pub fn apply_vehicle_cell_damage(
+    health: &mut VehicleHealth,
+    design: &VehicleDesign,
+    pos: IVec3,
+    dmg: u16,
+) -> VehicleHitOutcome {
+    let mut out = VehicleHitOutcome::default();
+    let Some(slot) = health.cells.iter_mut().find(|(p, _)| *p == pos) else {
+        return out;
+    };
+    if slot.1 == 0 {
+        return out;
+    }
+    slot.1 = slot.1.saturating_sub(dmg);
+    if slot.1 > 0 {
+        return out;
+    }
+    out.cell_destroyed = true;
+    let kind = design.grid.get(pos).map(|c| c.kind);
+    let min_z = design.grid.bounds().map(|(lo, _)| lo.z).unwrap_or(0);
+    match kind {
+        Some(VehiclePartKind::Wheel | VehiclePartKind::Axle | VehiclePartKind::Track) => {
+            health.disabled.set(VehicleDisableFlags::MOVEMENT);
+            out.movement_disabled = true;
+        }
+        Some(VehiclePartKind::CargoBay) => {
+            health.disabled.set(VehicleDisableFlags::CARGO);
+            out.spill_cargo = true;
+        }
+        Some(VehiclePartKind::Hitch | VehiclePartKind::Yoke) => {
+            out.release_animals = true;
+        }
+        Some(VehiclePartKind::CrewSeat) => {
+            out.eject_crew = true;
+        }
+        _ => {}
+    }
+    // A destroyed low support cell drops the chassis — force a rollover.
+    if pos.z == min_z
+        && matches!(
+            kind,
+            Some(VehiclePartKind::Frame | VehiclePartKind::Deck | VehiclePartKind::Axle)
+        )
+    {
+        out.force_overturn = true;
+    }
+    out
+}
+
+/// Melee cooldown between an attacker's swings at a vehicle (seconds) — mirrors
+/// `combat::BASE_ATTACK_COOLDOWN`.
+const VEHICLE_ATTACK_COOLDOWN: f32 = 1.0;
+/// Base melee damage a bare-handed attacker deals to a vehicle cell.
+const VEHICLE_BASE_ATTACK_DAMAGE: u16 = 2;
+
+/// Sequential (after `combat_system`): resolve melee attacks aimed at a
+/// `Vehicle`. `combat_system` recognises a vehicle target as a live entity but
+/// can't damage it (a vehicle has no `Health` / `Body`); this system does the
+/// per-cell hit-location resolution and applies the structural consequences.
+#[allow(clippy::too_many_arguments)]
+pub fn vehicle_combat_system(
+    mut commands: Commands,
+    registry: Res<VehicleDesignRegistry>,
+    spatial: Res<SpatialIndex>,
+    mut ground_items: Query<&mut GroundItem>,
+    mut attackers: Query<(
+        &CombatTarget,
+        &Transform,
+        &LodLevel,
+        Option<&mut CombatCooldown>,
+        Option<&Stats>,
+        Option<&Equipment>,
+    )>,
+    mut vehicles: Query<(
+        &mut Vehicle,
+        &mut VehicleHealth,
+        &mut VehicleInventory,
+        &mut VehicleDraft,
+        &mut VehicleCrew,
+    )>,
+) {
+    // Vehicles wrecked / despawned earlier this pass — skip further hits.
+    let mut wrecked: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+
+    for (target, tf, lod, mut cd, stats, eq) in attackers.iter_mut() {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        let Some(target_e) = target.0 else {
+            continue;
+        };
+        if wrecked.contains(&target_e) {
+            continue;
+        }
+        // Melee cooldown — `combat_system` already decremented it this tick.
+        if let Some(ref cd) = cd {
+            if cd.0 > 0.0 {
+                continue;
+            }
+        }
+        let Ok((mut v, mut health, mut inv, mut draft, mut crew)) = vehicles.get_mut(target_e)
+        else {
+            continue;
+        };
+        let Some(design) = registry.get(v.design_id).cloned() else {
+            continue;
+        };
+
+        // Adjacency — the attacker must be within chebyshev 1 of a footprint
+        // tile (the vehicle is not in `SpatialIndex`, so combat_system can't
+        // resolve this itself).
+        let ax = (tf.translation.x / TILE_SIZE).floor() as i32;
+        let ay = (tf.translation.y / TILE_SIZE).floor() as i32;
+        let fp = footprint_tiles(&design, v.anchor_tile, v.heading);
+        if !fp.iter().any(|&(tx, ty)| cheb((ax, ay), (tx, ty)) <= 1) {
+            continue;
+        }
+
+        // Damage — base + weapon bonus + positive STR modifier (mirrors
+        // `combat_system`'s melee maths).
+        let mut dmg = VEHICLE_BASE_ATTACK_DAMAGE;
+        if let Some(eq) = eq {
+            if let Some(weapon) = eq.items.get(&EquipmentSlot::MainHand) {
+                if let Some(w) = weapon.weapon_stats {
+                    dmg = dmg.saturating_add(w.damage_bonus as u16);
+                }
+            }
+        }
+        if let Some(s) = stats {
+            dmg = dmg.saturating_add(stats::modifier(s.strength).max(0) as u16);
+        }
+        if let Some(ref mut cd) = cd {
+            cd.0 = VEHICLE_ATTACK_COOLDOWN;
+        }
+
+        let Some(hit) = pick_hit_cell(&health) else {
+            continue;
+        };
+        let outcome = apply_vehicle_cell_damage(&mut health, &design, hit, dmg);
+        if !outcome.cell_destroyed {
+            continue;
+        }
+        let (vx, vy) = v.anchor_tile;
+
+        if outcome.movement_disabled {
+            commands.entity(target_e).remove::<VehiclePathFollow>();
+            if v.state == VehicleState::Moving {
+                v.state = VehicleState::Parked;
+            }
+        }
+        if outcome.spill_cargo {
+            for (rid, qty) in std::mem::take(&mut inv.items) {
+                if qty > 0 {
+                    crate::simulation::items::spawn_or_merge_ground_item(
+                        &mut commands,
+                        &spatial,
+                        &mut ground_items,
+                        vx,
+                        vy,
+                        rid,
+                        qty,
+                    );
+                }
+            }
+        }
+        if outcome.release_animals {
+            for &a in &draft.hitched {
+                release_animal_work_claim(&mut commands, a);
+            }
+            draft.hitched.clear();
+        }
+        if outcome.eject_crew {
+            // Expose one occupant — passenger / gunner first, driver last.
+            let exposed = crew
+                .passengers
+                .pop()
+                .or_else(|| crew.gunners.pop())
+                .or_else(|| crew.driver.take());
+            if let Some(rider) = exposed {
+                commands.entity(rider).remove::<BoardedVehicle>();
+            }
+        }
+
+        // A destroyed low support cell, or losing the last cell, overturns /
+        // wrecks the vehicle: release cargo + animals + crew.
+        let wreck = health.intact_cells() == 0;
+        if outcome.force_overturn || wreck {
+            if v.state != VehicleState::Overturned {
+                v.state = VehicleState::Overturned;
+            }
+            commands.entity(target_e).remove::<VehiclePathFollow>();
+            for (rid, qty) in std::mem::take(&mut inv.items) {
+                if qty > 0 {
+                    crate::simulation::items::spawn_or_merge_ground_item(
+                        &mut commands,
+                        &spatial,
+                        &mut ground_items,
+                        vx,
+                        vy,
+                        rid,
+                        qty,
+                    );
+                }
+            }
+            for &a in &draft.hitched {
+                release_animal_work_claim(&mut commands, a);
+            }
+            draft.hitched.clear();
+            if let Some(h) = v.hauler.take() {
+                commands.entity(h).remove::<BoardedVehicle>();
+            }
+            for rider in eject_all_crew(&mut crew) {
+                commands.entity(rider).remove::<BoardedVehicle>();
+            }
+        }
+        if wreck {
+            wrecked.insert(target_e);
+            commands.entity(target_e).despawn_recursive();
         }
     }
 }
@@ -3180,5 +3578,91 @@ mod tests {
         assert_eq!(inv.total_qty(), 40);
         assert_eq!(inv.take(core_ids::stone(), 25), 25);
         assert_eq!(inv.qty_of(core_ids::stone()), 15);
+    }
+
+    // ── Phase 6: chariot crew, draft & combat ─────────────────────────────
+
+    #[test]
+    fn vehicle_health_mirrors_design_durability() {
+        let (_, registry) = load_vehicle_assets();
+        let design = registry.by_name("Handcart").unwrap();
+        let health = VehicleHealth::from_design(design);
+        assert_eq!(health.cells.len(), design.grid.cells.len());
+        assert!(health.cells.iter().all(|(_, hp)| *hp > 0));
+        assert_eq!(health.intact_cells(), design.grid.cells.len());
+        assert!(!health.movement_disabled());
+    }
+
+    #[test]
+    fn crew_seat_count_matches_template() {
+        let (_, registry) = load_vehicle_assets();
+        assert_eq!(crew_seat_count(registry.by_name("Handcart").unwrap()), 0);
+        assert_eq!(
+            crew_seat_count(registry.by_name("Light Chariot").unwrap()),
+            1
+        );
+    }
+
+    #[test]
+    fn destroying_a_wheel_disables_movement() {
+        let (_, registry) = load_vehicle_assets();
+        let design = registry.by_name("Handcart").unwrap().clone();
+        let mut health = VehicleHealth::from_design(&design);
+        // Handcart wheel at (0, 0, 0).
+        let out = apply_vehicle_cell_damage(&mut health, &design, IVec3::new(0, 0, 0), 9_999);
+        assert!(out.cell_destroyed && out.movement_disabled);
+        assert!(health.movement_disabled());
+    }
+
+    #[test]
+    fn destroying_cargo_bay_spills_and_hitch_releases() {
+        let (_, registry) = load_vehicle_assets();
+        let design = registry.by_name("Handcart").unwrap().clone();
+        let mut health = VehicleHealth::from_design(&design);
+        // CargoBay at (1, 2, 0), Hitch at (0, 3, 0).
+        assert!(
+            apply_vehicle_cell_damage(&mut health, &design, IVec3::new(1, 2, 0), 9_999)
+                .spill_cargo
+        );
+        assert!(
+            apply_vehicle_cell_damage(&mut health, &design, IVec3::new(0, 3, 0), 9_999)
+                .release_animals
+        );
+    }
+
+    #[test]
+    fn destroying_low_frame_forces_overturn() {
+        let (_, registry) = load_vehicle_assets();
+        let design = registry.by_name("Handcart").unwrap().clone();
+        let mut health = VehicleHealth::from_design(&design);
+        // Frame at (0, 2, 0) — bottom Z, a structural support cell.
+        let out = apply_vehicle_cell_damage(&mut health, &design, IVec3::new(0, 2, 0), 9_999);
+        assert!(out.force_overturn, "a destroyed low support cell overturns");
+    }
+
+    #[test]
+    fn partial_damage_leaves_cell_standing() {
+        let (_, registry) = load_vehicle_assets();
+        let design = registry.by_name("Handcart").unwrap().clone();
+        let mut health = VehicleHealth::from_design(&design);
+        let out = apply_vehicle_cell_damage(&mut health, &design, IVec3::new(0, 0, 0), 1);
+        assert!(!out.cell_destroyed);
+        assert!(health.cell_health(IVec3::new(0, 0, 0)) > 0);
+    }
+
+    #[test]
+    fn hit_location_biases_low_cells() {
+        // Two stacked cells; the low one should be hit far more often.
+        let health = VehicleHealth {
+            cells: vec![(IVec3::new(0, 0, 0), 100), (IVec3::new(0, 0, 1), 100)],
+            disabled: VehicleDisableFlags::default(),
+        };
+        let mut low = 0;
+        for _ in 0..600 {
+            if pick_hit_cell(&health).unwrap().z == 0 {
+                low += 1;
+            }
+        }
+        assert!(low > 300, "melee should bias the low cell ({low}/600)");
     }
 }

@@ -22,6 +22,8 @@ pub struct AnimalTextures {
     pub wolf: [Handle<Image>; 8],
     pub deer: [Handle<Image>; 8],
     pub horse: [Handle<Image>; 8],
+    pub cow: [Handle<Image>; 8],
+    pub cat: [Handle<Image>; 8],
 }
 
 pub fn setup_animal_textures(asset_server: Res<AssetServer>, mut tex: ResMut<AnimalTextures>) {
@@ -39,6 +41,8 @@ pub fn setup_animal_textures(asset_server: Res<AssetServer>, mut tex: ResMut<Ani
         tex.wolf[i] = asset_server.load(format!("textures/wolf/rotations/{d}.png"));
         tex.deer[i] = asset_server.load(format!("textures/deer/rotations/{d}.png"));
         tex.horse[i] = asset_server.load(format!("textures/horse/rotations/{d}.png"));
+        tex.cow[i] = asset_server.load(format!("textures/cow/rotations/{d}.png"));
+        tex.cat[i] = asset_server.load(format!("textures/cat/rotations/{d}.png"));
     }
 }
 

@@ -15,7 +15,7 @@
 //! walls). Never the sole authority — always confirm a `Some(true)` / `None`
 //! with `path_exists`.
 //!
-//! Every placement surface (houses, starting farms, farmstead yards,
+//! Every placement surface (houses, starting farms, kitchen gardens,
 //! `spawn_population`, market households, organic site choice, chief directives,
 //! farm-tile dispatch) routes through this one module so "we said reachable"
 //! can never drift from what the agent pathfinder will actually do. The legacy

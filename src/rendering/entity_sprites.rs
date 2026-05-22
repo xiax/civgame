@@ -1211,18 +1211,14 @@ pub fn spawn_cow_sprites(
     mut commands: Commands,
     query: Query<(Entity, Option<&BiologicalSex>), (With<Cow>, Without<CowVisual>)>,
     sprite_lib: Res<SpriteLibrary>,
+    animal_tex: Res<AnimalTextures>,
     art_mode: Res<ArtMode>,
 ) {
     for (entity, sex_opt) in query.iter() {
-        let pixel_key = "anim_cow_anim_s_a";
-        let ascii_key = "creature_cow";
         let img = if *art_mode == ArtMode::Pixel {
-            sprite_lib
-                .get(pixel_key)
-                .cloned()
-                .or_else(|| sprite_lib.get(ascii_key).cloned())
+            Some(animal_tex.cow[FacingDirection::South as usize].clone())
         } else {
-            sprite_lib.get(ascii_key).cloned()
+            sprite_lib.get("creature_cow").cloned()
         };
         let Some(img) = img else { continue };
 
@@ -1257,46 +1253,36 @@ pub fn spawn_cow_sprites(
 pub fn animate_cows_system(
     time: Res<Time>,
     art_mode: Res<ArtMode>,
-    sprite_lib: Res<SpriteLibrary>,
+    animal_tex: Res<AnimalTextures>,
     mut cows: Query<(&Transform, &Children, &mut FacingDirection, &mut LastPos), With<Cow>>,
-    mut child_sprites: Query<&mut Sprite, With<VisualChild>>,
+    mut child_sprites: Query<
+        (&mut Sprite, &mut Transform),
+        (
+            With<VisualChild>,
+            Without<Wolf>,
+            Without<Deer>,
+            Without<Horse>,
+        ),
+    >,
 ) {
     if *art_mode == ArtMode::Ascii {
         return;
     }
-    let frame_b = (time.elapsed_secs() * 4.0).floor() as u64 % 2 == 1;
     for (transform, children, mut facing, mut last_pos) in cows.iter_mut() {
         let pos = transform.translation.truncate();
         let diff = pos - last_pos.0;
         let is_moving = diff.length() > 0.5;
-        if is_moving {
-            *facing = if diff.x.abs() > diff.y.abs() {
-                if diff.x > 0.0 {
-                    FacingDirection::East
-                } else {
-                    FacingDirection::West
-                }
-            } else {
-                if diff.y > 0.0 {
-                    FacingDirection::North
-                } else {
-                    FacingDirection::South
-                }
-            };
-        }
+        *facing = FacingDirection::from_velocity(diff, *facing);
         last_pos.0 = pos;
-        let dir = facing.as_str();
-        let frame_str = if is_moving && frame_b { "b" } else { "a" };
-        let key = format!("anim_cow_anim_{dir}_{frame_str}");
-        for &child in children.iter() {
-            if let Ok(mut sprite) = child_sprites.get_mut(child) {
-                if let Some(img) = sprite_lib.get(&key) {
-                    if sprite.image != *img {
-                        sprite.image = img.clone();
-                    }
-                }
-            }
-        }
+
+        let img = animal_tex.cow[*facing as usize].clone();
+        update_animal_visual(
+            &mut child_sprites,
+            children,
+            img,
+            is_moving,
+            time.elapsed_secs(),
+        );
     }
 }
 
@@ -1580,18 +1566,14 @@ pub fn spawn_cat_sprites(
     mut commands: Commands,
     query: Query<(Entity, Option<&BiologicalSex>), (With<Cat>, Without<CatVisual>)>,
     sprite_lib: Res<SpriteLibrary>,
+    animal_tex: Res<AnimalTextures>,
     art_mode: Res<ArtMode>,
 ) {
     for (entity, sex_opt) in query.iter() {
-        let pixel_key = "anim_cat_s_a";
-        let ascii_key = "creature_cat";
         let img = if *art_mode == ArtMode::Pixel {
-            sprite_lib
-                .get(pixel_key)
-                .cloned()
-                .or_else(|| sprite_lib.get(ascii_key).cloned())
+            Some(animal_tex.cat[FacingDirection::South as usize].clone())
         } else {
-            sprite_lib.get(ascii_key).cloned()
+            sprite_lib.get("creature_cat").cloned()
         };
         let Some(img) = img else { continue };
 
@@ -1625,46 +1607,36 @@ pub fn spawn_cat_sprites(
 pub fn animate_cats_system(
     time: Res<Time>,
     art_mode: Res<ArtMode>,
-    sprite_lib: Res<SpriteLibrary>,
+    animal_tex: Res<AnimalTextures>,
     mut cats: Query<(&Transform, &Children, &mut FacingDirection, &mut LastPos), With<Cat>>,
-    mut child_sprites: Query<&mut Sprite, With<VisualChild>>,
+    mut child_sprites: Query<
+        (&mut Sprite, &mut Transform),
+        (
+            With<VisualChild>,
+            Without<Wolf>,
+            Without<Deer>,
+            Without<Horse>,
+        ),
+    >,
 ) {
     if *art_mode == ArtMode::Ascii {
         return;
     }
-    let frame_b = (time.elapsed_secs() * 4.0).floor() as u64 % 2 == 1;
     for (transform, children, mut facing, mut last_pos) in cats.iter_mut() {
         let pos = transform.translation.truncate();
         let diff = pos - last_pos.0;
         let is_moving = diff.length() > 0.5;
-        if is_moving {
-            *facing = if diff.x.abs() > diff.y.abs() {
-                if diff.x > 0.0 {
-                    FacingDirection::East
-                } else {
-                    FacingDirection::West
-                }
-            } else {
-                if diff.y > 0.0 {
-                    FacingDirection::North
-                } else {
-                    FacingDirection::South
-                }
-            };
-        }
+        *facing = FacingDirection::from_velocity(diff, *facing);
         last_pos.0 = pos;
-        let dir = facing.as_str();
-        let frame_str = if is_moving && frame_b { "b" } else { "a" };
-        let key = format!("anim_cat_{dir}_{frame_str}");
-        for &child in children.iter() {
-            if let Ok(mut sprite) = child_sprites.get_mut(child) {
-                if let Some(img) = sprite_lib.get(&key) {
-                    if sprite.image != *img {
-                        sprite.image = img.clone();
-                    }
-                }
-            }
-        }
+
+        let img = animal_tex.cat[*facing as usize].clone();
+        update_animal_visual(
+            &mut child_sprites,
+            children,
+            img,
+            is_moving,
+            time.elapsed_secs(),
+        );
     }
 }
 

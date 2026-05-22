@@ -594,28 +594,26 @@ pub fn seed_starting_farms_system(
             plot_index.by_settlement.entry(sid.0).or_default().push(pid);
             // Seasonal-farming jellyfish: most of the belt is left UN-prepared
             // at game start (the tribe tills it over the following seasons),
-            // but a mottled STARTER patch is pre-stamped `Cropland` so year 1
-            // is a real first crop rather than a from-zero prepare spike —
-            // founders break ground as part of settling. Budget: half the
-            // annual demand, capped at half the plot so it never paves the
-            // whole field. `field_tile_role` mottles the patch.
-            use crate::simulation::land::{field_tile_role, FieldTileRole};
+            // but a bounded contiguous STARTER patch is pre-tilled to `Cropland`
+            // so year 1 skips the from-zero Prepare spike — founders break
+            // ground as part of settling. Budget: half the annual demand,
+            // capped at half the plot so it never paves the whole field.
+            // Fertility is NOT overridden — the patch's planting viability
+            // rides on natural world-gen soil (the belt is fertility-selected
+            // by `build_ag_belt`); the founder grain buffer covers a weak year.
             use crate::world::tile::{TileData, TileKind};
             let plot_area = rect.w as u32 * rect.h as u32;
             let mut starter_budget = (demand_tiles / 2).min(plot_area / 2);
-            let starter_seed = (fid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
             for ty in rect.y0..rect.y0 + rect.h as i32 {
                 for tx in rect.x0..rect.x0 + rect.w as i32 {
                     plot_index.by_tile.insert((tx, ty), pid);
                     plot_index.ag_tiles.insert((tx, ty));
                     let z = chunk_map.surface_z_at(tx, ty);
                     let cur = chunk_map.tile_at(tx, ty, z);
-                    let role = field_tile_role(starter_seed, fid, (tx, ty), rect);
                     let pre_stamp = starter_budget > 0
-                        && matches!(role, FieldTileRole::Cropland | FieldTileRole::CroplandLow)
+                        && cur.kind != TileKind::Cropland
                         && (cur.kind == TileKind::Grass || cur.kind.is_soil_like());
                     if pre_stamp {
-                        let fert: u8 = if role == FieldTileRole::Cropland { 200 } else { 120 };
                         chunk_map.set_tile(
                             tx,
                             ty,
@@ -623,18 +621,16 @@ pub fn seed_starting_farms_system(
                             TileData {
                                 kind: TileKind::Cropland,
                                 elevation: cur.elevation,
-                                fertility: fert,
+                                fertility: cur.fertility,
                                 flags: cur.flags,
                                 ore: cur.ore,
                             },
                         );
                         tile_changed
                             .send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
-                        field_tiles.ensure_entry((tx, ty), pid, fert);
                         starter_budget -= 1;
-                    } else {
-                        field_tiles.ensure_entry((tx, ty), pid, cur.fertility);
                     }
+                    field_tiles.ensure_entry((tx, ty), pid, cur.fertility);
                 }
             }
         }
@@ -680,11 +676,11 @@ pub fn seed_starting_farms_system(
     }
 }
 
-/// One-shot OnEnter(Playing) backfill: any tile already in `PlotIndex.ag_tiles`
-/// that doesn't yet have a `FieldTileIndex` entry gets one with
-/// `nutrients = tile.fertility, last_crop = None`. Covers the
-/// `seed_farmstead_yard` (which still stamps Cropland at seed time) and any
-/// future save-game with pre-stamped Cropland tiles.
+/// One-shot OnEnter(Playing) backfill safety net: any tile already in
+/// `PlotIndex.ag_tiles` that doesn't yet have a `FieldTileIndex` entry gets one
+/// with `nutrients = tile.fertility, last_crop = None`. `carve_plots_system`
+/// and `seed_starting_farms_system` already seed entries directly; this covers
+/// save-games with pre-stamped Cropland tiles.
 pub fn backfill_field_tile_index_system(
     plot_index: Res<crate::simulation::land::PlotIndex>,
     chunk_map: Res<crate::world::chunk::ChunkMap>,

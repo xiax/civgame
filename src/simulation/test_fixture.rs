@@ -5107,8 +5107,17 @@ mod smoke {
                     plot_index.ag_tiles.contains(&(tx, ty)),
                     "belt tile ({tx},{ty}) must be in ag_tiles"
                 );
-                if field_tiles.by_tile.contains_key(&(tx, ty)) {
+                if let Some(state) = field_tiles.by_tile.get(&(tx, ty)) {
                     sampled_field_entries += 1;
+                    // Fertility is never overridden — the FieldTileIndex
+                    // nutrient pool seeds straight from natural world-gen
+                    // fertility, stamped tile or not.
+                    let z = chunk_map.surface_z_at(tx, ty);
+                    assert_eq!(
+                        state.nutrients,
+                        chunk_map.tile_at(tx, ty, z).fertility,
+                        "tile ({tx},{ty}) nutrients must equal natural fertility"
+                    );
                 }
                 let z = chunk_map.surface_z_at(tx, ty);
                 if chunk_map.tile_at(tx, ty, z).kind == TileKind::Cropland {
@@ -6823,6 +6832,139 @@ mod smoke {
         assert!(
             refunded > 0,
             "Deconstruct must refund part of the design bill as ground items"
+        );
+    }
+
+    /// Vehicle system (Phase 6): the `AssignCrew` order seats an idle faction
+    /// member as the driver and boards them (`BoardedVehicle`).
+    #[test]
+    fn vehicle_assign_crew_seats_and_boards_a_driver() {
+        use crate::simulation::vehicle::{
+            BoardedVehicle, PendingVehicleOps, Vehicle, VehicleCrew, VehicleDesignRegistry,
+            VehicleDraft, VehicleHealth, VehicleInventory, VehicleOrderKind, VehiclePurpose,
+            VehicleState,
+        };
+
+        let mut sim = TestSim::new(0xC0DE6);
+        sim.flat_world(6, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        let design = {
+            let reg = sim.app.world().resource::<VehicleDesignRegistry>();
+            reg.by_name("Light Chariot").unwrap().clone()
+        };
+        let _m1 = sim.spawn_person(fid, (3, 3), |_| {});
+        let _m2 = sim.spawn_person(fid, (3, 4), |_| {});
+        let vehicle = sim
+            .app
+            .world_mut()
+            .spawn((
+                Vehicle {
+                    owner_faction: fid,
+                    design_id: design.id,
+                    purpose: VehiclePurpose::War,
+                    heading: 0,
+                    state: VehicleState::Parked,
+                    anchor_tile: (0, 0),
+                    z: 0,
+                    hauler: None,
+                },
+                VehicleInventory::default(),
+                VehicleCrew::default(),
+                VehicleDraft { hitched: Vec::new(), required_animals: 1 },
+                VehicleHealth::from_design(&design),
+            ))
+            .id();
+
+        sim.app
+            .world_mut()
+            .resource_mut::<PendingVehicleOps>()
+            .ops
+            .push((vehicle, VehicleOrderKind::AssignCrew));
+        let sys = sim
+            .app
+            .world_mut()
+            .register_system(crate::simulation::vehicle::vehicle_player_command_system);
+        sim.app.world_mut().run_system(sys).unwrap();
+
+        let driver = sim
+            .app
+            .world()
+            .get::<VehicleCrew>(vehicle)
+            .unwrap()
+            .driver
+            .expect("AssignCrew must seat a driver");
+        assert!(
+            sim.app.world().get::<BoardedVehicle>(driver).is_some(),
+            "the seated driver must board the vehicle"
+        );
+    }
+
+    /// Vehicle system (Phase 6): melee attacks aimed at a `Vehicle` resolve
+    /// against its cells — destroying every cell wrecks (despawns) the hulk.
+    #[test]
+    fn vehicle_combat_wrecks_a_vehicle() {
+        use crate::simulation::combat::{CombatCooldown, CombatTarget};
+        use crate::simulation::vehicle::{
+            Vehicle, VehicleCrew, VehicleDesignRegistry, VehicleDraft, VehicleHealth,
+            VehicleInventory, VehiclePurpose, VehicleState,
+        };
+
+        let mut sim = TestSim::new(0xC0DE7);
+        sim.flat_world(6, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        let design = {
+            let reg = sim.app.world().resource::<VehicleDesignRegistry>();
+            reg.by_name("Handcart").unwrap().clone()
+        };
+        // Every cell at 1 HP — one landed hit destroys it.
+        let health = VehicleHealth {
+            cells: design.grid.cells.iter().map(|(p, _)| (*p, 1u16)).collect(),
+            disabled: Default::default(),
+        };
+        let vehicle = sim
+            .app
+            .world_mut()
+            .spawn((
+                Vehicle {
+                    owner_faction: fid,
+                    design_id: design.id,
+                    purpose: VehiclePurpose::Cargo,
+                    heading: 0,
+                    state: VehicleState::Parked,
+                    anchor_tile: (0, 0),
+                    z: 0,
+                    hauler: None,
+                },
+                VehicleInventory::default(),
+                VehicleCrew::default(),
+                VehicleDraft { hitched: Vec::new(), required_animals: 0 },
+                health,
+            ))
+            .id();
+
+        // An attacker standing on a footprint tile, targeting the vehicle.
+        let attacker = sim.spawn_person(fid, (1, 1), |_| {});
+        sim.app
+            .world_mut()
+            .entity_mut(attacker)
+            .remove::<CombatCooldown>();
+        *sim.app.world_mut().get_mut::<CombatTarget>(attacker).unwrap() =
+            CombatTarget(Some(vehicle));
+
+        let sys = sim
+            .app
+            .world_mut()
+            .register_system(crate::simulation::vehicle::vehicle_combat_system);
+        for _ in 0..20 {
+            if sim.app.world().get_entity(vehicle).is_err() {
+                break;
+            }
+            sim.app.world_mut().run_system(sys).unwrap();
+        }
+
+        assert!(
+            sim.app.world().get_entity(vehicle).is_err(),
+            "destroying every cell must wreck (despawn) the vehicle"
         );
     }
 
@@ -16729,6 +16871,32 @@ mod onenter_era_seeding {
             "player faction {player_faction_id} spawned no members"
         );
         (beds, faction.member_count, home)
+    }
+
+    /// Cropland only ever appears inside an Agricultural plot — the seed
+    /// pipeline no longer stamps a house yard. After the full OnEnter chain,
+    /// every `Cropland` tile near home must be registered in
+    /// `PlotIndex.ag_tiles`.
+    #[test]
+    fn seeded_cropland_stays_inside_agricultural_plots() {
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        trigger_onenter(&mut sim);
+
+        let world = sim.app.world();
+        let (_, _, home) = player_seeded_beds_near_home(&sim);
+        let chunk_map = world.resource::<ChunkMap>();
+        let plot_index = world.resource::<crate::simulation::land::PlotIndex>();
+        for ty in home.1 - 80..=home.1 + 80 {
+            for tx in home.0 - 80..=home.0 + 80 {
+                if chunk_map.tile_kind_at(tx, ty) == Some(TileKind::Cropland) {
+                    assert!(
+                        plot_index.ag_tiles.contains(&(tx, ty)),
+                        "Cropland tile ({tx},{ty}) is outside any Agricultural plot"
+                    );
+                }
+            }
+        }
     }
 
     fn assert_perm_settlement_adopted(sim: &TestSim, label: &str) {

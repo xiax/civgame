@@ -277,7 +277,8 @@ Manual acceptance (`cargo run`, never `--sandbox`, Bronze Age start):
 
 - **Tank / siege content** — `Engine/Track/ArmorPlate/Turret` enum variants exist and
   `validate_design` has the 3D hooks; activating them needs tech-tree entries, `core.ron`
-  part defs, and a ranged-combat/turret system. Write `plans/vehicle-system-tanks.md`.
+  part defs, and a ranged-combat/turret system. Skeleton plan written:
+  `plans/vehicle-system-tanks.md`.
 - **Save-game serialization** of freeform designs — blocked on the project having no save
   layer; `VehicleDesignRegistry` is a single serializable resource when one lands.
 
@@ -357,7 +358,33 @@ Manual acceptance (`cargo run`, never `--sandbox`, Bronze Age start):
     with Phase 6 combat.
   - 953-test suite passes (incl. `vehicle_player_command_right_uprights_overturned`,
     `vehicle_player_command_deconstruct_refunds_and_despawns`).
-  **Phase 5 — complete.** Phases 6-7 (chariot combat, docs) pending.
+  **Phase 5 — complete.**
+- **Phase 6 — shipped.** Chariot crew, draft & per-cell combat.
+  - `VehicleHealth` component (per-cell live-health mirror of design durabilities +
+    `disabled: VehicleDisableFlags`), inserted on every spawned `Vehicle`.
+  - `combat_system` gains a `vehicle_query` so a bodiless `Vehicle` target is recognised as a
+    live target (not cleared); `vehicle_combat_system` (Sequential, after `combat_system`)
+    does the per-cell resolution. `pick_hit_cell` is height-weighted toward low cells (melee
+    biases wheels/axles); `apply_vehicle_cell_damage` → `VehicleHitOutcome`.
+  - Cell-destruction effects: Wheel/Axle → movement disabled (route dropped, parks);
+    CargoBay → cargo spills; Hitch/Yoke → draft released; CrewSeat → occupant ejected; low
+    support cell → overturn; last cell → wrecked + despawn.
+  - `AssignCrew` seats driver + passengers up to `crew_seat_count`, boarding each via
+    `BoardedVehicle`; `vehicle_crew_sync_system` snaps every rider; crew fight adjacent foes
+    through the stock `combat_system` rules (mobile crew platform — no new combat code).
+    `vehicle_rollover_system` / `Deconstruct` eject seated crew.
+  - `WeaponMount` modelled + validated; advanced ranged/turret behaviour stays dormant.
+  - **Simplification:** crew fight through stock combat rules without bespoke vehicle-provided
+    damage/protection modifiers (faithful to "fight through existing combat rules").
+  - 8 new vehicle tests (`vehicle_health_mirrors_design_durability`,
+    `destroying_a_wheel_disables_movement`, `destroying_cargo_bay_spills_and_hitch_releases`,
+    `destroying_low_frame_forces_overturn`, `hit_location_biases_low_cells`,
+    `crew_seat_count_matches_template`, `partial_damage_leaves_cell_standing`, plus
+    `vehicle_assign_crew_seats_and_boards_a_driver` / `vehicle_combat_wrecks_a_vehicle`).
+- **Phase 7 — shipped.** `src/simulation/CLAUDE.md` "Vehicle system" section rewritten to
+  cover Phases 1-7 (header now "complete (Phases 1-7)"). `plans/vehicle-system-tanks.md`
+  skeleton written for the deferred tank/siege extension.
+  **Vehicle system complete.**
 
 ## Assumptions
 

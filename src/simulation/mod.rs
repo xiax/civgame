@@ -923,6 +923,11 @@ impl Plugin for SimulationPlugin {
                 (
                     combat::hand_drop_event_handler.after(combat::combat_system),
                     combat::combat_retaliation_cleanup_system.after(combat::combat_system),
+                    // Vehicle system (Phase 6): per-cell vehicle combat —
+                    // resolves attacks aimed at a `Vehicle` after
+                    // `combat_system` has left the (bodiless) vehicle target
+                    // intact.
+                    vehicle::vehicle_combat_system.after(combat::combat_system),
                     reproduction::cosleep_observation_system
                         .after(movement::sync_indexed_after_move_system),
                     tasks::play_system.after(movement::sync_indexed_after_move_system),

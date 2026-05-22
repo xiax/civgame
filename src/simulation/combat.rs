@@ -215,6 +215,7 @@ pub fn combat_system(
     mut faction_registry: ResMut<FactionRegistry>,
     clock: Res<SimClock>,
     mut events: CombatEventWriters,
+    vehicle_query: Query<(), With<crate::simulation::vehicle::Vehicle>>,
 ) {
     let dt = time.delta_secs();
 
@@ -282,7 +283,14 @@ pub fn combat_system(
             false
         };
 
-        if target_is_dead || (!health_query.contains(target) && !body_query.contains(target)) {
+        // A `Vehicle` target has no `Health` / `Body`; it is still a live
+        // target — `vehicle_combat_system` (Sequential, after this) resolves
+        // the per-cell damage. Don't clear the combat target here.
+        if target_is_dead
+            || (!health_query.contains(target)
+                && !body_query.contains(target)
+                && !vehicle_query.contains(target))
+        {
             if let Ok(mut ai) = ai_query.get_mut(attacker) {
                 ai.state = AiState::Idle;
             }

@@ -1,0 +1,36 @@
+{
+  "group_id": null,
+  "states": [
+    {
+      "character": {
+        "id": "234da133-cf07-4f54-b595-cb3dfd1ff542",
+        "name": "cow",
+        "prompt": "cow",
+        "size": {
+          "width": 68,
+          "height": 68
+        },
+        "template_id": "horse",
+        "directions": 8,
+        "view": "side",
+        "created_at": "2026-05-16T18:31:12.047329+00:00"
+      },
+      "folder": "234da133",
+      "frames": {
+        "rotations": {
+          "south": "234da133/rotations/south.png",
+          "south-east": "234da133/rotations/south-east.png",
+          "east": "234da133/rotations/east.png",
+          "north-east": "234da133/rotations/north-east.png",
+          "north": "234da133/rotations/north.png",
+          "north-west": "234da133/rotations/north-west.png",
+          "west": "234da133/rotations/west.png",
+          "south-west": "234da133/rotations/south-west.png"
+        },
+        "animations": {}
+      }
+    }
+  ],
+  "export_version": "3.0",
+  "export_date": "2026-05-17T03:47:03.687063"
+}
