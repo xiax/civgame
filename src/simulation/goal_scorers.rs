@@ -406,10 +406,27 @@ pub struct GoalScoringContext<'a> {
     /// by `HealNeedScorer` to gate `SeekCare` and drive
     /// severity-weighted urgency.
     pub injury: Option<crate::simulation::medicine::Injury>,
-    /// Heal-pipeline (Heal-2): true when any agent in the same
-    /// faction currently carries an `Injury` component. Read by
-    /// `ProvideCareScorer` (Healer-side) to gate `ProvideCare`.
-    pub faction_has_injured: bool,
+    /// Goal-contract: true when an executable care target exists — an
+    /// injured same-faction patient (or `CareNeed` opportunity) within
+    /// `goal_contract::HEAL_SCAN_RADIUS` of the agent, the radius
+    /// `htn_provide_care_dispatch_system` scans. Read by
+    /// `ProvideCareScorer`; a faction-wide "any injured" gate would pin
+    /// a Healer on a `ProvideCare` goal whose dispatcher cannot route to
+    /// a patient out of range.
+    pub has_local_care_patient: bool,
+    /// Goal-contract: true when another `Person` is within
+    /// `goal_contract::SOCIAL_PARTNER_RADIUS`. Read by `SocialScorer` —
+    /// dedicated `Socialize` has no fallback task, so without a reachable
+    /// partner the goal cannot decompose and would idle-loop.
+    ///
+    /// Note there is deliberately no parallel `has_play_option` field:
+    /// `Play` has cheap solo fallbacks (stone-throw / seed-plant / toy)
+    /// whose executable test is a 5-way storage/ground scan. Replicating
+    /// that in the scorer would either drift from
+    /// `htn_play_dispatch_system` or false-negative legitimate solo play;
+    /// instead `Play` relies on the dispatcher's `goal_contract::blocked`
+    /// backstop at every no-task exit.
+    pub has_social_partner: bool,
     /// Farming: true when the agent is a `HouseholdMember` of a household
     /// that holds a `ZoneKind::Agricultural` plot (with state-Owned or
     /// household-Owned tenure). Read by `FarmWorkScorer` so any
@@ -810,6 +827,13 @@ impl GoalScorer for SocialScorer {
         if urgency < 0.15 {
             return None;
         }
+        // Goal-contract: dedicated `Socialize` decomposes only with a
+        // reachable partner (`htn_socialize_dispatch_system` scans
+        // `SOCIAL_PARTNER_RADIUS`). Emitting it with no partner pins an
+        // indecomposable goal.
+        if !ctx.has_social_partner {
+            return None;
+        }
         let lift = disposition_lift(ctx.disposition.gregariousness, SOCIAL_GREG_LIFT);
         Some(GoalScore::new(
             AgentGoal::Socialize,
@@ -1019,18 +1043,13 @@ impl GoalScorer for ProvideCareScorer {
         if !matches!(ctx.profession, Profession::Healer | Profession::Apprentice) {
             return None;
         }
-        let has_care_opportunity = ctx
-            .opportunities
-            .map(|idx| {
-                idx.iter_kind_for_faction(
-                    ctx.faction_member.faction_id,
-                    crate::simulation::opportunity::OpportunityKind::CareNeed,
-                )
-                .next()
-                .is_some()
-            })
-            .unwrap_or(ctx.faction_has_injured);
-        if !has_care_opportunity {
+        // Goal-contract: only fire when a patient is actually within the
+        // dispatcher's `HEAL_SCAN_RADIUS`. `has_local_care_patient` is
+        // precomputed in `goal_update_system` from radius-filtered
+        // `CareNeed` opportunities + injured same-faction agent positions
+        // — a faction-wide "any injured" gate would pin `ProvideCare` on
+        // a Healer who can't route to an out-of-range patient.
+        if !ctx.has_local_care_patient {
             return None;
         }
         Some(GoalScore::new(
@@ -1291,7 +1310,8 @@ mod tests {
             has_personal_build_site: false,
             should_craft: false,
             injury: None,
-            faction_has_injured: false,
+            has_local_care_patient: false,
+            has_social_partner: true,
             time_of_day_bonus: 0.0,
             age_ticks: 0,
             private_farm_available: false,
@@ -1337,7 +1357,8 @@ mod tests {
             has_personal_build_site: false,
             should_craft: false,
             injury: None,
-            faction_has_injured: false,
+            has_local_care_patient: false,
+            has_social_partner: true,
             time_of_day_bonus: 0.0,
             age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
             private_farm_available: false,
@@ -1670,18 +1691,46 @@ mod tests {
         let skills = Skills::default();
         let mut ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
         // Non-Healer: declines regardless of patients.
-        ctx.faction_has_injured = true;
+        ctx.has_local_care_patient = true;
         ctx.profession = Profession::Farmer;
         assert!(ProvideCareScorer.score(&ctx).is_none());
-        // Healer without patients: declines.
+        // Healer without a local patient: declines.
         ctx.profession = Profession::Healer;
-        ctx.faction_has_injured = false;
+        ctx.has_local_care_patient = false;
         assert!(ProvideCareScorer.score(&ctx).is_none());
-        // Healer with patients: fires.
-        ctx.faction_has_injured = true;
+        // Healer with a patient in range: fires.
+        ctx.has_local_care_patient = true;
         let s = ProvideCareScorer.score(&ctx).expect("fires");
         assert_eq!(s.goal, AgentGoal::ProvideCare);
         assert_eq!(s.class, GoalClass::Subsistence);
+    }
+
+    // ─── Goal-contract executable-opportunity gates ───────────────
+
+    /// `SocialScorer` must decline when no partner is reachable — a
+    /// partnerless `Socialize` goal cannot decompose into a task.
+    #[test]
+    fn social_scorer_requires_partner() {
+        let (reg, fid) = make_faction();
+        let faction = reg.factions.get(&fid).unwrap();
+        let mut needs = Needs::default();
+        needs.social = 200.0;
+        let agent = EconomicAgent::default();
+        let member = FactionMember {
+            faction_id: fid,
+            ..Default::default()
+        };
+        let board = JobBoard::default();
+        let skills = Skills::default();
+        let mut ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
+        ctx.disposition.gregariousness = 230;
+        ctx.has_social_partner = false;
+        assert!(
+            SocialScorer.score(&ctx).is_none(),
+            "no partner ⇒ no Socialize goal",
+        );
+        ctx.has_social_partner = true;
+        assert!(SocialScorer.score(&ctx).is_some(), "partner ⇒ Socialize");
     }
 
     // ─── Phase B-3: end-to-end registry calibration ───────────────

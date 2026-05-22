@@ -10953,6 +10953,18 @@ pub fn htn_play_dispatch_system(
             && play_toy_storage_tile.is_none()
             && play_plant_destination_tile.is_none()
         {
+            // Goal-contract: no executable play option. This is the
+            // primary no-task exit for `Play` — record the throttled
+            // backstop here too (not only at the `dispatch_for_goal`
+            // miss below), or a `Play`-goal agent with no option idles
+            // without ever accumulating a `MethodHistory` failure.
+            crate::simulation::goal_contract::blocked(
+                &mut history,
+                &mut ai,
+                now,
+                AgentGoal::Play,
+                crate::simulation::goal_contract::BlockedReason::NoPlayOption,
+            );
             continue;
         }
 

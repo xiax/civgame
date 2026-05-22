@@ -59,16 +59,36 @@ Shipped (structural fix — ends the *permanent* idle loop):
 - Tests: `goal_contract::tests` (throttle + chronic-threshold accumulation);
   full suite 958 passing.
 
-Deferred (idle-churn polish — backstop already guarantees correctness):
-- Per-scorer executable gates needing `GoalScoringContext` fields:
-  `ProvideCare` (radius-filter `CareNeed` opportunities), `Socialize`/`Play`
-  (`has_social_partner` / `has_play_option`), `Craft`
-  (`faction_has_craft_order_path`), `Build` (`has_build_material_path`),
-  `Farm` (seed-availability tightening of the seasonal-work snapshot).
-  Each needs the `GoalScoringContext` struct + its 3 build sites in
-  `goal_update_system` + the scorer body. Without them an agent may pick a
-  dead-end goal for up to ~60 ticks before the backstop releases it; with the
-  backstop it never loops permanently.
+Shipped (per-scorer executable gates — the deferred follow-up):
+- `GoalScoringContext` gained `has_local_care_patient` / `has_social_partner`
+  (replacing the broad `faction_has_injured`). Computed in
+  `goal_update_system`'s `Scored` build site: `has_local_care_patient` from
+  radius-filtered `CareNeed` opportunities + injured-agent positions within
+  `HEAL_SCAN_RADIUS`; `has_social_partner` from a `SOCIAL_PARTNER_RADIUS`
+  box sweep over a **fresh per-tile `Person`-count grid** built same-tick
+  from live `Transform`s (not `SpatialIndex` — a cold index would flip a
+  tick-1 `Socialize` agent off its goal). Bounded behind the social
+  urgency threshold. The maintenance + EarnIncome build sites stub the
+  gates (those paths never read them).
+- `ProvideCareScorer` / `SocialScorer` decline when their gate is false.
+- `Play` has **no** scorer gate by design: its solo fallbacks (stone-throw
+  / seed-plant / toy) make a cheap `has_play_option` false-negative-prone
+  and a faithful one a 5-way scan that duplicates `htn_play_dispatch_system`
+  (drift risk). Instead the dispatcher's primary "no play option" exit —
+  previously a silent `continue` — now records the `goal_contract::blocked`
+  backstop, so every `Play` no-task exit is backstopped.
+- Farm: the `households_with_seasonal_work` snapshot's Spring `plantable`
+  branch now also requires the household (or parent village) to hold
+  `grain_seed` — a seedless household no longer selects `Farm` for
+  plant-only work (unprepared/Prepare tiles still count).
+- `Craft` / `Build` need no new gate: `should_craft` already gates
+  `CraftDemandScorer` on recipe-input availability, and `PersonalBuildScorer`
+  must NOT gate on stored materials — a player-commissioned blueprint with
+  no materials is built via the dispatcher's gather path; gating it would
+  strand the player's order. Both goals are multi-dispatcher-backstopped.
+
+Tests: `goal_scorers::tests::social_scorer_requires_partner` + updated
+`provide_care_only_fires_*`.
 
 ## Assumptions
 

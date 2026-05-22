@@ -86,12 +86,16 @@ pub struct ScorerInputs<'w, 's> {
     pub profession_q: Query<'w, 's, &'static crate::simulation::person::Profession>,
     pub decision_q: Query<'w, 's, &'static mut crate::simulation::goal_scorers::AgentDecisionState>,
     pub injury_q: Query<'w, 's, &'static crate::simulation::medicine::Injury>,
-    /// All currently-injured agents' faction membership. Walked once
-    /// at the top of `goal_update_system` to build a per-faction
-    /// "any injured" set — cheap because `Injury` is rare and the
+    /// All currently-injured agents — entity, faction, position. Walked
+    /// once at the top of `goal_update_system` to build the radius-aware
+    /// `has_local_care_patient` gate. Cheap: `Injury` is rare so the
     /// query iterates only injured entities.
-    pub injured_faction_q:
-        Query<'w, 's, &'static FactionMember, With<crate::simulation::medicine::Injury>>,
+    pub injured_faction_q: Query<
+        'w,
+        's,
+        (Entity, &'static FactionMember, &'static Transform),
+        With<crate::simulation::medicine::Injury>,
+    >,
     /// Household membership for the agent. Read once per
     /// `goal_update_system` cycle to decide `private_farm_available`
     /// for the FarmWorkScorer household-availability gate.
@@ -115,6 +119,13 @@ pub struct ScorerInputs<'w, 's> {
     /// Backing `ChunkMap` for the seasonal-work classification (reads
     /// each plot tile's `TileKind` to decide unprepared / plantable).
     pub chunk_map_view: Res<'w, crate::world::chunk::ChunkMap>,
+    /// Goal-contract: live `Person` positions for the `has_social_partner`
+    /// gate. Read fresh (current-tick `Transform`s) rather than via
+    /// `SpatialIndex` so the gate has no one-tick indexing lag — a cold
+    /// index would otherwise flip a freshly-spawned `Socialize` agent off
+    /// its goal on tick 1.
+    pub person_pos_q:
+        Query<'w, 's, &'static Transform, With<crate::simulation::person::Person>>,
 }
 
 #[repr(u8)]
@@ -629,12 +640,32 @@ pub fn goal_update_system(
 ) {
     let time_of_day_bonus =
         crate::simulation::utility_curves::time_of_day_bonus(calendar.time_phase());
-    // Heal-2: precompute "any injured agent in faction" once per
-    // system invocation. Cheap — query iterates only entities that
-    // already carry an `Injury` component (rare in practice).
-    let mut faction_has_injured: ahash::AHashSet<u32> = ahash::AHashSet::default();
-    for member in scorer_inputs.injured_faction_q.iter() {
-        faction_has_injured.insert(member.faction_id);
+    // Goal-contract (Heal): every injured agent's (faction, entity, tile),
+    // collected once per invocation for the radius-aware
+    // `has_local_care_patient` gate. Cheap — the query iterates only
+    // entities that already carry an `Injury` component (rare in practice).
+    let injured_positions: Vec<(u32, Entity, (i32, i32))> = scorer_inputs
+        .injured_faction_q
+        .iter()
+        .map(|(ent, member, tf)| {
+            (
+                member.faction_id,
+                ent,
+                (
+                    (tf.translation.x / TILE_SIZE).floor() as i32,
+                    (tf.translation.y / TILE_SIZE).floor() as i32,
+                ),
+            )
+        })
+        .collect();
+    // Goal-contract: live per-tile `Person` count for the
+    // `has_social_partner` gate. Built fresh from current `Transform`s so
+    // the gate sees no `SpatialIndex` one-tick lag.
+    let mut person_count: ahash::AHashMap<(i32, i32), u16> = ahash::AHashMap::default();
+    for tf in scorer_inputs.person_pos_q.iter() {
+        let tx = (tf.translation.x / TILE_SIZE).floor() as i32;
+        let ty = (tf.translation.y / TILE_SIZE).floor() as i32;
+        *person_count.entry((tx, ty)).or_insert(0) += 1;
     }
     // Farm §4: snapshot every household that holds an Agricultural plot.
     // Read by `FarmWorkScorer` via `ctx.private_farm_available` so any
@@ -656,6 +687,23 @@ pub fn goal_update_system(
             households_with_ag_plot.insert(faction_id);
             // Per-plot tile scan for seasonal-work classification.
             let rect = plot.rect;
+            // Goal-contract (Farm seed tightening): a plantable tile only
+            // counts as seasonal work when the household — or its parent
+            // village, the §5 seed fallback — actually holds grain seed.
+            // Without this a seedless household keeps selecting `Farm`,
+            // `htn_plant_from_storage_dispatch_system` finds no seed
+            // source, and the agent idles until the backstop releases it.
+            // Unprepared (Prepare-phase) tiles still count unconditionally
+            // — tilling needs no seed.
+            let household_has_grain_seed = {
+                let seed_id = crate::economy::core_ids::grain_seed();
+                registry.factions.get(&faction_id).map_or(false, |f| {
+                    f.storage.stock_of(seed_id) > 0
+                        || f.parent_faction
+                            .and_then(|p| registry.factions.get(&p))
+                            .map_or(false, |pf| pf.storage.stock_of(seed_id) > 0)
+                })
+            };
             let mut has_work = false;
             'tiles: for ty in rect.y0..rect.y0 + rect.h as i32 {
                 for tx in rect.x0..rect.x0 + rect.w as i32 {
@@ -675,7 +723,7 @@ pub fn goal_update_system(
                             let plantable = is_cropland
                                 && nut >= crate::simulation::farm::MIN_PLANTABLE_NUTRIENTS
                                 && !scorer_inputs.plant_map.0.contains_key(&(tx, ty));
-                            if unprepared || plantable {
+                            if unprepared || (plantable && household_has_grain_seed) {
                                 has_work = true;
                                 break 'tiles;
                             }
@@ -925,7 +973,12 @@ pub fn goal_update_system(
                         has_personal_build_site: false,
                         should_craft: false,
                         injury: scorer_inputs.injury_q.get(entity).ok().copied(),
-                        faction_has_injured: faction_has_injured.contains(&member.faction_id),
+                        // Durable-assignment path runs only maintenance
+                        // scorers (`best_maintenance_score`); ProvideCare /
+                        // Social / Play are not maintenance goals, so these
+                        // gates are never read here — stub them.
+                        has_local_care_patient: false,
+                        has_social_partner: false,
                         time_of_day_bonus,
                         age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
                         private_farm_available: scorer_inputs
@@ -1320,6 +1373,57 @@ pub fn goal_update_system(
                 .get(entity)
                 .copied()
                 .unwrap_or(crate::simulation::person::Profession::None);
+            // Goal-contract executable gates (plans/goal-cleanup.md).
+            // `SocialScorer` has no solo fallback, so a partnerless
+            // `Socialize` cannot decompose. Gate it on a `Person` within
+            // `SOCIAL_PARTNER_RADIUS` — the same radius
+            // `htn_socialize_dispatch_system` scans. The box sweep over the
+            // fresh `person_count` grid is bounded to agents already near
+            // the social urgency threshold so it stays off the hot path.
+            let needs_partner_scan = crate::simulation::utility_curves::social_utility(
+                needs.social,
+                disposition.gregariousness,
+            ) >= 0.15;
+            let mut has_social_partner = false;
+            if needs_partner_scan {
+                const R: i32 = crate::simulation::goal_contract::SOCIAL_PARTNER_RADIUS;
+                'partner_scan: for dy in -R..=R {
+                    for dx in -R..=R {
+                        let tile = (agent_tile.0 + dx, agent_tile.1 + dy);
+                        let mut count =
+                            person_count.get(&tile).copied().unwrap_or(0);
+                        if tile == agent_tile {
+                            // Discount the scoring agent itself.
+                            count = count.saturating_sub(1);
+                        }
+                        if count > 0 {
+                            has_social_partner = true;
+                            break 'partner_scan;
+                        }
+                    }
+                }
+            }
+            // ProvideCare: an injured same-faction patient (or CareNeed
+            // opportunity) within the dispatcher's HEAL_SCAN_RADIUS.
+            let has_local_care_patient = matches!(
+                profession,
+                crate::simulation::person::Profession::Healer
+                    | crate::simulation::person::Profession::Apprentice
+            ) && {
+                const HEAL_R: i32 = crate::simulation::goal_contract::HEAL_SCAN_RADIUS;
+                let cheb =
+                    |a: (i32, i32)| (a.0 - agent_tile.0).abs().max((a.1 - agent_tile.1).abs());
+                scorer_inputs
+                    .opportunities
+                    .iter_kind_for_faction(
+                        member.faction_id,
+                        crate::simulation::opportunity::OpportunityKind::CareNeed,
+                    )
+                    .any(|o| cheb(o.tile) <= HEAL_R)
+                    || injured_positions.iter().any(|(fid, ent, t)| {
+                        *fid == member.faction_id && *ent != entity && cheb(*t) <= HEAL_R
+                    })
+            };
             let ctx = crate::simulation::goal_scorers::GoalScoringContext {
                 agent: entity,
                 agent_tile,
@@ -1343,7 +1447,8 @@ pub fn goal_update_system(
                 has_personal_build_site,
                 should_craft: should_craft_now,
                 injury: scorer_inputs.injury_q.get(entity).ok().copied(),
-                faction_has_injured: faction_has_injured.contains(&member.faction_id),
+                has_local_care_patient,
+                has_social_partner,
                 time_of_day_bonus,
                 age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
                 private_farm_available: scorer_inputs
@@ -1648,7 +1753,11 @@ pub fn earnincome_goal_override_system(
             has_personal_build_site: false,
             should_craft: false,
             injury: None,
-            faction_has_injured: false,
+            // EarnIncome override acts only on Enterprise+ picks; the
+            // care / social / play gates are Subsistence-or-lower and
+            // filtered out downstream — stub them.
+            has_local_care_patient: false,
+            has_social_partner: false,
             time_of_day_bonus: 0.0,
             age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
             // EarnIncome override only acts on Enterprise+ tier picks; the

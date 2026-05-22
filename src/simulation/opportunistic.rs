@@ -225,7 +225,15 @@ pub fn opportunistic_interrupt_system(
             has_personal_build_site: false,
             should_craft: false,
             injury: None,
-            faction_has_injured: false,
+            has_local_care_patient: false,
+            // The opportunistic path leaves `has_social_partner` open: it
+            // is itself a 20-tick "try" preempt whose dispatcher
+            // (`htn_socialize_dispatch_system`) records a `MethodHistory`
+            // failure if no partner is in range, so a missed gate here
+            // self-corrects via chronic-failure release. Recomputing the
+            // partner sweep for every walking agent would be pure
+            // overhead the backstop already covers.
+            has_social_partner: true,
             time_of_day_bonus,
             age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
             // FarmWorkScorer isn't an opportunistic challenger — leave false.
@@ -373,7 +381,8 @@ mod tests {
             has_personal_build_site: false,
             should_craft: false,
             injury: None,
-            faction_has_injured: false,
+            has_local_care_patient: false,
+            has_social_partner: true,
             time_of_day_bonus: 0.0,
             age_ticks: crate::simulation::utility_curves::ADULT_AGE_TICKS_PLACEHOLDER,
             // FarmWorkScorer isn't an opportunistic challenger — leave false.
