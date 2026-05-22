@@ -2,6 +2,7 @@ use ahash::AHashSet;
 use bevy::prelude::*;
 use std::collections::VecDeque;
 
+use crate::pathfinding::tile_cost::TraversalProfile;
 use crate::world::chunk::ChunkCoord;
 
 /// Default node budget for the first A* attempt on a single segment.
@@ -126,6 +127,10 @@ pub struct PathRequest {
     pub kind: PathKind,
     pub max_budget: u32,
     pub task_id: u16,
+    /// Traversal profile. `Land` (default) routes through the chunk
+    /// graph; `Amphibious` runs a single bounded full-route A* over
+    /// `passable_for(Amphibious)` so swim crossings can be planned.
+    pub profile: TraversalProfile,
 }
 
 /// Lifecycle of an agent's `PathFollow`.
@@ -209,6 +214,10 @@ pub struct PathFollow {
     /// have accumulated since the previous attempt — single transient
     /// connectivity misses don't yank the agent off-task.
     pub last_recovery_conn_count: u32,
+    /// Traversal profile this path was planned under. Movement reads it
+    /// to pick the profile-aware boundary check (a swimmer stepping onto
+    /// a water tile would be rejected by the `Land` rule).
+    pub profile: TraversalProfile,
 }
 
 impl Default for PathFollow {
@@ -238,6 +247,7 @@ impl Default for PathFollow {
             last_astar_dump: None,
             last_recovery_tick: 0,
             last_recovery_conn_count: 0,
+            profile: TraversalProfile::Land,
         }
     }
 }
@@ -254,7 +264,7 @@ pub struct PathRequestQueue {
 }
 
 impl PathRequestQueue {
-    /// Enqueue (or replace) a request. Returns the request id assigned.
+    /// Enqueue (or replace) a `Land` request. Returns the request id.
     pub fn enqueue(
         &mut self,
         agent: Entity,
@@ -263,6 +273,29 @@ impl PathRequestQueue {
         kind: PathKind,
         max_budget: u32,
         task_id: u16,
+    ) -> u64 {
+        self.enqueue_with_profile(
+            agent,
+            start,
+            goal,
+            kind,
+            max_budget,
+            task_id,
+            TraversalProfile::Land,
+        )
+    }
+
+    /// Enqueue (or replace) a request with an explicit traversal profile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_with_profile(
+        &mut self,
+        agent: Entity,
+        start: (i32, i32, i8),
+        goal: (i32, i32, i8),
+        kind: PathKind,
+        max_budget: u32,
+        task_id: u16,
+        profile: TraversalProfile,
     ) -> u64 {
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
@@ -274,6 +307,7 @@ impl PathRequestQueue {
             kind,
             max_budget,
             task_id,
+            profile,
         };
         if self.pending.contains(&agent) {
             for slot in self.queue.iter_mut() {

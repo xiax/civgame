@@ -205,6 +205,7 @@ pub fn combat_system(
         Option<&mut crate::simulation::carry::Carrier>,
         Option<&Stats>,
         Option<&mut crate::simulation::typed_task::ActionQueue>,
+        Option<&mut crate::simulation::energy::Energy>,
     )>,
     mut health_query: Query<&mut Health>,
     mut body_query: Query<(&mut Body, Option<&Stats>)>,
@@ -240,6 +241,7 @@ pub fn combat_system(
         mut attacker_carrier,
         attacker_stats,
         mut attacker_aq,
+        mut attacker_energy,
     ) in &mut attacker_query
     {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
@@ -383,9 +385,19 @@ pub fn combat_system(
             }
             combat_activity_attackers.push(attacker);
 
+            // Energy: a swing is tiring. When tired, the swing also lands
+            // slower — lengthen the cooldown.
+            let mut cooldown_scale = 1.0;
+            if let Some(energy) = attacker_energy.as_deref_mut() {
+                energy.drain(crate::simulation::energy::ENERGY_ATTACK_DRAIN);
+                if energy.is_tired() {
+                    cooldown_scale = 1.3;
+                }
+            }
+
             // Apply cooldown
             if let Some(ref mut cd) = cd {
-                cd.0 = BASE_ATTACK_COOLDOWN / attack_speed_bonus;
+                cd.0 = BASE_ATTACK_COOLDOWN / attack_speed_bonus * cooldown_scale;
             }
 
             if !attack_lands {
@@ -438,7 +450,7 @@ pub fn combat_system(
         }
 
         // Retaliation
-        if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _, _)) =
+        if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _, _, _)) =
             attacker_query.get_mut(target)
         {
             if let Ok(mut target_ai) = ai_query.get_mut(target) {
@@ -484,7 +496,7 @@ pub fn combat_system(
         }
 
         // Retaliation
-        if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _, _)) =
+        if let Ok((_, mut target_combat, _, _, _, _, _, _, _, _, _, _)) =
             attacker_query.get_mut(target)
         {
             if let Ok(mut target_ai) = ai_query.get_mut(target) {

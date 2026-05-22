@@ -22,7 +22,7 @@ use crate::ui::selection::SelectedEntity;
 
 const SKILL_NAMES: [&str; SKILL_COUNT] = [
     "Farming", "Mining", "Building", "Trading", "Combat", "Crafting", "Social", "Medicine",
-    "Fishing",
+    "Fishing", "Swimming",
 ];
 
 const ACTIVITY_KINDS: [ActivityKind; ACTIVITY_COUNT] = [
@@ -111,7 +111,15 @@ pub fn debug_panel_system(
     mut overlay: ResMut<ZoneOverlayToggle>,
     mut path: PathPanelParams,
     selected: Res<SelectedEntity>,
-    mut agents: Query<(&mut Needs, &mut Skills, &mut EconomicAgent), With<Person>>,
+    mut agents: Query<
+        (
+            &mut Needs,
+            &mut Skills,
+            &mut EconomicAgent,
+            Option<&mut crate::simulation::energy::Energy>,
+        ),
+        With<Person>,
+    >,
     terraform_map: Res<TerraformMap>,
     terraform_sites: Query<&TerraformSite>,
     decision_panel: DecisionPanelParams,
@@ -274,7 +282,9 @@ pub fn debug_panel_system(
                         );
                         return;
                     };
-                    let Ok((mut needs, mut skills, mut agent)) = agents.get_mut(entity) else {
+                    let Ok((mut needs, mut skills, mut agent, mut energy)) =
+                        agents.get_mut(entity)
+                    else {
                         ui.label(
                             egui::RichText::new("Selected entity has no agent data.")
                                 .color(egui::Color32::GRAY),
@@ -332,6 +342,16 @@ pub fn debug_panel_system(
                             ui.label("Repro");
                             ui.add(egui::Slider::new(&mut needs.reproduction, 0.0..=255.0));
                             ui.end_row();
+                            if let Some(energy) = energy.as_deref_mut() {
+                                ui.label("Energy");
+                                if ui
+                                    .add(egui::Slider::new(&mut energy.current, 0.0..=255.0))
+                                    .changed()
+                                {
+                                    energy.refresh_flag();
+                                }
+                                ui.end_row();
+                            }
                         });
 
                     ui.add_space(4.0);

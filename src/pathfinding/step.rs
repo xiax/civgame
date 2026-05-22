@@ -1,3 +1,4 @@
+use crate::pathfinding::tile_cost::TraversalProfile;
 use crate::world::chunk::ChunkMap;
 
 /// True iff `from → to` is a single legal 3D step AND, for diagonals,
@@ -28,6 +29,33 @@ pub fn passable_diagonal_step(
             let cz = from.2 + cdz;
             chunk_map.passable_step_3d(from, (cx, cy, cz))
                 && chunk_map.passable_step_3d((cx, cy, cz), to)
+        })
+    };
+    corner_ok(to.0, from.1) && corner_ok(from.0, to.1)
+}
+
+/// Profile-aware `passable_diagonal_step`. `Land` behaves identically to
+/// the historical function; `Amphibious` validates every leg via
+/// `passable_step_for`, so a swimmer may corner through water cells.
+pub fn passable_diagonal_step_for(
+    chunk_map: &ChunkMap,
+    from: (i32, i32, i32),
+    to: (i32, i32, i32),
+    profile: TraversalProfile,
+) -> bool {
+    if !chunk_map.passable_step_for(from, to, profile) {
+        return false;
+    }
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    if dx == 0 || dy == 0 {
+        return true;
+    }
+    let corner_ok = |cx: i32, cy: i32| {
+        [0i32, 1, -1].iter().any(|&cdz| {
+            let cz = from.2 + cdz;
+            chunk_map.passable_step_for(from, (cx, cy, cz), profile)
+                && chunk_map.passable_step_for((cx, cy, cz), to, profile)
         })
     };
     corner_ok(to.0, from.1) && corner_ok(from.0, to.1)

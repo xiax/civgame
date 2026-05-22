@@ -188,6 +188,7 @@ pub fn inspector_panel_system(
             &FactionMember,
             &Profession,
             Option<&Stats>,
+            Option<&crate::simulation::energy::Energy>,
         ),
         (
             Option<&Health>,
@@ -303,7 +304,7 @@ pub fn inspector_panel_system(
     }
 
     let Ok((
-        (needs, mood, skills, ai, agent, goal, personality, sex, member, profession, stats),
+        (needs, mood, skills, ai, agent, goal, personality, sex, member, profession, stats, energy),
         (
             health,
             body,
@@ -592,13 +593,26 @@ pub fn inspector_panel_system(
                         needs_bar(ui, "Social", needs.social);
                         needs_bar(ui, "Repro", needs.reproduction);
                         willpower_bar(ui, needs.willpower);
+                        if let Some(e) = energy {
+                            let label = if e.is_exhausted() {
+                                "Energy (EXHAUSTED)"
+                            } else if e.is_tired() {
+                                "Energy (tired)"
+                            } else {
+                                "Energy"
+                            };
+                            ui.label(format!(
+                                "{}: {:.0} / {:.0}",
+                                label, e.current, e.max
+                            ));
+                        }
                     });
                 egui::CollapsingHeader::new(egui::RichText::new("Skills").strong())
                     .default_open(false)
                     .show(ui, |ui| {
                         let peaks = wage_params.peaks_q.get(entity).ok().copied();
                         for i in 0..SKILL_COUNT {
-                            let kind = unsafe { std::mem::transmute::<u8, SkillKind>(i as u8) };
+                            let kind = SkillKind::ALL[i];
                             let cur = skills.0[i];
                             let (peak, floor) = match peaks {
                                 Some(p) => {

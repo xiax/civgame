@@ -450,6 +450,13 @@ pub struct GoalScoringContext<'a> {
     /// When age tracking lands, scorer behaviour shifts without
     /// touching the scorer code.
     pub age_ticks: u64,
+    /// Energy executable gate. True when the agent's `Energy` component
+    /// reads exhausted (hysteresis: below `ENERGY_EXHAUSTED`, holds until
+    /// `ENERGY_RECOVERED`). `best_with_incumbent` drops every candidate
+    /// goal that is not `Survival`/`Safety` class while this is set, so an
+    /// exhausted agent stops picking up noncritical heavy labor and idles
+    /// (recovering) until rested. Eat/drink/sleep/flee remain ungated.
+    pub is_exhausted: bool,
 }
 
 /// Trait every scorer implements. Trait objects live in the
@@ -513,6 +520,15 @@ impl GoalScorerRegistry {
             let Some(candidate) = scorer.score(ctx) else {
                 continue;
             };
+            // Energy exhaustion gate: an exhausted agent only takes
+            // critical (Survival/Safety) goals — eat, drink, sleep,
+            // heal, flee, defend. Noncritical labor is shed until the
+            // agent has recovered (it idles, recovering, meanwhile).
+            if ctx.is_exhausted
+                && !matches!(candidate.class, GoalClass::Survival | GoalClass::Safety)
+            {
+                continue;
+            }
             if best.map_or(true, |b| Self::beats(candidate, b.score)) {
                 best = Some(GoalScorerPick {
                     score: candidate,
@@ -1317,6 +1333,7 @@ mod tests {
             private_farm_available: false,
             farm_season: crate::simulation::farm::FarmSeasonPhase::SpringPrepPlant,
             private_plot_has_seasonal_work: false,
+            is_exhausted: false,
         };
         let best = registry.best(&ctx).expect("at least one stub fires");
         assert_eq!(best.goal, AgentGoal::Sleep);
@@ -1364,6 +1381,7 @@ mod tests {
             private_farm_available: false,
             farm_season: crate::simulation::farm::FarmSeasonPhase::SpringPrepPlant,
             private_plot_has_seasonal_work: false,
+            is_exhausted: false,
         }
     }
 
@@ -1409,6 +1427,46 @@ mod tests {
             assert_eq!(score.goal, AgentGoal::Survive);
             assert!(score.score > 0.4);
         }
+    }
+
+    /// Swimming plan Phase 1: an exhausted agent sheds noncritical labor.
+    /// `best_with_incumbent` drops every non-Survival/Safety candidate when
+    /// `ctx.is_exhausted` is set, so a tired-out agent idles (recovering)
+    /// rather than picking up a Belonging/Subsistence/Enterprise goal.
+    #[test]
+    fn exhaustion_gate_sheds_noncritical_goals() {
+        let (reg, fid) = make_faction();
+        let faction = reg.factions.get(&fid).unwrap();
+        let agent = EconomicAgent::default();
+        let member = FactionMember {
+            faction_id: fid,
+            ..Default::default()
+        };
+        let board = JobBoard::default();
+        let skills = Skills::default();
+        let mut registry = GoalScorerRegistry::default();
+        register_default_scorers(&mut registry);
+
+        // High social need → SocialScorer (Belonging) is the best pick.
+        let mut needs = Needs::default();
+        needs.social = 250.0;
+        let mut ctx = test_ctx(&needs, &agent, &member, faction, &board, &skills);
+
+        let fresh = registry.best(&ctx).expect("a goal fires when fresh");
+        assert_eq!(fresh.goal, AgentGoal::Socialize);
+        assert_eq!(fresh.class, GoalClass::Belonging);
+
+        // Exhausted: the Belonging pick (and every other noncritical
+        // candidate) is gated out — nothing critical fires here.
+        ctx.is_exhausted = true;
+        let picked = registry.best(&ctx);
+        assert!(
+            picked.map_or(true, |p| matches!(
+                p.class,
+                GoalClass::Survival | GoalClass::Safety
+            )),
+            "exhausted agent must not pick a noncritical goal, got {picked:?}",
+        );
     }
 
     #[test]

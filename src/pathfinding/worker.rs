@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use std::time::Instant;
 
-use crate::pathfinding::astar::{find_path_in, AStarResult};
+use crate::pathfinding::astar::{find_path_in, find_path_profile, AStarResult};
 use crate::pathfinding::chunk_graph::{ChunkGraph, ComponentId};
 use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
@@ -12,7 +12,8 @@ use crate::pathfinding::path_request::{
     PathKind, PathReady, PathReadyKind, PathRequest, PathRequestQueue,
 };
 use crate::pathfinding::pool::{AStarPool, AStarScratch};
-use crate::pathfinding::step::passable_diagonal_step;
+use crate::pathfinding::step::{passable_diagonal_step, passable_diagonal_step_for};
+use crate::pathfinding::tile_cost::TraversalProfile;
 use crate::simulation::tasks::task_kind_label;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 
@@ -129,6 +130,7 @@ fn first_invalid_step(
     chunk_map: &ChunkMap,
     start: (i32, i32, i8),
     path: &[(i32, i32, i8)],
+    profile: TraversalProfile,
 ) -> Option<usize> {
     let mut prev = start;
     for (i, &(x, y, z)) in path.iter().enumerate() {
@@ -139,9 +141,9 @@ fn first_invalid_step(
             let dx = (to.0 - from.0).abs();
             let dy = (to.1 - from.1).abs();
             let ok = if dx == 1 && dy == 1 {
-                passable_diagonal_step(chunk_map, from, to)
+                passable_diagonal_step_for(chunk_map, from, to, profile)
             } else {
-                chunk_map.passable_step_3d(from, to)
+                chunk_map.passable_step_for(from, to, profile)
             };
             if !ok {
                 return Some(i);
@@ -331,8 +333,49 @@ pub fn drain_path_requests_system(
     diag.worker_us_per_tick = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
 }
 
+/// Top-level path build. A `Land` request routes through the chunk
+/// graph (`compute_land`). An `Amphibious` request **also tries the land
+/// route first** — when a dry route exists nothing swims, and the fast
+/// hierarchical pathfinder is preserved with zero regression. Only when
+/// land routing fails as `Unreachable` / `NoRoute` (banks split by
+/// water) does it fall back to `compute_amphibious`'s bounded swim A*.
 #[allow(clippy::too_many_arguments)]
 fn compute_outcome(
+    req: PathRequest,
+    chunk_map: &ChunkMap,
+    graph: &ChunkGraph,
+    router: &ChunkRouter,
+    conn: &ChunkConnectivity,
+    hotspots: &HotspotFlowFields,
+    flags: &PathDebugFlags,
+    scratch: &mut AStarScratch,
+) -> ComputeOutcome {
+    let land = compute_land(
+        req.clone(),
+        chunk_map,
+        graph,
+        router,
+        conn,
+        hotspots,
+        flags,
+        scratch,
+    );
+    if req.profile == TraversalProfile::Amphibious {
+        if let OutcomeBody::Failure(ref fb) = land.body {
+            use crate::pathfinding::path_request::FailReason;
+            if matches!(
+                fb.sub.to_reason(),
+                FailReason::Unreachable | FailReason::NoRoute
+            ) {
+                return compute_amphibious(req, chunk_map, scratch, flags);
+            }
+        }
+    }
+    land
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_land(
     req: PathRequest,
     chunk_map: &ChunkMap,
     graph: &ChunkGraph,
@@ -350,7 +393,7 @@ fn compute_outcome(
     // every cooldown elapse. The dispatch path is supposed to snap goal Z
     // via `nearest_standable_z` but stale `target_z` can sneak through
     // (Routing→Seeking, stranded recovery, etc.).
-    if !chunk_map.passable_at(req.goal.0, req.goal.1, req.goal.2 as i32) {
+    if !chunk_map.passable_for(req.goal.0, req.goal.1, req.goal.2 as i32, req.profile) {
         if flags.verbose_logs {
             info!(
                 "[path] goal not standable agent={:?} goal={:?}",
@@ -363,6 +406,7 @@ fn compute_outcome(
             FailureBody::connectivity(FailSubReason::UnreachableConnectivity, goal),
         );
     }
+
 
     // Look up start/goal components in the new component-typed graph.
     // The agent's exact (x, y, z) classifies into a single component;
@@ -449,7 +493,9 @@ fn compute_outcome(
             let cell_idx = ly as usize * CHUNK_SIZE + lx as usize;
             if field.cell_z[cell_idx] == req.start.2 {
                 if let Some(path) = walk_to_goal(field, (lx, ly)) {
-                    if let Some(bad) = first_invalid_step(chunk_map, req.start, &path) {
+                    if let Some(bad) =
+                        first_invalid_step(chunk_map, req.start, &path, TraversalProfile::Land)
+                    {
                         if flags.verbose_logs {
                             let prev = if bad == 0 {
                                 req.start
@@ -587,7 +633,9 @@ fn compute_outcome(
         }
     };
 
-    if let Some(bad) = first_invalid_step(chunk_map, req.start, &segment_path) {
+    if let Some(bad) =
+        first_invalid_step(chunk_map, req.start, &segment_path, TraversalProfile::Land)
+    {
         if flags.verbose_logs {
             let prev = if bad == 0 {
                 req.start
@@ -623,6 +671,111 @@ fn compute_outcome(
         astar_calls,
         astar_iters: astar_iters_total,
         astar_iters_max_single: astar_iters_max,
+    }
+}
+
+/// Amphibious path build: one bounded full-route A* over
+/// `passable_for(Amphibious)`. The whole tile path is stuffed into a
+/// single segment with a length-1 `chunk_route` (just the start chunk)
+/// so `movement_system` walks `segment_path` to completion and then
+/// reports arrival without requesting a next segment.
+fn compute_amphibious(
+    req: PathRequest,
+    chunk_map: &ChunkMap,
+    scratch: &mut AStarScratch,
+    flags: &PathDebugFlags,
+) -> ComputeOutcome {
+    let mut astar_calls: u32 = 1;
+    let (mut result, mut iters) = find_path_profile(
+        scratch,
+        chunk_map,
+        req.start,
+        req.goal,
+        req.max_budget as usize,
+        TraversalProfile::Amphibious,
+    );
+    let mut iters_total = iters;
+    let mut iters_max = iters;
+    if matches!(result, AStarResult::BudgetExhausted { .. }) {
+        astar_calls += 1;
+        let retry = find_path_profile(
+            scratch,
+            chunk_map,
+            req.start,
+            req.goal,
+            req.max_budget.saturating_mul(4) as usize,
+            TraversalProfile::Amphibious,
+        );
+        result = retry.0;
+        iters = retry.1;
+        iters_total = iters_total.saturating_add(iters);
+        iters_max = iters_max.max(iters);
+    }
+
+    let (segment_path, ready_kind) = match result {
+        AStarResult::Found(path) => (path, PathReadyKind::Strict),
+        AStarResult::BudgetExhausted { best_so_far } => {
+            if matches!(req.kind, PathKind::Strict) {
+                if flags.verbose_logs {
+                    info!(
+                        "[path] amphibious A* budget exhausted agent={:?} start={:?} goal={:?}",
+                        req.agent, req.start, req.goal
+                    );
+                }
+                let goal = req.goal;
+                return fail_outcome_with_metrics(
+                    req,
+                    FailureBody::basic(FailSubReason::BudgetExhausted, goal),
+                    astar_calls,
+                    iters_total,
+                    iters_max,
+                );
+            }
+            (vec![best_so_far], PathReadyKind::BestEffort)
+        }
+        AStarResult::Unreachable => {
+            if flags.verbose_logs {
+                info!(
+                    "[path] amphibious A* unreachable agent={:?} start={:?} goal={:?}",
+                    req.agent, req.start, req.goal
+                );
+            }
+            let goal = req.goal;
+            return fail_outcome_with_metrics(
+                req,
+                FailureBody::basic(FailSubReason::UnreachableAstar, goal),
+                astar_calls,
+                iters_total,
+                iters_max,
+            );
+        }
+    };
+
+    if let Some(_bad) =
+        first_invalid_step(chunk_map, req.start, &segment_path, TraversalProfile::Amphibious)
+    {
+        let goal = req.goal;
+        return fail_outcome_with_metrics(
+            req,
+            FailureBody::basic(FailSubReason::NoRouteStepContinuity, goal),
+            astar_calls,
+            iters_total,
+            iters_max,
+        );
+    }
+
+    let chunk_route = vec![chunk_of(req.start)];
+    ComputeOutcome {
+        body: OutcomeBody::Success {
+            chunk_route,
+            segment_path,
+            ready_kind,
+            flow_field_hit: false,
+        },
+        req,
+        astar_calls,
+        astar_iters: iters_total,
+        astar_iters_max_single: iters_max,
     }
 }
 
@@ -860,6 +1013,7 @@ fn write_success(
             follow.planning_generation = conn_generation;
             follow.request_id = req.id;
             follow.last_fail_streak = 0;
+            follow.profile = req.profile;
             // Intentionally do NOT clear `last_astar_dump`: a successful
             // path between failures would wipe the dump before the user
             // can read it. The dump is overwritten on the next
@@ -1021,7 +1175,7 @@ mod tests {
             );
         }
         let path = vec![(6i32, 6i32, 0i8)];
-        assert_eq!(first_invalid_step(&map, (5, 5, 0), &path), Some(0));
+        assert_eq!(first_invalid_step(&map, (5, 5, 0), &path, TraversalProfile::Land), Some(0));
     }
 
     #[test]
@@ -1029,6 +1183,6 @@ mod tests {
         let mut map = ChunkMap::default();
         map.0.insert(ChunkCoord(0, 0), flat_chunk(0));
         let path = vec![(6i32, 6i32, 0i8)];
-        assert_eq!(first_invalid_step(&map, (5, 5, 0), &path), None);
+        assert_eq!(first_invalid_step(&map, (5, 5, 0), &path, TraversalProfile::Land), None);
     }
 }

@@ -3,6 +3,23 @@ use crate::world::tile::TileKind;
 
 pub const FURNITURE_SPEED_FACTOR: f32 = 0.5;
 
+/// Which set of tiles an agent may traverse. `Land` is the historical
+/// behaviour — water is impassable. `Amphibious` additionally treats a
+/// water-surface cell as standable (swimming), at a finite but expensive
+/// step cost. Mounted humans and all animals use `Land`; humans on foot
+/// use `Amphibious`.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default, Hash)]
+pub enum TraversalProfile {
+    #[default]
+    Land,
+    Amphibious,
+}
+
+/// Effective speed multiplier of a swimming step over `Water`/`River`
+/// (~0.35× of a grass step). Phase 2 cost is depth-blind; Phase 3
+/// enriches the per-tile swim cost with current vectors.
+pub const SWIM_SPEED_MULT: f32 = 0.35;
+
 pub fn tile_speed_multiplier(kind: TileKind) -> f32 {
     match kind {
         TileKind::Grass | TileKind::Stone | TileKind::Ramp => 1.0,
@@ -36,6 +53,21 @@ pub fn tile_step_cost(kind: TileKind) -> u16 {
         IMPASSABLE
     } else {
         ((BASE_STEP_COST as f32) / m).round() as u16
+    }
+}
+
+/// Profile-aware step cost. `Land` is `tile_step_cost` verbatim; for
+/// `Amphibious`, `Water`/`River` resolve to a finite expensive cost
+/// instead of `IMPASSABLE` so swim routes can be planned.
+pub fn step_cost_for(kind: TileKind, profile: TraversalProfile) -> u16 {
+    match profile {
+        TraversalProfile::Land => tile_step_cost(kind),
+        TraversalProfile::Amphibious => match kind {
+            TileKind::Water | TileKind::River => {
+                ((BASE_STEP_COST as f32) / SWIM_SPEED_MULT).round() as u16
+            }
+            _ => tile_step_cost(kind),
+        },
     }
 }
 
@@ -112,5 +144,28 @@ mod tests {
     fn river_remains_impassable() {
         assert_eq!(tile_speed_multiplier(TileKind::River), 0.0);
         assert_eq!(tile_step_cost(TileKind::River), IMPASSABLE);
+    }
+
+    #[test]
+    fn amphibious_makes_water_finite_but_expensive() {
+        for k in [TileKind::Water, TileKind::River] {
+            assert_eq!(step_cost_for(k, TraversalProfile::Land), IMPASSABLE);
+            let amph = step_cost_for(k, TraversalProfile::Amphibious);
+            assert!(amph < IMPASSABLE, "amphibious water must be finite");
+            assert!(
+                amph > tile_step_cost(TileKind::Grass),
+                "swimming must cost more than a grass step",
+            );
+        }
+    }
+
+    #[test]
+    fn amphibious_leaves_land_tiles_unchanged() {
+        for k in [TileKind::Grass, TileKind::Road, TileKind::Forest, TileKind::Wall] {
+            assert_eq!(
+                step_cost_for(k, TraversalProfile::Amphibious),
+                tile_step_cost(k),
+            );
+        }
     }
 }

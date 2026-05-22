@@ -20,6 +20,7 @@ pub mod dig;
 pub mod doormat;
 pub mod draftwork;
 pub mod drink;
+pub mod energy;
 pub mod faction;
 pub mod farm;
 pub mod fishing;
@@ -77,6 +78,7 @@ pub mod sound;
 pub mod speed;
 pub mod stats;
 pub mod survey_task;
+pub mod swimming;
 pub mod tasks;
 pub mod teaching;
 pub mod technology;
@@ -497,6 +499,7 @@ impl Plugin for SimulationPlugin {
                 FixedUpdate,
                 (
                     needs::tick_needs_system,
+                    energy::energy_tick_system.after(needs::tick_needs_system),
                     mood::derive_mood_system,
                     items::recompute_inventory_capacity_system,
                     lod::update_lod_levels_system,
@@ -826,6 +829,14 @@ impl Plugin for SimulationPlugin {
                     .after(movement::movement_system)
                     .after(combat::combat_retaliation_cleanup_system)
                     .before(reproduction::cosleep_observation_system)
+                    .in_set(SimulationSet::Sequential),
+            )
+            // Swimming mechanics — reads the post-move tile, so after
+            // `movement_system`.
+            .add_systems(
+                FixedUpdate,
+                swimming::swimming_system
+                    .after(movement::movement_system)
                     .in_set(SimulationSet::Sequential),
             )
             // Phase 3 (thirst): animal water seek + drink executors.

@@ -508,6 +508,62 @@ impl ChunkMap {
         clear
     }
 
+    /// Profile-aware passability. `Land` is `passable_at` verbatim.
+    /// `Amphibious` additionally accepts a **water-surface cell** as
+    /// standable: a wet column (`water_depth_at > 0`) whose surface Z is
+    /// `tz`, whose foot tile is `Water`/`River`, with `Air`/`Ramp`
+    /// headspace above. Lets a swimmer's path plan over open water.
+    pub fn passable_for(
+        &self,
+        tile_x: i32,
+        tile_y: i32,
+        tz: i32,
+        profile: crate::pathfinding::tile_cost::TraversalProfile,
+    ) -> bool {
+        if self.passable_at(tile_x, tile_y, tz) {
+            return true;
+        }
+        if profile != crate::pathfinding::tile_cost::TraversalProfile::Amphibious {
+            return false;
+        }
+        if tz < Z_MIN || tz > Z_MAX {
+            return false;
+        }
+        // Must be the wet column's surface Z.
+        if self.water_depth_at(tile_x, tile_y) <= 0.0 || self.surface_z_at(tile_x, tile_y) != tz {
+            return false;
+        }
+        let here = self.tile_at(tile_x, tile_y, tz).kind;
+        if !matches!(here, TileKind::Water | TileKind::River) {
+            return false;
+        }
+        let head = self.tile_at(tile_x, tile_y, tz + 1).kind;
+        matches!(head, TileKind::Air | TileKind::Ramp)
+    }
+
+    /// Profile-aware 3D step. `Land` is `passable_step_3d` verbatim;
+    /// `Amphibious` validates the destination via `passable_for`.
+    pub fn passable_step_for(
+        &self,
+        from: (i32, i32, i32),
+        to: (i32, i32, i32),
+        profile: crate::pathfinding::tile_cost::TraversalProfile,
+    ) -> bool {
+        let (sx, sy, sz) = from;
+        let (dx, dy, dz) = to;
+        let (ddx, ddy, ddz) = (dx - sx, dy - sy, dz - sz);
+        if ddx.abs() > 1 || ddy.abs() > 1 || ddz.abs() > 1 {
+            return false;
+        }
+        if ddx == 0 && ddy == 0 && ddz == 0 {
+            return false;
+        }
+        if sz < Z_MIN || sz > Z_MAX {
+            return false;
+        }
+        self.passable_for(dx, dy, dz, profile)
+    }
+
     /// 3D step passability for an agent moving from (sx,sy,sz) to (dx,dy,dz).
     /// 8-connected in XY, |Δz| ≤ 1. Both endpoints must be standable.
     pub fn passable_step_3d(&self, from: (i32, i32, i32), to: (i32, i32, i32)) -> bool {
@@ -679,6 +735,26 @@ mod tests {
         );
         // z=1 stays Wall (since surface=5, z=1 < surface defaults to Wall).
         assert!(!map.passable_at(5, 5, 0));
+    }
+
+    #[test]
+    fn passable_for_amphibious_accepts_water_surface() {
+        use crate::pathfinding::tile_cost::TraversalProfile;
+        let mut map = ChunkMap::default();
+        map.0.insert(ChunkCoord(0, 0), make_chunk(0));
+        // Wet (5,5): bed at z=-2, depth 2 → water surface at z=0.
+        map.0
+            .get_mut(&ChunkCoord(0, 0))
+            .unwrap()
+            .apply_water_column(5, 5, -2, 2.0, 0);
+        assert_eq!(map.surface_z_at(5, 5), 0);
+        // Land never stands on water; Amphibious stands on the surface.
+        assert!(!map.passable_at(5, 5, 0));
+        assert!(!map.passable_for(5, 5, 0, TraversalProfile::Land));
+        assert!(map.passable_for(5, 5, 0, TraversalProfile::Amphibious));
+        // A dry grass tile stays passable under both profiles.
+        assert!(map.passable_for(8, 8, 0, TraversalProfile::Land));
+        assert!(map.passable_for(8, 8, 0, TraversalProfile::Amphibious));
     }
 
     #[test]

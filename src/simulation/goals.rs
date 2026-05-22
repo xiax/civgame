@@ -86,6 +86,10 @@ pub struct ScorerInputs<'w, 's> {
     pub profession_q: Query<'w, 's, &'static crate::simulation::person::Profession>,
     pub decision_q: Query<'w, 's, &'static mut crate::simulation::goal_scorers::AgentDecisionState>,
     pub injury_q: Query<'w, 's, &'static crate::simulation::medicine::Injury>,
+    /// Energy exhaustion gate. Read once per agent to set
+    /// `GoalScoringContext.is_exhausted` (drives the noncritical-labor
+    /// goal gate in `GoalScorerRegistry::best_with_incumbent`).
+    pub energy_q: Query<'w, 's, &'static crate::simulation::energy::Energy>,
     /// All currently-injured agents — entity, faction, position. Walked
     /// once at the top of `goal_update_system` to build the radius-aware
     /// `has_local_care_patient` gate. Cheap: `Injury` is rare so the
@@ -996,6 +1000,10 @@ pub fn goal_update_system(
                             .map_or(false, |hm| {
                                 households_with_seasonal_work.contains(&hm.household_id)
                             }),
+                        is_exhausted: scorer_inputs
+                            .energy_q
+                            .get(entity)
+                            .map_or(false, |e| e.is_exhausted()),
                     };
                     scorer_inputs.metrics.goal_evaluations =
                         scorer_inputs.metrics.goal_evaluations.saturating_add(1);
@@ -1466,6 +1474,10 @@ pub fn goal_update_system(
                     .map_or(false, |hm| {
                         households_with_seasonal_work.contains(&hm.household_id)
                     }),
+                is_exhausted: scorer_inputs
+                    .energy_q
+                    .get(entity)
+                    .map_or(false, |e| e.is_exhausted()),
             };
             // Hysteresis margin damps single-tick flips around
             // utility crossover; Survival/Subsistence still
@@ -1766,6 +1778,7 @@ pub fn earnincome_goal_override_system(
             private_farm_available: false,
             farm_season: crate::simulation::farm::FarmSeasonPhase::SpringPrepPlant,
             private_plot_has_seasonal_work: false,
+            is_exhausted: false,
         };
         let Some(best) = scorer_registry.best(&ctx) else {
             continue;

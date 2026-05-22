@@ -371,6 +371,7 @@ pub struct PersonBuilder {
     tile: (i32, i32),
     surface_z: i8,
     needs: Needs,
+    energy: f32,
     skills: Skills,
     profession: Profession,
     goal: AgentGoal,
@@ -386,6 +387,7 @@ impl PersonBuilder {
             tile,
             surface_z,
             needs: Needs::new(30.0, 20.0, 10.0, 5.0, 40.0, 200.0),
+            energy: crate::simulation::energy::ENERGY_MAX,
             skills: Skills::default(),
             profession: Profession::None,
             goal: AgentGoal::default(),
@@ -402,6 +404,13 @@ impl PersonBuilder {
 
     pub fn hunger(&mut self, hunger: f32) -> &mut Self {
         self.needs.hunger = hunger;
+        self
+    }
+
+    /// Override the agent's starting `Energy.current` (default
+    /// `ENERGY_MAX`). Used by the Phase 1 energy regression tests.
+    pub fn energy(&mut self, energy: f32) -> &mut Self {
+        self.energy = energy;
         self
     }
 
@@ -520,7 +529,10 @@ impl PersonBuilder {
                     crate::simulation::goal_scorers::AgentDecisionState::default(),
                     crate::simulation::goal_scorers::Disposition::default(),
                 ),
-                (crate::simulation::social_contact::SecondarySocial::inactive(),),
+                (
+                    crate::simulation::social_contact::SecondarySocial::inactive(),
+                    crate::simulation::energy::Energy::new(self.energy),
+                ),
             ))
             .id();
         if self.drafted {
@@ -545,6 +557,13 @@ pub fn person_ai(app: &App, entity: Entity) -> PersonAI {
     *app.world()
         .get::<PersonAI>(entity)
         .expect("PersonAI missing")
+}
+
+/// Quick accessor for an agent's `Energy` component (returns a copy).
+pub fn person_energy(app: &App, entity: Entity) -> crate::simulation::energy::Energy {
+    *app.world()
+        .get::<crate::simulation::energy::Energy>(entity)
+        .expect("Energy missing")
 }
 
 /// Quick accessor for an agent's typed `ActionQueue.current` task. Phase 4a
@@ -731,6 +750,62 @@ mod smoke {
         let _person = sim.spawn_person(sim.player_faction_id, (4, 4), |_| {});
         sim.tick_n(5);
         assert!(sim.tick_count() > 0);
+    }
+
+    // ─── Swimming plan, Phase 1 — Energy physiological resource ───
+
+    #[test]
+    fn new_humans_spawn_with_full_energy() {
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let person = sim.spawn_person(sim.player_faction_id, (4, 4), |_| {});
+        let e = person_energy(&sim.app, person);
+        assert_eq!(e.current, crate::simulation::energy::ENERGY_MAX);
+        assert!(!e.is_exhausted());
+    }
+
+    #[test]
+    fn working_state_drains_energy() {
+        use crate::simulation::person::{AiState, PersonAI};
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let person = sim.spawn_person(sim.player_faction_id, (4, 4), |b| {
+            b.drafted();
+        });
+        // Force the labor state; `energy_tick_system` drains while Working.
+        sim.app
+            .world_mut()
+            .get_mut::<PersonAI>(person)
+            .unwrap()
+            .state = AiState::Working;
+        let before = person_energy(&sim.app, person).current;
+        sim.tick_n(40);
+        let after = person_energy(&sim.app, person).current;
+        assert!(after < before, "labor should drain energy: {before} -> {after}");
+    }
+
+    #[test]
+    fn idle_state_recovers_energy() {
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        // Drafted so no dispatcher hands it a task — it stays Idle.
+        let person = sim.spawn_person(sim.player_faction_id, (4, 4), |b| {
+            b.energy(120.0).drafted();
+        });
+        let before = person_energy(&sim.app, person).current;
+        sim.tick_n(40);
+        let after = person_energy(&sim.app, person).current;
+        assert!(after > before, "idle should recover energy: {before} -> {after}");
+    }
+
+    #[test]
+    fn exhaustion_floor_slows_work() {
+        use crate::simulation::energy::Energy;
+        // The `energy_factor()` ramp: a drained agent works at the floor.
+        let drained = Energy::new(0.0);
+        let fresh = Energy::default();
+        assert!(drained.energy_factor() < fresh.energy_factor());
+        assert!(drained.is_exhausted());
     }
 
     // ─── Pluralist Economy rewrite — R0 currency-helper unit tests ───
@@ -16266,6 +16341,7 @@ mod wage_aware_phase0_phase1 {
             private_farm_available: false,
             farm_season: crate::simulation::farm::FarmSeasonPhase::SpringPrepPlant,
             private_plot_has_seasonal_work: false,
+            is_exhausted: false,
         };
         let lo = scorer
             .score(&make_ctx(Disposition {

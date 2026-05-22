@@ -1,6 +1,6 @@
 use crate::pathfinding::pool::AStarScratch;
-use crate::pathfinding::step::passable_diagonal_step;
-use crate::pathfinding::tile_cost::{tile_step_cost, IMPASSABLE};
+use crate::pathfinding::step::passable_diagonal_step_for;
+use crate::pathfinding::tile_cost::{step_cost_for, TraversalProfile, IMPASSABLE};
 use crate::world::chunk::ChunkMap;
 use std::cmp::Reverse;
 
@@ -38,13 +38,28 @@ const NEIGHBORS: [(i32, i32, bool); 8] = [
 /// Bounded 3D A* over tiles, using `passable_step_3d` for transitions
 /// (so it walks via ramps automatically — including ramps in neighbouring
 /// chunks). Reuses scratch buffers from the caller-provided `AStarScratch`
-/// so steady-state searches don't allocate.
+/// so steady-state searches don't allocate. `Land` traversal — water is
+/// impassable.
 pub fn find_path_in(
     scratch: &mut AStarScratch,
     chunk_map: &ChunkMap,
     start: (i32, i32, i8),
     goal: (i32, i32, i8),
     max_nodes: usize,
+) -> (AStarResult, u32) {
+    find_path_profile(scratch, chunk_map, start, goal, max_nodes, TraversalProfile::Land)
+}
+
+/// Profile-aware bounded 3D A*. `Land` is `find_path_in` verbatim;
+/// `Amphibious` treats water-surface cells as standable (at the expensive
+/// `step_cost_for` swim cost) so a swim route can be planned end-to-end.
+pub fn find_path_profile(
+    scratch: &mut AStarScratch,
+    chunk_map: &ChunkMap,
+    start: (i32, i32, i8),
+    goal: (i32, i32, i8),
+    max_nodes: usize,
+    profile: TraversalProfile,
 ) -> (AStarResult, u32) {
     scratch.reset();
     if start == goal {
@@ -102,15 +117,15 @@ pub fn find_path_in(
                     // within ±1 of cur.z that is also a legal step into
                     // the chosen target Z, otherwise the boundary check
                     // in movement_system rejects the cross at runtime.
-                    passable_diagonal_step(chunk_map, cur3, to3)
+                    passable_diagonal_step_for(chunk_map, cur3, to3, profile)
                 } else {
-                    chunk_map.passable_step_3d(cur3, to3)
+                    chunk_map.passable_step_for(cur3, to3, profile)
                 };
                 if !ok {
                     continue;
                 }
                 let kind = chunk_map.tile_at(nx, ny, nz).kind;
-                let base = tile_step_cost(kind);
+                let base = step_cost_for(kind, profile);
                 if base == IMPASSABLE {
                     continue;
                 }
@@ -388,6 +403,48 @@ mod tests {
                 assert_eq!(path.len(), 1);
             }
             other => panic!("expected Found, got {:?}", other.0.kind()),
+        }
+    }
+
+    #[test]
+    fn amphibious_crosses_water_strip_that_blocks_land() {
+        use crate::pathfinding::tile_cost::TraversalProfile;
+        // A full-height water column at x=10 splits the chunk in two.
+        let mut map = ChunkMap::default();
+        map.0.insert(ChunkCoord(0, 0), flat_chunk(0));
+        {
+            let chunk = map.0.get_mut(&ChunkCoord(0, 0)).unwrap();
+            for y in 0..CHUNK_SIZE {
+                // bed z=-2, depth 2 → water surface at z=0 (level with banks).
+                chunk.apply_water_column(10, y, -2, 2.0, 0);
+            }
+        }
+        let mut s = AStarScratch::default();
+        // Land cannot cross — the water column has no gap within the chunk.
+        let (land, _) =
+            find_path_profile(&mut s, &map, (5, 5, 0), (15, 5, 0), 4000, TraversalProfile::Land);
+        assert!(
+            !matches!(land, AStarResult::Found(_)),
+            "land must not cross a water strip",
+        );
+        // Amphibious swims straight across.
+        let (amph, _) = find_path_profile(
+            &mut s,
+            &map,
+            (5, 5, 0),
+            (15, 5, 0),
+            4000,
+            TraversalProfile::Amphibious,
+        );
+        match amph {
+            AStarResult::Found(path) => {
+                assert_eq!(path.last(), Some(&(15, 5, 0)));
+                assert!(
+                    path.iter().any(|&(x, _, _)| x == 10),
+                    "amphibious path must pass through the water column",
+                );
+            }
+            other => panic!("amphibious expected Found, got {:?}", other.kind()),
         }
     }
 

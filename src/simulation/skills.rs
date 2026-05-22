@@ -3,7 +3,7 @@ use bevy::prelude::*;
 use crate::simulation::schedule::SimClock;
 use crate::world::seasons::TICKS_PER_DAY;
 
-pub const SKILL_COUNT: usize = 9;
+pub const SKILL_COUNT: usize = 10;
 /// Phase 1: per-skill ceiling. Previously skills grew without bound; the
 /// new EV-based profession choice path needs a normalised competence
 /// score, so we clamp.
@@ -37,9 +37,26 @@ pub enum SkillKind {
     Social = 6,
     Medicine = 7,
     Fishing = 8,
+    Swimming = 9,
 }
 
 impl SkillKind {
+    /// Every variant in discriminant order — index `i` is the variant
+    /// with discriminant `i`, so `ALL[i] as usize == i`. Iterate this
+    /// instead of `transmute`-ing a `u8` into the enum.
+    pub const ALL: [SkillKind; SKILL_COUNT] = [
+        SkillKind::Farming,
+        SkillKind::Mining,
+        SkillKind::Building,
+        SkillKind::Trading,
+        SkillKind::Combat,
+        SkillKind::Crafting,
+        SkillKind::Social,
+        SkillKind::Medicine,
+        SkillKind::Fishing,
+        SkillKind::Swimming,
+    ];
+
     pub fn name(self) -> &'static str {
         match self {
             SkillKind::Farming => "Farming",
@@ -51,6 +68,7 @@ impl SkillKind {
             SkillKind::Social => "Social",
             SkillKind::Medicine => "Medicine",
             SkillKind::Fishing => "Fishing",
+            SkillKind::Swimming => "Swimming",
         }
     }
 }

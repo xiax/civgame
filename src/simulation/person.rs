@@ -669,7 +669,10 @@ pub fn spawn_population(
                     ),
                     // Always-present (never insert/removed at runtime — see
                     // social_contact.rs) so the Person archetype stays stable.
-                    (crate::simulation::social_contact::SecondarySocial::inactive(),),
+                    (
+                        crate::simulation::social_contact::SecondarySocial::inactive(),
+                        crate::simulation::energy::Energy::default(),
+                    ),
                 ))
                 .id();
 

@@ -240,6 +240,10 @@ pub fn opportunistic_interrupt_system(
             private_farm_available: false,
             farm_season: crate::simulation::farm::FarmSeasonPhase::SpringPrepPlant,
             private_plot_has_seasonal_work: false,
+            // The opportunistic path only scores Social / Play detours;
+            // the exhaustion gate on noncritical labor is enforced by
+            // `goal_update_system`'s main pass — leave false here.
+            is_exhausted: false,
         };
         // Ambient-social suppression: a worker with a live ambient
         // work-pairing is already getting social relief + relationships /
@@ -389,6 +393,7 @@ mod tests {
             private_farm_available: false,
             farm_season: crate::simulation::farm::FarmSeasonPhase::SpringPrepPlant,
             private_plot_has_seasonal_work: false,
+            is_exhausted: false,
         };
 
         let pick = |ctx: &GoalScoringContext, current: AgentGoal| -> Option<GoalScore> {

@@ -1020,6 +1020,8 @@ pub fn animate_wolves_system(
             Without<Wolf>,
             Without<Deer>,
             Without<Horse>,
+            Without<Cow>,
+            Without<Cat>,
         ),
     >,
 ) {
@@ -1056,6 +1058,8 @@ pub fn animate_deer_system(
             Without<Wolf>,
             Without<Deer>,
             Without<Horse>,
+            Without<Cow>,
+            Without<Cat>,
         ),
     >,
 ) {
@@ -1142,6 +1146,8 @@ pub fn animate_horses_system(
             Without<Wolf>,
             Without<Deer>,
             Without<Horse>,
+            Without<Cow>,
+            Without<Cat>,
         ),
     >,
 ) {
@@ -1176,6 +1182,8 @@ fn update_animal_visual(
             Without<Wolf>,
             Without<Deer>,
             Without<Horse>,
+            Without<Cow>,
+            Without<Cat>,
         ),
     >,
     children: &Children,
@@ -1262,6 +1270,8 @@ pub fn animate_cows_system(
             Without<Wolf>,
             Without<Deer>,
             Without<Horse>,
+            Without<Cow>,
+            Without<Cat>,
         ),
     >,
 ) {
@@ -1616,6 +1626,8 @@ pub fn animate_cats_system(
             Without<Wolf>,
             Without<Deer>,
             Without<Horse>,
+            Without<Cow>,
+            Without<Cat>,
         ),
     >,
 ) {

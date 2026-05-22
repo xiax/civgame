@@ -57,6 +57,7 @@ pub fn sleep_task_system(
         &Transform,
         &BucketSlot,
         &LodLevel,
+        Option<&mut crate::simulation::energy::Energy>,
     )>,
 ) {
     // Bucket compensation only — game speed scales FixedUpdate firing rate.
@@ -64,7 +65,7 @@ pub fn sleep_task_system(
 
     query
         .par_iter_mut()
-        .for_each(|(mut ai, mut aq, mut needs, transform, slot, lod)| {
+        .for_each(|(mut ai, mut aq, mut needs, transform, slot, lod, mut energy_opt)| {
             // Dormant agents' Sleep tasks are frozen (parity: both the old
             // `tick_needs_system` and `htn_dispatch_system` skipped Dormant).
             if *lod == LodLevel::Dormant {
@@ -123,6 +124,11 @@ pub fn sleep_task_system(
             needs.sleep = (needs.sleep - SLEEP_RECOVER_RATE * mult * dt).clamp(0.0, 255.0);
             needs.willpower =
                 (needs.willpower + WILLPOWER_SLEEP_RECOVER * mult * dt).clamp(0.0, 255.0);
+            // Sleep is the primary energy recovery channel (a bed doubles
+            // the rate, same `mult` as sleep/willpower).
+            if let Some(energy) = energy_opt.as_deref_mut() {
+                energy.recover(crate::simulation::energy::ENERGY_SLEEP_RECOVER * mult * dt);
+            }
             if needs.sleep < SLEEP_WAKE_THRESHOLD {
                 // Rested — retire the typed Sleep task. `goal_update_system`
                 // flips the Sleep goal off on its next cadence; until then

@@ -106,6 +106,7 @@ pub fn movement_system(
             Option<&RelationshipMemory>,
             Option<&MountedOn>,
             Option<&crate::simulation::medicine::Sickness>,
+            Option<&mut crate::simulation::energy::Energy>,
         ),
         // A boarded vehicle driver is moved by `vehicle_crew_sync_system`, not
         // by their own path — skip them here.
@@ -135,11 +136,20 @@ pub fn movement_system(
         rel_opt,
         mounted_opt,
         sickness_opt,
+        mut energy_opt,
     ) in query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
             continue;
         }
+
+        // Traversal profile: a human on foot may swim (`Amphibious`); a
+        // mounted human keeps to land. Animals never reach this system.
+        let move_profile = if mounted_opt.is_some() {
+            crate::pathfinding::tile_cost::TraversalProfile::Land
+        } else {
+            crate::pathfinding::tile_cost::TraversalProfile::Amphibious
+        };
 
         // Snap to tile center if pixel position drifted off-center while the
         // agent's `target_tile` is their own tile. Without this the agent
@@ -175,7 +185,11 @@ pub fn movement_system(
                     let base = (sim_dt * 20.0).max(0.0);
                     let factor = sickness_opt
                         .map(|s| crate::simulation::medicine::sickness_work_factor(s.severity))
-                        .unwrap_or(1.0);
+                        .unwrap_or(1.0)
+                        * energy_opt
+                            .as_deref()
+                            .map(|e| e.energy_factor())
+                            .unwrap_or(1.0);
                     let progress = (base * factor) as u8;
                     ai.work_progress = ai.work_progress.saturating_add(progress);
                 }
@@ -274,14 +288,15 @@ pub fn movement_system(
                         );
                         continue;
                     }
-                    path_queue.enqueue(
+                    path_queue.enqueue_with_profile(
                         entity,
                         cur3,
                         goal3,
                         PathKind::BestEffort,
                         DEFAULT_PATH_BUDGET,
                         aq.current_task_kind(),
-                    );
+                        move_profile,
+                        );
                     pf.status = FollowStatus::Pending;
                     pf.goal = goal3;
                     continue;
@@ -337,14 +352,15 @@ pub fn movement_system(
                             );
                             continue;
                         }
-                        path_queue.enqueue(
+                        path_queue.enqueue_with_profile(
                             entity,
                             cur3,
                             goal3,
                             PathKind::BestEffort,
                             DEFAULT_PATH_BUDGET,
                             aq.current_task_kind(),
-                        );
+                            move_profile,
+                            );
                         pf.status = FollowStatus::Pending;
                         pf.goal = goal3;
                         continue;
@@ -372,14 +388,15 @@ pub fn movement_system(
                             pf.segment_path.clear();
                             continue;
                         }
-                        path_queue.enqueue(
+                        path_queue.enqueue_with_profile(
                             entity,
                             cur3,
                             goal3,
                             PathKind::BestEffort,
                             DEFAULT_PATH_BUDGET,
                             aq.current_task_kind(),
-                        );
+                            move_profile,
+                            );
                         pf.status = FollowStatus::Pending;
                         continue;
                     }
@@ -397,7 +414,9 @@ pub fn movement_system(
                     // (xy, current_z).
                     let cur3i = (cur_tx, cur_ty, ai.current_z as i32);
                     let next3i = (sx as i32, sy as i32, sz as i32);
-                    if next3i != cur3i && !chunk_map.passable_step_3d(cur3i, next3i) {
+                    if next3i != cur3i
+                        && !chunk_map.passable_step_for(cur3i, next3i, move_profile)
+                    {
                         path_diag.path_drift_rejections_total += 1;
                         let center = tile_to_world(cur_tx, cur_ty);
                         transform.translation.x = center.x;
@@ -428,10 +447,12 @@ pub fn movement_system(
                 MOVE_SPEED
             };
             // Per-tile terrain multiplier (Road 1.4×, Forest 0.7×, etc.).
+            let mut terrain_mult = 1.0_f32;
             if let Some(kind) = chunk_map.tile_kind_at(cur_tx, cur_ty) {
                 let m = tile_speed_multiplier(kind);
                 if m > 0.0 {
                     effective_speed *= m;
+                    terrain_mult = m;
                 }
             }
             // Furniture slowdown (Bed/Chair/Table/Workbench/Loom).
@@ -443,7 +464,29 @@ pub fn movement_system(
                 &workbench_map,
                 &loom_map,
             );
+            // Tired agents move slower (mirrors the work-progress factor).
+            effective_speed *= energy_opt
+                .as_deref()
+                .map(|e| e.energy_factor())
+                .unwrap_or(1.0);
             let step = dir * effective_speed * dt;
+            // Energy drain per tile of on-foot travel. Slow terrain costs
+            // more effort per tile; mounted travel costs far less.
+            if let Some(energy) = energy_opt.as_deref_mut() {
+                let tiles_moved = step.length() / TILE_SIZE;
+                let effort = (2.0 - terrain_mult).clamp(0.5, 2.0);
+                let mount_scale = if mounted_opt.is_some() {
+                    crate::simulation::energy::ENERGY_MOVE_MOUNTED_SCALE
+                } else {
+                    1.0
+                };
+                energy.drain(
+                    tiles_moved
+                        * crate::simulation::energy::ENERGY_MOVE_DRAIN_PER_TILE
+                        * effort
+                        * mount_scale,
+                );
+            }
             // Overshoot arrival: when the smooth step would reach or pass the
             // final target tile this tick, clamp to target_world and fall
             // through to the arrival branch. Without this, agents within
@@ -485,7 +528,11 @@ pub fn movement_system(
                 };
                 let mut chosen: Option<i32> = None;
                 for tz in candidates {
-                    if chunk_map.passable_step_3d((cur_tx, cur_ty, cz), (new_tx, new_ty, tz)) {
+                    if chunk_map.passable_step_for(
+                        (cur_tx, cur_ty, cz),
+                        (new_tx, new_ty, tz),
+                        move_profile,
+                    ) {
                         chosen = Some(tz);
                         break;
                     }
@@ -625,7 +672,11 @@ pub fn movement_system(
                     let base = (sim_dt * 20.0).max(0.0);
                     let factor = sickness_opt
                         .map(|s| crate::simulation::medicine::sickness_work_factor(s.severity))
-                        .unwrap_or(1.0);
+                        .unwrap_or(1.0)
+                        * energy_opt
+                            .as_deref()
+                            .map(|e| e.energy_factor())
+                            .unwrap_or(1.0);
                     let progress = (base * factor) as u8;
                     ai.work_progress = ai.work_progress.saturating_add(progress);
                 }

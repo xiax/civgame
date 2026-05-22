@@ -64,6 +64,14 @@ Largest `chunk_route.len()` per tick surfaces as `chunk_route_len_max_last_tick`
 
 Pre-built per-chunk flow fields for popular destinations (faction centres, storage, rally points, doors, tunnel mouths). Fast-path used when goal is in start chunk; cross-chunk routing always goes through the router. Dirty fields rebuild through a small per-tick budget (`PerfWorkBudget.hotspot_rebuilds_per_tick`) so tile-change bursts do not drain every field in one PostUpdate. **Flow fields are reserved for hotspots — per-agent local nav is A*.**
 
+## Amphibious traversal (swimming)
+
+`TraversalProfile { Land, Amphibious }` (`tile_cost.rs`). `Land` is the historical behaviour. `Amphibious` additionally treats a **water-surface cell** as standable — `ChunkMap::passable_for(x,y,z,profile)` accepts a wet column (`water_depth_at > 0`) at its surface Z with `Air` headspace; `step_cost_for(kind, profile)` gives `Water`/`River` a finite expensive cost (`SWIM_SPEED_MULT = 0.35`) instead of `IMPASSABLE`. `passable_step_for` / `passable_diagonal_step_for` are the profile-aware step checks; `astar::find_path_profile` is the profile-aware A* (`find_path_in` = `Land` wrapper).
+
+`PathRequest`/`PathFollow` carry `profile`; `PathRequestQueue::enqueue_with_profile` (plain `enqueue` stays `Land`). `movement_system` enqueues `Amphibious` for humans on foot, `Land` for mounted humans (animals never reach it), and uses `passable_step_for(.., pf.profile)` for the boundary check so a swimmer isn't snapped back off a water tile.
+
+**The amphibious worker path is land-first.** `compute_outcome` always runs the full chunk-graph route (`compute_land`) first; for an `Amphibious` request it falls back to `compute_amphibious` **only** when land routing fails `Unreachable`/`NoRoute` (banks split by water). So a dry route never swims and the hierarchical pathfinder is preserved with zero regression. `compute_amphibious` is a single bounded full-route A* over `passable_for(Amphibious)` stuffed into one segment (`chunk_route` = `[start_chunk]`). **This deliberately is *not* the dual-layer chunk graph** from `plans/swimming.md` — the bounded-A* fallback is a complete, lower-risk alternative that delivers the same behaviour (humans swim short crossings); a long swim exceeding the A* budget fails gracefully.
+
 ## Conventions
 
 - Coords: world `(i32, i32, i8)`; chunks `ChunkCoord(i32, i32)`.
