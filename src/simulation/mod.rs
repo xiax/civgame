@@ -92,6 +92,7 @@ pub mod trader;
 pub mod typed_task;
 pub mod utility_curves;
 pub mod vehicle;
+pub mod vision;
 pub mod well;
 pub mod wild_herd;
 pub mod world_sim;
@@ -191,6 +192,7 @@ impl Plugin for SimulationPlugin {
             .add_event::<combat::ProjectileFired>()
             .add_event::<knowledge::DiscoveryActionEvent>()
             .add_event::<construction::WallDestroyed>()
+            .add_event::<construction::WallConstructed>()
             .add_event::<land::PlotEvictedEvent>()
             .add_event::<player_command::PlayerCommandEvent>()
             .insert_resource(player_command::PlayerCommandIdGen::default())
@@ -1631,6 +1633,51 @@ impl Plugin for SimulationPlugin {
                         .after(sedentary_collapse::sedentary_collapse_system),
                 )
                     .in_set(SimulationSet::Economy),
+            )
+            // Autonomous scout-arrival → Lookout pause. Must run before
+            // `goal_dispatch_system`'s Explore catch-all so we replace the
+            // about-to-be-cancelled Explore with a bounded stand-and-scan
+            // pause (`plans/lookout-base.md`). Own add_systems call —
+            // the ParallelB tuple is already at its 20-element ceiling.
+            .add_systems(
+                FixedUpdate,
+                vision::autonomous_scout_lookout_pause_system
+                    .before(tasks::goal_dispatch_system)
+                    .in_set(SimulationSet::ParallelB),
+            )
+            // Vision sources (per `plans/lookout-base.md`):
+            //   - `lookout_task_system` is the executor: arrival pins the
+            //     agent on the anchor + attaches `ActiveLookout` +
+            //     `CachedVisionSet`; expiry on autonomous pauses ends the
+            //     task and removes the components.
+            //   - Prune `ActiveLookout` whose anchor drifted (movement
+            //     under a different command).
+            //   - Attach `CachedVisionSet` to fresh player-faction
+            //     Settlement / Camp anchors (idempotent).
+            //   - Invalidate caches whose bounding box saw a terrain /
+            //     wall change, or whose owner-faction era advanced.
+            //   - Rebuild the dirty caches (one raycast per dirty source).
+            // Combat / sound LOS untouched; fog union happens in
+            // `rendering::fog::fog_update_system` (Update).
+            .add_systems(
+                FixedUpdate,
+                (
+                    vision::lookout_task_system
+                        .after(movement::movement_system),
+                    vision::prune_active_lookouts_system
+                        .after(vision::lookout_task_system),
+                    // Idempotent — picks up newly-spawned Settlement/Camp
+                    // entities on whatever tick they appear (one-tick lag
+                    // is fine; fog union catches up the cycle after).
+                    vision::attach_base_vision_caches_system,
+                    vision::invalidate_vision_caches_system
+                        .after(vision::prune_active_lookouts_system)
+                        .after(vision::attach_base_vision_caches_system)
+                        .after(construction::wall_destruction_system),
+                    vision::recompute_dirty_vision_sets_system
+                        .after(vision::invalidate_vision_caches_system),
+                )
+                    .in_set(SimulationSet::Sequential),
             );
     }
 }

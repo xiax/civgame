@@ -553,6 +553,15 @@ pub enum Task {
     StowToolKit {
         req: crate::simulation::tools::ToolRequirement,
     },
+    /// Stand on a tile and hold, extending vision via `ActiveLookout`.
+    /// `expires_tick = None` is a manual / indefinite player lookout;
+    /// `Some(t)` is an autonomous (HTN scout) pause that auto-clears at
+    /// tick `t`. Executor: `vision::lookout_task_system`.
+    Lookout {
+        anchor: (i32, i32),
+        anchor_z: i8,
+        expires_tick: Option<u64>,
+    },
 }
 
 /// Source for a `Task::Drink`. Inventory drinks consume one `clean_water`
@@ -931,6 +940,7 @@ pub fn task_kind_for(task: Task) -> u16 {
         // A tool withdraw shares the WithdrawMaterial executor + gate.
         Task::WithdrawTool { .. } => TK::WithdrawMaterial,
         Task::StowToolKit { .. } => TK::StowToolKit,
+        Task::Lookout { .. } => TK::Lookout,
     };
     kind as u16
 }

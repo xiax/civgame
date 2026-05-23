@@ -3,10 +3,12 @@ use bevy::prelude::*;
 
 use crate::rendering::camera::CameraViewZ;
 use crate::rendering::color_map::{shaded_ore_tile_color, shaded_tile_color, z_bucket};
+use crate::simulation::construction::{Wall, WallMap};
 use crate::simulation::faction::{FactionMember, PlayerFaction, PlayerFactionMarker};
-use crate::simulation::line_of_sight::has_los;
+use crate::simulation::line_of_sight::has_vision_los;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::person::PersonAI;
+use crate::simulation::vision::{ActiveLookout, CachedVisionSet};
 use crate::world::chunk::{ChunkMap, Z_MIN};
 use crate::world::chunk_streaming::{
     resolve_render_tile, TileMaterials, TileSprite, TileSpriteIndex, RENDERABLE_KINDS,
@@ -91,22 +93,31 @@ pub fn setup_fog_tile_materials(
     }
 }
 
-const VIEW_RADIUS: i32 = 15;
-const VIEW_RADIUS_SQ: i32 = VIEW_RADIUS * VIEW_RADIUS;
-
 /// Update: recompute which tiles the player faction can see this frame.
+///
+/// Per-agent sweeps run live every frame at `effective_vision_radius`
+/// (`STANDARD_VIEW_RADIUS = 15` normally; `LOOKOUT_VIEW_RADIUS = 50`
+/// while `ActiveLookout` is attached). Static vision sources
+/// (settlements, camps, active lookouts) contribute via their cached
+/// `CachedVisionSet.tiles` — a pure set-union here, no LOS work.
+/// LOS uses `has_vision_los` so the player faction can see through its
+/// own constructed walls and doors. See `plans/lookout-base.md`.
 pub fn fog_update_system(
     player_faction: Res<PlayerFaction>,
     chunk_map: Res<ChunkMap>,
+    wall_map: Res<WallMap>,
     door_map: Res<crate::simulation::construction::DoorMap>,
-    agent_query: Query<(&Transform, &PersonAI, &FactionMember, &LodLevel)>,
+    wall_q: Query<&Wall>,
+    agent_query: Query<(&Transform, &PersonAI, &FactionMember, &LodLevel, Option<&ActiveLookout>)>,
     landmark_query: Query<&Transform, With<PlayerFactionMarker>>,
+    cached_sources: Query<&CachedVisionSet>,
     mut fog_map: ResMut<FogMap>,
 ) {
     let old_visible = std::mem::take(&mut fog_map.visible);
     fog_map.dirty_tiles.clear();
 
     let mut new_visible: AHashSet<(i32, i32)> = AHashSet::default();
+    let observer = player_faction.faction_id;
 
     // Player-owned landmarks (FactionCenter) are always considered visible so
     // they stay bright even when no persons are nearby.
@@ -116,8 +127,8 @@ pub fn fog_update_system(
         new_visible.insert((lx, ly));
     }
 
-    for (transform, ai, member, lod) in agent_query.iter() {
-        if member.faction_id != player_faction.faction_id {
+    for (transform, ai, member, lod, active_lookout) in agent_query.iter() {
+        if member.faction_id != observer {
             continue;
         }
 
@@ -131,11 +142,22 @@ pub fn fog_update_system(
             continue;
         }
 
-        let az = ai.current_z;
+        // An agent under `ActiveLookout` runs its sweep via the cached
+        // source (joined below) — skip the live scan here so we don't
+        // duplicate work every frame at radius 50.
+        if active_lookout.is_some() {
+            new_visible.insert((ax, ay));
+            continue;
+        }
 
-        for dy in -VIEW_RADIUS..=VIEW_RADIUS {
-            for dx in -VIEW_RADIUS..=VIEW_RADIUS {
-                if dx * dx + dy * dy > VIEW_RADIUS_SQ {
+        let az = ai.current_z;
+        let view_radius =
+            crate::simulation::vision::effective_vision_radius(None) as i32;
+        let view_radius_sq = view_radius * view_radius;
+
+        for dy in -view_radius..=view_radius {
+            for dx in -view_radius..=view_radius {
+                if dx * dx + dy * dy > view_radius_sq {
                     continue;
                 }
                 let ttx = ax + dx;
@@ -145,12 +167,30 @@ pub fn fog_update_system(
                 let tz = raw_z.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
 
                 let in_los = dx * dx + dy * dy <= 1
-                    || has_los(&chunk_map, &door_map, (ax, ay, az), (ttx, tty, tz));
+                    || has_vision_los(
+                        &chunk_map,
+                        &wall_map,
+                        &door_map,
+                        &wall_q,
+                        (ax, ay, az),
+                        (ttx, tty, tz),
+                        observer,
+                    );
                 if in_los {
                     new_visible.insert((ttx as i32, tty as i32));
                 }
             }
         }
+    }
+
+    // Union the cached visible sets of every player-faction static source
+    // (lookouts, settlements, camps). One set-union per source — the LOS
+    // raycast lives in `recompute_dirty_vision_sets_system`.
+    for cache in cached_sources.iter() {
+        if cache.faction != observer {
+            continue;
+        }
+        new_visible.extend(cache.tiles.iter().copied());
     }
 
     // Tiles that changed state this frame.

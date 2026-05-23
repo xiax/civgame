@@ -1,5 +1,6 @@
-use crate::simulation::construction::DoorMap;
+use crate::simulation::construction::{DoorMap, Wall, WallMap};
 use crate::world::chunk::ChunkMap;
+use bevy::prelude::Query;
 
 /// 3D voxel LOS from `from` to `to` (each is `(tx, ty, foot_z)`).
 ///
@@ -13,6 +14,73 @@ pub fn has_los(
     door_map: &DoorMap,
     from: (i32, i32, i8),
     to: (i32, i32, i8),
+) -> bool {
+    walk_ray(from, to, |(x, y, z)| {
+        let kind = chunk_map.tile_at(x, y, z as i32).kind;
+        if kind.is_opaque() {
+            return true;
+        }
+        if let Some(door) = door_map.0.get(&(x, y)) {
+            if !door.open {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Faction-aware LOS for fog / resource vision. Same ray walk as `has_los`,
+/// but skips opacity for the observer's own constructed walls (`WallMap`
+/// entry with `owner_faction == Some(observer_faction)`) and own doors
+/// (open or closed). Natural rock (no `WallMap` entry OR `owner_faction == None`)
+/// and enemy walls / closed enemy doors still block. Combat / sound /
+/// projectile LOS keep calling `has_los` — they MUST treat own walls as
+/// solid so a wall actually defends.
+pub fn has_vision_los(
+    chunk_map: &ChunkMap,
+    wall_map: &WallMap,
+    door_map: &DoorMap,
+    wall_q: &Query<&Wall>,
+    from: (i32, i32, i8),
+    to: (i32, i32, i8),
+    observer_faction: u32,
+) -> bool {
+    walk_ray(from, to, |(x, y, z)| {
+        let kind = chunk_map.tile_at(x, y, z as i32).kind;
+        if kind.is_opaque() {
+            // Own constructed wall? Transparent to own vision.
+            if let Some(&wall_entity) = wall_map.0.get(&(x, y)) {
+                if let Ok(wall) = wall_q.get(wall_entity) {
+                    if wall.owner_faction == Some(observer_faction) {
+                        return false;
+                    }
+                }
+            }
+            // Natural rock (no WallMap entry) or enemy wall blocks.
+            return true;
+        }
+        if let Some(door) = door_map.0.get(&(x, y)) {
+            // Own door is transparent regardless of open/closed state.
+            // Foreign closed door blocks; foreign open door is transparent.
+            if door.faction_id == observer_faction {
+                return false;
+            }
+            if !door.open {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Shared inner walker. Calls `blocker((x, y, z))` at every non-endpoint
+/// voxel along the 3D Bresenham ray; returns `false` (LOS blocked) the
+/// moment any voxel reports `true`, else `true` (LOS clear). Endpoints
+/// are skipped (caller's own tiles can't block).
+fn walk_ray(
+    from: (i32, i32, i8),
+    to: (i32, i32, i8),
+    mut blocker: impl FnMut((i32, i32, i8)) -> bool,
 ) -> bool {
     let (mut x0, mut y0) = (from.0, from.1);
     let (x1, y1) = (to.0, to.1);
@@ -38,14 +106,9 @@ pub fn has_los(
         if (x0, y0) != (from.0, from.1) && (x0, y0) != (to.0, to.1) {
             let t = steps as f32 / total_dist;
             let ray_z = (from_z + t * (to_z - from_z)).round() as i32;
-            if chunk_map.tile_at(x0, y0, ray_z).kind.is_opaque() {
+            let z_i8 = ray_z.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
+            if blocker((x0, y0, z_i8)) {
                 return false;
-            }
-            // Closed door blocks LOS even though the underlying tile is passable.
-            if let Some(door) = door_map.0.get(&(x0 as i32, y0 as i32)) {
-                if !door.open {
-                    return false;
-                }
             }
         }
 
@@ -116,8 +179,6 @@ mod tests {
 
     #[test]
     fn underground_tunnel_has_los_along_its_length() {
-        // Hill column surface=5 across the chunk (set by flat_chunk_map at 0,
-        // so reuse and lift surface). Build a fresh chunk with surface=5.
         let mut m = ChunkMap::default();
         let surface_z = Box::new([[5i8; CHUNK_SIZE]; CHUNK_SIZE]);
         let surface_kind = Box::new([[TileKind::Stone; CHUNK_SIZE]; CHUNK_SIZE]);
@@ -126,7 +187,6 @@ mod tests {
             ChunkCoord(0, 0),
             Chunk::new(surface_z, surface_kind, surface_fertility),
         );
-        // Carve a tunnel at z=-4 along y=10, x=0..10.
         for x in 0..10i32 {
             m.set_tile(
                 x,
@@ -147,15 +207,12 @@ mod tests {
                 },
             );
         }
-        // Two agents inside the tunnel can see each other.
         let d = DoorMap::default();
         assert!(has_los(&m, &d, (0, 10, -4), (9, 10, -4)));
     }
 
     #[test]
     fn solid_rock_between_underground_agents_blocks_los() {
-        // Two agents at z=-4 in a chunk that has NO carving — every voxel
-        // between them is Wall, so LOS is blocked.
         let mut m = ChunkMap::default();
         let surface_z = Box::new([[5i8; CHUNK_SIZE]; CHUNK_SIZE]);
         let surface_kind = Box::new([[TileKind::Stone; CHUNK_SIZE]; CHUNK_SIZE]);
@@ -170,8 +227,6 @@ mod tests {
 
     #[test]
     fn surface_to_underground_blocked_by_overhead_rock() {
-        // Surface agent at z=0 trying to see underground agent at z=-4
-        // through unbroken rock — blocked.
         let mut m = ChunkMap::default();
         let surface_z = Box::new([[0i8; CHUNK_SIZE]; CHUNK_SIZE]);
         let surface_kind = Box::new([[TileKind::Grass; CHUNK_SIZE]; CHUNK_SIZE]);

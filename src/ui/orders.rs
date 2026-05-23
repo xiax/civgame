@@ -65,6 +65,9 @@ pub enum MenuAction {
     /// Packed`). The chief is the dispatched actor; the apply system
     /// re-seeds the camp here and flips state to Pitched.
     PitchCampHere,
+    /// Stand on this tile and act as a lookout — extends vision to
+    /// `LOOKOUT_VIEW_RADIUS`. Manual / indefinite (held until superseded).
+    Lookout,
 }
 
 impl MenuAction {
@@ -118,6 +121,7 @@ impl MenuAction {
             MenuAction::QueueVehicle(_) => "Assemble Vehicle",
             MenuAction::VehicleAct(_, kind) => vehicle_order_label(kind),
             MenuAction::PitchCampHere => "Pitch Camp Here",
+            MenuAction::Lookout => "Lookout here",
         }
     }
 }
@@ -475,6 +479,10 @@ pub fn right_click_context_menu_system(
                         }
                         if kind.is_passable() && !underground {
                             actions.push(MenuAction::DigDown);
+                            // Lookout: stand-and-hold on any passable
+                            // surface tile, owner-faction-aware vision
+                            // fans out to LOOKOUT_VIEW_RADIUS.
+                            actions.push(MenuAction::Lookout);
                             if !already_built {
                                 for bk in all_build_options() {
                                     let unlocked = faction_can_build(bk, &player_techs);
@@ -874,6 +882,10 @@ fn menu_action_to_command(
         // Handled by a dedicated faction-level branch before this call.
         MenuAction::VehicleAct(..) => return None,
         MenuAction::PitchCampHere => PlayerCommand::PitchCamp {
+            tile: target_tile,
+            z: target_z,
+        },
+        MenuAction::Lookout => PlayerCommand::Lookout {
             tile: target_tile,
             z: target_z,
         },

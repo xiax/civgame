@@ -375,18 +375,19 @@ pub fn vision_system(
             &crate::simulation::person::PersonAI,
             Option<&crate::simulation::faction::FactionMember>,
             Option<&crate::simulation::reproduction::HouseholdMember>,
+            Option<&crate::simulation::vision::ActiveLookout>,
             &mut CurrentVision,
         ),
         With<Person>,
     >,
 ) {
     use crate::simulation::shared_knowledge::KnowledgeTier;
-    const VIEW_RADIUS: i32 = 15;
 
     let now = clock.tick;
-    for (transform, slot, lod, ai, faction_member, household_member, mut current_vision) in
+    for (transform, slot, lod, ai, faction_member, household_member, active_lookout, mut current_vision) in
         query.iter_mut()
     {
+        let view_radius = crate::simulation::vision::effective_vision_radius(active_lookout) as i32;
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -412,9 +413,9 @@ pub fn vision_system(
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
         let from_z = ai.current_z;
 
-        for dy in -VIEW_RADIUS..=VIEW_RADIUS {
-            for dx in -VIEW_RADIUS..=VIEW_RADIUS {
-                if dx * dx + dy * dy > VIEW_RADIUS * VIEW_RADIUS {
+        for dy in -view_radius..=view_radius {
+            for dx in -view_radius..=view_radius {
+                if dx * dx + dy * dy > view_radius * view_radius {
                     continue;
                 }
 

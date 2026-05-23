@@ -67,6 +67,7 @@ pub struct RoadCarveQueue(pub Vec<(u32, (i32, i32), (i32, i32))>);
 pub struct DoorEntry {
     pub entity: Entity,
     pub open: bool,
+    pub faction_id: u32,
 }
 
 /// Maps tile positions to door entries placed there.
@@ -219,6 +220,10 @@ pub fn on_structure_label_remove(
 #[derive(bevy::ecs::system::SystemParam)]
 pub struct FurnitureMaps<'w> {
     pub bed_map: ResMut<'w, BedMap>,
+    /// `WallConstructed` writer. Bundled here so `construction_system` stays
+    /// under Bevy's 16-param ceiling. Lives next to `WallMap` since the same
+    /// system that mutates the map fires the event.
+    pub wall_constructed: bevy::ecs::event::EventWriter<'w, WallConstructed>,
     pub wall_map: ResMut<'w, WallMap>,
     pub campfire_map: ResMut<'w, CampfireMap>,
     pub door_map: ResMut<'w, DoorMap>,
@@ -347,10 +352,15 @@ impl WallMaterial {
     }
 }
 
-/// Marker placed on completed wall entities.
+/// Marker placed on completed wall entities. `owner_faction = None` for
+/// natural bedrock walls (chunk-streaming-spawned placeholders for exposed
+/// rock); `Some(faction_id)` for constructed walls. The faction-aware
+/// vision LOS lets observers see through their own constructed walls but
+/// not natural rock or enemy walls.
 #[derive(Component)]
 pub struct Wall {
     pub material: WallMaterial,
+    pub owner_faction: Option<u32>,
 }
 
 /// Fired when a wall is destroyed (HP reaches zero). Carries the tile so
@@ -358,6 +368,17 @@ pub struct Wall {
 #[derive(Event, Clone, Copy, Debug)]
 pub struct WallDestroyed {
     pub tile: (i32, i32),
+}
+
+/// Fired when a constructed wall finalises (or a natural wall first enters
+/// `WallMap`). Carries the tile + owning faction so vision sources can
+/// invalidate their cached visible-tile sets — see
+/// `simulation::vision::recompute_dirty_vision_sets_system`. Natural walls
+/// spawned by chunk streaming pass `faction = None`.
+#[derive(Event, Clone, Copy, Debug)]
+pub struct WallConstructed {
+    pub tile: (i32, i32),
+    pub faction: Option<u32>,
 }
 
 /// The single damage entry point for walls. Applies tier `damage_resist`
@@ -5048,6 +5069,7 @@ fn seed_apply_intent(
             doormat,
             tile,
             wall_mat,
+            faction_id,
         )
         .then_some(tile),
         BuildIntent::CompositeHouse { .. } => {
@@ -5075,6 +5097,7 @@ fn seed_apply_wall_tile(
     doormat: &crate::simulation::doormat::DoormatReservations,
     tile: (i32, i32),
     material: WallMaterial,
+    faction_id: u32,
 ) -> bool {
     if used.contains(&tile) || doormat.is_reserved(tile) {
         return false;
@@ -5104,7 +5127,10 @@ fn seed_apply_wall_tile(
     let world_pos = tile_to_world(tile.0, tile.1);
     let e = commands
         .spawn((
-            Wall { material },
+            Wall {
+                material,
+                owner_faction: Some(faction_id),
+            },
             crate::simulation::combat::Health::new(material.max_hp()),
             StructureLabel(material.label()),
             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
@@ -6471,7 +6497,10 @@ pub fn construction_system(
 
                     let wall_entity = commands
                         .spawn((
-                            Wall { material },
+                            Wall {
+                                material,
+                                owner_faction: Some(bp.faction_id),
+                            },
                             crate::simulation::combat::Health::new(material.max_hp()),
                             StructureLabel(material.label()),
                             Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
@@ -6481,6 +6510,10 @@ pub fn construction_system(
                         ))
                         .id();
                     maps.wall_map.0.insert(tile, wall_entity);
+                    maps.wall_constructed.send(WallConstructed {
+                        tile,
+                        faction: Some(bp.faction_id),
+                    });
                     wall_entity
                 }
                 BuildSiteKind::Bed => {
@@ -6636,6 +6669,7 @@ pub fn construction_system(
                         DoorEntry {
                             entity: door_entity,
                             open: false,
+                            faction_id: bp.faction_id,
                         },
                     );
                     doormat_reservations.0.insert(
@@ -8596,6 +8630,7 @@ fn seed_walled_house_at(
                     DoorEntry {
                         entity: e,
                         open: false,
+                        faction_id,
                     },
                 );
                 doormat.0.insert(
@@ -8640,7 +8675,10 @@ fn seed_walled_house_at(
                 );
                 let e = commands
                     .spawn((
-                        Wall { material: *mat },
+                        Wall {
+                            material: *mat,
+                            owner_faction: Some(faction_id),
+                        },
                         crate::simulation::combat::Health::new(mat.max_hp()),
                         StructureLabel(mat.label()),
                         Transform::from_xyz(world_pos.x, world_pos.y, 0.4),

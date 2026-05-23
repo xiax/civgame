@@ -535,6 +535,7 @@ pub fn spawn_chunk_sprites(
                         .spawn((
                             Wall {
                                 material: WallMaterial::Stone,
+                                owner_faction: None,
                             },
                             StructureLabel(WallMaterial::Stone.label()),
                             Transform::from_xyz(wx, wy, 0.4),
@@ -1278,6 +1279,7 @@ pub fn refresh_changed_tiles_system(
                     .spawn((
                         Wall {
                             material: WallMaterial::Stone,
+                            owner_faction: None,
                         },
                         StructureLabel(WallMaterial::Stone.label()),
                         Transform::from_xyz(wx, wy, 0.4),

@@ -158,6 +158,13 @@ pub enum TaskKind {
     /// the just-withdrawn tool `Item` from inventory into the worker's
     /// `ToolKit`. Executor: `tools::stow_toolkit_task_system`.
     StowToolKit = 57,
+    /// Stand on a tile and hold, extending vision to `LOOKOUT_VIEW_RADIUS`
+    /// via an `ActiveLookout` component. Manual lookouts (player-issued)
+    /// hold indefinitely; HTN-driven scout pauses carry an `expires_tick`.
+    /// Executor: `vision::lookout_task_system`. Cleared when the agent
+    /// moves off the anchor or `expires_tick` elapses (cleanup lives in
+    /// `prune_active_lookouts_system`).
+    Lookout = 58,
 }
 
 /// Human-readable label for a `TaskKind` discriminant. Returns "Unemployed"
@@ -221,6 +228,7 @@ pub fn task_kind_label(task_id: u16) -> &'static str {
         x if x == TaskKind::Fishing as u16 => "Fishing",
         x if x == TaskKind::SiegeWall as u16 => "Sieging Wall",
         x if x == TaskKind::StowToolKit as u16 => "Stowing Tool",
+        x if x == TaskKind::Lookout as u16 => "Lookout",
         _ => "Unemployed",
     }
 }
@@ -1336,6 +1344,20 @@ pub fn goal_dispatch_system(
                         // ticks (200 ticks = 10 s, scout walks may be 30-60s).
                         AgentGoal::Scout if aq.current_task_kind() == TaskKind::Explore as u16 => {
                             Some(TaskKind::Explore as u16)
+                        }
+                        // Autonomous lookout pause
+                        // (`autonomous_scout_lookout_pause_system`) — a
+                        // Hunter on Survive/GatherFood whose Explore arrival
+                        // converted into a `Task::Lookout` holds for
+                        // `AUTONOMOUS_LOOKOUT_TICKS`. The stand-and-hold leg
+                        // must survive every goal-eval tick during the
+                        // pause; `lookout_task_system` ends the chain on its
+                        // own expiry. Goal arena matches the scout
+                        // dispatcher (`Survive | GatherFood`).
+                        AgentGoal::Survive | AgentGoal::GatherFood
+                            if aq.current_task_kind() == TaskKind::Lookout as u16 =>
+                        {
+                            Some(TaskKind::Lookout as u16)
                         }
                         // Heal-3b: SeekCare patient walking to the recovery
                         // site. The walk leg outlives goal-eval ticks; the

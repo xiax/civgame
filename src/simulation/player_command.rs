@@ -185,6 +185,14 @@ pub enum PlayerCommand {
         vehicle: Entity,
         kind: crate::simulation::vehicle::VehicleOrderKind,
     },
+    /// Stand on a tile and hold; extends vision to
+    /// `LOOKOUT_VIEW_RADIUS` via `ActiveLookout`. Manual / indefinite —
+    /// the worker holds until the player issues a new command or
+    /// movement drifts off the anchor. See `plans/lookout-base.md`.
+    Lookout {
+        tile: (i32, i32),
+        z: i8,
+    },
 }
 
 /// Per-actor authority marker. Replaces `PlayerOrder` once Commit 3 lands.
@@ -545,6 +553,10 @@ pub fn player_command_lifecycle_system(
             | PlayerCommand::QueueVehicle { .. }
             | PlayerCommand::QueueCustomVehicle { .. }
             | PlayerCommand::VehicleOrder { .. } => Some(CommandStatus::Completed),
+            // Lookout never auto-completes — the worker holds the anchor
+            // until the player supersedes the command or `aq.cancel`
+            // drops the chain via another dispatch.
+            PlayerCommand::Lookout { .. } => None,
         };
         if let Some(new_status) = outcome {
             cmd.status = new_status;
@@ -1250,6 +1262,33 @@ fn dispatch_one(
             // Faction-level — applied directly in
             // `drain_player_command_events_system` (empty `actors`). If an
             // event ever arrives carrying actors, the dispatch is a no-op.
+            DispatchOutcome::Active
+        }
+        Lookout { tile, z } => {
+            // Stand-on routing (target == stand tile). The lookout task
+            // is preserved by being under AgentGoal::FollowingPlayerCommand
+            // (short-circuit at the top of goal_dispatch_system).
+            let routed = assign_task_with_routing(
+                ai,
+                cur_tile,
+                cur_chunk,
+                tile,
+                TaskKind::Lookout,
+                None,
+                &routing.chunk_graph,
+                &routing.chunk_router,
+                &routing.chunk_map,
+                &routing.chunk_connectivity,
+            );
+            if !routed {
+                return DispatchOutcome::Failed(CommandFailure::Unreachable);
+            }
+            ai.target_z = z;
+            aq.dispatch(crate::simulation::typed_task::Task::Lookout {
+                anchor: tile,
+                anchor_z: z,
+                expires_tick: None,
+            });
             DispatchOutcome::Active
         }
     }
