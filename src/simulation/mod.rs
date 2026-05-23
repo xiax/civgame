@@ -411,14 +411,28 @@ impl Plugin for SimulationPlugin {
                     // `PlotIndex.by_faction_hash` is established before any
                     // runtime carve can mismatch + re-tear-down).
                     (
+                        // Drain `RoadCarveQueue` synchronously after the seed
+                        // pushes its doormat / spine / connector entries so
+                        // `resurvey_after_seeding_system` reads the chunk_map
+                        // with the actual carved roads. Without this drain,
+                        // the resurvey computes parcels against an
+                        // empty-road chunk_map and the first runtime survey
+                        // (which sees the roads carved at tick 1) emits a
+                        // different parcel set → culture_hash flips →
+                        // `carve_plots_system` re-shoots the Agricultural
+                        // belt away from the seed Cropland patch.
+                        construction::road_carve_system
+                            .after(construction::seed_starting_buildings_system)
+                            .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                         // Re-survey post-seed so `SettlementBrain.parcels`
-                        // reflect the actual built structures. Without this
-                        // the Agricultural belt placement (driven by built-up
-                        // footprint) is stale and would shift on the first
-                        // runtime survey — orphaning any seed-stamped
-                        // Cropland.
+                        // reflect the actual built structures (and the just-
+                        // carved roads). Without this the Agricultural belt
+                        // placement (driven by built-up footprint) is stale
+                        // and would shift on the first runtime survey —
+                        // orphaning any seed-stamped Cropland.
                         organic_settlement::resurvey_after_seeding_system
                             .after(construction::seed_starting_buildings_system)
+                            .after(construction::road_carve_system)
                             .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),
                         // Project the brain into the compatibility
                         // `SettlementPlan` surface that `carve_plots_system`

@@ -1528,11 +1528,11 @@ fn techs_through_era(era: Era) -> FactionTechs {
 /// structures carry `posted_by = None` and never call `record_tech_use`.
 ///
 /// `from_era` resolves the era-appropriate tier ladder once. The seed
-/// pipeline still threads a `FactionTechs` bitset into the shared
-/// `generate_candidates` / `seed_apply_intent` path (so seed and runtime
-/// emit the same intent stream); `seed_techs()` exposes it. This makes
-/// the seed driver a named profile rather than an `Option<&FactionTechs>`
-/// that quietly impersonates community adoption.
+/// pipeline threads the era-keyed tiers into `seed_apply_intent` for
+/// stamp-time tier picks; the organic pressure path reads
+/// `faction.buildable_techs` (populated by the OnEnter pool refresh) for
+/// intent selection. This makes the seed driver a named profile rather
+/// than an ad-hoc `FactionTechs` bitset.
 ///
 /// Note: `seed_prime_tech_adoption_system` is **retained**, not removed —
 /// the audit found non-construction consumers (`nomad`, settlement spawn
@@ -1587,9 +1587,9 @@ impl SeedConstructionProfile {
         }
     }
 
-    /// The `FactionTechs` bitset threaded into the shared seed pipeline.
-    /// Drives tier picks in `generate_candidates` / `seed_apply_intent`
-    /// via the same `best_*_for` ladder the runtime chief uses.
+    /// The `FactionTechs` bitset for the seed pipeline. Drives tier picks
+    /// in `seed_apply_intent` via the same `best_*_for` ladder the
+    /// runtime chief uses.
     #[inline]
     pub fn seed_techs(&self) -> &FactionTechs {
         &self.seed_techs
@@ -1774,9 +1774,10 @@ pub struct ConstructionPosterPool {
 impl ConstructionPosterPool {
     /// Union of every resident poster's `Learned` set for the given
     /// settlement, plus the faction chief fallback. This is the
-    /// candidate-*enumeration* surface — what `generate_candidates` is
-    /// allowed to consider building. Actual emission is still filtered
-    /// per-intent through `select_poster_for_intent`.
+    /// candidate-*enumeration* surface — the buildable-tech bitset the
+    /// organic pressure path consults via `community_has`. Actual
+    /// emission is still filtered per-intent through
+    /// `select_poster_for_intent`.
     pub fn union_of_learned(
         &self,
         faction_id: u32,
@@ -2175,457 +2176,6 @@ fn count_monuments_near(map: &MonumentMap, home: (i32, i32), radius: i32) -> usi
         .count()
 }
 
-/// Find a clear (2·hw+1) × (2·hh+1) footprint anchored at the frontage edge
-/// of a vacant lot of `kind` owned by `faction_id`. Walks every plot of the
-/// matching zone kind that has frontage info, picks the first vacant one
-/// closest to `home`, and searches inward from its `access_tile` for a clear,
-/// flat footprint. Returns the centre.
-///
-/// "Vacant" here means no Bed and no Blueprint already occupies the plot's
-/// rect — sufficient for the chief's one-building-per-residential-lot model.
-/// Returns `None` if no plot with frontage exists or none accept a footprint;
-/// callers fall back to `find_footprint_in_zone`.
-///
-/// Phase 3 of the Construction Overhaul: residential placement aligns to
-/// streets so doors face roads. Civic placement keeps zone-area scoring.
-fn find_footprint_at_frontage_lot(
-    chunk_map: &ChunkMap,
-    bed_map: &BedMap,
-    bp_map: &BlueprintMap,
-    doormat: &crate::simulation::doormat::DoormatReservations,
-    plot_index: &crate::simulation::land::PlotIndex,
-    plot_q: &Query<&crate::simulation::land::Plot>,
-    faction_id: u32,
-    kind: crate::simulation::settlement::ZoneKind,
-    home: (i32, i32),
-    half_w: i32,
-    half_h: i32,
-) -> Option<((i32, i32), crate::simulation::land::TileEdge)> {
-    use crate::simulation::land::TileEdge;
-
-    // Gather candidate plots: matching faction + zone kind + has frontage +
-    // vacant rect. Sort by chebyshev distance to home so we fill near-home
-    // lots first.
-    let mut plots: Vec<(
-        i32,
-        (i32, i32),
-        TileEdge,
-        crate::simulation::settlement::TileRect,
-    )> = Vec::new();
-    for (&pid, &entity) in plot_index.by_id.iter() {
-        let _ = pid;
-        let Ok(plot) = plot_q.get(entity) else {
-            continue;
-        };
-        if plot.faction_id != faction_id || plot.zone_kind != kind {
-            continue;
-        }
-        let (Some(edge), Some(at)) = (plot.frontage_edge, plot.access_tile) else {
-            continue;
-        };
-        if !plot_rect_vacant(bed_map, bp_map, doormat, plot.rect) {
-            continue;
-        }
-        let d = (at.0 - home.0).abs().max((at.1 - home.1).abs());
-        plots.push((d, at, edge, plot.rect));
-    }
-    plots.sort_by_key(|(d, _, _, _)| *d);
-
-    for (_, access, edge, rect) in plots {
-        // Anchor centre near the frontage. For East frontage the door faces
-        // east; place the centre `half_w + 1` tiles inside the eastern edge.
-        let (ax_min, ax_max, ay_min, ay_max) = (
-            rect.x0 + half_w,
-            rect.x0 + rect.w as i32 - half_w - 1,
-            rect.y0 + half_h,
-            rect.y0 + rect.h as i32 - half_h - 1,
-        );
-        if ax_min > ax_max || ay_min > ay_max {
-            continue;
-        }
-        let preferred = match edge {
-            TileEdge::East => (ax_max, access.1.clamp(ay_min, ay_max)),
-            TileEdge::West => (ax_min, access.1.clamp(ay_min, ay_max)),
-            TileEdge::North => (access.0.clamp(ax_min, ax_max), ay_max),
-            TileEdge::South => (access.0.clamp(ax_min, ax_max), ay_min),
-        };
-        // Spiral outward from `preferred` within the plot rect; pick the
-        // first clear, low-spread tile.
-        let mut best: Option<(u8, i32, (i32, i32))> = None;
-        for cy in ay_min..=ay_max {
-            for cx in ax_min..=ax_max {
-                if !is_clear_footprint(chunk_map, bed_map, bp_map, doormat, cx, cy, half_w, half_h)
-                {
-                    continue;
-                }
-                let (_, spread) = footprint_z_stats(chunk_map, cx, cy, half_w, half_h);
-                if spread > MAX_TERRAFORM_SPREAD {
-                    continue;
-                }
-                let d = (cx - preferred.0).abs() + (cy - preferred.1).abs();
-                let cand = (spread, d, (cx, cy));
-                if best.map(|b| (cand.0, cand.1) < (b.0, b.1)).unwrap_or(true) {
-                    best = Some(cand);
-                }
-            }
-        }
-        if let Some((_, _, p)) = best {
-            return Some((p, edge));
-        }
-    }
-    None
-}
-
-/// True iff no Bed and no Blueprint sits inside `rect`. Cheap rect-scan;
-/// chief residential lots are at most 6×6 = 36 tiles.
-fn plot_rect_vacant(
-    bed_map: &BedMap,
-    bp_map: &BlueprintMap,
-    doormat: &crate::simulation::doormat::DoormatReservations,
-    rect: crate::simulation::settlement::TileRect,
-) -> bool {
-    for ty in rect.y0..rect.y0 + rect.h as i32 {
-        for tx in rect.x0..rect.x0 + rect.w as i32 {
-            if bed_map.0.contains_key(&(tx, ty)) || bp_map.0.contains_key(&(tx, ty)) {
-                return false;
-            }
-            if doormat.is_reserved((tx, ty)) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-/// Find a clear (2·hw+1) × (2·hh+1) footprint inside the first matching zone
-/// of `plan`. Returns the centre. Falls back to `find_building_origin` (radial
-/// search around home) when no matching zone exists or the zone is full.
-fn find_footprint_in_zone(
-    chunk_map: &ChunkMap,
-    bed_map: &BedMap,
-    bp_map: &BlueprintMap,
-    doormat: &crate::simulation::doormat::DoormatReservations,
-    plan: Option<&crate::simulation::settlement::SettlementPlan>,
-    kind: crate::simulation::settlement::ZoneKind,
-    home: (i32, i32),
-    half_w: i32,
-    half_h: i32,
-    fallback_radius: i32,
-) -> Option<(i32, i32)> {
-    let (hx, hy) = (home.0 as i32, home.1 as i32);
-
-    if let Some(plan) = plan {
-        if let Some(rect) = plan.zones.iter().find(|z| z.kind == kind).map(|z| z.rect) {
-            // Rank candidates by (spread asc, distance asc). Flat ground is
-            // strongly preferred; uneven sites that exceed MAX_TERRAFORM_SPREAD
-            // are rejected outright so we don't queue megaprojects.
-            let mut best: Option<(u8, i32, (i32, i32))> = None;
-            let cx_min = rect.x0 as i32 + half_w;
-            let cy_min = rect.y0 as i32 + half_h;
-            let cx_max = rect.x0 as i32 + rect.w as i32 - half_w - 1;
-            let cy_max = rect.y0 as i32 + rect.h as i32 - half_h - 1;
-            for cy in cy_min..=cy_max {
-                for cx in cx_min..=cx_max {
-                    if !is_clear_footprint(
-                        chunk_map, bed_map, bp_map, doormat, cx, cy, half_w, half_h,
-                    ) {
-                        continue;
-                    }
-                    if blocks_cardinal_corridor(cx, cy, half_w, half_h, home) {
-                        continue;
-                    }
-                    let (_, spread) = footprint_z_stats(chunk_map, cx, cy, half_w, half_h);
-                    if spread > MAX_TERRAFORM_SPREAD {
-                        continue;
-                    }
-                    let d = (cx - hx).abs() + (cy - hy).abs();
-                    let cand = (spread, d, (cx as i32, cy as i32));
-                    if best.map(|b| (cand.0, cand.1) < (b.0, b.1)).unwrap_or(true) {
-                        best = Some(cand);
-                    }
-                }
-            }
-            if let Some((_, _, p)) = best {
-                return Some(p);
-            }
-        }
-    }
-
-    // Fallback: organic radial search.
-    find_building_origin(
-        chunk_map,
-        bed_map,
-        bp_map,
-        doormat,
-        home,
-        half_w,
-        half_h,
-        fallback_radius,
-    )
-}
-
-/// Pick a clear single-tile site inside the first zone of the given kind in
-/// `plan`. Returns the tile closest to `home`. Falls back to a radial search
-/// around `home` when no zone of the requested kind exists or no clear tile
-/// is found within it.
-fn find_clear_tile_in_zone(
-    chunk_map: &ChunkMap,
-    bed_map: &BedMap,
-    bp_map: &BlueprintMap,
-    doormat: &crate::simulation::doormat::DoormatReservations,
-    plan: Option<&crate::simulation::settlement::SettlementPlan>,
-    kind: crate::simulation::settlement::ZoneKind,
-    home: (i32, i32),
-    fallback_radius: i32,
-) -> Option<(i32, i32)> {
-    let (hx, hy) = (home.0 as i32, home.1 as i32);
-
-    if let Some(plan) = plan {
-        if let Some(rect) = plan.zones.iter().find(|z| z.kind == kind).map(|z| z.rect) {
-            let mut best: Option<(i32, (i32, i32))> = None;
-            for dy in 0..rect.h as i32 {
-                for dx in 0..rect.w as i32 {
-                    let tx = rect.x0 as i32 + dx;
-                    let ty = rect.y0 as i32 + dy;
-                    let pos = (tx as i32, ty as i32);
-                    if bp_map.0.contains_key(&pos) || bed_map.0.contains_key(&pos) {
-                        continue;
-                    }
-                    if doormat.is_reserved(pos) {
-                        continue;
-                    }
-                    let Some(k) = chunk_map.tile_kind_at(tx, ty) else {
-                        continue;
-                    };
-                    if !k.is_passable() || k == TileKind::Wall {
-                        continue;
-                    }
-                    let d = (tx - hx).abs() + (ty - hy).abs();
-                    if best.map(|(bd, _)| d < bd).unwrap_or(true) {
-                        best = Some((d, pos));
-                    }
-                }
-            }
-            if let Some((_, p)) = best {
-                return Some(p);
-            }
-        }
-    }
-
-    // Fallback radial search.
-    for d in 1..=fallback_radius {
-        for dy in -d..=d {
-            for dx in -d..=d {
-                if dx.abs().max(dy.abs()) != d {
-                    continue;
-                }
-                let pos = ((hx + dx) as i32, (hy + dy) as i32);
-                if bp_map.0.contains_key(&pos) || bed_map.0.contains_key(&pos) {
-                    continue;
-                }
-                if doormat.is_reserved(pos) {
-                    continue;
-                }
-                let Some(k) = chunk_map.tile_kind_at(hx + dx, hy + dy) else {
-                    continue;
-                };
-                if k.is_passable() && k != TileKind::Wall {
-                    return Some(pos);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Find a passable, unreserved tile in the first Civic zone of `plan` whose
-/// rect doesn't already contain a campfire. Lets multi-hearth Paleolithic
-/// camps place each new fire at a fresh Civic anchor instead of clustering
-/// the second hearth on top of the first. Falls back to a 6-tile radial
-/// search around `home` when no plan / no eligible zone is available.
-fn find_unfilled_civic_zone_tile(
-    chunk_map: &ChunkMap,
-    bed_map: &BedMap,
-    bp_map: &BlueprintMap,
-    doormat: &crate::simulation::doormat::DoormatReservations,
-    campfire_map: &CampfireMap,
-    plan: Option<&crate::simulation::settlement::SettlementPlan>,
-    home: (i32, i32),
-) -> Option<(i32, i32)> {
-    use crate::simulation::settlement::ZoneKind;
-    if let Some(plan) = plan {
-        for zone in plan.zones.iter().filter(|z| z.kind == ZoneKind::Civic) {
-            let rect = zone.rect;
-            let occupied = campfire_map.0.keys().any(|&(x, y)| rect.contains(x, y));
-            if occupied {
-                continue;
-            }
-            let mut best: Option<(i32, (i32, i32))> = None;
-            let zcx = rect.x0 as i32 + rect.w as i32 / 2;
-            let zcy = rect.y0 as i32 + rect.h as i32 / 2;
-            for dy in 0..rect.h as i32 {
-                for dx in 0..rect.w as i32 {
-                    let tx = rect.x0 as i32 + dx;
-                    let ty = rect.y0 as i32 + dy;
-                    let pos = (tx as i32, ty as i32);
-                    if bp_map.0.contains_key(&pos) || bed_map.0.contains_key(&pos) {
-                        continue;
-                    }
-                    if doormat.is_reserved(pos) {
-                        continue;
-                    }
-                    let Some(k) = chunk_map.tile_kind_at(tx, ty) else {
-                        continue;
-                    };
-                    if !k.is_passable() || k == TileKind::Wall {
-                        continue;
-                    }
-                    let d = (tx - zcx).abs() + (ty - zcy).abs();
-                    if best.map(|(bd, _)| d < bd).unwrap_or(true) {
-                        best = Some((d, pos));
-                    }
-                }
-            }
-            if let Some((_, p)) = best {
-                return Some(p);
-            }
-        }
-    }
-    // No plan / no eligible Civic zone — fall back to a tight radial search
-    // so the very first hearth still gets placed before the planner runs.
-    let (hx, hy) = (home.0 as i32, home.1 as i32);
-    for d in 1i32..=6 {
-        for dy in -d..=d {
-            for dx in -d..=d {
-                if dx.abs().max(dy.abs()) != d {
-                    continue;
-                }
-                let pos = ((hx + dx) as i32, (hy + dy) as i32);
-                if bp_map.0.contains_key(&pos)
-                    || bed_map.0.contains_key(&pos)
-                    || campfire_map.0.contains_key(&pos)
-                {
-                    continue;
-                }
-                if doormat.is_reserved(pos) {
-                    continue;
-                }
-                let Some(k) = chunk_map.tile_kind_at(hx + dx, hy + dy) else {
-                    continue;
-                };
-                if k.is_passable() && k != TileKind::Wall {
-                    return Some(pos);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Pick a bed tile inside one of two opposing crescents around a hearth.
-/// The crescent axis is perpendicular to the home→hearth direction so beds
-/// flank the approach path on either side, leaving the home-facing and
-/// far-facing corridors clear. Diagonal corners (≥45° off-axis) are
-/// excluded; the chosen tile balances bed counts across the two crescents.
-fn find_bed_tile_around_hearth(
-    chunk_map: &ChunkMap,
-    bed_map: &BedMap,
-    bp_map: &BlueprintMap,
-    doormat: &crate::simulation::doormat::DoormatReservations,
-    hearths: &[(i32, i32)],
-    home: (i32, i32),
-    inner_r: i32,
-    outer_r: i32,
-) -> Option<(i32, i32)> {
-    if hearths.is_empty() {
-        return None;
-    }
-    // cos(~44°) — accept tiles within ~44° of either crescent pole. Just
-    // tight enough to reject 45° diagonals so the cluster doesn't square off.
-    const ALIGNMENT_THRESHOLD: f32 = 0.72;
-
-    // Per-hearth crescent axis (unit vector), perpendicular to the
-    // home→hearth direction.
-    let bed_axes: Vec<(f32, f32)> = hearths
-        .iter()
-        .map(|&(hx, hy)| {
-            let approach_dx = home.0 as f32 - hx as f32;
-            let approach_dy = home.1 as f32 - hy as f32;
-            let approach = approach_dy.atan2(approach_dx);
-            let axis = approach + std::f32::consts::FRAC_PI_2;
-            (axis.cos(), axis.sin())
-        })
-        .collect();
-
-    // Per-hearth occupancy of the two crescents (positive vs negative pole).
-    let crescents_per_hearth: Vec<[u8; 2]> = hearths
-        .iter()
-        .enumerate()
-        .map(|(hi, &(hx, hy))| {
-            let (ax, ay) = bed_axes[hi];
-            let mut s = [0u8; 2];
-            for &(bx, by) in bed_map.0.keys() {
-                let dx = bx as i32 - hx as i32;
-                let dy = by as i32 - hy as i32;
-                let dist2 = dx * dx + dy * dy;
-                if dist2 < inner_r * inner_r || dist2 > outer_r * outer_r {
-                    continue;
-                }
-                let r = (dist2 as f32).sqrt();
-                let alignment = (dx as f32 * ax + dy as f32 * ay) / r;
-                if alignment.abs() < ALIGNMENT_THRESHOLD {
-                    continue;
-                }
-                s[(alignment < 0.0) as usize] += 1;
-            }
-            s
-        })
-        .collect();
-
-    let mut best: Option<(i32, (i32, i32))> = None;
-    for (hi, &(hx, hy)) in hearths.iter().enumerate() {
-        let (ax, ay) = bed_axes[hi];
-        let crescents = &crescents_per_hearth[hi];
-        let min_side = (*crescents.iter().min().unwrap_or(&0)) as i32;
-        for dy in -outer_r..=outer_r {
-            for dx in -outer_r..=outer_r {
-                let dist2 = dx * dx + dy * dy;
-                if dist2 < inner_r * inner_r || dist2 > outer_r * outer_r {
-                    continue;
-                }
-                let tx = hx as i32 + dx;
-                let ty = hy as i32 + dy;
-                let pos = (tx as i32, ty as i32);
-                if bp_map.0.contains_key(&pos) || bed_map.0.contains_key(&pos) {
-                    continue;
-                }
-                if doormat.is_reserved(pos) {
-                    continue;
-                }
-                let Some(k) = chunk_map.tile_kind_at(tx, ty) else {
-                    continue;
-                };
-                if !k.is_passable() || k == TileKind::Wall {
-                    continue;
-                }
-                let r = (dist2 as f32).sqrt();
-                let alignment = (dx as f32 * ax + dy as f32 * ay) / r;
-                if alignment.abs() < ALIGNMENT_THRESHOLD {
-                    continue;
-                }
-                let side = (alignment < 0.0) as usize;
-                let arc_pressure = (crescents[side] as i32 - min_side) * 24;
-                let radial_pressure = (dist2 - inner_r * inner_r).max(0);
-                let hearth_pressure = (hi as i32) * 4;
-                let cost = arc_pressure + radial_pressure + hearth_pressure;
-                if best.map(|(c, _)| cost < c).unwrap_or(true) {
-                    best = Some((cost, pos));
-                }
-            }
-        }
-    }
-    best.map(|(_, p)| p)
-}
 
 /// Maximum surface_z spread (max - min) we are willing to terraform for a
 /// single building footprint. Sites above this are rejected entirely so the
@@ -2739,69 +2289,7 @@ pub(crate) fn find_emergency_bed_tile(
     None
 }
 
-/// Shape-aware variant of `is_clear_footprint`: walks every tile in the
-/// `shape` mask under `rotation` at `anchor` and rejects when any cell is
-/// non-passable, walled, beded, blueprinted, or reserved as another door's
-/// doormat. Used by `BuildIntent::CompositeHouse` placement so non-rectangular
-/// masks don't drift onto impassable interior tiles that a bounding-box
-/// `is_clear_footprint` wouldn't catch.
-fn is_clear_shape(
-    chunk_map: &ChunkMap,
-    bed_map: &BedMap,
-    bp_map: &BlueprintMap,
-    doormat: &crate::simulation::doormat::DoormatReservations,
-    shape: crate::simulation::building_template::FootprintShape,
-    rotation: crate::simulation::building_template::Rotation,
-    anchor: (i32, i32),
-) -> bool {
-    for (tx, ty) in crate::simulation::building_template::shape_tiles(shape, anchor, rotation) {
-        let pos = (tx, ty);
-        if bp_map.0.contains_key(&pos) || bed_map.0.contains_key(&pos) {
-            return false;
-        }
-        if doormat.is_reserved(pos) {
-            return false;
-        }
-        let Some(kind) = chunk_map.tile_kind_at(tx, ty) else {
-            return false;
-        };
-        if !kind.is_passable() || kind == TileKind::Wall || kind == TileKind::Road {
-            return false;
-        }
-    }
-    true
-}
 
-/// Returns true if any wall tile or bed exists within `radius` tiles of the
-/// expanded bounding box of the footprint — i.e. there is something to attach to.
-fn has_nearby_structure(
-    chunk_map: &ChunkMap,
-    bed_map: &BedMap,
-    cx: i32,
-    cy: i32,
-    half_w: i32,
-    half_h: i32,
-    radius: i32,
-) -> bool {
-    let outer_w = half_w + radius;
-    let outer_h = half_h + radius;
-    for dy in -outer_h..=outer_h {
-        for dx in -outer_w..=outer_w {
-            if dy.abs() <= half_h && dx.abs() <= half_w {
-                continue;
-            } // skip own footprint
-            let nx = cx + dx;
-            let ny = cy + dy;
-            if bed_map.0.contains_key(&(nx as i32, ny as i32)) {
-                return true;
-            }
-            if chunk_map.tile_kind_at(nx, ny) == Some(TileKind::Wall) {
-                return true;
-            }
-        }
-    }
-    false
-}
 
 /// Returns true if the footprint would straddle either cardinal corridor from the
 /// faction center — i.e. any tile in the footprint lies on `x = home.x` (N-S axis)
@@ -2814,50 +2302,6 @@ fn blocks_cardinal_corridor(cx: i32, cy: i32, half_w: i32, half_h: i32, home: (i
     blocks_ns || blocks_ew
 }
 
-/// Phase 1/2: find the center of a clear (2·half_w+1) × (2·half_h+1) footprint.
-/// Returns a site near the camp center for the first few buildings, then expands
-/// outward organically (adjacent to existing structures).
-fn find_building_origin(
-    chunk_map: &ChunkMap,
-    bed_map: &BedMap,
-    bp_map: &BlueprintMap,
-    doormat: &crate::simulation::doormat::DoormatReservations,
-    camp_home: (i32, i32),
-    half_w: i32,
-    half_h: i32,
-    max_radius: i32,
-) -> Option<(i32, i32)> {
-    let (hx, hy) = (camp_home.0 as i32, camp_home.1 as i32);
-    let min_ring = half_w.max(half_h) + 1;
-    let early_ring = min_ring + 3; // within this ring: always accept a clear footprint
-
-    for ring in min_ring..=max_radius {
-        for dy in -ring..=ring {
-            for dx in -ring..=ring {
-                if dx.abs().max(dy.abs()) != ring {
-                    continue;
-                }
-                let cx = hx + dx;
-                let cy = hy + dy;
-                if blocks_cardinal_corridor(cx, cy, half_w, half_h, camp_home) {
-                    continue;
-                }
-                if !is_clear_footprint(chunk_map, bed_map, bp_map, doormat, cx, cy, half_w, half_h)
-                {
-                    continue;
-                }
-                if ring <= early_ring {
-                    return Some((cx as i32, cy as i32));
-                }
-                // Beyond the seeding zone, grow organically: require adjacency.
-                if has_nearby_structure(chunk_map, bed_map, cx, cy, half_w, half_h, 2) {
-                    return Some((cx as i32, cy as i32));
-                }
-            }
-        }
-    }
-    None
-}
 
 /// Phase 1/2: plan all wall and bed blueprints for a single rectangular building.
 /// The perimeter wall tile closest to camp_home becomes the entrance (left open).
@@ -3126,167 +2570,6 @@ fn plan_building(
     });
 }
 
-/// Settlement realism: read-only borrow of every map a palisade envelope
-/// needs. Bundled as a struct rather than a SystemParam so both the chief
-/// path (`BuildingMapsRO`) and seed-time callers can construct one from
-/// what they already hold.
-pub struct PalisadeMapsRO<'a> {
-    pub bed_map: &'a BedMap,
-    pub granary_map: &'a GranaryMap,
-    pub shrine_map: &'a ShrineMap,
-    pub well_map: &'a WellMap,
-    pub campfire_map: &'a CampfireMap,
-}
-
-/// Phase 1/2: find a single open slot on the rectangular palisade that
-/// wraps the settlement's *defended core* plus a buffer. Returns None
-/// when the palisade is complete, no defended structures exist near
-/// camp, or every remaining perimeter tile is blocked.
-///
-/// Settlement realism: the envelope is the axis-aligned bbox over
-/// `BedMap ∪ GranaryMap ∪ ShrineMap ∪ WellMap ∪ CampfireMap` filtered to
-/// chebyshev ≤ 25 of `camp_home`, *not* `BedMap` alone — so granaries
-/// and shrines stamped outside the original bed cluster get wrapped too.
-/// Gateways align with spine endpoints from `brain.road_segments` rather
-/// than `hx`/`hy`, so the wall opens where the actual street crosses it.
-fn find_palisade_site(
-    chunk_map: &ChunkMap,
-    maps: PalisadeMapsRO,
-    brain: Option<&crate::simulation::organic_settlement::SettlementBrain>,
-    bp_map: &BlueprintMap,
-    doormat: &crate::simulation::doormat::DoormatReservations,
-    camp_home: (i32, i32),
-    buffer: i32,
-) -> Option<(i32, i32)> {
-    let (hx, hy) = (camp_home.0 as i32, camp_home.1 as i32);
-    let search = 25i32;
-
-    let mut min_x = i32::MAX;
-    let mut max_x = i32::MIN;
-    let mut min_y = i32::MAX;
-    let mut max_y = i32::MIN;
-    let mut consider =
-        |pos: (i32, i32), min_x: &mut i32, max_x: &mut i32, min_y: &mut i32, max_y: &mut i32| {
-            let (bx, by) = pos;
-            if (bx - hx).abs() > search || (by - hy).abs() > search {
-                return;
-            }
-            *min_x = (*min_x).min(bx);
-            *max_x = (*max_x).max(bx);
-            *min_y = (*min_y).min(by);
-            *max_y = (*max_y).max(by);
-        };
-    for &pos in maps.bed_map.0.keys() {
-        consider(pos, &mut min_x, &mut max_x, &mut min_y, &mut max_y);
-    }
-    for &pos in maps.granary_map.0.keys() {
-        consider(pos, &mut min_x, &mut max_x, &mut min_y, &mut max_y);
-    }
-    for &pos in maps.shrine_map.0.keys() {
-        consider(pos, &mut min_x, &mut max_x, &mut min_y, &mut max_y);
-    }
-    for &pos in maps.well_map.0.keys() {
-        consider(pos, &mut min_x, &mut max_x, &mut min_y, &mut max_y);
-    }
-    for &pos in maps.campfire_map.0.keys() {
-        consider(pos, &mut min_x, &mut max_x, &mut min_y, &mut max_y);
-    }
-    if min_x == i32::MAX {
-        return None;
-    }
-
-    min_x -= buffer;
-    max_x += buffer;
-    min_y -= buffer;
-    max_y += buffer;
-
-    // Spine-aligned gateway centres. For each cardinal edge we walk the
-    // planned/carved road segments to find the tile where the spine
-    // crosses the edge; the 3-tile gateway centres on that crossing.
-    // Fallback to `hx`/`hy` when no road meets that edge.
-    let gateway_half = 1i32; // half-width: gateway spans 3 tiles
-    let crossing_on_edge = |fixed_y: Option<i32>, fixed_x: Option<i32>, default: i32| -> i32 {
-        let Some(brain) = brain else { return default };
-        // Walk every planned road tile; the one whose row/column matches
-        // the requested edge and lies inside the rect wins. Take the
-        // tile closest (chebyshev) to the original cardinal centre.
-        let mut best: Option<(i32, i32)> = None;
-        for &tile in brain.road_tiles.iter() {
-            if let Some(yy) = fixed_y {
-                if tile.1 != yy {
-                    continue;
-                }
-                if tile.0 < min_x || tile.0 > max_x {
-                    continue;
-                }
-                let d = (tile.0 - default).abs();
-                if best.map_or(true, |(bd, _)| d < bd) {
-                    best = Some((d, tile.0));
-                }
-            } else if let Some(xx) = fixed_x {
-                if tile.0 != xx {
-                    continue;
-                }
-                if tile.1 < min_y || tile.1 > max_y {
-                    continue;
-                }
-                let d = (tile.1 - default).abs();
-                if best.map_or(true, |(bd, _)| d < bd) {
-                    best = Some((d, tile.1));
-                }
-            }
-        }
-        best.map(|(_, v)| v).unwrap_or(default)
-    };
-    let gate_x_north = crossing_on_edge(Some(min_y), None, hx);
-    let gate_x_south = crossing_on_edge(Some(max_y), None, hx);
-    let gate_y_west = crossing_on_edge(None, Some(min_x), hy);
-    let gate_y_east = crossing_on_edge(None, Some(max_x), hy);
-
-    for x in min_x..=max_x {
-        for &(y, gx) in &[(min_y, gate_x_north), (max_y, gate_x_south)] {
-            if (x - gx).abs() <= gateway_half {
-                continue;
-            }
-            let tile = (x as i32, y as i32);
-            if bp_map.0.contains_key(&tile) {
-                continue;
-            }
-            if doormat.is_reserved(tile) {
-                continue;
-            }
-            let Some(kind) = chunk_map.tile_kind_at(x, y) else {
-                continue;
-            };
-            if !kind.is_passable() || kind == TileKind::Wall || kind == TileKind::Road {
-                continue;
-            }
-            return Some(tile);
-        }
-    }
-    for y in (min_y + 1)..max_y {
-        for &(x, gy) in &[(min_x, gate_y_west), (max_x, gate_y_east)] {
-            if (y - gy).abs() <= gateway_half {
-                continue;
-            }
-            let tile = (x as i32, y as i32);
-            if bp_map.0.contains_key(&tile) {
-                continue;
-            }
-            if doormat.is_reserved(tile) {
-                continue;
-            }
-            let Some(kind) = chunk_map.tile_kind_at(x, y) else {
-                continue;
-            };
-            if !kind.is_passable() || kind == TileKind::Wall || kind == TileKind::Road {
-                continue;
-            }
-            return Some(tile);
-        }
-    }
-    None
-}
 
 // ── Blueprint planning system ─────────────────────────────────────────────────
 
@@ -3311,59 +2594,34 @@ pub struct BuildingMapsRO<'w> {
     // sleepy-dove Phase 4: bundled here so `chief_directive_system`
     // stays under Bevy's 16-param ceiling.
     pub poster_pool: Res<'w, ConstructionPosterPool>,
-    // Settlement realism: needed to thread `maturity` into
-    // `generate_candidates`. Bundled here for the same 16-param reason.
-    pub start_options: Res<'w, crate::GameStartOptions>,
-}
-
-/// Read-only borrow of the structure-map set that `generate_candidates` needs.
-/// Produced from either `BuildingMapsRO` (chief path) or `FurnitureMaps` (seed
-/// path) so the same candidate generator drives both contexts. Doormat /
-/// organic_selected / organic_brains stay separate parameters because the
-/// chief and seed paths have different access patterns.
-pub struct GenCandidatesMaps<'a> {
-    pub bed_map: &'a BedMap,
-    pub wall_map: &'a WallMap,
-    pub campfire_map: &'a CampfireMap,
-    pub workbench_map: &'a WorkbenchMap,
-    pub granary_map: &'a GranaryMap,
-    pub shrine_map: &'a ShrineMap,
-    pub market_map: &'a MarketMap,
-    pub barracks_map: &'a BarracksMap,
-    pub monument_map: &'a MonumentMap,
-    pub well_map: &'a WellMap,
-}
-
-impl<'w> BuildingMapsRO<'w> {
-    pub fn as_view(&self) -> GenCandidatesMaps<'_> {
-        GenCandidatesMaps {
-            bed_map: &self.bed_map,
-            wall_map: &self.wall_map,
-            campfire_map: &self.campfire_map,
-            workbench_map: &self.workbench_map,
-            granary_map: &self.granary_map,
-            shrine_map: &self.shrine_map,
-            market_map: &self.market_map,
-            barracks_map: &self.barracks_map,
-            monument_map: &self.monument_map,
-            well_map: &self.well_map,
-        }
-    }
 }
 
 impl<'w> FurnitureMaps<'w> {
-    pub fn as_view(&self) -> GenCandidatesMaps<'_> {
-        GenCandidatesMaps {
-            bed_map: &self.bed_map,
-            wall_map: &self.wall_map,
-            campfire_map: &self.campfire_map,
-            workbench_map: &self.workbench_map,
-            granary_map: &self.granary_map,
-            shrine_map: &self.shrine_map,
-            market_map: &self.market_map,
-            barracks_map: &self.barracks_map,
-            monument_map: &self.monument_map,
-            well_map: &self.well_map,
+    /// Borrow the read-only structure-map set as the lightweight view that
+    /// `organic_settlement` helpers (`append_pressures_for_faction`,
+    /// `pressure_to_intent`, …) consume. Lets the seed pipeline drive the
+    /// organic intent path without going through the SystemParam `Res<T>`
+    /// bundle (which can't be constructed from a `ResMut`-style
+    /// `FurnitureMaps`).
+    pub fn organic_view<'a>(
+        &'a self,
+        structure_index: &'a StructureIndex,
+    ) -> crate::simulation::organic_settlement::OrganicStructureMaps<'a> {
+        crate::simulation::organic_settlement::OrganicStructureMaps {
+            bed_map: &*self.bed_map,
+            wall_map: &*self.wall_map,
+            campfire_map: &*self.campfire_map,
+            door_map: &*self.door_map,
+            workbench_map: &*self.workbench_map,
+            loom_map: &*self.loom_map,
+            table_map: &*self.table_map,
+            granary_map: &*self.granary_map,
+            shrine_map: &*self.shrine_map,
+            market_map: &*self.market_map,
+            barracks_map: &*self.barracks_map,
+            monument_map: &*self.monument_map,
+            well_map: &*self.well_map,
+            structure_index,
         }
     }
 }
@@ -3473,66 +2731,6 @@ fn rect_tiles(centre: (i32, i32), half_w: i32, half_h: i32) -> Vec<(i32, i32)> {
 }
 
 impl BuildIntent {
-    /// The primary input goods this intent will require, summed across every
-    /// blueprint it would spawn. Used by the deficit-EMA feedback loop in
-    /// `generate_candidates` so candidates that need a chronically-scarce
-    /// good get down-scored.
-    fn required_goods(self) -> ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32> {
-        let mut totals: ahash::AHashMap<_, u32> = ahash::AHashMap::new();
-        let mut add = |kind: BuildSiteKind, multiplier: u32| {
-            for &(rid, qty) in &recipe_for(kind).inputs {
-                *totals.entry(rid).or_insert(0) += qty as u32 * multiplier;
-            }
-        };
-        match self {
-            BuildIntent::Single(kind) => add(kind, 1),
-            BuildIntent::Hut(mat) => {
-                // 4 wall tiles + 1 door + 1 bed.
-                add(BuildSiteKind::Wall(mat), 4);
-                add(BuildSiteKind::Door, 1);
-                add(BuildSiteKind::Bed, 1);
-            }
-            BuildIntent::Longhouse(mat) => {
-                add(BuildSiteKind::Wall(mat), 8);
-                add(BuildSiteKind::Door, 1);
-                add(BuildSiteKind::Bed, 2);
-                // Interior centre-tile hearth.
-                add(BuildSiteKind::Campfire, 1);
-            }
-            BuildIntent::PalisadeSegment(mat, _) => add(BuildSiteKind::Wall(mat), 1),
-            BuildIntent::CompositeHouse {
-                shape,
-                rotation,
-                wall_material,
-            } => {
-                use crate::simulation::building_template::shape_tiles;
-                // Walk canonical tiles, classify perimeter vs interior. We
-                // don't know exact wall/bed counts without inspecting the
-                // shape mask — close enough is fine for the deficit-EMA
-                // feedback loop. Perimeter ≈ outside-facing tiles; interior
-                // ≈ everything else, which we map to beds.
-                let tiles = shape_tiles(shape, (0, 0), rotation);
-                let tile_set: ahash::AHashSet<(i32, i32)> = tiles.iter().copied().collect();
-                let mut perim = 0u32;
-                let mut interior = 0u32;
-                for &(tx, ty) in &tiles {
-                    let is_perim = [(1, 0), (-1, 0), (0, 1), (0, -1)]
-                        .iter()
-                        .any(|&(ox, oy)| !tile_set.contains(&(tx + ox, ty + oy)));
-                    if is_perim {
-                        perim += 1;
-                    } else {
-                        interior += 1;
-                    }
-                }
-                add(BuildSiteKind::Wall(wall_material), perim.saturating_sub(1));
-                add(BuildSiteKind::Door, 1);
-                add(BuildSiteKind::Bed, interior.max(1));
-            }
-        }
-        totals
-    }
-
     /// Every `BuildSiteKind` this intent would emit at least one blueprint
     /// for. Used by the poster pool: a single poster must be able to author
     /// *all* gated parts (no Frankenstein composite mixing two architects'
@@ -3584,7 +2782,6 @@ pub fn chief_directive_system(
     mut terraform_map: ResMut<crate::simulation::terraform::TerraformMap>,
     mut pending_footprints: ResMut<crate::simulation::terraform::PendingFootprints>,
     bp_query: Query<&Blueprint>,
-    plans: Res<crate::simulation::settlement::SettlementPlans>,
     // Chief PersonKnowledge powers the sleepy-dove BlueprintAuthor snapshot
     // for runtime intent emission. Replaces the prior unused chief_query
     // (`AgentGoal`-gating was retired — see comment block below).
@@ -3592,7 +2789,6 @@ pub fn chief_directive_system(
     plot_index: Res<crate::simulation::land::PlotIndex>,
     plot_q: Query<&crate::simulation::land::Plot>,
     settlement_map: Res<crate::simulation::settlement::SettlementMap>,
-    settlement_q: Query<&crate::simulation::settlement::Settlement>,
 ) {
     if clock.tick % 60 != 0 || !auto_build.0 {
         return;
@@ -3609,23 +2805,9 @@ pub fn chief_directive_system(
     // chief's `PersonKnowledge.learned` to snapshot into `BlueprintAuthor`.
 
     let mut faction_bp_count: AHashMap<u32, usize> = AHashMap::new();
-    // Pending-blueprint kind counters per faction. Every civic gate inside
-    // `generate_candidates` previously checked *built* counts only, so a
-    // structure already queued in `GatherMaterials` didn't satisfy its own
-    // gate — every chief tick the same kind got re-queued (visible as "3
-    // campfires queued at once" once Phase 1 lifted the one-bp-at-a-time
-    // cap). The PendingKindCounts table is consulted alongside the built
-    // counts so an in-flight blueprint counts toward fulfillment.
-    let mut pending_kinds_per_faction: AHashMap<u32, AHashMap<BuildSiteKind, u32>> =
-        AHashMap::new();
     for &bp_entity in bp_map.0.values() {
         if let Ok(bp) = bp_query.get(bp_entity) {
             *faction_bp_count.entry(bp.faction_id).or_insert(0) += 1;
-            *pending_kinds_per_faction
-                .entry(bp.faction_id)
-                .or_default()
-                .entry(bp.kind)
-                .or_insert(0) += 1;
         }
     }
     // Pending footprints (mid-terraform, no walls yet) also count as
@@ -3634,8 +2816,6 @@ pub fn chief_directive_system(
     for pending in &pending_footprints.queue {
         *faction_bp_count.entry(pending.faction_id).or_insert(0) += 1;
     }
-
-    let empty_pending: AHashMap<BuildSiteKind, u32> = AHashMap::new();
     for (&faction_id, faction) in faction_registry.factions.iter() {
         if faction_id == SOLO || faction.member_count == 0 {
             continue;
@@ -3679,100 +2859,20 @@ pub fn chief_directive_system(
             continue;
         }
 
-        let plan = plans.0.get(&faction_id);
-        let pending_kinds = pending_kinds_per_faction
-            .get(&faction_id)
-            .unwrap_or(&empty_pending);
-        // Peak population for civic-milestone gates. Falls back to current
-        // member_count when the faction has no Settlement entity yet (e.g.
-        // first-tick before `auto_found_default_settlements_system` ran).
-        let peak_pop = settlement_map
-            .first_for_faction(faction_id)
-            .and_then(|sid| settlement_map.by_id.get(&sid))
-            .and_then(|&e| settlement_q.get(e).ok())
-            .map(|s| s.peak_population)
-            .unwrap_or(faction.member_count);
-        // Brain-readiness gate: when an organic survey has been initiated
-        // for this faction's settlement but hasn't completed its first
-        // survey (last_survey_tick == 0), suppress shelter-class candidates
-        // from the legacy `generate_candidates` fallback. Otherwise the
-        // chief would stamp Hut/Longhouse/CompositeHouse into broad legacy
-        // zones before parcel-driven placement has had its first pass —
-        // leading to houses on planned roads or on land marked for other
-        // districts. Non-shelter candidates (Hearth, Granary, civic, etc.)
-        // remain allowed so the settlement still gets useful work.
-        let brain_for_faction = settlement_map
-            .first_for_faction(faction_id)
-            .and_then(|sid| maps.organic_brains.0.get(&sid));
-        let brain_pending_first_survey = brain_for_faction
-            .map(|b| b.last_survey_tick == 0)
-            .unwrap_or(false);
-
-        // sleepy-dove Phase 4: buildable surface for this settlement is
-        // the poster-pool union of resident chief + architect Learned.
-        let settlement_id = settlement_map.first_for_faction(faction_id);
-        let available_techs = poster_pool.union_of_learned(faction_id, settlement_id);
-
-        let best = maps
+        // Organic pressure pipeline is the only source of construction
+        // intents. `settlement_morphology_system` (Sequential, every
+        // `PRESSURE_INTERVAL` ticks) writes `SelectedSettlementIntents`;
+        // this chief consumes it. When no intent has been selected for a
+        // faction this tick (cold start, no pressure, every candidate
+        // failed parcel/commons/reachability gates), the chief simply
+        // skips — the next morphology tick fills the gap. No legacy
+        // `generate_candidates` fallback.
+        let Some(best) = maps
             .organic_selected
             .0
             .get(&faction_id)
             .map(build_candidate_from_organic)
-            .or_else(|| {
-                let mut candidates = generate_candidates(
-                    faction_id,
-                    faction,
-                    plan,
-                    &chunk_map,
-                    &maps.as_view(),
-                    &bp_map,
-                    &*maps.doormat,
-                    pending_kinds,
-                    &plot_index,
-                    &plot_q,
-                    peak_pop,
-                    None,
-                    available_techs,
-                    maps.start_options.maturity,
-                    brain_for_faction,
-                );
-                if brain_pending_first_survey {
-                    candidates.retain(|c| {
-                        !matches!(
-                            c.intent,
-                            BuildIntent::Hut(_)
-                                | BuildIntent::Longhouse(_)
-                                | BuildIntent::CompositeHouse { .. }
-                        )
-                    });
-                }
-                // Stage 3 feedback: penalize candidates whose required inputs include
-                // a chronically-deficient good (per `material_deficit_ema`). Skips the
-                // upgrade-rebuild path which short-circuits with score 5000 from
-                // `generate_candidates`.
-                for candidate in candidates.iter_mut() {
-                    let required = candidate.intent.required_goods();
-                    let mut penalty = 0.0f32;
-                    for (rid, qty) in required {
-                        if qty == 0 {
-                            continue;
-                        }
-                        let ema = faction.material_deficit_ema_of(rid);
-                        if ema >= crate::simulation::projects::DEFICIT_EMA_RARE_THRESHOLD {
-                            penalty += 600.0;
-                        } else if ema >= 80 {
-                            penalty += 200.0;
-                        }
-                    }
-                    candidate.score -= penalty;
-                }
-                candidates.into_iter().max_by(|a, b| {
-                    a.score
-                        .partial_cmp(&b.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            });
-        let Some(best) = best else {
+        else {
             continue;
         };
 
@@ -3825,6 +2925,7 @@ pub fn chief_directive_system(
         // `PersonKnowledge` (test fixtures, SOLO-ish) have an empty pool;
         // fall back to the legacy chief-knowledge author so existing
         // headless tests keep emitting blueprints.
+        let settlement_id = settlement_map.first_for_faction(faction_id);
         let author =
             match poster_pool.select_poster_for_intent(faction_id, settlement_id, best.intent) {
                 Some(cap) => Some(cap.author()),
@@ -3866,798 +2967,6 @@ pub fn chief_directive_system(
     }
 }
 
-/// Build the per-faction candidate list. Each pressure source contributes at
-/// most one candidate; cheap to compute since each calls O(zone) helpers.
-fn generate_candidates(
-    faction_id: u32,
-    faction: &FactionData,
-    plan: Option<&crate::simulation::settlement::SettlementPlan>,
-    chunk_map: &ChunkMap,
-    maps: &GenCandidatesMaps,
-    bp_map: &BlueprintMap,
-    doormat: &crate::simulation::doormat::DoormatReservations,
-    pending_kinds: &AHashMap<BuildSiteKind, u32>,
-    plot_index: &crate::simulation::land::PlotIndex,
-    plot_q: &Query<&crate::simulation::land::Plot>,
-    peak_pop: u32,
-    seed_techs: Option<&FactionTechs>,
-    // sleepy-dove Phase 4: runtime buildable surface = union of the
-    // settlement's resident chief + architect Learned sets (from
-    // `ConstructionPosterPool`). Ignored when `seed_techs` is `Some`
-    // (seed mode drives tiers from the era profile instead). Replaces
-    // the faction-wide `community_adoption_bitset` gate so a band can
-    // build whatever a single member learned.
-    available_techs: FactionTechs,
-    // Settlement realism: civic-seeding density. Only consulted when
-    // `seed_techs.is_some()` (seed mode); runtime callers can pass
-    // `StartSettlementMaturity::Established` (the value is ignored
-    // because `should_seed_civic` falls through to
-    // `civic_milestone_allows` when `seed_mode == false`).
-    maturity: crate::game_state::StartSettlementMaturity,
-    // Settlement realism: drives `find_palisade_site`'s spine-aligned
-    // gateways. Optional — when `None` (e.g. fixture factions without a
-    // brain) the helper falls back to `home_tile` axes.
-    brain: Option<&crate::simulation::organic_settlement::SettlementBrain>,
-) -> Vec<BuildCandidate> {
-    let pending_of = |k: BuildSiteKind| -> u32 { pending_kinds.get(&k).copied().unwrap_or(0) };
-    // Walls are tracked per-material (`Wall(Palisade)`, `Wall(Stone)`, …);
-    // the wall-deficit gate cares only about total wall blueprints in flight.
-    let pending_walls_total: u32 = pending_kinds
-        .iter()
-        .filter_map(|(k, n)| match k {
-            BuildSiteKind::Wall(_) => Some(*n),
-            _ => None,
-        })
-        .sum();
-    use crate::simulation::settlement::ZoneKind;
-
-    let mut out: Vec<BuildCandidate> = Vec::with_capacity(8);
-    let home = faction.home_tile;
-    let members = faction.member_count;
-    // sleepy-dove Phase 4: the buildable surface. In seed mode it's the
-    // era profile (`seed_techs`); at runtime it's the poster-pool union
-    // of resident chief + architect **Learned** sets — NOT the
-    // faction-wide `community_adoption_bitset`. A band can build whatever
-    // any single resident learned regardless of community adoption stage;
-    // adoption is now a downstream emergent signal fed by `record_tech_use`
-    // at completion, not a precondition. `select_poster_for_intent` still
-    // filters each emitted intent to one poster who can author every part.
-    let community_techs = seed_techs.cloned().unwrap_or(available_techs);
-    let techs = &community_techs;
-    let seed_mode = seed_techs.is_some();
-    let culture = &faction.culture;
-    // Step 2: route through the era-aware selector. Seed mode passes `None`
-    // (unconstrained — materials are stamped for free). Runtime also passes
-    // `None` until Step 3 threads the chief-cadence `MaterialAvailabilityView`
-    // in, at which point a `Scarce` input keeps this rung + market-hauls it and
-    // an all-`Unavailable` ladder returns `EmergencyShelter` (handled at the
-    // residential branch in Step 7). `mat()` is always `Some` under `None`.
-    let wall_sel = select_wall_material(techs, None);
-    let wall_mat = wall_sel.mat().unwrap_or_else(|| best_wall_material(techs));
-
-    // 0. Upgrade rebuild — if a structure has been deconstructed for upgrade
-    //    and the slot is now empty, prioritise refilling it with the upgraded
-    //    material. Bypass other candidates so the upgrade cycle resolves
-    //    promptly and no agent picks up the slot for an unrelated build.
-    if let Some(up_tile) = faction.active_upgrade {
-        let still_a_wall = maps.wall_map.0.contains_key(&up_tile);
-        if !still_a_wall {
-            // Slot is vacant. Verify the tile is passable and unreserved.
-            let tx = up_tile.0 as i32;
-            let ty = up_tile.1 as i32;
-            let blocked = bp_map.0.contains_key(&up_tile) || maps.bed_map.0.contains_key(&up_tile);
-            let passable = chunk_map
-                .tile_kind_at(tx, ty)
-                .map(|k| k.is_passable() && k != TileKind::Wall)
-                .unwrap_or(false);
-            if !blocked && passable {
-                out.push(BuildCandidate {
-                    intent: BuildIntent::PalisadeSegment(wall_mat, 2),
-                    tile: up_tile,
-                    score: 5000.0,
-                    door_dir: None,
-                });
-                return out; // skip everything else this tick
-            }
-        }
-    }
-
-    // 1. Hearths — pacing depends on era:
-    //    - Paleolithic/Mesolithic: band camps grow one fire per ~6 members,
-    //      gated on *crescent saturation* across all hearths plus a remaining
-    //      bed deficit. Bands fill out hearth #1's crescent before #2 opens.
-    //    - Neolithic: each hearth represents an extended-family household
-    //      cluster (~8 people). A new hearth opens once *every* existing
-    //      hearth has ≥ 8 beds inside its 2..6 crescent ring.
-    //    - Chalcolithic+: settled cultures keep a single civic-zone hearth
-    //      (hearth-per-house remains future work — needs Household component).
-    let era = current_era(techs);
-    const NEOLITHIC_BEDS_PER_HEARTH: u32 = 8;
-    let desired_hearths: u32 = match era {
-        Era::Paleolithic | Era::Mesolithic => {
-            crate::simulation::settlement::paleolithic_hearth_count(members)
-        }
-        // Bootstrap follow-up: a Neolithic+ seeded village wants ONE civic
-        // hearth at game start (per the original settlement-bootstrap plan).
-        // Extra hearths grow at runtime via the population-driven gate; we
-        // don't want a 20-founder Established start stamping 3 hearths
-        // lined up in the same civic parcel on tick 0.
-        Era::Neolithic if seed_techs.is_some() => 1,
-        Era::Neolithic => {
-            ((members + NEOLITHIC_BEDS_PER_HEARTH - 1) / NEOLITHIC_BEDS_PER_HEARTH).max(1)
-        }
-        _ => 1,
-    };
-    // Counts include both built structures *and* in-flight blueprints, so a
-    // structure already queued in `GatherMaterials` is treated as fulfilling
-    // its own gate — without this, every chief tick re-queues another of the
-    // same kind until the first one finishes building.
-    let built_hearths = count_campfires_near(&maps.campfire_map, home, 30) as u32;
-    let existing_hearths = built_hearths.saturating_add(pending_of(BuildSiteKind::Campfire));
-    let built_beds = count_beds_near(&maps.bed_map, home, 30) as i32;
-    let bed_count = built_beds + pending_of(BuildSiteKind::Bed) as i32;
-    let bed_deficit_pre = (members as i32 - bed_count).max(0);
-    let gate_ok = if existing_hearths == 0 {
-        true
-    } else if matches!(era, Era::Paleolithic | Era::Mesolithic) {
-        let hearths: Vec<(i32, i32)> = maps
-            .campfire_map
-            .0
-            .keys()
-            .copied()
-            .filter(|&(cx, cy)| {
-                (cx as i32 - home.0 as i32).abs() <= 25 && (cy as i32 - home.1 as i32).abs() <= 25
-            })
-            .collect();
-        let crescents_saturated = !hearths.is_empty()
-            && find_bed_tile_around_hearth(
-                chunk_map,
-                &maps.bed_map,
-                bp_map,
-                doormat,
-                &hearths,
-                home,
-                2,
-                6,
-            )
-            .is_none();
-        crescents_saturated && bed_deficit_pre > 0
-    } else if matches!(era, Era::Neolithic) {
-        // One hearth per ~8-person extended-family cluster. `desired_hearths`
-        // already caps the total at ceil(members/8); require each existing
-        // hearth to be "earning" its 8-person share before opening another.
-        // The old gate inspected a paleo crescent ring around each hearth —
-        // meaningless at Neolithic, where beds live *inside* walled huts the
-        // seed planner clusters near home, incidentally overlapping the ring
-        // and tripping the gate into queueing redundant campfires.
-        existing_hearths < desired_hearths
-            && (existing_hearths as u32) * NEOLITHIC_BEDS_PER_HEARTH <= members
-    } else {
-        false // Chalcolithic+: single civic hearth
-    };
-    let effective_desired = if gate_ok {
-        desired_hearths
-    } else {
-        existing_hearths
-    };
-    if techs.has(FIRE_MAKING) && existing_hearths < effective_desired {
-        let mut tile_opt = find_unfilled_civic_zone_tile(
-            chunk_map,
-            &maps.bed_map,
-            bp_map,
-            doormat,
-            &maps.campfire_map,
-            plan,
-            home,
-        );
-        // Bootstrap: a freshly-created Paleolithic faction may not have its
-        // first plan yet (planner is staggered ~60 ticks). Use the
-        // deterministic hearth offsets directly so even the very first fire
-        // lands at the proper distance from home rather than adjacent to it.
-        if tile_opt.is_none() && !techs.has(PERM_SETTLEMENT) && plan.is_none() {
-            let hearths = crate::simulation::settlement::paleolithic_hearth_positions_river_aware(
-                chunk_map, faction_id, home, members,
-            );
-            'outer: for (hx, hy) in hearths {
-                for dy in -1i32..=1 {
-                    for dx in -1i32..=1 {
-                        let tx = hx + dx;
-                        let ty = hy + dy;
-                        let pos = (tx as i32, ty as i32);
-                        if bp_map.0.contains_key(&pos)
-                            || maps.bed_map.0.contains_key(&pos)
-                            || maps.campfire_map.0.contains_key(&pos)
-                        {
-                            continue;
-                        }
-                        let Some(k) = chunk_map.tile_kind_at(tx, ty) else {
-                            continue;
-                        };
-                        if k.is_passable() && k != TileKind::Wall {
-                            tile_opt = Some(pos);
-                            break 'outer;
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(tile) = tile_opt {
-            out.push(BuildCandidate {
-                intent: BuildIntent::Single(BuildSiteKind::Campfire),
-                tile,
-                score: 1000.0,
-                door_dir: None,
-            });
-        }
-    }
-
-    let bed_deficit = bed_deficit_pre as f32;
-
-    // Step 7: era-appropriate emergency shelter. At runtime (never seed —
-    // seed stamps materials for free), if every wall ladder rung is
-    // unobtainable (`select_wall_material → EmergencyShelter`: not stored,
-    // not raw-gatherable, not affordably procurable) a Neolithic+ band would
-    // otherwise stall shelter-less forever. Emit a low-score bare `Bed`
-    // candidate on a deterministic era-keyed annulus so the band gets
-    // *something* — the walled-house candidate below is still emitted and
-    // far out-scores this, so the moment any real wall material arrives the
-    // band resumes proper huts and these emergency beds stop. Paleo/Meso are
-    // excluded (their crescent-bed branch is the native pattern). Non-shelter
-    // builds get no previous-era substitute — they simply defer (no
-    // candidate), which is the pre-existing behaviour.
-    let emergency_shelter = !seed_mode
-        && bed_deficit > 0.0
-        && !matches!(era, Era::Paleolithic | Era::Mesolithic)
-        && !faction.material_view.is_empty()
-        && matches!(
-            select_wall_material(techs, Some(&faction.material_view)),
-            WallSelection::EmergencyShelter
-        );
-    if emergency_shelter {
-        let layout_seed = plan.map(|p| p.culture_hash).unwrap_or(faction_id as u64);
-        if let Some(tile) = find_emergency_bed_tile(
-            chunk_map,
-            &maps.bed_map,
-            bp_map,
-            doormat,
-            home,
-            era,
-            layout_seed,
-            bed_count,
-        ) {
-            out.push(BuildCandidate {
-                intent: BuildIntent::Single(BuildSiteKind::Bed),
-                tile,
-                // Below every walled-house score (Hut 230+, Longhouse 260+)
-                // so proper shelter always wins once buildable.
-                score: 100.0 + bed_deficit * 20.0,
-                door_dir: None,
-            });
-        }
-    }
-
-    // 2. Residential — the principal growth axis. Pre-settlement: simple beds.
-    //    Post-settlement: walled huts; with CITY_STATE_ORG, longhouses preferred.
-    if bed_deficit > 0.0 {
-        if matches!(era, Era::Paleolithic | Era::Mesolithic) {
-            // Paleolithic/Mesolithic: cluster beds in a crescent annulus
-            // around the nearest hearth. Defer if no fire exists yet — the
-            // campfire candidate above (score 1000) will resolve first,
-            // matching the historical ordering of fire-then-shelter.
-            // Era-gated (not `!techs.has(PERM_SETTLEMENT)`) so a Neolithic+
-            // band never degenerates to outdoor beds if the poster pool
-            // transiently lacks PERM_SETTLEMENT (e.g. chief-death gap) — it
-            // simply emits no bed candidate that tick and retries.
-            let hearths: Vec<(i32, i32)> = maps
-                .campfire_map
-                .0
-                .keys()
-                .copied()
-                .filter(|&(cx, cy)| {
-                    let dx = cx as i32 - home.0 as i32;
-                    let dy = cy as i32 - home.1 as i32;
-                    dx.abs() <= 25 && dy.abs() <= 25
-                })
-                .collect();
-            if !hearths.is_empty() {
-                if let Some(tile) = find_bed_tile_around_hearth(
-                    chunk_map,
-                    &maps.bed_map,
-                    bp_map,
-                    doormat,
-                    &hearths,
-                    home,
-                    2,
-                    6,
-                ) {
-                    out.push(BuildCandidate {
-                        intent: BuildIntent::Single(BuildSiteKind::Bed),
-                        tile,
-                        score: 200.0 + bed_deficit * 30.0,
-                        door_dir: None,
-                    });
-                }
-            }
-        } else if !seed_mode && faction.material_view.is_empty() {
-            // Step 7: scarcity not yet classified this chief window. Emitting
-            // a higher-tier hut now would stall (no material) and fill the
-            // per-faction concurrency cap, after which the emergency Bed can
-            // never be *selected*. Defer one window — the emergency block
-            // above handles the truly-unobtainable case once classified.
-        } else if emergency_shelter {
-            // Emergency Bed already emitted above. Suppress the walled house
-            // so it can't out-score the fallback or hog the concurrency cap
-            // with a blueprint that can never finalize.
-        } else if (techs.has(CITY_STATE_ORG) || (seed_mode && bed_deficit >= 2.0))
-            && bed_deficit >= 2.0
-        {
-            // Bootstrap P3: at seed time, allow Longhouses at Neolithic+ once
-            // bed deficit ≥ 2 — kin-group seeding (settlement_bootstrap P2)
-            // partitions founders into ≤4-adult households, and a 6-founder
-            // start with 2 households of 3 should read as multi-bed dwellings,
-            // not 6 identical huts. Post-seed, the CITY_STATE_ORG gate keeps
-            // the runtime ladder unchanged.
-            // Frontage-first: prefer vacant residential lots whose access tile
-            // sits on the carved spine; fall back to zone-area scoring.
-            // Layout-seed roll: Longhouse is the default when bed deficit is
-            // large (≥4), but for smaller deficits we roll for visual variety.
-            // Seed mixes plan.culture_hash with current bed_count so successive
-            // builds in the same faction don't all pick the same footprint.
-            let layout_seed =
-                plan.map(|p| p.culture_hash).unwrap_or(faction_id as u64) ^ (bed_count as u64);
-            let mut roll_rng = fastrand::Rng::with_seed(layout_seed);
-            let try_longhouse = if bed_deficit >= 4.0 {
-                true
-            } else {
-                roll_rng.f32() < 0.6
-            };
-            // Composite L-shapes are temporarily disabled for shelter
-            // auto-builds: the current 2×2 + 2×1 mask has no true interior
-            // cells, so `plan_composite_building` emits walls/door but no
-            // beds. Keep layout stable with huts/longhouses until the
-            // composite template grows a real room interior.
-            let try_lshape = false;
-            if try_lshape {
-                // L-shape main block (2×2) + east extension (2×1) — 4×2
-                // bounding box. Use the bounding-box search to find a
-                // candidate anchor, then verify the actual mask via
-                // `is_clear_shape` so non-rectangular interior cells aren't
-                // dropped onto impassable terrain.
-                let lshape = crate::simulation::building_template::FootprintShape::LShape {
-                    w1: 2,
-                    h1: 2,
-                    w2: 2,
-                    h2: 1,
-                };
-                if let Some(origin) = find_footprint_in_zone(
-                    chunk_map,
-                    &maps.bed_map,
-                    bp_map,
-                    doormat,
-                    plan,
-                    ZoneKind::Residential,
-                    home,
-                    2,
-                    1,
-                    18,
-                ) {
-                    let rotation = crate::simulation::building_template::Rotation::R0;
-                    if is_clear_shape(
-                        chunk_map,
-                        &maps.bed_map,
-                        bp_map,
-                        doormat,
-                        lshape,
-                        rotation,
-                        origin,
-                    ) {
-                        out.push(BuildCandidate {
-                            intent: BuildIntent::CompositeHouse {
-                                shape: lshape,
-                                rotation,
-                                wall_material: wall_mat,
-                            },
-                            tile: origin,
-                            score: 245.0 + bed_deficit * 25.0,
-                            door_dir: None,
-                        });
-                    }
-                }
-            }
-            let lh_origin: Option<((i32, i32), Option<crate::simulation::land::TileEdge>)> =
-                if try_longhouse {
-                    find_footprint_at_frontage_lot(
-                        chunk_map,
-                        &maps.bed_map,
-                        bp_map,
-                        doormat,
-                        plot_index,
-                        plot_q,
-                        faction_id,
-                        ZoneKind::Residential,
-                        home,
-                        2,
-                        1,
-                    )
-                    .map(|(t, e)| (t, Some(e)))
-                    .or_else(|| {
-                        find_footprint_in_zone(
-                            chunk_map,
-                            &maps.bed_map,
-                            bp_map,
-                            doormat,
-                            plan,
-                            ZoneKind::Residential,
-                            home,
-                            2,
-                            1,
-                            20,
-                        )
-                        .map(|t| (t, None))
-                    })
-                } else {
-                    None
-                };
-            if let Some((origin, edge)) = lh_origin {
-                out.push(BuildCandidate {
-                    intent: BuildIntent::Longhouse(wall_mat),
-                    tile: origin,
-                    score: 260.0 + bed_deficit * 25.0,
-                    door_dir: edge,
-                });
-            } else {
-                let hut_origin: Option<((i32, i32), Option<crate::simulation::land::TileEdge>)> =
-                    find_footprint_at_frontage_lot(
-                        chunk_map,
-                        &maps.bed_map,
-                        bp_map,
-                        doormat,
-                        plot_index,
-                        plot_q,
-                        faction_id,
-                        ZoneKind::Residential,
-                        home,
-                        1,
-                        1,
-                    )
-                    .map(|(t, e)| (t, Some(e)))
-                    .or_else(|| {
-                        find_footprint_in_zone(
-                            chunk_map,
-                            &maps.bed_map,
-                            bp_map,
-                            doormat,
-                            plan,
-                            ZoneKind::Residential,
-                            home,
-                            1,
-                            1,
-                            18,
-                        )
-                        .map(|t| (t, None))
-                    });
-                if let Some((origin, edge)) = hut_origin {
-                    out.push(BuildCandidate {
-                        intent: BuildIntent::Hut(wall_mat),
-                        tile: origin,
-                        score: 230.0 + bed_deficit * 25.0,
-                        door_dir: edge,
-                    });
-                }
-            }
-        } else {
-            let hut_origin: Option<((i32, i32), Option<crate::simulation::land::TileEdge>)> =
-                find_footprint_at_frontage_lot(
-                    chunk_map,
-                    &maps.bed_map,
-                    bp_map,
-                    doormat,
-                    plot_index,
-                    plot_q,
-                    faction_id,
-                    ZoneKind::Residential,
-                    home,
-                    1,
-                    1,
-                )
-                .map(|(t, e)| (t, Some(e)))
-                .or_else(|| {
-                    find_footprint_in_zone(
-                        chunk_map,
-                        &maps.bed_map,
-                        bp_map,
-                        doormat,
-                        plan,
-                        ZoneKind::Residential,
-                        home,
-                        1,
-                        1,
-                        18,
-                    )
-                    .map(|t| (t, None))
-                });
-            if let Some((origin, edge)) = hut_origin {
-                out.push(BuildCandidate {
-                    intent: BuildIntent::Hut(wall_mat),
-                    tile: origin,
-                    score: 230.0 + bed_deficit * 25.0,
-                    door_dir: edge,
-                });
-            }
-        }
-    }
-
-    // 3. Defense — palisade reinforcement. Driven by culture.defensive.
-    //    Pre-Chalcolithic societies don't fortify: Paleolithic bands and
-    //    Neolithic farming villages were typically unwalled. Defensive
-    //    perimeters become standard with Chalcolithic/Bronze Age city-states.
-    if matches!(era, Era::Chalcolithic | Era::BronzeAge) {
-        let walls_count =
-            count_walls_near(&maps.wall_map, home, 25) as i32 + pending_walls_total as i32;
-        let target_walls = (members as i32 * 2 + 8).min(48);
-        let defense_deficit = (target_walls - walls_count).max(0) as f32;
-        if defense_deficit > 0.0 && bed_count > 0 {
-            if let Some(tile) = find_palisade_site(
-                chunk_map,
-                PalisadeMapsRO {
-                    bed_map: maps.bed_map,
-                    granary_map: maps.granary_map,
-                    shrine_map: maps.shrine_map,
-                    well_map: maps.well_map,
-                    campfire_map: maps.campfire_map,
-                },
-                brain,
-                bp_map,
-                doormat,
-                home,
-                2,
-            ) {
-                let def_mult = 0.4 + (culture.defensive as f32 / 255.0) * 1.6;
-                out.push(BuildCandidate {
-                    intent: BuildIntent::PalisadeSegment(wall_mat, 2),
-                    tile,
-                    score: 70.0 * def_mult + defense_deficit * 1.5,
-                    door_dir: None,
-                });
-            }
-        }
-    }
-
-    // 4. Crafting — Workbench when FLINT_KNAPPING and we have somewhere to live.
-    if techs.has(FLINT_KNAPPING)
-        && count_workbenches_near(&maps.workbench_map, home, 25)
-            + pending_of(BuildSiteKind::Workbench) as usize
-            == 0
-        && bed_count >= 2
-    {
-        if let Some(tile) = find_clear_tile_in_zone(
-            chunk_map,
-            &maps.bed_map,
-            bp_map,
-            doormat,
-            plan,
-            ZoneKind::Crafting,
-            home,
-            10,
-        ) {
-            out.push(BuildCandidate {
-                intent: BuildIntent::Single(BuildSiteKind::Workbench),
-                tile,
-                score: 150.0,
-                door_dir: None,
-            });
-        }
-    }
-
-    // 5. Granary — gated by GRANARY tech + (era, peak_pop) milestone.
-    if techs.has(GRANARY)
-        && count_granaries_near(&maps.granary_map, home, 25)
-            + pending_of(BuildSiteKind::Granary) as usize
-            == 0
-        && crate::simulation::civic_milestones::should_seed_civic(
-            crate::simulation::civic_milestones::CivicKind::Granary,
-            era,
-            peak_pop,
-            maturity,
-            seed_mode,
-        )
-    {
-        if let Some(tile) = find_clear_tile_in_zone(
-            chunk_map,
-            &maps.bed_map,
-            bp_map,
-            doormat,
-            plan,
-            ZoneKind::Storage,
-            home,
-            10,
-        ) {
-            let mer_mult = 0.7 + (culture.mercantile as f32 / 255.0) * 0.8;
-            out.push(BuildCandidate {
-                intent: BuildIntent::Single(BuildSiteKind::Granary),
-                tile,
-                score: 180.0 * mer_mult,
-                door_dir: None,
-            });
-        }
-    }
-
-    // 5b. Well — gated by WELL_DIGGING. Per-era target: Paleo/Meso 0,
-    // Neo 1, Chalco 2, Bronze 3. Seed mode bypasses civic gates.
-    if techs.has(WELL_DIGGING) {
-        let target_wells = match era {
-            Era::Paleolithic | Era::Mesolithic => 0,
-            Era::Neolithic => 1,
-            Era::Chalcolithic => 2,
-            Era::BronzeAge => 3,
-        };
-        if target_wells > 0 {
-            let built = count_wells_near(&maps.well_map, home, 25);
-            let pending = pending_of(BuildSiteKind::Well) as usize;
-            if built + pending < target_wells {
-                // Try civic, then storage, then residential zones.
-                let zone = [ZoneKind::Civic, ZoneKind::Storage, ZoneKind::Residential]
-                    .into_iter()
-                    .find_map(|z| {
-                        find_clear_tile_in_zone(
-                            chunk_map,
-                            &maps.bed_map,
-                            bp_map,
-                            doormat,
-                            plan,
-                            z,
-                            home,
-                            12,
-                        )
-                    });
-                if let Some(tile) = zone {
-                    out.push(BuildCandidate {
-                        intent: BuildIntent::Single(BuildSiteKind::Well),
-                        tile,
-                        score: 175.0,
-                        door_dir: None,
-                    });
-                }
-            }
-        }
-    }
-
-    // 6. Shrine — gated by SACRED_RITUAL + (era, peak_pop) milestone.
-    if techs.has(SACRED_RITUAL)
-        && count_shrines_near(&maps.shrine_map, home, 25)
-            + pending_of(BuildSiteKind::Shrine) as usize
-            == 0
-        && crate::simulation::civic_milestones::should_seed_civic(
-            crate::simulation::civic_milestones::CivicKind::Shrine,
-            era,
-            peak_pop,
-            maturity,
-            seed_mode,
-        )
-    {
-        if let Some(tile) = find_clear_tile_in_zone(
-            chunk_map,
-            &maps.bed_map,
-            bp_map,
-            doormat,
-            plan,
-            ZoneKind::Sacred,
-            home,
-            10,
-        ) {
-            let cer_mult = 0.4 + (culture.ceremonial as f32 / 255.0) * 2.0;
-            out.push(BuildCandidate {
-                intent: BuildIntent::Single(BuildSiteKind::Shrine),
-                tile,
-                score: 110.0 * cer_mult,
-                door_dir: None,
-            });
-        }
-    }
-
-    // 7. Market — LONG_DIST_TRADE + (era, peak_pop) milestone.
-    if techs.has(LONG_DIST_TRADE)
-        && crate::simulation::civic_milestones::should_seed_civic(
-            crate::simulation::civic_milestones::CivicKind::Market,
-            era,
-            peak_pop,
-            maturity,
-            seed_mode,
-        )
-    {
-        let target_count = if culture.mercantile > 180 { 2 } else { 1 };
-        let market_count = count_markets_near(&maps.market_map, home, 25)
-            + pending_of(BuildSiteKind::Market) as usize;
-        if market_count < target_count {
-            if let Some(tile) = find_clear_tile_in_zone(
-                chunk_map,
-                &maps.bed_map,
-                bp_map,
-                doormat,
-                plan,
-                ZoneKind::Market,
-                home,
-                12,
-            ) {
-                let mer_mult = 0.6 + (culture.mercantile as f32 / 255.0) * 1.6;
-                out.push(BuildCandidate {
-                    intent: BuildIntent::Single(BuildSiteKind::Market),
-                    tile,
-                    score: 130.0 * mer_mult,
-                    door_dir: None,
-                });
-            }
-        }
-    }
-
-    // 8. Barracks — PROFESSIONAL_ARMY + (era, peak_pop) milestone.
-    if techs.has(PROFESSIONAL_ARMY)
-        && count_barracks_near(&maps.barracks_map, home, 25)
-            + pending_of(BuildSiteKind::Barracks) as usize
-            == 0
-        && crate::simulation::civic_milestones::should_seed_civic(
-            crate::simulation::civic_milestones::CivicKind::Barracks,
-            era,
-            peak_pop,
-            maturity,
-            seed_mode,
-        )
-    {
-        if let Some(tile) = find_clear_tile_in_zone(
-            chunk_map,
-            &maps.bed_map,
-            bp_map,
-            doormat,
-            plan,
-            ZoneKind::Defense,
-            home,
-            12,
-        ) {
-            let mar_mult = 0.5 + (culture.martial as f32 / 255.0) * 1.8;
-            out.push(BuildCandidate {
-                intent: BuildIntent::Single(BuildSiteKind::Barracks),
-                tile,
-                score: 140.0 * mar_mult,
-                door_dir: None,
-            });
-        }
-    }
-
-    // 9. Monument — MONUMENTAL_BUILDING + (era, peak_pop) milestone.
-    if techs.has(MONUMENTAL_BUILDING)
-        && count_monuments_near(&maps.monument_map, home, 30)
-            + pending_of(BuildSiteKind::Monument) as usize
-            == 0
-        && crate::simulation::civic_milestones::should_seed_civic(
-            crate::simulation::civic_milestones::CivicKind::Monument,
-            era,
-            peak_pop,
-            maturity,
-            seed_mode,
-        )
-    {
-        if let Some(tile) = find_clear_tile_in_zone(
-            chunk_map,
-            &maps.bed_map,
-            bp_map,
-            doormat,
-            plan,
-            ZoneKind::Sacred,
-            home,
-            12,
-        ) {
-            let cer_mult = 0.5 + (culture.ceremonial as f32 / 255.0) * 2.2;
-            out.push(BuildCandidate {
-                intent: BuildIntent::Single(BuildSiteKind::Monument),
-                tile,
-                score: 95.0 * cer_mult,
-                door_dir: None,
-            });
-        }
-    }
-
-    out
-}
 
 /// Spawn the blueprint(s) that realise a chosen intent at the given tile.
 fn spawn_intent(
@@ -4938,6 +3247,26 @@ fn seed_walled_house_or_nearby(
                 let candidate = (anchor.0 + dx, anchor.1 + dy);
                 if blocks_cardinal_corridor(candidate.0, candidate.1, half_w, half_h, home) {
                     continue;
+                }
+                // L1: civic commons keepout — non-civic builds may not
+                // overlap the home commons disc, period. The relocate
+                // spiral walks rings around the (already commons-clean)
+                // anchor and can land back inside the disc if the anchor
+                // sits at its edge. The organic intent layer already
+                // honoured commons; this is defence in depth.
+                if let Some(b) = brain {
+                    let foot = crate::simulation::settlement::TileRect::new(
+                        candidate.0 - half_w,
+                        candidate.1 - half_h,
+                        (2 * half_w + 1) as u16,
+                        (2 * half_h + 1) as u16,
+                    );
+                    if crate::simulation::organic_settlement::rect_intersects_commons(
+                        b.commons_rect,
+                        foot,
+                    ) {
+                        continue;
+                    }
                 }
                 if !seed_house_footprint_clear(
                     candidate, used, maps, chunk_map, doormat, half_w, half_h,
@@ -5932,12 +4261,11 @@ pub fn road_carve_system(
         let y1 = to.1 as i32;
         let dx_abs = (x1 - x0).abs();
         let dy_abs = (y1 - y0).abs();
-        // Widen perpendicular to the dominant axis: horizontal-ish runs get
-        // a +1 row, vertical-ish runs get a +1 column. The widening tile is
-        // best-effort — same writability rules as the main tile; farm /
-        // wall / road / building cells silently stay 1-wide there.
-        let widen_dx = if dy_abs > dx_abs { 1 } else { 0 };
-        let widen_dy = if dy_abs > dx_abs { 0 } else { 1 };
+        // Widen perpendicular to the dominant axis. Shared helper with the
+        // organic planner's `road_corridor_tiles_for_segments` so the planner
+        // reservation and physical carve stay in lock-step.
+        let (widen_dx, widen_dy) =
+            crate::simulation::organic_settlement::road_widen_offset(from, to);
         let dx = dx_abs;
         let dy = -dy_abs;
         let sx = if x0 < x1 { 1 } else { -1 };
@@ -8266,8 +6594,8 @@ pub fn seed_starting_buildings_system(
     mut road_carve_queue: ResMut<RoadCarveQueue>,
     brains: Res<crate::simulation::organic_settlement::SettlementBrains>,
     settlement_map: Res<crate::simulation::settlement::SettlementMap>,
-    plot_index: Res<crate::simulation::land::PlotIndex>,
-    plot_q: Query<&crate::simulation::land::Plot>,
+    structure_index: Res<StructureIndex>,
+    archetypes: Res<crate::simulation::organic_settlement::BuildingArchetypeCatalog>,
     settlement_q: Query<&crate::simulation::settlement::Settlement>,
 ) {
     if !options.seed_buildings {
@@ -8283,11 +6611,20 @@ pub fn seed_starting_buildings_system(
     let seed_techs = *profile.seed_techs();
     let hearth_tier = profile.hearth_tier;
 
-    // Generate-candidates needs an empty bp_map at seed time; we don't spawn
-    // any blueprints in seed mode, so the chief's pending-blueprint accounting
-    // is always zero. Likewise pending_kinds is empty.
+    // The seed pipeline drives the organic intent path directly (one
+    // pipeline, two consumers): `append_pressures_for_faction` →
+    // `pressure_to_intent` → `seed_apply_intent`. No blueprints, no
+    // workers, no `generate_candidates`. The civic-milestone gate is
+    // routed through `CivicGate::Seed(options.maturity)` so a Founder
+    // start re-imposes runtime gates while Established/Developed seeds
+    // civic capital regardless of pop. The placeholder `BlueprintMap` /
+    // pending-counts table satisfy the helpers' signatures; the seeded
+    // structures are stamped directly through `maps` so they show up in
+    // the same maps the next pressure pass reads.
     let empty_bp_map = BlueprintMap::default();
     let empty_pending: AHashMap<BuildSiteKind, u32> = AHashMap::new();
+    let civic_gate =
+        crate::simulation::organic_settlement::CivicGate::Seed(options.maturity);
 
     for (&faction_id, faction) in registry.factions.iter() {
         if faction_id == SOLO || faction.member_count == 0 {
@@ -8320,38 +6657,32 @@ pub fn seed_starting_buildings_system(
             continue;
         }
 
-        // Settlement plan for the candidate generator. Prefer the brain-derived
-        // compat plan (one zone per parcel — matches what the runtime chief
-        // sees) and fall back to the deterministic `build_settlement_plan`
-        // when no brain exists yet (sandbox / camp / first-tick edge cases).
+        // Brain is mandatory for the organic intent path — its parcels
+        // / road segments / commons rect / phase drive every site pick.
+        // `kickoff_initial_survey_system` runs before this system in the
+        // OnEnter chain, so settled non-Paleo factions always have one.
         let brain_ref = settlement_map
             .by_faction
             .get(&faction_id)
             .and_then(|ids| ids.first().copied())
             .and_then(|sid| brains.0.get(&sid));
-        let plan = if let Some(b) = brain_ref {
-            crate::simulation::organic_settlement::compat_plan_from_brain(faction_id, faction, 0, b)
-        } else {
-            crate::simulation::settlement::build_settlement_plan(faction_id, faction, 0)
-        };
-        let plan_ref = Some(&plan);
 
-        // Peak population for civic-milestone gates. At seed time this falls
-        // back to current member_count (the Settlement entity hasn't yet
-        // ratcheted peak via `settlement_peak_population_system`).
-        let peak_pop = settlement_map
+        // Settlement entity is needed by `append_pressures_for_faction` for
+        // peak-population reads. Both the brain lookup and this lookup walk
+        // the same `settlement_map.by_faction[fid].first()`.
+        let settlement_entity = settlement_map
             .first_for_faction(faction_id)
-            .and_then(|sid| settlement_map.by_id.get(&sid))
-            .and_then(|&e| settlement_q.get(e).ok())
-            .map(|s| s.peak_population)
-            .unwrap_or(faction.member_count);
+            .and_then(|sid| settlement_map.by_id.get(&sid).copied());
+        let settlement_for_pressures =
+            settlement_entity.and_then(|e| settlement_q.get(e).ok());
 
         // Branch on era. Paleo / Meso keep the band-camp seeder
         // (`paleolithic_hearth_positions_river_aware` provides the canonical
-        // multi-hearth layout that the unified candidate loop doesn't
-        // reproduce — its bootstrap path only fires when no plan exists).
-        // Neo+ runs through the unified `generate_candidates` loop so seed
-        // and runtime emit the same intent stream.
+        // multi-hearth layout that the organic pressure path doesn't
+        // reproduce — Camp phase has no commons / parcels / road network).
+        // Neo+ runs through the unified organic intent loop so seed and
+        // runtime emit the same intent stream and obey the same commons /
+        // distance-band / road-corridor gates.
         if (era as u8) < (Era::Neolithic as u8) {
             // Per-era founder count: house every member with a Paleo / Meso
             // floor so very-small bands still get a basic camp.
@@ -8406,52 +6737,81 @@ pub fn seed_starting_buildings_system(
             continue;
         }
 
-        // ── Neolithic+: unified intent loop ────────────────────────────
-        // Drives `generate_candidates` (the runtime chief's selector)
-        // until it stops returning candidates or the safety cap fires.
-        // Stamps each chosen intent via `seed_apply_intent`; the next
-        // iteration sees the updated bed / hearth / civic / wall counts
-        // and gates accordingly. One pipeline, two consumers.
+        // ── Neolithic+: organic pressure → intent → stamp loop ────────
+        // Runs the same `append_pressures_for_faction` → `pressure_to_intent`
+        // chain the runtime drivers use, but synchronously and with
+        // `CivicGate::Seed(maturity)` so civic capital seeds at game start
+        // without waiting for `civic_milestone_allows` pop thresholds.
+        // Stamping is direct (via `seed_apply_intent`) so members have
+        // shelter on tick 0. Each iteration re-reads the live structure
+        // maps, so a stamped bed / hearth / granary lowers the next pass's
+        // pressure and the loop converges.
         //
         // Cap reasoning: a Bronze 80-pop start needs ~80 huts + 1 of each
-        // civic + ~48 palisade tiles ≈ 130 candidates. 512 is comfortable
-        // headroom against any future intent kind.
+        // civic + ~48 palisade tiles ≈ 130 stamps. 512 is comfortable
+        // headroom; the stall guard exits earlier in practice.
+        let Some(settlement) = settlement_for_pressures else {
+            // Settled non-Paleo faction without a Settlement entity is a
+            // bug upstream of seeding. Skip rather than fall back —
+            // there's no longer a legacy planner to recover into.
+            continue;
+        };
+        let Some(brain) = brain_ref else {
+            // Same: `kickoff_initial_survey_system` is in the OnEnter chain
+            // ahead of this system. Missing brain ⇒ skip.
+            continue;
+        };
         const MAX_SEED_ITERATIONS: u32 = 512;
         let mut last_progress_iter: u32 = 0;
         for iter in 0..MAX_SEED_ITERATIONS {
-            let mut candidates = generate_candidates(
-                faction_id,
-                faction,
-                plan_ref,
-                &chunk_map,
-                &maps.as_view(),
-                &empty_bp_map,
-                &doormat_reservations,
-                &empty_pending,
-                &plot_index,
-                &plot_q,
-                peak_pop,
-                Some(&seed_techs),
-                // Ignored in seed mode (seed_techs is Some); pass the
-                // same era profile for clarity.
-                seed_techs,
-                options.maturity,
-                brain_ref,
-            );
-            if candidates.is_empty() {
+            let mut pressures: Vec<crate::simulation::organic_settlement::SettlementPressure> =
+                Vec::new();
+            {
+                let organic_view = maps.organic_view(&structure_index);
+                crate::simulation::organic_settlement::append_pressures_for_faction(
+                    faction_id,
+                    faction,
+                    settlement,
+                    &chunk_map,
+                    &organic_view,
+                    Some(&empty_pending),
+                    civic_gate,
+                    &mut pressures,
+                );
+            }
+            if pressures.is_empty() {
                 break;
             }
-            candidates.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
+            pressures.sort_by(|a, b| {
+                b.urgency
+                    .partial_cmp(&a.urgency)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
 
             let mut applied_any = false;
-            for best in candidates {
-                let intent = best.intent;
-                let tile = best.tile;
-                let door_dir = best.door_dir;
+            let mut chosen_tiles: AHashSet<(i32, i32)> = AHashSet::default();
+            for pressure in &pressures {
+                let intent_opt = {
+                    let organic_view = maps.organic_view(&structure_index);
+                    crate::simulation::organic_settlement::pressure_to_intent(
+                        faction,
+                        brain,
+                        pressure,
+                        &chunk_map,
+                        &organic_view,
+                        &empty_bp_map,
+                        &doormat_reservations,
+                        &archetypes,
+                        &mut chosen_tiles,
+                        civic_gate,
+                    )
+                };
+                let Some(intent) = intent_opt else {
+                    continue;
+                };
+                let candidate = build_candidate_from_organic(&intent);
+                let tile = candidate.tile;
+                let door_dir = candidate.door_dir;
                 let applied_tile = seed_apply_intent(
                     &mut commands,
                     &mut maps,
@@ -8462,33 +6822,35 @@ pub fn seed_starting_buildings_system(
                     &mut road_carve_queue,
                     faction_id,
                     home,
-                    intent,
+                    candidate.intent,
                     tile,
                     door_dir,
                     &seed_techs,
-                    brain_ref,
+                    Some(brain),
                 );
                 if applied_tile.is_some() {
                     applied_any = true;
                     last_progress_iter = iter;
-                    // Personal kitchen gardens are no longer stamped here as a
-                    // seed-time house yard — they are emitted as real
-                    // Agricultural parcels by `organic_settlement::
-                    // append_dwelling_gardens` and tilled into `Cropland`
-                    // through the normal field-prep pipeline. Cropland only
-                    // ever appears inside an Agricultural plot.
+                    // Personal kitchen gardens are no longer stamped here
+                    // as a seed-time house yard — they are emitted as real
+                    // Agricultural parcels by
+                    // `organic_settlement::append_dwelling_gardens` and
+                    // tilled into `Cropland` through the normal field-prep
+                    // pipeline. Cropland only ever appears inside an
+                    // Agricultural plot.
                     break;
                 }
-                // Mark tile as used so lower-priority candidates in this pass
-                // and the next generate_candidates call can make progress away
-                // from a blocked anchor.
+                // Mark the tile as used so the next iteration's pressure
+                // pass can't pick the same blocked anchor again, and so
+                // any lower-urgency pressure in this iteration's list
+                // skips it via `chosen_tiles`.
                 used.insert(tile);
             }
 
             if !applied_any {
                 // Stall guard: 32 consecutive no-progress iterations means
-                // generate_candidates is stuck on blocked anchors with no
-                // path forward. Bail.
+                // every pressure-driven intent is stuck on blocked anchors
+                // with no path forward.
                 if iter.saturating_sub(last_progress_iter) > 32 {
                     break;
                 }
@@ -8525,6 +6887,23 @@ fn seed_walled_house_at(
     seed_techs: &FactionTechs,
     brain: Option<&crate::simulation::organic_settlement::SettlementBrain>,
 ) -> bool {
+    // L1: civic commons keepout — a walled house may NEVER stamp into the
+    // home commons disc. Every upstream picker (`pressure_to_intent` →
+    // `choose_site_for_intent`, the relocate spiral) already rejects
+    // commons-overlapping footprints; this is the structural backstop so
+    // no future caller can ever land here inside the commons regardless
+    // of which helper chose the anchor.
+    if let Some(b) = brain {
+        let foot = crate::simulation::settlement::TileRect::new(
+            cx - half_w,
+            cy - half_h,
+            (2 * half_w + 1) as u16,
+            (2 * half_h + 1) as u16,
+        );
+        if crate::simulation::organic_settlement::rect_intersects_commons(b.commons_rect, foot) {
+            return false;
+        }
+    }
     // Pre-flight: every tile in the footprint must be clear (passable, not a
     // wall/stone/road, not already used, not reserved as another building's
     // doormat). Roads are protected so a seeded hut can't pave over an existing

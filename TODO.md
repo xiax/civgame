@@ -161,6 +161,8 @@ X - Import new animal sprites
 
 X - Faction queues way too many crafting jobs for stuff the faction doesn't even need.
 
+Mining and digging should be incremental work. Each tile can be dug to up to 7 levels, completing the 7th removes the tile. At each level you get incremental resources. Without tools you can't dig past level 3. Digging down has effects even at incremental levels since it can provide cover and slow down people passing through the tile.
+
 Add initial food and resources and stone tools to spawn appropriate for each era.
 
 Adjust work time and show progress bars. Cutting down trees should take way longer with initial stone tools
@@ -170,3 +172,9 @@ Need UI overhaul to add commands for all actions players can take, in a way that
 Need debug menu overhaul that works with the current version of the game and contains all important tools a developer needs to debug and test the game like entity spawners and ways to give resources to factions, etc.
 
 Workers spend too much time preparing fields that they miss the chance to actually plant seeds.
+
+Diplomacy
+
+Barter economies
+
+The amount of game map z level variability should depend on the biome and status in the world map. Currently we can't even properly simulate plains. Our game map generation needs to be more realistic.

@@ -49,9 +49,10 @@ pub fn civic_milestone_allows(kind: CivicKind, era: Era, peak_population: u32) -
 }
 
 /// Seed-time wrapper around `civic_milestone_allows` that folds in the
-/// player-chosen `StartSettlementMaturity`. Used by `generate_candidates`
-/// when running under `seed_techs.is_some()` to decide whether a civic
-/// kind is allowed despite under-threshold pop.
+/// player-chosen `StartSettlementMaturity`. Threaded into
+/// `organic_settlement::append_pressures_for_faction` via
+/// `CivicGate::Seed(maturity)` so the seed pipeline decides whether a
+/// civic kind is allowed despite under-threshold pop.
 ///
 /// - `Founder` re-imposes the runtime gates (no civic-seeding bypass).
 /// - `Established` keeps the legacy "society in progress" behaviour:

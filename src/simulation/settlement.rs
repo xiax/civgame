@@ -404,9 +404,9 @@ pub const PALEO_PRIMARY_HEARTH_DIST: f32 = 5.0;
 pub const PALEO_SECONDARY_HEARTH_DIST: f32 = 12.0;
 
 /// Number of hearths a Paleolithic band camp targets given a member count.
-/// One hearth per ~6 members. The actual hearth-queue cadence is gated by
-/// crescent saturation + bed deficit in `generate_candidates`, so this is an
-/// upper bound, not a hard cap.
+/// One hearth per ~6 members. The actual hearth-queue cadence at runtime is
+/// gated by `append_pressures_for_faction`'s population-vs-existing check,
+/// so this is an upper bound used by the seed-time band-camp seeder.
 pub fn paleolithic_hearth_count(members: u32) -> u32 {
     ((members + 5) / 6).max(1)
 }

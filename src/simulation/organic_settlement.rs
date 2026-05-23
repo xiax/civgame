@@ -11,8 +11,9 @@ use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use serde::Deserialize;
 
+use crate::game_state::StartSettlementMaturity;
 use crate::simulation::building_template::{FootprintShape, Rotation};
-use crate::simulation::civic_milestones::{civic_milestone_allows, CivicKind};
+use crate::simulation::civic_milestones::{civic_milestone_allows, should_seed_civic, CivicKind};
 use crate::simulation::construction::{
     best_wall_material, faction_can_build, find_emergency_bed_tile, recipe_for,
     select_wall_material, BarracksMap, BedMap, Blueprint, BlueprintMap, BuildSiteKind, CampfireMap,
@@ -103,6 +104,19 @@ impl DistrictKind {
             DistrictKind::Market => ZoneKind::Market,
         }
     }
+
+    pub fn from_zone_kind(zk: ZoneKind) -> Self {
+        match zk {
+            ZoneKind::Residential => DistrictKind::Residential,
+            ZoneKind::Agricultural => DistrictKind::Agricultural,
+            ZoneKind::Crafting => DistrictKind::Crafting,
+            ZoneKind::Civic => DistrictKind::Civic,
+            ZoneKind::Defense => DistrictKind::Defense,
+            ZoneKind::Storage => DistrictKind::Storage,
+            ZoneKind::Sacred => DistrictKind::Sacred,
+            ZoneKind::Market => DistrictKind::Market,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -181,11 +195,22 @@ impl Parcel {
 pub struct SettlementBrain {
     pub settlement_id: SettlementId,
     pub owner_faction: u32,
+    pub home_tile: (i32, i32),
     pub phase: SettlementPhase,
     pub anchors: Vec<SettlementAnchor>,
     pub districts: Vec<DistrictInfluence>,
     pub road_segments: Vec<StreetSegment>,
     pub road_tiles: AHashSet<(i32, i32)>,
+    /// Widened road footprint that mirrors what `road_carve_system` actually
+    /// stamps: every centerline tile plus the dominant-axis perpendicular
+    /// widening tile. Parcel allocation rejects against this so a planner
+    /// reservation can't be clipped by the carver.
+    pub road_corridor_tiles: AHashSet<(i32, i32)>,
+    /// Phase-keyed civic commons keepout disc around `home_tile`. Civic
+    /// builds (well/granary/shrine/market/hearth/bureaucrat) may stamp
+    /// inside; residential / crafting / storage (warehouse) / sacred /
+    /// defense / composite-house must stay outside.
+    pub commons_rect: Option<TileRect>,
     pub parcels: Vec<Parcel>,
     pub traffic_heat: AHashMap<(i32, i32), u8>,
     pub frontier: Vec<(i32, i32)>,
@@ -200,11 +225,14 @@ impl SettlementBrain {
         Self {
             settlement_id,
             owner_faction,
+            home_tile: (0, 0),
             phase: SettlementPhase::Camp,
             anchors: Vec::new(),
             districts: Vec::new(),
             road_segments: Vec::new(),
             road_tiles: AHashSet::default(),
+            road_corridor_tiles: AHashSet::default(),
+            commons_rect: None,
             parcels: Vec::new(),
             traffic_heat: AHashMap::default(),
             frontier: Vec::new(),
@@ -213,6 +241,79 @@ impl SettlementBrain {
             last_survey_tick: 0,
             last_path_carve_tick: 0,
         }
+    }
+}
+
+/// Phase-keyed chebyshev radius for the civic commons disc around `home_tile`.
+/// Camp has no commons; settled phases reserve a small ring (5×5 / 7×7) for
+/// civic-only construction.
+pub(crate) fn commons_radius(phase: SettlementPhase) -> i32 {
+    match phase {
+        SettlementPhase::Camp => 0,
+        SettlementPhase::Hamlet | SettlementPhase::Village => 2,
+        SettlementPhase::Chiefdom | SettlementPhase::ProtoUrban | SettlementPhase::Urban => 3,
+    }
+}
+
+/// Build the `commons_rect` keepout disc for a settlement.
+pub(crate) fn commons_rect_for(home: (i32, i32), phase: SettlementPhase) -> Option<TileRect> {
+    let r = commons_radius(phase);
+    if r <= 0 {
+        return None;
+    }
+    Some(TileRect::new(
+        home.0 - r,
+        home.1 - r,
+        (2 * r + 1) as u16,
+        (2 * r + 1) as u16,
+    ))
+}
+
+/// True if `tile` sits inside the commons keepout.
+pub(crate) fn tile_inside_commons(commons: Option<TileRect>, tile: (i32, i32)) -> bool {
+    commons.map_or(false, |r| r.contains(tile.0, tile.1))
+}
+
+/// True if `rect` intersects the commons keepout.
+pub(crate) fn rect_intersects_commons(commons: Option<TileRect>, rect: TileRect) -> bool {
+    let Some(c) = commons else {
+        return false;
+    };
+    let ax0 = rect.x0;
+    let ay0 = rect.y0;
+    let ax1 = rect.x0 + rect.w as i32;
+    let ay1 = rect.y0 + rect.h as i32;
+    let bx0 = c.x0;
+    let by0 = c.y0;
+    let bx1 = c.x0 + c.w as i32;
+    let by1 = c.y0 + c.h as i32;
+    ax0 < bx1 && bx0 < ax1 && ay0 < by1 && by0 < ay1
+}
+
+/// Districts allowed to stamp inside the civic commons.
+pub(crate) fn district_allowed_in_commons(kind: DistrictKind) -> bool {
+    matches!(kind, DistrictKind::Civic)
+}
+
+/// `OrganicBuildKind`s allowed inside the civic commons (well, granary,
+/// shrine, market, hearth/campfire, bureaucrat office, table). Residential,
+/// crafting workshops, storage warehouses, defense, sacred monuments, and
+/// composite/walled houses are barred.
+pub(crate) fn build_kind_allowed_in_commons(build_kind: OrganicBuildKind) -> bool {
+    match build_kind {
+        OrganicBuildKind::Single(kind) => matches!(
+            kind,
+            BuildSiteKind::Campfire
+                | BuildSiteKind::Granary
+                | BuildSiteKind::Shrine
+                | BuildSiteKind::Market
+                | BuildSiteKind::Well
+                | BuildSiteKind::Table
+        ),
+        OrganicBuildKind::Hut(_)
+        | OrganicBuildKind::Longhouse(_)
+        | OrganicBuildKind::PalisadeSegment(_)
+        | OrganicBuildKind::CompositeHouse { .. } => false,
     }
 }
 
@@ -435,8 +536,13 @@ pub fn load_building_archetype_catalog() -> BuildingArchetypeCatalog {
     BuildingArchetypeCatalog { by_id }
 }
 
+/// SystemParam bundle of structure-map `Res`es. Driver systems take this
+/// directly; internal helpers take `OrganicStructureMaps<'_>` (the borrowed
+/// view below) instead, so the seed pipeline (which holds a `FurnitureMaps`
+/// `ResMut` bundle) can re-use the same helpers without going through
+/// `Res<T>`.
 #[derive(SystemParam)]
-pub struct OrganicStructureMaps<'w> {
+pub struct OrganicStructureMapsParam<'w> {
     pub bed_map: Res<'w, BedMap>,
     pub wall_map: Res<'w, WallMap>,
     pub campfire_map: Res<'w, CampfireMap>,
@@ -451,6 +557,51 @@ pub struct OrganicStructureMaps<'w> {
     pub monument_map: Res<'w, MonumentMap>,
     pub well_map: Res<'w, WellMap>,
     pub structure_index: Res<'w, StructureIndex>,
+}
+
+impl<'w> OrganicStructureMapsParam<'w> {
+    /// Borrow the inner map references as the lightweight
+    /// `OrganicStructureMaps<'_>` view that every internal helper consumes.
+    pub fn view(&self) -> OrganicStructureMaps<'_> {
+        OrganicStructureMaps {
+            bed_map: &*self.bed_map,
+            wall_map: &*self.wall_map,
+            campfire_map: &*self.campfire_map,
+            door_map: &*self.door_map,
+            workbench_map: &*self.workbench_map,
+            loom_map: &*self.loom_map,
+            table_map: &*self.table_map,
+            granary_map: &*self.granary_map,
+            shrine_map: &*self.shrine_map,
+            market_map: &*self.market_map,
+            barracks_map: &*self.barracks_map,
+            monument_map: &*self.monument_map,
+            well_map: &*self.well_map,
+            structure_index: &*self.structure_index,
+        }
+    }
+}
+
+/// Lightweight borrowed view of the structure-map set. Helpers
+/// (`append_pressures_for_faction`, `pressure_to_intent`, parcel
+/// builders, etc.) accept this so the same code path serves runtime
+/// (`OrganicStructureMapsParam::view`) and the seed pipeline's
+/// `FurnitureMaps::organic_view` without depending on `Res<T>`.
+pub struct OrganicStructureMaps<'a> {
+    pub bed_map: &'a BedMap,
+    pub wall_map: &'a WallMap,
+    pub campfire_map: &'a CampfireMap,
+    pub door_map: &'a DoorMap,
+    pub workbench_map: &'a WorkbenchMap,
+    pub loom_map: &'a LoomMap,
+    pub table_map: &'a TableMap,
+    pub granary_map: &'a GranaryMap,
+    pub shrine_map: &'a ShrineMap,
+    pub market_map: &'a MarketMap,
+    pub barracks_map: &'a BarracksMap,
+    pub monument_map: &'a MonumentMap,
+    pub well_map: &'a WellMap,
+    pub structure_index: &'a StructureIndex,
 }
 
 /// Send-able structure-map view captured on the main thread before a
@@ -656,8 +807,10 @@ fn compute_settlement_survey_core<F: SurveyFactionView>(
         .unwrap_or_else(|| SettlementBrain::new(settlement.id, settlement.owner_faction, seed));
 
     brain.owner_faction = settlement.owner_faction;
+    brain.home_tile = faction.home_tile();
     brain.seed = seed;
     brain.phase = phase_for(faction, settlement.peak_population);
+    brain.commons_rect = commons_rect_for(faction.home_tile(), brain.phase);
     brain.last_survey_tick = tick;
     decay_traffic(&mut brain.traffic_heat);
     accumulate_traffic_offsets(&mut brain, faction.home_tile(), member_offsets);
@@ -665,6 +818,7 @@ fn compute_settlement_survey_core<F: SurveyFactionView>(
     brain.districts = build_districts(faction, settlement, &brain);
     brain.road_segments = build_road_network(faction, &brain, chunk_map, member_offsets);
     brain.road_tiles = road_tiles_for_segments(&brain.road_segments);
+    brain.road_corridor_tiles = road_corridor_tiles_for_segments(&brain.road_segments);
     brain.frontier = build_frontier(faction, &brain, chunk_map, maps);
     brain.parcels = build_parcels(faction, settlement, &brain, chunk_map, maps);
     brain.layout_hash = layout_hash(faction, &brain);
@@ -750,9 +904,10 @@ pub fn resurvey_after_seeding_system(
     settlements: Query<&Settlement>,
     registry: Res<FactionRegistry>,
     chunk_map: Res<ChunkMap>,
-    maps: OrganicStructureMaps,
+    maps: OrganicStructureMapsParam,
     member_q: Query<(&FactionMember, &Transform)>,
 ) {
+    let maps = maps.view();
     for settlement in settlements.iter() {
         let Some(faction) = registry.factions.get(&settlement.owner_faction) else {
             continue;
@@ -790,9 +945,10 @@ pub fn kickoff_initial_survey_system(
     settlements: Query<&Settlement>,
     registry: Res<FactionRegistry>,
     chunk_map: Res<ChunkMap>,
-    maps: OrganicStructureMaps,
+    maps: OrganicStructureMapsParam,
     member_q: Query<(&FactionMember, &Transform)>,
 ) {
+    let maps = maps.view();
     for settlement in settlements.iter() {
         let Some(faction) = registry.factions.get(&settlement.owner_faction) else {
             continue;
@@ -819,7 +975,7 @@ pub fn settlement_pressure_system(
     registry: Res<FactionRegistry>,
     settlements: Query<&Settlement>,
     chunk_map: Res<ChunkMap>,
-    maps: OrganicStructureMaps,
+    maps: OrganicStructureMapsParam,
     bp_map: Res<BlueprintMap>,
     bp_query: Query<&Blueprint>,
     mut pressures: ResMut<SettlementPressureMap>,
@@ -829,6 +985,7 @@ pub fn settlement_pressure_system(
     }
     pressures.0.clear();
 
+    let maps = maps.view();
     let pending = pending_kind_counts(&bp_map, &bp_query);
     for settlement in settlements.iter() {
         let faction_id = settlement.owner_faction;
@@ -846,6 +1003,7 @@ pub fn settlement_pressure_system(
             &chunk_map,
             &maps,
             pending.get(&faction_id),
+            CivicGate::Runtime,
             &mut out,
         );
         if !out.is_empty() {
@@ -867,7 +1025,7 @@ pub fn settlement_morphology_system(
     pressures: Res<SettlementPressureMap>,
     mut intents: ResMut<SettlementIntentMap>,
     chunk_map: Res<ChunkMap>,
-    maps: OrganicStructureMaps,
+    maps: OrganicStructureMapsParam,
     bp_map: Res<BlueprintMap>,
     doormat: Res<crate::simulation::doormat::DoormatReservations>,
     archetypes: Res<BuildingArchetypeCatalog>,
@@ -877,6 +1035,7 @@ pub fn settlement_morphology_system(
     }
     intents.0.clear();
 
+    let maps = maps.view();
     for settlement in settlements.iter() {
         let faction_id = settlement.owner_faction;
         let Some(faction) = registry.factions.get(&faction_id) else {
@@ -901,6 +1060,7 @@ pub fn settlement_morphology_system(
                 &doormat,
                 &archetypes,
                 &mut chosen_tiles,
+                CivicGate::Runtime,
             ) {
                 faction_intents.push(intent);
             }
@@ -1806,14 +1966,14 @@ fn trace_crosses_river(chunk_map: &ChunkMap, seg: StreetSegment) -> bool {
     false
 }
 
-fn road_network_radius(phase: SettlementPhase) -> i32 {
+pub(crate) fn road_network_radius(phase: SettlementPhase) -> i32 {
     match phase {
         SettlementPhase::Camp => 0,
-        SettlementPhase::Hamlet => 8,
-        SettlementPhase::Village => 12,
-        SettlementPhase::Chiefdom => 16,
-        SettlementPhase::ProtoUrban => 20,
-        SettlementPhase::Urban => 24,
+        SettlementPhase::Hamlet => 10,
+        SettlementPhase::Village => 16,
+        SettlementPhase::Chiefdom => 22,
+        SettlementPhase::ProtoUrban => 30,
+        SettlementPhase::Urban => 36,
     }
 }
 
@@ -1838,6 +1998,41 @@ fn road_tiles_for_segments(segments: &[StreetSegment]) -> AHashSet<(i32, i32)> {
                 continue;
             }
             tiles.insert(tile);
+        }
+    }
+    tiles
+}
+
+/// Compute the perpendicular widening offset for a single Bresenham segment.
+/// Horizontal-ish runs widen with a +1 row; vertical-ish runs with a +1
+/// column. Mirrors the rule in `construction::road_carve_system`; single
+/// source of truth.
+#[inline]
+pub(crate) fn road_widen_offset(from: (i32, i32), to: (i32, i32)) -> (i32, i32) {
+    let dx_abs = (to.0 - from.0).abs();
+    let dy_abs = (to.1 - from.1).abs();
+    if dy_abs > dx_abs {
+        (1, 0)
+    } else {
+        (0, 1)
+    }
+}
+
+/// Road corridor (centerline + perpendicular widening tile) for the given
+/// segments. Matches what `road_carve_system` actually stamps, so the planner
+/// can reject parcel rects that the carver would otherwise clip.
+pub(crate) fn road_corridor_tiles_for_segments(
+    segments: &[StreetSegment],
+) -> AHashSet<(i32, i32)> {
+    let mut tiles = AHashSet::default();
+    for segment in segments {
+        let (wdx, wdy) = road_widen_offset(segment.start, segment.end);
+        for tile in bresenham_tiles(segment.start, segment.end) {
+            if tile == segment.start || tile == segment.end {
+                continue;
+            }
+            tiles.insert(tile);
+            tiles.insert((tile.0 + wdx, tile.1 + wdy));
         }
     }
     tiles
@@ -2126,7 +2321,7 @@ fn append_dwelling_gardens<F: SurveyFactionView>(
         let mut chosen: Option<TileRect> = None;
         for edge in candidates {
             let rect = kitchen_rect_for_edge(dwelling.rect, edge, depth);
-            if !rect_clear_for_parcel(chunk_map, rect, &brain.road_tiles) {
+            if !rect_clear_for_parcel(chunk_map, rect, &brain.road_corridor_tiles) {
                 continue;
             }
             if footprint.iter().any(|f| rects_overlap(*f, rect)) {
@@ -2238,7 +2433,7 @@ fn build_parcels_frontier_driven<F: SurveyFactionView>(
         if occupied.iter().any(|r| rects_overlap(*r, rect)) {
             continue;
         }
-        if !rect_clear_for_parcel(chunk_map, rect, &brain.road_tiles) {
+        if !rect_clear_for_parcel(chunk_map, rect, &brain.road_corridor_tiles) {
             continue;
         }
         let (frontage_edge, access_tile) = frontage_to_network(chunk_map, brain, rect);
@@ -2261,6 +2456,58 @@ fn build_parcels_frontier_driven<F: SurveyFactionView>(
         next_id = next_id.wrapping_add(1);
     }
     parcels
+}
+
+/// Ideal-distance band (min, ideal, max) in chebyshev tiles from home for a
+/// district at the given phase. Bands replace the old monotonic
+/// `1/(1 + home_dist·0.05)` proximity bias so each district lands in its own
+/// ring (civic clings to commons, defense rings the outer road, residential
+/// fills the middle), preventing the visible center-clump.
+///
+/// `ideal` scales with the road radius across phases, so a Hamlet gets a
+/// tighter layout than an Urban settlement automatically.
+pub(crate) fn ideal_distance_band(
+    district: DistrictKind,
+    phase: SettlementPhase,
+) -> Option<(i32, i32, i32)> {
+    let cr = commons_radius(phase);
+    let rr = road_network_radius(phase);
+    if rr == 0 {
+        return None;
+    }
+    // Phase scaling factor — `ideal` for "core" districts is proportional to
+    // road radius. The 0.40 / 0.55 / 0.85 anchors are picked so Village
+    // (rr=16) → ideal Residential ~6, Crafting/Market/Sacred ~9, Defense ~14.
+    let ideal_at = |frac: f32| -> i32 {
+        let v = (rr as f32 * frac).round() as i32;
+        v.max(cr + 1)
+    };
+    match district {
+        DistrictKind::Civic => Some((0, cr.max(1), (cr + 2).max(2))),
+        DistrictKind::Storage => Some((cr + 1, (cr + 3).max(ideal_at(0.30)), rr / 2 + 2)),
+        DistrictKind::Residential => Some((cr + 2, ideal_at(0.40), (rr - 1).max(cr + 3))),
+        DistrictKind::Crafting | DistrictKind::Market | DistrictKind::Sacred => {
+            Some((cr + 4, ideal_at(0.55), rr))
+        }
+        DistrictKind::Defense => Some(((rr - 4).max(cr + 1), rr, rr + 2)),
+        DistrictKind::Agricultural => None,
+    }
+}
+
+/// Band multiplier for `(district, phase, dist-from-home)`: triangular peak at
+/// `ideal`, falls to 0 at the band edges, hard 0 outside `[min, max]`.
+pub(crate) fn band_mul(district: DistrictKind, phase: SettlementPhase, dist: i32) -> f32 {
+    let Some((lo, ideal, hi)) = ideal_distance_band(district, phase) else {
+        return 1.0;
+    };
+    if dist < lo || dist > hi {
+        return 0.0;
+    }
+    let left = (ideal - lo).max(1) as f32;
+    let right = (hi - ideal).max(1) as f32;
+    let dev = (dist - ideal).abs() as f32;
+    let denom = if dist <= ideal { left } else { right };
+    (1.0 - dev / denom).clamp(0.0, 1.0)
 }
 
 /// Road-tile-driven parcel allocation. For each road tile, derives one
@@ -2329,7 +2576,14 @@ fn build_parcels_road_driven<F: SurveyFactionView>(
                 }
                 let (w, h) = parcel_size(kind, brain.phase);
                 let rect = parcel_rect_from_road(road_tile, edge, w, h);
-                if !rect_clear_for_parcel(chunk_map, rect, &brain.road_tiles) {
+                if !rect_clear_for_parcel(chunk_map, rect, &brain.road_corridor_tiles) {
+                    continue;
+                }
+                // L1: commons keepout — only Civic builds may stamp into the
+                // home commons disc; everything else must keep clear.
+                if !district_allowed_in_commons(kind)
+                    && rect_intersects_commons(brain.commons_rect, rect)
+                {
                     continue;
                 }
                 let centre = rect.center();
@@ -2344,7 +2598,13 @@ fn build_parcels_road_driven<F: SurveyFactionView>(
                     continue;
                 }
                 let home_dist = cheb(centre, home);
-                let score = s * (target as f32) * (1.0 / (1.0 + home_dist as f32 * 0.05));
+                // L4: distance-band scoring. Hard reject outside the band;
+                // multiply suitability by the triangular peak inside it.
+                let band = band_mul(kind, brain.phase, home_dist);
+                if band <= 0.0 {
+                    continue;
+                }
+                let score = s * (target as f32) * band;
                 let tile_hash = ((centre.0 as i64).wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64)
                     ^ centre.1 as i64) as u64;
                 candidates.push(Cand {
@@ -2370,7 +2630,7 @@ fn build_parcels_road_driven<F: SurveyFactionView>(
     });
 
     let mut parcels = Vec::new();
-    let mut occupied: Vec<TileRect> = Vec::new();
+    let mut occupied: Vec<(TileRect, DistrictKind, (i32, i32))> = Vec::new();
     let mut counts: AHashMap<DistrictKind, usize> = AHashMap::default();
     let mut next_id = 0u32;
     for cand in candidates {
@@ -2382,7 +2642,15 @@ fn build_parcels_road_driven<F: SurveyFactionView>(
         if already >= target {
             continue;
         }
-        if occupied.iter().any(|r| rects_overlap(*r, cand.rect)) {
+        // L5: 1-tile inter-parcel buffer for non-agricultural pairs, with a
+        // shared-frontage carve-out (two parcels facing across the same road
+        // segment legitimately share an edge — row-house geometry).
+        if occupied.iter().any(|(r, k, access)| {
+            parcels_conflict(
+                cand.rect, cand.kind, cand.access_tile,
+                *r, *k, *access,
+            )
+        }) {
             continue;
         }
         parcels.push(Parcel {
@@ -2396,11 +2664,46 @@ fn build_parcels_road_driven<F: SurveyFactionView>(
             district_hint: Some(cand.kind),
             suitability: cand.suitability,
         });
-        occupied.push(cand.rect);
+        occupied.push((cand.rect, cand.kind, cand.access_tile));
         *counts.entry(cand.kind).or_insert(0) += 1;
         next_id = next_id.wrapping_add(1);
     }
     parcels
+}
+
+/// Conflict predicate for non-agricultural parcel pairs. Agricultural pairs
+/// use plain overlap (`build_ag_belt` already runs its own keepout). Non-ag
+/// pairs require a 1-tile breathing gap unless both parcels share frontage
+/// on the same road tile (legitimate row-house geometry across a road).
+fn parcels_conflict(
+    a_rect: TileRect,
+    a_kind: DistrictKind,
+    a_access: (i32, i32),
+    b_rect: TileRect,
+    b_kind: DistrictKind,
+    b_access: (i32, i32),
+) -> bool {
+    if a_kind == DistrictKind::Agricultural || b_kind == DistrictKind::Agricultural {
+        return rects_overlap(a_rect, b_rect);
+    }
+    let inflated = TileRect::new(
+        a_rect.x0 - 1,
+        a_rect.y0 - 1,
+        a_rect.w + 2,
+        a_rect.h + 2,
+    );
+    if !rects_overlap(inflated, b_rect) {
+        return false;
+    }
+    // Hard overlap stays a conflict regardless of frontage sharing.
+    if rects_overlap(a_rect, b_rect) {
+        return true;
+    }
+    // Shared frontage carve-out: both access tiles are on adjacent or the
+    // same road tile, and the inflated overlap is exactly the road strip.
+    let shared_frontage =
+        (a_access.0 - b_access.0).abs() <= 1 && (a_access.1 - b_access.1).abs() <= 1;
+    !shared_frontage
 }
 
 /// Agricultural-belt allocation. Fields are deliberately NOT road-fronted
@@ -2514,7 +2817,7 @@ fn build_ag_belt<F: SurveyFactionView>(
             if footprint.iter().any(|f| rects_overlap(*f, rect)) {
                 continue;
             }
-            if !rect_clear_for_parcel(chunk_map, rect, &brain.road_tiles) {
+            if !rect_clear_for_parcel(chunk_map, rect, &brain.road_corridor_tiles) {
                 continue;
             }
             // 5-sample mean fertility (centre + 4 corners), mirroring
@@ -2694,13 +2997,36 @@ fn parcel_rect_from_road(road: (i32, i32), edge: TileEdge, w: u16, h: u16) -> Ti
     }
 }
 
-fn append_pressures_for_faction(
+/// Civic-milestone gating mode for `append_pressures_for_faction`.
+///
+/// `Runtime` runs the standard `civic_milestone_allows(Era, peak_pop)`
+/// table. `Seed(maturity)` routes through `should_seed_civic` so the
+/// player-chosen `StartSettlementMaturity` (Founder / Established /
+/// Developed) can bypass the pop threshold at game start — matching the
+/// legacy seed planner's behaviour without duplicating logic.
+#[derive(Copy, Clone, Debug)]
+pub enum CivicGate {
+    Runtime,
+    Seed(StartSettlementMaturity),
+}
+
+impl CivicGate {
+    fn allows(self, kind: CivicKind, era: Era, peak_pop: u32) -> bool {
+        match self {
+            CivicGate::Runtime => civic_milestone_allows(kind, era, peak_pop),
+            CivicGate::Seed(m) => should_seed_civic(kind, era, peak_pop, m, true),
+        }
+    }
+}
+
+pub(crate) fn append_pressures_for_faction(
     _faction_id: u32,
     faction: &FactionData,
     settlement: &Settlement,
     chunk_map: &ChunkMap,
     maps: &OrganicStructureMaps,
     pending: Option<&AHashMap<BuildSiteKind, u32>>,
+    civic_gate: CivicGate,
     out: &mut Vec<SettlementPressure>,
 ) {
     let pending_of =
@@ -2778,7 +3104,7 @@ fn append_pressures_for_faction(
     }
 
     if faction.community_has(GRANARY)
-        && civic_milestone_allows(CivicKind::Granary, era, settlement.peak_population)
+        && civic_gate.allows(CivicKind::Granary, era, settlement.peak_population)
         && count_near(&maps.granary_map.0, home, 30) + pending_of(BuildSiteKind::Granary) as usize
             == 0
     {
@@ -2824,7 +3150,7 @@ fn append_pressures_for_faction(
     }
 
     if faction.community_has(SACRED_RITUAL)
-        && civic_milestone_allows(CivicKind::Shrine, era, settlement.peak_population)
+        && civic_gate.allows(CivicKind::Shrine, era, settlement.peak_population)
         && count_near(&maps.shrine_map.0, home, 32) + pending_of(BuildSiteKind::Shrine) as usize
             == 0
     {
@@ -2839,7 +3165,7 @@ fn append_pressures_for_faction(
     }
 
     if faction.community_has(LONG_DIST_TRADE)
-        && civic_milestone_allows(CivicKind::Market, era, settlement.peak_population)
+        && civic_gate.allows(CivicKind::Market, era, settlement.peak_population)
     {
         let target = if faction.culture.mercantile > 180 {
             2
@@ -2887,7 +3213,7 @@ fn append_pressures_for_faction(
     }
 
     if faction.community_has(PROFESSIONAL_ARMY)
-        && civic_milestone_allows(CivicKind::Barracks, era, settlement.peak_population)
+        && civic_gate.allows(CivicKind::Barracks, era, settlement.peak_population)
         && count_near(&maps.barracks_map.0, home, 32) + pending_of(BuildSiteKind::Barracks) as usize
             == 0
     {
@@ -2902,7 +3228,7 @@ fn append_pressures_for_faction(
     }
 
     if faction.community_has(MONUMENTAL_BUILDING)
-        && civic_milestone_allows(CivicKind::Monument, era, settlement.peak_population)
+        && civic_gate.allows(CivicKind::Monument, era, settlement.peak_population)
         && count_near(&maps.monument_map.0, home, 36) + pending_of(BuildSiteKind::Monument) as usize
             == 0
     {
@@ -2931,7 +3257,7 @@ fn append_pressures_for_faction(
     }
 }
 
-fn pressure_to_intent(
+pub(crate) fn pressure_to_intent(
     faction: &FactionData,
     brain: &SettlementBrain,
     pressure: &SettlementPressure,
@@ -2941,7 +3267,9 @@ fn pressure_to_intent(
     doormat: &crate::simulation::doormat::DoormatReservations,
     archetypes: &BuildingArchetypeCatalog,
     occupied: &mut AHashSet<(i32, i32)>,
+    civic_gate: CivicGate,
 ) -> Option<ConstructionIntent> {
+    let seed_mode = matches!(civic_gate, CivicGate::Seed(_));
     let community_techs =
         crate::simulation::technology_adoption::community_adoption_bitset(faction);
     let era = current_era(&community_techs);
@@ -2972,6 +3300,7 @@ fn pressure_to_intent(
     if matches!(pressure.kind, SettlementPressureKind::Shelter)
         && community_techs.has(PERM_SETTLEMENT)
         && view_opt.is_none()
+        && !seed_mode
     {
         return None;
     }
@@ -2987,7 +3316,13 @@ fn pressure_to_intent(
             OrganicBuildKind::Single(BuildSiteKind::Bed)
         }
         SettlementPressureKind::Shelter => {
-            shelter_kind(era, &community_techs, pressure.population_scope, wall_mat)
+            shelter_kind(
+                era,
+                &community_techs,
+                pressure.population_scope,
+                wall_mat,
+                seed_mode,
+            )
         }
         SettlementPressureKind::Storage => OrganicBuildKind::Single(BuildSiteKind::Granary),
         SettlementPressureKind::Craft => OrganicBuildKind::Single(BuildSiteKind::Workbench),
@@ -3022,6 +3357,7 @@ fn pressure_to_intent(
     } else {
         choose_site_for_intent(
             faction, brain, district, build_kind, chunk_map, maps, bp_map, doormat, occupied,
+            seed_mode,
         )
     }?;
     occupied.insert(tile);
@@ -3043,9 +3379,18 @@ fn shelter_kind(
     community_techs: &crate::simulation::faction::FactionTechs,
     bed_deficit: u32,
     wall_mat: WallMaterial,
+    seed_mode: bool,
 ) -> OrganicBuildKind {
+    // Bootstrap P3 seed-only lift (was in the legacy `generate_candidates`):
+    // at seed time, allow Longhouses at Neolithic+ once bed deficit ≥ 2.
+    // The kin-group partition (settlement_bootstrap P2) puts founders into
+    // ≤4-adult households, so a 6-founder Neolithic start should seed
+    // visible dwelling variety (2-bed Longhouses + 1-bed Huts), not 6
+    // identical huts. Runtime ladder unchanged — CITY_STATE_ORG remains the
+    // post-seed gate.
     if community_techs.has(CITY_STATE_ORG)
         || (matches!(era, Era::Chalcolithic | Era::BronzeAge) && bed_deficit >= 2)
+        || (seed_mode && bed_deficit >= 2)
     {
         OrganicBuildKind::Longhouse(wall_mat)
     } else {
@@ -3063,13 +3408,20 @@ fn choose_site_for_intent(
     bp_map: &BlueprintMap,
     doormat: &crate::simulation::doormat::DoormatReservations,
     occupied: &AHashSet<(i32, i32)>,
+    seed_mode: bool,
 ) -> Option<(i32, i32)> {
     let mut candidates: Vec<(f32, (i32, i32))> = Vec::new();
     let road_frontage_required =
         faction.community_has(PERM_SETTLEMENT) && build_kind_requires_frontage(build_kind);
+    let commons_blocks = !build_kind_allowed_in_commons(build_kind);
     for parcel in &brain.parcels {
         let tile = parcel.centre();
         if occupied.contains(&tile) {
+            continue;
+        }
+        // L1: civic commons keepout — non-civic builds may not anchor inside
+        // the commons disc.
+        if commons_blocks && tile_inside_commons(brain.commons_rect, tile) {
             continue;
         }
         if road_frontage_required
@@ -3096,13 +3448,24 @@ fn choose_site_for_intent(
         }
         let frontage_bonus = parcel.frontage_edge.map(|_| 8.0).unwrap_or(0.0);
         let spread = well_spread_adjustment(build_kind, tile, chunk_map, maps);
-        candidates.push((suitability * 100.0 + frontage_bonus + spread, tile));
+        // L4: distance-band scoring. Outside `[min, max]` the band is 0 and
+        // the parcel hard-rejects; inside, the triangular curve weights the
+        // suitability score so a mid-band tile beats a center-clinging tile.
+        let dist = cheb(tile, faction.home_tile);
+        let band = band_mul(district, brain.phase, dist);
+        if band <= 0.0 {
+            continue;
+        }
+        candidates.push((suitability * 100.0 * band + frontage_bonus + spread, tile));
     }
     for &tile in &brain.frontier {
         if road_frontage_required {
             continue;
         }
         if occupied.contains(&tile) {
+            continue;
+        }
+        if commons_blocks && tile_inside_commons(brain.commons_rect, tile) {
             continue;
         }
         if !intent_site_clear(build_kind, tile, chunk_map, maps, bp_map, doormat, brain) {
@@ -3116,17 +3479,143 @@ fn choose_site_for_intent(
             continue;
         }
         let spread = well_spread_adjustment(build_kind, tile, chunk_map, maps);
-        candidates.push((
-            site_bonus(brain, district, tile) - cheb(tile, faction.home_tile) as f32 * 0.2 + spread,
-            tile,
-        ));
+        let dist = cheb(tile, faction.home_tile);
+        let band = band_mul(district, brain.phase, dist);
+        if band <= 0.0 {
+            continue;
+        }
+        candidates.push((site_bonus(brain, district, tile) * band + spread, tile));
     }
     candidates.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.1.cmp(&b.1))
     });
-    candidates.first().map(|(_, tile)| *tile)
+    if let Some((_, tile)) = candidates.first() {
+        return Some(*tile);
+    }
+
+    // Home-radial fallback — **seed mode only**. At runtime the chief
+    // genuinely should stall when no parcel-fronted lot fits; the next
+    // morphology tick reruns the survey and gives it real parcels with
+    // frontage. At seed time the brain may have 0–1 parcels for a
+    // freshly-surveyed faction (small survey window, sparse road
+    // anchors), so without this fallback Shelter / Hearth / civic
+    // intents starve and the seed pipeline produces no beds. The
+    // fallback honours every gate (commons / distance band /
+    // intent_site_clear / reachability), it only relaxes the
+    // parcel-frontage requirement.
+    if !seed_mode {
+        return None;
+    }
+    home_radial_fallback(
+        faction,
+        brain,
+        district,
+        build_kind,
+        chunk_map,
+        maps,
+        bp_map,
+        doormat,
+        occupied,
+        commons_blocks,
+        road_frontage_required,
+    )
+}
+
+/// Phase-keyed spiral scan around `home_tile` that finds the highest-band
+/// tile passing every `choose_site_for_intent` gate. Reserved for the
+/// cold-start case where the brain hasn't yet generated parcels with
+/// matching frontage. Bounded by `survey_radius(phase) + 4` so it stays
+/// inside loaded terrain.
+#[allow(clippy::too_many_arguments)]
+fn home_radial_fallback(
+    faction: &FactionData,
+    brain: &SettlementBrain,
+    district: DistrictKind,
+    build_kind: OrganicBuildKind,
+    chunk_map: &ChunkMap,
+    maps: &OrganicStructureMaps,
+    bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
+    occupied: &AHashSet<(i32, i32)>,
+    commons_blocks: bool,
+    road_frontage_required: bool,
+) -> Option<(i32, i32)> {
+    // Frontage-required intents (Hut / Longhouse / CompositeHouse) still
+    // run the radial fallback when no road-fronted parcel was found.
+    // `seed_walled_house_at` resolves the door direction relative to home
+    // when `door_dir == None`, and the doormat tile pushes onto
+    // `RoadCarveQueue` so the next survey re-rolls the parcel network with
+    // real frontage. Suppressing the fallback for frontage builds would
+    // starve every Neolithic+ seeded village whose brain hasn't ratcheted
+    // up parcels yet.
+    let _ = road_frontage_required;
+    let max_r = survey_radius(brain.phase).max(8) + 4;
+    let home = faction.home_tile;
+    let (half_w, half_h) = match build_kind {
+        OrganicBuildKind::Hut(_) => (1, 1),
+        OrganicBuildKind::Longhouse(_) => (2, 1),
+        // Composite footprints aren't emitted by the organic pressure
+        // path (composite shelter is disabled in `pressure_to_intent` —
+        // the 2×2+2×1 mask has no interior bed cells). Use the longhouse
+        // bounding box as a conservative default if one ever appears so
+        // the radial fallback still rejects commons-overlap.
+        OrganicBuildKind::CompositeHouse { .. } => (2, 1),
+        OrganicBuildKind::Single(_) | OrganicBuildKind::PalisadeSegment(_) => (0, 0),
+    };
+    let mut best: Option<(f32, (i32, i32))> = None;
+    for r in 1..=max_r {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx.abs().max(dy.abs()) != r {
+                    continue;
+                }
+                let tile = (home.0 + dx, home.1 + dy);
+                if occupied.contains(&tile) {
+                    continue;
+                }
+                // Footprint-rect commons check (multi-tile builds: a centre
+                // outside commons can still put walls inside the disc).
+                if commons_blocks {
+                    let foot = TileRect::new(
+                        tile.0 - half_w,
+                        tile.1 - half_h,
+                        (2 * half_w + 1) as u16,
+                        (2 * half_h + 1) as u16,
+                    );
+                    if rect_intersects_commons(brain.commons_rect, foot) {
+                        continue;
+                    }
+                }
+                let band = band_mul(district, brain.phase, r);
+                if band <= 0.0 {
+                    continue;
+                }
+                if !intent_site_clear(build_kind, tile, chunk_map, maps, bp_map, doormat, brain) {
+                    continue;
+                }
+                if !crate::simulation::placement_reachability::tile_reachable_from_home(
+                    chunk_map, home, tile,
+                ) {
+                    continue;
+                }
+                let spread = well_spread_adjustment(build_kind, tile, chunk_map, maps);
+                let score = band * 100.0 + spread;
+                if best.map_or(true, |b| score > b.0) {
+                    best = Some((score, tile));
+                }
+            }
+        }
+        // Early-out: as soon as we have any candidate inside ring r, take
+        // the best of this ring. Bands fall off with distance, so a r+1
+        // hit would only beat a r hit on a freak spread bonus — not worth
+        // searching the whole annulus.
+        if best.is_some() {
+            return best.map(|(_, tile)| tile);
+        }
+    }
+    None
 }
 
 /// Per-well penalty that pushes 2nd/3rd wells away from existing wells and
@@ -4843,6 +5332,229 @@ mod tests {
         let west = kitchen_rect_for_edge(longhouse, TileEdge::West, 4);
         assert_eq!(dims(west), (-4, 0, 4, 3));
         assert_eq!(west.h, 3);
+    }
+
+    // ─── Decrowding plan: L1/L2/L4/L5/L6 tests ────────────────────────────
+
+    fn dense_offsets(n: usize) -> Vec<(i32, i32)> {
+        (0..n as i32).map(|i| (i - (n as i32) / 2, 0)).collect()
+    }
+
+    fn build_village_brain(home: (i32, i32), members: u32) -> (FactionData, SettlementBrain, Settlement, ChunkMap, Vec<(i32, i32)>) {
+        use crate::economy::market::SettlementMarket;
+        let mut faction = dummy_faction(home, members);
+        force_adopt(&mut faction, PERM_SETTLEMENT);
+        let mut brain = SettlementBrain::new(SettlementId(1), 1, 42);
+        brain.home_tile = home;
+        brain.phase = SettlementPhase::Village;
+        brain.commons_rect = commons_rect_for(home, brain.phase);
+        let map = grass_map();
+        let offsets = dense_offsets(members as usize);
+        brain.road_segments = build_road_network(&faction, &brain, &map, &offsets);
+        brain.road_tiles = road_tiles_for_segments(&brain.road_segments);
+        brain.road_corridor_tiles = road_corridor_tiles_for_segments(&brain.road_segments);
+        let settlement = Settlement {
+            id: SettlementId(1),
+            owner_faction: 1,
+            market_tile: home,
+            founding_tick: 0,
+            name: "DecrowdTest".into(),
+            treasury: 0.0,
+            market: SettlementMarket::default(),
+            peak_population: members,
+        };
+        (faction, brain, settlement, map, offsets)
+    }
+
+    #[test]
+    fn commons_keepout_blocks_residential_in_hamlet() {
+        let mut faction = dummy_faction((0, 0), 12);
+        force_adopt(&mut faction, PERM_SETTLEMENT);
+        let mut brain = SettlementBrain::new(SettlementId(1), 1, 42);
+        brain.home_tile = (0, 0);
+        brain.phase = SettlementPhase::Hamlet;
+        brain.commons_rect = commons_rect_for((0, 0), brain.phase);
+        assert_eq!(commons_radius(SettlementPhase::Hamlet), 2);
+        assert!(brain.commons_rect.is_some());
+        let map = grass_map();
+        let offsets = dense_offsets(12);
+        brain.road_segments = build_road_network(&faction, &brain, &map, &offsets);
+        brain.road_tiles = road_tiles_for_segments(&brain.road_segments);
+        brain.road_corridor_tiles = road_corridor_tiles_for_segments(&brain.road_segments);
+        use crate::economy::market::SettlementMarket;
+        let settlement = Settlement {
+            id: SettlementId(1),
+            owner_faction: 1,
+            market_tile: (0, 0),
+            founding_tick: 0,
+            name: "Commons".into(),
+            treasury: 0.0,
+            market: SettlementMarket::default(),
+            peak_population: 12,
+        };
+        let parcels = build_parcels_road_driven(&faction, &settlement, &brain, &map);
+        let commons = brain.commons_rect.unwrap();
+        for p in parcels.iter().filter(|p| {
+            matches!(
+                p.district_hint,
+                Some(DistrictKind::Residential | DistrictKind::Crafting | DistrictKind::Storage)
+            )
+        }) {
+            assert!(
+                !rect_intersects_commons(Some(commons), p.rect()),
+                "non-civic parcel {:?} overlaps commons {:?}",
+                p.rect(),
+                commons
+            );
+        }
+    }
+
+    #[test]
+    fn commons_keepout_allows_civic_district() {
+        // The commons is civic-only — `district_allowed_in_commons` /
+        // `build_kind_allowed_in_commons` must permit it. Encode the policy
+        // explicitly so a future change to commons rules is forced through
+        // this test.
+        assert!(district_allowed_in_commons(DistrictKind::Civic));
+        assert!(build_kind_allowed_in_commons(OrganicBuildKind::Single(
+            BuildSiteKind::Granary
+        )));
+        assert!(build_kind_allowed_in_commons(OrganicBuildKind::Single(
+            BuildSiteKind::Well
+        )));
+        assert!(build_kind_allowed_in_commons(OrganicBuildKind::Single(
+            BuildSiteKind::Campfire
+        )));
+        // And non-civic builds must be excluded.
+        assert!(!build_kind_allowed_in_commons(OrganicBuildKind::Hut(
+            WallMaterial::WattleDaub
+        )));
+        assert!(!build_kind_allowed_in_commons(OrganicBuildKind::PalisadeSegment(
+            WallMaterial::WattleDaub
+        )));
+    }
+
+    #[test]
+    fn road_corridor_widening_matches_carver() {
+        // Pure-function test: every centerline interior tile plus its
+        // dominant-axis perpendicular widening tile must appear in the
+        // corridor set — same rule `road_carve_system` uses to stamp.
+        let segs = vec![
+            StreetSegment {
+                start: (-6, 0),
+                end: (6, 0),
+                tier: StreetTier::Primary,
+            },
+            StreetSegment {
+                start: (0, -5),
+                end: (0, 5),
+                tier: StreetTier::Primary,
+            },
+        ];
+        let corridor = road_corridor_tiles_for_segments(&segs);
+        for seg in &segs {
+            let (wdx, wdy) = road_widen_offset(seg.start, seg.end);
+            for tile in bresenham_tiles(seg.start, seg.end) {
+                if tile == seg.start || tile == seg.end {
+                    continue;
+                }
+                assert!(
+                    corridor.contains(&tile),
+                    "corridor missing centerline {:?}",
+                    tile
+                );
+                assert!(
+                    corridor.contains(&(tile.0 + wdx, tile.1 + wdy)),
+                    "corridor missing widening tile for {:?} (offset {:?})",
+                    tile,
+                    (wdx, wdy)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parcels_respect_distance_bands_and_buffer() {
+        let (faction, brain, settlement, map, _offsets) = build_village_brain((0, 0), 24);
+        assert!(
+            !brain.road_tiles.is_empty(),
+            "village should have a road skeleton"
+        );
+        let parcels = build_parcels_road_driven(&faction, &settlement, &brain, &map);
+        // Bands hard-reject parcels outside `[min, max]` — every emitted
+        // parcel must land inside its band (band_mul > 0).
+        for p in &parcels {
+            let kind = p.district_hint.unwrap();
+            if kind == DistrictKind::Agricultural {
+                continue;
+            }
+            let d = cheb(p.rect().center(), (0, 0));
+            let b = band_mul(kind, brain.phase, d);
+            assert!(
+                b > 0.0,
+                "parcel {:?} kind={:?} dist={} fell outside band",
+                p.rect(),
+                kind,
+                d
+            );
+        }
+        // L5: no two non-ag parcels touch except via shared road frontage.
+        let non_ag: Vec<&Parcel> = parcels
+            .iter()
+            .filter(|p| p.district_hint != Some(DistrictKind::Agricultural))
+            .collect();
+        for (i, a) in non_ag.iter().enumerate() {
+            for b in &non_ag[i + 1..] {
+                let ar = a.rect();
+                let br = b.rect();
+                let touches = parcels_conflict(
+                    ar,
+                    a.district_hint.unwrap(),
+                    a.access_tile.unwrap_or((0, 0)),
+                    br,
+                    b.district_hint.unwrap(),
+                    b.access_tile.unwrap_or((0, 0)),
+                );
+                assert!(
+                    !touches,
+                    "parcels {:?} and {:?} violate L5 spacing",
+                    ar, br
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parcel_buffer_allows_shared_road_frontage() {
+        // Two residentials facing each other across the same road tile must
+        // not conflict — `parcels_conflict` carves out shared-frontage cases.
+        let a_rect = TileRect::new(-3, 1, 3, 3); // south side of y=0 road
+        let b_rect = TileRect::new(-3, -3, 3, 3); // north side of y=0 road
+        let road = (-2, 0);
+        assert!(!parcels_conflict(
+            a_rect,
+            DistrictKind::Residential,
+            road,
+            b_rect,
+            DistrictKind::Residential,
+            road,
+        ));
+    }
+
+    #[test]
+    fn ideal_distance_bands_separate_districts_per_phase() {
+        // For Village/Chiefdom phases the per-district ideal radii must be
+        // strictly ordered Storage < Residential < Crafting ≤ Sacred ≤
+        // Defense — that's the donut layout the plan targets.
+        for phase in [SettlementPhase::Village, SettlementPhase::Chiefdom] {
+            let s = ideal_distance_band(DistrictKind::Storage, phase).unwrap().1;
+            let r = ideal_distance_band(DistrictKind::Residential, phase).unwrap().1;
+            let c = ideal_distance_band(DistrictKind::Crafting, phase).unwrap().1;
+            let d = ideal_distance_band(DistrictKind::Defense, phase).unwrap().1;
+            assert!(s <= r, "phase {:?} storage {} should be ≤ residential {}", phase, s, r);
+            assert!(r <= c, "phase {:?} residential {} should be ≤ crafting {}", phase, r, c);
+            assert!(c <= d, "phase {:?} crafting {} should be ≤ defense {}", phase, c, d);
+        }
     }
 }
 

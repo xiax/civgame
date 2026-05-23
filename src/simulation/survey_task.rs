@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use crate::simulation::construction::RoadCarveQueue;
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
 use crate::simulation::organic_settlement::{
-    compute_settlement_survey, OrganicStructureMaps, SettlementBrains, SettlementParcelIndex,
+    compute_settlement_survey, OrganicStructureMapsParam, SettlementBrains, SettlementParcelIndex,
     SettlementSurveyDiff, SettlementSurveyInput, SurveyFactionSnapshot, SurveyStructureSnapshot,
 };
 use crate::simulation::perf::{micros_u32, BackgroundWorkDiagnostics, PerfWorkBudget};
@@ -91,7 +91,7 @@ pub fn schedule_survey_tasks_system(
     settlements: Query<&Settlement>,
     registry: Res<FactionRegistry>,
     chunk_map: Res<ChunkMap>,
-    maps: OrganicStructureMaps,
+    maps: OrganicStructureMapsParam,
     member_q: Query<(&FactionMember, &Transform)>,
     mut perf: ResMut<BackgroundWorkDiagnostics>,
 ) {
@@ -145,6 +145,7 @@ pub fn schedule_survey_tasks_system(
     let Some(faction) = registry.factions.get(&settlement.owner_faction) else {
         return;
     };
+    let maps_view = maps.view();
     let terrain_snapshot = clone_chunk_window(&chunk_map, faction.home_tile);
     let snapshot_chunks = terrain_snapshot.0.len();
     let input = SettlementSurveyInput {
@@ -153,7 +154,7 @@ pub fn schedule_survey_tasks_system(
         tick: clock.tick,
         prior_brain: brains.0.get(&settlement.id).cloned(),
         chunk_map: terrain_snapshot,
-        maps: MapsSnapshot::capture(&maps, faction.home_tile),
+        maps: MapsSnapshot::capture(&maps_view, faction.home_tile),
         member_offsets: snapshot_member_offsets(
             faction.home_tile,
             settlement.owner_faction,

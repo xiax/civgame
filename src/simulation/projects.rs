@@ -839,8 +839,8 @@ const DEFICIT_EMA_ALPHA: f32 = 0.3;
 pub const DEFICIT_EMA_RARE_THRESHOLD: u8 = 160;
 
 /// Detect stalled `GatherMaterials` projects and cancel them. Updates the
-/// faction's `material_deficit_ema` for the stalled good so future
-/// `generate_candidates` invocations avoid that input until supply recovers.
+/// faction's `material_deficit_ema` for the stalled good (consumed by the
+/// runtime construction selector to avoid that input until supply recovers).
 /// Runs in `Economy` after `project_lifecycle_system` so phase + progress are
 /// fresh.
 pub fn project_stagnation_system(

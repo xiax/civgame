@@ -2564,10 +2564,10 @@ pub struct FactionData {
     /// instead of the old flat 50%-of-population rule.
     pub workforce_budget: crate::simulation::projects::WorkforceBudget,
     /// EMA per resource of how long material gather has been stagnating for
-    /// this faction. Stage 3 reads this in `generate_candidates` to avoid
-    /// picking blueprints that need a chronically-deficient input. Range
-    /// 0..=255. Phase 2-residual: keyed on `ResourceId`; legacy callers go
-    /// through `material_deficit_ema_of(good)`.
+    /// this faction. Written by `project_stagnation_system`; currently only
+    /// surfaced via `material_deficit_ema_of` for diagnostics — the chief
+    /// no longer reads it now that construction routes through the organic
+    /// `pressure_to_intent` path. Range 0..=255. Keyed on `ResourceId`.
     pub material_deficit_ema: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u8>,
     /// Anticipatory stockpile reserves: target storage levels per resource
     /// that the chief asks workers to maintain even before any blueprint
@@ -2611,10 +2611,11 @@ pub struct FactionData {
     pub procurement_market: Option<(Entity, (i32, i32))>,
     /// Full per-input scarcity snapshot, refreshed alongside
     /// `procurement_plan` by `classify_construction_procurement_system`.
-    /// `generate_candidates` reads it (runtime only) so the era-aware
-    /// `select_wall_material` can return `EmergencyShelter` and emit
-    /// era-appropriate emergency bedding when every wall rung is
-    /// unobtainable. Empty in seed mode (selector passed `None`).
+    /// `organic_settlement::pressure_to_intent` reads it (runtime only)
+    /// so the era-aware `select_wall_material` can return
+    /// `EmergencyShelter` and emit era-appropriate emergency bedding when
+    /// every wall rung is unobtainable. Empty in seed mode (the seed
+    /// pressure path bypasses the deferral so shelter still emits).
     pub material_view: crate::simulation::construction::MaterialAvailabilityView,
     /// Per-resource economic policy. Pluralist Economy R4: each entry
     /// is `ResourceId → ResourceControlPolicy` (composable flags
