@@ -910,6 +910,17 @@ pub fn goal_dispatch_system(
                         {
                             Some(TaskKind::Scavenge as u16)
                         }
+                        // AcquireFood forage chain (`ForageFromKnownMethod`
+                        // expands to `[Gather, Eat]`): the Gather head must
+                        // survive across goal-dispatch ticks until completion
+                        // or external preempt, mirroring the Scavenge /
+                        // WithdrawFood / Fishing arms. The trailing Eat leg is
+                        // covered by the `(Survive, Eat)` arm above.
+                        AgentGoal::Survive
+                            if aq.current_task_kind() == TaskKind::Gather as u16 =>
+                        {
+                            Some(TaskKind::Gather as u16)
+                        }
                         // Phase 5c-ii-b: AcquireGood haul chain runs without an
                         // ActivePlan. Both legs (storage withdraw + haul to
                         // blueprint) need to survive across goal-dispatch ticks

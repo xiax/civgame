@@ -1640,11 +1640,14 @@ impl Method for ScavengeFoodFromGroundMethod {
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
-        // Visible-ground tier: outranks `WithdrawFromStorageMethod`
-        // (`UTIL_BASELINE`). Distance discount picks the closer of two
-        // visible piles; cap (`MAX_DIST_PENALTY`) preserves the
-        // inter-tier ranking against the baseline-tier sibling.
-        UTIL_VISIBLE_GROUND - dist_penalty(ctx, ctx.scavenge_target_tile)
+        // Flat baseline tier — once preconditions read live world state,
+        // every concrete `AcquireFood` method is equally "verified
+        // available," so distance is the only honest differentiator. The
+        // legacy `UTIL_VISIBLE_GROUND` premium was inherited from a model
+        // where vision-confirmed targets were more trusted than memory-
+        // derived ones; with the live SpatialIndex fallback in
+        // `htn_acquire_food_dispatch_system`, that asymmetry is gone.
+        UTIL_BASELINE - dist_penalty(ctx, ctx.scavenge_target_tile)
     }
 
     fn expand(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> Vec<Task> {
@@ -4117,11 +4120,20 @@ pub fn htn_acquire_food_dispatch_system(
             } else {
                 None
             };
-            // `food_stock` returns f32 because it sums Fruit/Meat/Grain at
-            // floating-point granularity in some legacy code; for ctx purposes
-            // we want a u32 tally. Floor the value — under-counting is the
-            // safer side for the precondition gate.
-            let faction_food_stock = faction_registry.food_stock(member.faction_id) as u32;
+            // Live-derived storage availability. `nearest_storage_tile` was
+            // computed via a live SpatialIndex+GroundItem scan above, so when
+            // it's `Some(_)` we *know* at least one edible item exists there
+            // this tick. Set a non-zero sentinel so
+            // `WithdrawFromStorageMethod::precondition` (which gates on
+            // `faction_food_stock > 0`) stays in sync with the picker — the
+            // cached `food_stock(...)` rollup is Economy-cadence and can be
+            // stale at 0 between sync passes. We fall back to the cached
+            // total only when no reachable storage tile holds edible items,
+            // so legacy ctx fields downstream still reflect non-zero totals
+            // when pack inventories hold food.
+            let live_storage_sentinel: u32 = if nearest_storage_tile.is_some() { 1 } else { 0 };
+            let faction_food_stock =
+                live_storage_sentinel.max(faction_registry.food_stock(member.faction_id) as u32);
 
             // Vision-first scavenge target: nearest visible loose edible
             // GroundItem within the agent's current vision (LOS-checked by
@@ -4154,8 +4166,51 @@ pub fn htn_acquire_food_dispatch_system(
                 |t| storage_tile_map.tiles.contains_key(&t),
                 reach_from_agent,
             );
-            let scavenge_target_entity = scavenge.map(|(e, _)| e);
-            let scavenge_target_tile = scavenge.map(|(_, t)| t);
+            let (scavenge_target_entity, scavenge_target_tile) = match scavenge {
+                Some((e, t)) => (Some(e), Some(t)),
+                None => {
+                    // Vision-empty fallback: bucket-cadence vision hasn't
+                    // fired yet for this agent, but a freshly-dropped /
+                    // freshly-spawned edible item may sit within their
+                    // standard view radius. Run a bounded live SpatialIndex
+                    // scan with the same filter set as the vision picker
+                    // (storage-tile exclusion + reachability + same
+                    // detour-distance ranking). LOS deliberately omitted —
+                    // the storage scan above doesn't gate on LOS either, and
+                    // the param budget is at the 16-cap. Next vision bucket
+                    // overwrites this with a proper LOS-checked target.
+                    let r = crate::simulation::vision::STANDARD_VIEW_RADIUS as i32;
+                    let mut best: Option<(Entity, (i32, i32), i32)> = None;
+                    for dy in -r..=r {
+                        for dx in -r..=r {
+                            let tx = cur_tx + dx;
+                            let ty = cur_ty + dy;
+                            let t = (tx, ty);
+                            if storage_tile_map.tiles.contains_key(&t) {
+                                continue;
+                            }
+                            for &ent in spatial.get(tx, ty).iter() {
+                                let Ok(gi) = item_query.get(ent) else { continue };
+                                if !gi.item.resource_id.is_edible() || gi.qty == 0 {
+                                    continue;
+                                }
+                                if !reach_from_agent(t) {
+                                    continue;
+                                }
+                                let d = detour_dist(t);
+                                if best.as_ref().map_or(true, |(_, _, bd)| d < *bd) {
+                                    best = Some((ent, t, d));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    match best {
+                        Some((e, t, _)) => (Some(e), Some(t)),
+                        None => (None, None),
+                    }
+                }
+            };
 
             // Vision-first forage candidate: nearest visible mature edible
             // plant. Vision_system only writes mature-stage edible plants, so
@@ -4280,12 +4335,21 @@ pub fn htn_acquire_food_dispatch_system(
 
             let abstract_task = AbstractTask::AcquireFood;
             let methods = method_registry.methods_for(AbstractTaskKind::AcquireFood);
-            // Phase 6b: scoring goes through `score_method_with_history` so
-            // recent routing failures bias the argmax. Sibling methods that
-            // haven't failed get a free pass; a method with two recent
-            // failures eats a `2 * METHOD_FAILURE_PENALTY` discount.
-            let chosen = methods
+            // Concrete-first partition: enumerate `AcquireFood` methods whose
+            // precondition passes, excluding `ExploreForFoodMethod`. If any
+            // concrete is viable, argmax over concretes only — Explore is
+            // never compared against them. This is what the user's plan in
+            // `plans/food-pickup.md` calls "Explore as a true last resort":
+            // failure-bias on concretes (e.g. depleted fish spots) still
+            // reorders them among themselves, but a heavily-biased concrete
+            // can no longer fall below `UTIL_EXPLORE_FALLBACK` and let
+            // Explore win against a perfectly good live storage / scavenge
+            // target. Falls through to `ExploreForFoodMethod` (and the
+            // terminal-Explore backstop beneath) only when no concrete's
+            // precondition holds.
+            let concrete_chosen = methods
                 .iter()
+                .filter(|m| m.id() != MethodId::EXPLORE_FOR_FOOD)
                 .filter(|m| m.precondition(abstract_task, &ctx))
                 .max_by(|a, b| {
                     let ua =
@@ -4294,7 +4358,12 @@ pub fn htn_acquire_food_dispatch_system(
                         score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
                     ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
                 });
-
+            let chosen = concrete_chosen.or_else(|| {
+                methods
+                    .iter()
+                    .filter(|m| m.id() == MethodId::EXPLORE_FOR_FOOD)
+                    .find(|m| m.precondition(abstract_task, &ctx))
+            });
             let Some(method) = chosen else {
                 // Phase 3 terminal Explore fallback: every AcquireFood
                 // method's precondition failed (no inventory, no storage,
@@ -13315,23 +13384,35 @@ mod tests {
     }
 
     #[test]
-    fn scavenge_food_outranks_withdraw_even_at_max_distance() {
-        // Cap-preserves-ranking invariant: 1.5 - 0.30 = 1.20 > 1.0 - 0 = 1.0.
-        // A far visible food pile still beats a near-zero-distance storage
-        // tile because the bias-on-visibility margin is wider than
-        // MAX_DIST_PENALTY.
+    fn closer_food_method_outranks_farther_at_equal_tier() {
+        // Both methods now sit at UTIL_BASELINE (the legacy
+        // UTIL_VISIBLE_GROUND premium on ScavengeFoodFromGround was dropped
+        // when AcquireFood preconditions went fully live — see
+        // `plans/food-pickup.md`). Distance is the only differentiator: a
+        // near scavenge target beats a far storage tile, and vice versa.
         let scav = ScavengeFoodFromGroundMethod;
         let wd = WithdrawFromStorageMethod;
-        let mut ctx = ctx_with_storage(Some((0, 0)), 5, 220.0);
-        ctx.scavenge_target_entity = Some(Entity::from_raw(1));
-        ctx.scavenge_target_tile = Some((30, 0)); // beyond MAX_DIST_PENALTY
-        let u_scav = scav.utility(AbstractTask::AcquireFood, &ctx);
-        let u_wd = wd.utility(AbstractTask::AcquireFood, &ctx);
+
+        // Near scavenge target vs far storage → scavenge wins on distance.
+        let mut near_scav_ctx = ctx_with_storage(Some((30, 0)), 5, 220.0);
+        near_scav_ctx.scavenge_target_entity = Some(Entity::from_raw(1));
+        near_scav_ctx.scavenge_target_tile = Some((1, 0));
         assert!(
-            u_scav > u_wd,
-            "scavenge {} should still beat withdraw {}",
-            u_scav,
-            u_wd
+            scav.utility(AbstractTask::AcquireFood, &near_scav_ctx)
+                > wd.utility(AbstractTask::AcquireFood, &near_scav_ctx),
+            "near scavenge should beat far storage"
+        );
+
+        // Far scavenge vs near storage → storage wins (the formerly-
+        // overruled case: the old 1.5 premium made distant scavenge always
+        // win; now it correctly loses).
+        let mut far_scav_ctx = ctx_with_storage(Some((0, 0)), 5, 220.0);
+        far_scav_ctx.scavenge_target_entity = Some(Entity::from_raw(1));
+        far_scav_ctx.scavenge_target_tile = Some((30, 0));
+        assert!(
+            wd.utility(AbstractTask::AcquireFood, &far_scav_ctx)
+                > scav.utility(AbstractTask::AcquireFood, &far_scav_ctx),
+            "near storage should beat far scavenge under flat tiers"
         );
     }
 

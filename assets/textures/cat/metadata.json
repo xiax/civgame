@@ -7,8 +7,8 @@
         "name": "cat",
         "prompt": "cat",
         "size": {
-          "width": 36,
-          "height": 36
+          "width": 16,
+          "height": 16
         },
         "template_id": "cat",
         "directions": 8,

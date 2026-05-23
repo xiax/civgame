@@ -7,8 +7,8 @@
         "name": "horse",
         "prompt": "horse",
         "size": {
-          "width": 48,
-          "height": 48
+          "width": 32,
+          "height": 32
         },
         "template_id": "horse",
         "directions": 8,
