@@ -1,34 +1,87 @@
-# Follow-up: carve / plan sync after unified seed pipeline
+# Carve/Plan Sync After Unified Seed Pipeline
 
 ## Context
 
-When the seed pipeline switched from legacy `generate_candidates` to the organic `pressure_to_intent` path (this branch), the test `seeded_cropland_stays_inside_agricultural_plots` (`src/simulation/test_fixture.rs` line ~17961) became sensitive to a downstream gap between `PlotIndex.ag_tiles` and `SettlementPlans` Agricultural zone rects.
+`seeded_cropland_stays_inside_agricultural_plots` (`src/simulation/test_fixture.rs:17969`) is `#[ignore]`d because the unified seed pipeline (commits `5bca4c0`, `f2329b5`) exposes a real desync between `PlotIndex.ag_tiles` and `SettlementPlans` Agricultural zones. The test fires at post-tick180 with e.g. `(261, 255)`:
 
-The test panics at `post-tick180` with a tile like `(261, 255)`:
+- `PlotIndex.ag_tiles.contains((261, 255))` ✓ — a Plot entity still owns it
+- `plans.0.values().any(z.kind == Agricultural && z.rect.contains((261, 255)))` ✗ — no current zone covers it
 
-- `PlotIndex.ag_tiles.contains((261, 255))` — passes (so a Plot entity still tracks that tile)
-- `plans.0.values().any(zone.kind == Agricultural && zone.rect.contains((261, 255)))` — **fails**
+The invariant is correct; the production code has a hole.
 
-Meaning a Plot entity still owns `(261, 255)` as Agricultural, but no current `SettlementPlan` Agricultural zone projects onto it. The two should be in sync: every live Plot must correspond to a current `brain.parcels` entry that `compat_plan_from_brain` emits as a Zone.
+## Root cause
 
-## Why the unified pipeline triggers it
+`layout_hash` is positionally blind. `src/simulation/organic_settlement.rs:4582–4596` hashes only:
 
-Seed-time hut anchors differ slightly under the organic pipeline (commons-respecting radial fallback vs legacy radial `find_building_origin`). Different anchors → different doormats → different road_carve queue entries → different brain.parcels at tick 60+. When `compute_settlement_survey` re-emits brain.parcels with a different Agricultural rect, `carve_plots_system` should tear down the stale plot and add the new one. The test shows the teardown isn't fully happening — `PlotIndex.ag_tiles` keeps the old plot's tiles while the plan emits only the new parcel.
+```
+seed ^ phase ^ pop_bucket ^ parcels.len() ^ road_hash ^ culture_traits
+```
 
-The test was added in 5bca4c0 ("Implement Zone-Backed Spawn Farm Seeding") specifically to catch belt-shift regressions; the gap is real and the test is doing its job.
+It does **not** include any parcel `shape.rect()` coords. So when a re-survey produces the same number of Agricultural parcels covering the same road network but at slightly shifted rects (commons-respecting fallback vs the OnEnter pre-seed survey), `layout_hash` is identical, `culture_hash` is identical, and `carve_plots_system` (`src/simulation/land.rs:687–856`, gate at line 718) **skips the settlement** — old Plot entities survive with the old rects.
 
-## Likely fix area
+Meanwhile `compat_plan_from_brain` (`organic_settlement.rs:1129–1232`, Agricultural emission at 1143–1167) emits zones directly from the **new** `brain.parcels`. Result: `SettlementPlan.zones` has the new rect, `PlotIndex.ag_tiles` still holds the old rect.
 
-- `src/simulation/land.rs::carve_plots_system` — review the stale-teardown path: does it remove every `ag_tiles` entry from the old plot's rect before adding the new plot? Check whether `culture_hash` mismatch detection actually fires for *minor* parcel shifts (different `frontage_edge`, different rect by a few tiles) or only major resets.
-- Alternative: `compat_plan_from_brain` could emit a zone for every live Plot (not just live brain.parcels) so the plan stays in sync with PlotIndex even when the brain drifts.
+Secondary structural facts:
 
-## Current state
+- `Plot` (`land.rs:150–184`) has no `parcel_id` backlink.
+- `Parcel.id` is **not stable across surveys** — `build_parcels` reallocates each cycle.
+- `SettlementPlan.zone` carries only `(kind, rect)`.
+- Existing teardown is **wholesale per settlement** when `culture_hash` flips: every plot is despawned and re-carved, losing durable state.
 
-- `seeded_cropland_stays_inside_agricultural_plots` is `#[ignore]`d with a pointer to this plan.
-- Every other test in the OnEnter / cropland / farming / construction / organic_settlement suites passes (1065/1066).
-- The user-visible behaviour change from the unified pipeline (commons buffer honoured in Neolithic+ starts) is intact and verifiable in-game.
+## Rejected alternatives
 
-## Out of scope here
+- **"`compat_plan_from_brain` emits a zone per live Plot."** Inverts the unified pipeline (makes `PlotIndex` the source of truth) and reintroduces the seed/runtime divergence that `f2329b5` deliberately removed.
+- **Strengthen `layout_hash` to include parcel rects.** Works, but every parcel shift thrashes every Plot in the settlement, blowing away `plowed_year`, `tenure`/`holder`, `base_value`, `last_valued_tick`, `missed_payments`, `parent_plot`. Mid-game surveys would routinely lose this state. Also still couples carve correctness to a coarse trigger.
 
-- Reverting any part of the unified pipeline. That was the explicit ask.
-- Loosening the test's assertion: the invariant is correct and worth preserving once the carve/plan sync gap is fixed.
+## Fix: per-plot rect reconciliation
+
+Make `carve_plots_system` idempotent against the current plan instead of gated on a hash. Per settlement, every tick:
+
+1. Collect `current_zones: Vec<(ZoneKind, TileRect)>` from `plan.zones`.
+2. For each existing `Plot` in this settlement, check whether `plot.rect` is fully contained in some `current_zones` entry of the same `zone_kind`.
+   - **Yes** → keep the Plot (preserves `plowed_year`, `tenure`, etc.).
+   - **No** → call `tear_down_plot(pid)` (factored from the existing cleanup body at `land.rs:760–790`): despawn entity, drop from `by_id`/`by_settlement`/`by_tile`/`ag_tiles`/`field_tiles`.
+3. For each `current_zones` entry, compute the tiles not already covered by a kept plot of the same kind and carve fresh plots over the uncovered remainder. Reuse the existing subdivision pass.
+4. Drop `by_faction_hash` as the correctness gate. Keep it (or a per-settlement variant) only as an optional fast-path skip when nothing changed AND every settlement plot still matches. Correctness must not depend on it.
+
+This restores the natural invariant: every live Plot is backed by a current `plan.zones` rect, and every current `plan.zones` rect has plots over its tiles.
+
+### Cropland revert on teardown
+
+After step 3, walk the set of tiles touched by Agricultural plot teardowns. For each such tile:
+
+- If still inside some current Agricultural plot → leave `Cropland` as-is.
+- Otherwise → revert to the underlying natural soil (mirror the write-side of `farm::prepare_field_task_system`) and emit `TileChangedEvent`.
+
+This satisfies the *first* test invariant (`every Cropland tile is in plot_index.ag_tiles`) and prevents long-lived orphaned Cropland anywhere the plot belt shifts.
+
+Order matters: revert must happen **after** step 3 so we know tiles are truly orphaned, not just uncovered for one intra-tick step.
+
+## Files
+
+- `src/simulation/land.rs`
+  - `carve_plots_system`: replace the `by_faction_hash` early-return with per-plot rect reconciliation. Factor cleanup into `tear_down_plot(pid, ...)`. After reconcile, run the orphaned-Cropland revert pass.
+  - `PlotIndex`: optional `is_tile_in_any_ag_plot(tile)` helper (trivial via `ag_tiles`).
+- `src/simulation/organic_settlement.rs` — no change (`layout_hash` and `compat_plan_from_brain` stay as-is).
+- `src/simulation/test_fixture.rs` — unignore `seeded_cropland_stays_inside_agricultural_plots`. Add a regression test: same parcel count, same roads, shifted Agricultural rect → reconcile drops old, keeps unrelated plots' `plowed_year`.
+- `src/simulation/CLAUDE.md` — one-line note on the new behaviour.
+
+## Reused utilities
+
+- `TileRect` containment helpers in `world/`.
+- `TileChangedEvent` (existing pattern in `prepare_field_task_system`).
+- Existing teardown body (`land.rs:760–790`) — extract, don't rewrite.
+- `FieldTileIndex` mutation paths already used during teardown.
+
+## Verification
+
+1. `cargo test --bin civgame seeded_cropland_stays_inside_agricultural_plots` (unignored) — passes at post-tick60/120/180.
+2. `cargo test --bin civgame` — full suite, expect previous 1065 + the unignored one.
+3. New regression test (above): confirms position-blind `layout_hash` no longer masks drift AND that durable Plot state survives.
+4. `cargo run`, default settled start, year 2 spring: no Cropland outside Ag plots in inspector; ox-plowed plots stay plowed across re-survey; no plot flicker between ticks.
+
+## Out of scope
+
+- Reverting any part of the unified pipeline.
+- Loosening the test assertions.
+- Adding stable `Parcel` IDs. (Useful long-term — would replace rect-containment with ID matching — but not needed to fix this invariant.)

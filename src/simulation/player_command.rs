@@ -350,6 +350,7 @@ pub fn drain_player_command_events_system(
                         required_animals,
                         tech_gates,
                         author_faction: Some(player_faction.faction_id),
+                        from_user_file: false,
                         revision: 0,
                     });
                     vehicle_queue
@@ -400,6 +401,7 @@ pub fn drain_player_command_events_system(
                         required_animals,
                         tech_gates,
                         author_faction: Some(fid),
+                        from_user_file: false,
                         revision: 0,
                     });
                     let design = vehicle_registry

@@ -446,6 +446,7 @@ pub fn vehicle_designer_system(
                             &data,
                         ),
                         author_faction: None,
+                        from_user_file: false,
                         revision: 0,
                     };
                     match crate::simulation::vehicle::save_custom_design(&preview, &data) {
@@ -677,7 +678,11 @@ fn draw_saved_designs(
             let mut load: Option<VehicleDesign> = None;
             let mut any = false;
             for d in registry.iter() {
-                if d.author_faction.is_none() {
+                // Show in-process designs (player saves / AI proposals,
+                // both author-tagged) AND on-disk `user_*.ron` designs
+                // the loader stamped with `from_user_file`. Stock
+                // `core.ron` templates have neither and stay hidden.
+                if d.author_faction.is_none() && !d.from_user_file {
                     continue;
                 }
                 any = true;
@@ -909,6 +914,7 @@ fn draw_preview_column(
         required_animals: state.required_animals,
         tech_gates: Vec::new(),
         author_faction: None,
+        from_user_file: false,
         revision: 0,
     };
 

@@ -339,6 +339,12 @@ pub struct VehicleDesign {
     pub tech_gates: Vec<TechId>,
     /// Faction that authored this design; `None` for stock templates.
     pub author_faction: Option<u32>,
+    /// True when the design was parsed from a `user_<slug>.ron` file on
+    /// disk (the freeform-designer Save path). Stock `core.ron`
+    /// templates are false; in-process AI proposals / queued customs
+    /// keep `author_faction = Some(_)` and false here. The designer's
+    /// "Saved & proposed designs" list shows entries where either is set.
+    pub from_user_file: bool,
     pub revision: u16,
 }
 
@@ -1550,13 +1556,21 @@ pub fn load_vehicle_assets() -> (VehicleData, VehicleDesignRegistry) {
 
     let catalog = core_ids::catalog();
     let mut data = VehicleData::default();
-    let mut templates: Vec<TemplateDefRon> = Vec::new();
+    // (template, from_user_file) — the bool flags `user_*.ron` files
+    // so the freeform designer's saved-designs list can surface them
+    // on a fresh game start (stock `core.ron` templates stay false).
+    let mut templates: Vec<(TemplateDefRon, bool)> = Vec::new();
 
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("ron") {
             continue;
         }
+        let from_user_file = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.starts_with("user_"))
+            .unwrap_or(false);
         let body = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("VehicleData: cannot read {:?}: {}", path, e));
         let file: VehicleDataFile = ron::from_str(&body)
@@ -1659,7 +1673,7 @@ pub fn load_vehicle_assets() -> (VehicleData, VehicleDesignRegistry) {
                 extra_bill,
             });
         }
-        templates.extend(file.templates);
+        templates.extend(file.templates.into_iter().map(|t| (t, from_user_file)));
     }
 
     if data.parts.is_empty() {
@@ -1672,7 +1686,7 @@ pub fn load_vehicle_assets() -> (VehicleData, VehicleDesignRegistry) {
 
     // Build the stock-design registry from the templates.
     let mut registry = VehicleDesignRegistry::default();
-    for t in templates {
+    for (t, from_user_file) in templates {
         let mut grid = VehicleGrid::default();
         for c in &t.cells {
             let material = catalog
@@ -1745,6 +1759,7 @@ pub fn load_vehicle_assets() -> (VehicleData, VehicleDesignRegistry) {
             required_animals: t.required_animals,
             tech_gates,
             author_faction: None,
+            from_user_file,
             revision: 0,
         });
     }
@@ -3791,6 +3806,7 @@ pub fn vehicle_ai_design_proposal_system(
             required_animals: base.required_animals,
             tech_gates: base.tech_gates.clone(),
             author_faction: Some(fid),
+            from_user_file: false,
             revision: 0,
         };
         if validate_design(&proposal, &data).is_ok() {
@@ -5407,6 +5423,7 @@ mod tests {
             required_animals: 0,
             tech_gates: Vec::new(),
             author_faction: Some(1), // composed branch (not stock)
+            from_user_file: false,
             revision: 0,
         }
     }
@@ -5474,6 +5491,7 @@ mod tests {
             required_animals: 0,
             tech_gates: Vec::new(),
             author_faction: Some(1),
+            from_user_file: false,
             revision: 0,
         };
         let head_0 = crate::rendering::entity_sprites::vehicle_sprite_plan(&design, 0);
@@ -5654,6 +5672,7 @@ mod tests {
             required_animals: 1,
             tech_gates: vec![ANIMAL_HUSBANDRY],
             author_faction: Some(1),
+            from_user_file: false,
             revision: 0,
         };
         // Replicate save_custom_design's RON output without touching disk.

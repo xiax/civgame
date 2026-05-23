@@ -127,6 +127,7 @@ pub struct AnimalSexTint(pub Color);
 #[derive(Component, Clone, Copy)]
 pub struct VehicleCellTint(pub Color);
 
+
 #[derive(Component)]
 pub struct VisualChild;
 
@@ -449,14 +450,13 @@ pub fn vehicle_sprite_plan(design: &VehicleDesign, heading: u8) -> VehicleSprite
     };
     let w = (hi.x - lo.x + 1) as f32;
     let depth = (hi.y - lo.y + 1) as f32;
-    // One grid cell ≈ one world tile (`TILE_SIZE = 16 px`). A 5-wide tank
-    // reads ~5 tiles wide, a 1-wide handcart ~1 tile — i.e. each design
-    // renders at its real footprint scale instead of being collapsed
-    // into a pixel cluster.
-    const CELL_PX: f32 = 12.0;
-    // Depth uses a shorter per-cell projection so a deep body doesn't
-    // shear into the row above.
-    const DEPTH_PX: f32 = 6.0;
+    // One grid cell == one world tile (`TILE_SIZE = 16 px`) in both X and Y
+    // so adjacent cells render edge-to-edge, with no sub-tile gap. The
+    // Tilted-view projection layer (`ProjectedAnchor::Dynamic` auto-attached
+    // for `Vehicle`) handles Y-axis foreshortening — doing it here too
+    // would double-compress the body in Tilted mode and *under*-compress
+    // it in TopDown.
+    const CELL_PX: f32 = 16.0;
     let mut cells = Vec::with_capacity(design.grid.cells.len());
     for (p, c) in &design.grid.cells {
         let gx = (p.x - lo.x) as f32;
@@ -464,7 +464,7 @@ pub fn vehicle_sprite_plan(design: &VehicleDesign, heading: u8) -> VehicleSprite
         let gz = (p.z - lo.z) as f32;
         // Centre-relative XY, then rotate by heading.
         let cx = (gx - (w - 1.0) / 2.0) * CELL_PX;
-        let cy_in_plane = (gy - (depth - 1.0) / 2.0) * DEPTH_PX;
+        let cy_in_plane = (gy - (depth - 1.0) / 2.0) * CELL_PX;
         let (rx, ry) = rotate_xy(cx, cy_in_plane, heading);
         // Vertical lift from Z stays out of the rotation (it's screen-up).
         let sx = rx;
@@ -524,10 +524,11 @@ pub fn spawn_vehicle_sprites(
                         sprite.anchor = Anchor::BottomCenter;
                         parent.spawn((
                             VisualChild,
-                            // `apply_entity_fog_tint_system` writes a white
-                            // base every frame; without this marker the
-                            // per-cell `vehicle_cell_color(kind)` colour
-                            // gets clobbered to fog-darkened white.
+                            // `VehicleCellTint` survives the fog-tint sweep
+                            // (`apply_entity_fog_tint_system`) AND exempts
+                            // the cell from `update_animations`' (0,-8)
+                            // rest-position reset, which assumes a single
+                            // per-entity child (Person/animal).
                             VehicleCellTint(cell.color),
                             sprite,
                             Transform::from_xyz(

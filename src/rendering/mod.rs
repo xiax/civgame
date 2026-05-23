@@ -237,6 +237,7 @@ impl Plugin for RenderingPlugin {
                     projection::auto_attach_dynamic::<crate::simulation::construction::Bridge>,
                     projection::auto_attach_dynamic::<crate::simulation::construction::Blueprint>,
                     projection::auto_attach_dynamic::<crate::simulation::faction::FactionCenter>,
+                    projection::auto_attach_dynamic::<crate::simulation::vehicle::Vehicle>,
                 )
                     .run_if(in_state(crate::GameState::Playing)),
             );

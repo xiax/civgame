@@ -56,10 +56,21 @@ pub fn handle_combat_events(
 /// Drives the per-frame transform offsets for combat animations (lunge + hit shake).
 /// Color (hit-flash red, fog tint, clothing alpha) is owned by
 /// `apply_entity_fog_tint_system` — do not write `sprite.color` here.
+///
+/// The (0, -8) rest position assumes a single per-entity child sprite (Person /
+/// animal). Vehicle children compose a multi-cell body at per-cell offsets;
+/// `Without<VehicleCellTint>` excludes them so their layout isn't collapsed
+/// every frame.
 pub fn update_animations(
     time: Res<Time>,
     mut anim_query: Query<&mut CombatAnimations>,
-    mut visual_query: Query<(&Parent, &mut Transform), With<super::entity_sprites::VisualChild>>,
+    mut visual_query: Query<
+        (&Parent, &mut Transform),
+        (
+            With<super::entity_sprites::VisualChild>,
+            Without<super::entity_sprites::VehicleCellTint>,
+        ),
+    >,
 ) {
     let dt = time.delta_secs();
     const BASE_Y: f32 = -8.0;
