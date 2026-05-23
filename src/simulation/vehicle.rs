@@ -2190,6 +2190,14 @@ pub fn spawn_vehicle_at(
 #[derive(Component, Clone, Copy, Debug)]
 pub struct DebugTestDriveVehicle;
 
+/// Marker on a vehicle currently under player manual control.
+/// Autonomous claim sites (`htn_vehicle_haul_dispatch_system`) and the
+/// right-click `VehicleOrderKind::MoveTo` path skip these so the player's
+/// `VehiclePathFollow` slot isn't clobbered. Set when `ManualDriveState.active`
+/// flips to `Some(this)`; cleared when it flips back to `None`.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct PlayerPiloted;
+
 /// Marker stamped on a `Tamed` animal synthesised purely to satisfy a Test
 /// Drive vehicle's `required_animals`. When the owning vehicle despawns the
 /// `cleanup_debug_ghost_draft_system` removes these so the world isn't
@@ -2862,7 +2870,10 @@ pub fn htn_vehicle_haul_dispatch_system(
     board: Res<JobBoard>,
     registry: Res<VehicleDesignRegistry>,
     data: Res<VehicleData>,
-    mut vehicles_q: Query<(Entity, &mut Vehicle, &VehicleInventory, &mut VehicleDraft)>,
+    mut vehicles_q: Query<
+        (Entity, &mut Vehicle, &VehicleInventory, &mut VehicleDraft),
+        Without<PlayerPiloted>,
+    >,
     animals_q: Query<(Entity, &DomesticAnimal, &Tamed), Without<AnimalWorkClaim>>,
     mut workers: Query<
         (
@@ -3890,6 +3901,7 @@ pub fn vehicle_player_command_system(
         &mut VehicleCrew,
         &mut VehicleDraft,
     )>,
+    piloted_q: Query<(), With<PlayerPiloted>>,
     mut scratch: Local<VehiclePathScratch>,
 ) {
     if pending.ops.is_empty() {
@@ -3911,8 +3923,13 @@ pub fn vehicle_player_command_system(
         match kind {
             VehicleOrderKind::MoveTo(dest) => {
                 // Only an idle, upright vehicle obeys a player move — a
-                // mid-haul vehicle is owned by the cargo executor.
-                if v.hauler.is_some() || v.state == VehicleState::Overturned {
+                // mid-haul vehicle is owned by the cargo executor, and a
+                // `PlayerPiloted` vehicle is being steered by the manual-drive
+                // input system whose `VehiclePathFollow` slot we'd clobber.
+                if v.hauler.is_some()
+                    || v.state == VehicleState::Overturned
+                    || piloted_q.get(vehicle_e).is_ok()
+                {
                     continue;
                 }
                 if let Some(path) = plan_vehicle_route(

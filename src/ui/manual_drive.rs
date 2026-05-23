@@ -16,8 +16,8 @@ use bevy::prelude::*;
 use bevy_egui::EguiContexts;
 
 use crate::simulation::vehicle::{
-    plan_manual_step, ManualDriveState, ManualIntent, Vehicle, VehicleDesignRegistry,
-    VehicleOccupancyIndex, VehiclePathFollow,
+    plan_manual_step, ManualDriveState, ManualIntent, PlayerPiloted, Vehicle,
+    VehicleDesignRegistry, VehicleOccupancyIndex, VehiclePathFollow,
 };
 use crate::world::chunk::ChunkMap;
 
@@ -50,6 +50,7 @@ pub fn manual_drive_input_system(
         return;
     }
     if keys.just_pressed(KeyCode::Escape) {
+        commands.entity(active).remove::<PlayerPiloted>();
         manual.active = None;
         manual.last_status = Some("Manual drive: released".to_string());
         return;

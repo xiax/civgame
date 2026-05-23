@@ -376,7 +376,8 @@ pub fn drain_player_command_events_system(
                     }
                     use crate::simulation::vehicle::{
                         collect_design_tech_gates, find_debug_spawn_site, spawn_ghost_draft_for,
-                        spawn_vehicle_at, DebugTestDriveVehicle, VehicleDesign, VehicleDesignId,
+                        spawn_vehicle_at, DebugTestDriveVehicle, PlayerPiloted, VehicleDesign,
+                        VehicleDesignId,
                     };
                     let fid = player_faction.faction_id;
                     let home_tile = factions
@@ -439,7 +440,9 @@ pub fn drain_player_command_events_system(
                     };
                     let vehicle_e =
                         spawn_vehicle_at(&mut commands, fid, &design, tile, z, heading);
-                    commands.entity(vehicle_e).insert(DebugTestDriveVehicle);
+                    commands
+                        .entity(vehicle_e)
+                        .insert((DebugTestDriveVehicle, PlayerPiloted));
                     if required_animals > 0 {
                         let ghosts = spawn_ghost_draft_for(
                             &mut commands,

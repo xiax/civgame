@@ -3,6 +3,7 @@ use crate::rendering::projection::{
 };
 use crate::simulation::faction::{FactionMember, PlayerFaction};
 use crate::simulation::person::{Drafted, Person};
+use crate::simulation::vehicle::Vehicle;
 use crate::world::chunk::ChunkMap;
 use crate::world::terrain::TILE_SIZE;
 use bevy::prelude::*;
@@ -42,6 +43,7 @@ pub fn selection_input_system(
     windows: Query<&Window, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<Camera>>,
     persons: Query<(Entity, &Transform, Option<&FactionMember>), With<Person>>,
+    vehicles: Query<(Entity, &Transform, &Vehicle)>,
     player_faction: Res<PlayerFaction>,
     mut selected: ResMut<SelectedEntity>,
     mut selected_many: ResMut<SelectedEntities>,
@@ -90,9 +92,10 @@ pub fn selection_input_system(
 
     let mode = *view_projection.mode;
     let proj = *view_projection.proj;
-    // Project a person's logical Transform.translation into view-space so
-    // hit-tests against the cursor (also view-space) work in tilted mode.
-    let project_person = |logical: Vec2| -> Vec2 {
+    // Project a logical Transform.translation into view-space so hit-tests
+    // against the cursor (also view-space) work in tilted mode. Shared by
+    // Person + Vehicle picking — both sit at a single anchor tile.
+    let project_pos = |logical: Vec2| -> Vec2 {
         if mode == MapViewMode::TopDown {
             return logical;
         }
@@ -109,12 +112,22 @@ pub fn selection_input_system(
     };
 
     if start.distance(end) < DRAG_THRESHOLD_PX {
-        // Single-click: pick nearest Person within radius (view-space).
+        // Single-click: pick the globally-nearest Person OR Vehicle within
+        // radius (view-space). Vehicles get a wider pick radius because the
+        // composed sprite spans multiple cells.
         let mut best: Option<(Entity, f32)> = None;
         for (entity, transform, _faction) in persons.iter() {
-            let pos = project_person(transform.translation.truncate());
+            let pos = project_pos(transform.translation.truncate());
             let dist = pos.distance(end);
             if dist < SINGLE_CLICK_RADIUS_PX && best.map(|(_, d)| dist < d).unwrap_or(true) {
+                best = Some((entity, dist));
+            }
+        }
+        let vehicle_radius = SINGLE_CLICK_RADIUS_PX * 1.5;
+        for (entity, transform, _v) in vehicles.iter() {
+            let pos = project_pos(transform.translation.truncate());
+            let dist = pos.distance(end);
+            if dist < vehicle_radius && best.map(|(_, d)| dist < d).unwrap_or(true) {
                 best = Some((entity, dist));
             }
         }
@@ -131,8 +144,8 @@ pub fn selection_input_system(
         return;
     }
 
-    // Drag-select: collect all player-faction Persons whose *projected*
-    // position falls inside the screen-space rect.
+    // Drag-select: collect all player-faction Persons + Vehicles whose
+    // *projected* position falls inside the screen-space rect.
     let min = Vec2::new(start.x.min(end.x), start.y.min(end.y));
     let max = Vec2::new(start.x.max(end.x), start.y.max(end.y));
     let mut hits: Vec<Entity> = Vec::new();
@@ -141,7 +154,16 @@ pub fn selection_input_system(
         if member.faction_id != player_faction.faction_id {
             continue;
         }
-        let p = project_person(transform.translation.truncate());
+        let p = project_pos(transform.translation.truncate());
+        if p.x >= min.x && p.x <= max.x && p.y >= min.y && p.y <= max.y {
+            hits.push(entity);
+        }
+    }
+    for (entity, transform, v) in vehicles.iter() {
+        if v.owner_faction != player_faction.faction_id {
+            continue;
+        }
+        let p = project_pos(transform.translation.truncate());
         if p.x >= min.x && p.x <= max.x && p.y >= min.y && p.y <= max.y {
             hits.push(entity);
         }
