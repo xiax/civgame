@@ -173,7 +173,7 @@ pub fn settlement_peak_population_system(
 
 /// Inclusive-exclusive rectangle in tile coordinates: tiles `(x, y)` with
 /// `x0 <= x < x0+w`, `y0 <= y < y0+h`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TileRect {
     pub x0: i32,
     pub y0: i32,

@@ -12,6 +12,7 @@ pub mod pixel_art;
 pub mod projection;
 pub mod sprite_library;
 pub mod tile_render;
+pub mod vehicle_part_sprites;
 pub mod water_current_render;
 
 pub struct RenderingPlugin;

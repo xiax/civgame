@@ -5563,5 +5563,10 @@ pub fn setup_sprite_library(mut commands: Commands, mut images: ResMut<Assets<Im
         }
     }
 
+    crate::rendering::vehicle_part_sprites::register_vehicle_part_sprites(
+        &mut lib,
+        &mut images,
+    );
+
     commands.insert_resource(lib);
 }

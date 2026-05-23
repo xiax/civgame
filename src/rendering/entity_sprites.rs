@@ -3,7 +3,7 @@ use crate::rendering::pixel_art::{AnimalTextures, ArtMode, EntityTextures};
 use crate::rendering::sprite_library::SpriteLibrary;
 use crate::simulation::animals::{Cat, Cow, Deer, Fox, Horse, Pig, Rabbit, Wolf};
 use crate::simulation::vehicle::{
-    Vehicle, VehicleDesign, VehicleDesignRegistry, VehiclePartKind, VehicleVisual,
+    Vehicle, VehicleData, VehicleDesign, VehicleDesignRegistry, VehiclePartKind, VehicleVisual,
 };
 use crate::simulation::construction::{
     Bed, Blueprint, BuildSiteKind, Campfire, Chair, Door, Loom, Table, Wall, WallMaterial, Well,
@@ -402,13 +402,28 @@ pub fn vehicle_cell_color(kind: VehiclePartKind) -> Color {
 }
 
 /// One painted quad in a composed vehicle render.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct VehicleSpriteCell {
     /// Entity-local offset (x, y, z-order).
     pub local_offset: Vec3,
     /// Quad size in pixels.
     pub size: Vec2,
+    /// Base tint — the fallback when no sprite is registered, and the tint
+    /// `apply_entity_fog_tint_system` multiplies against the loaded sprite.
     pub color: Color,
+    /// Optional `SpriteLibrary` key. `spawn_vehicle_sprites` tries this
+    /// first, then [`fallback_sprite_key`], then paints a colour quad.
+    /// `vehicle_sprite_plan` returns `None` here; the data-aware
+    /// `vehicle_sprite_plan_with_data` populates it.
+    pub sprite_key: Option<String>,
+    /// Base-key fallback (e.g. `vehicle_wheel_base_side` for a
+    /// `vehicle_wheel_large_offroad_wheel_side` cell whose variant has no
+    /// distinct sprite registered). Skipped when `None`.
+    pub fallback_sprite_key: Option<String>,
+    /// Horizontal flip applied to the sprite when rendered (heading mirror —
+    /// west uses the east-facing side sprite flipped, see
+    /// `vehicle_part_sprites::view_for_heading`).
+    pub flip_x: bool,
 }
 
 /// The render plan for one vehicle design at a given heading. Both
@@ -438,7 +453,36 @@ fn rotate_xy(x: f32, y: f32, heading: u8) -> (f32, f32) {
 /// `spawn_vehicle_sprites` used pre-extraction, with explicit heading rotation
 /// applied to the in-plane (x, y) cell offsets (the legacy renderer assumed
 /// heading 0 because the parent `Transform` had no rotation).
+///
+/// Backward-compatible wrapper that returns a colour-only plan (no sprite
+/// keys, no module composites — used by the designer's egui inset preview
+/// and headless tests). The world renderer calls
+/// [`vehicle_sprite_plan_with_data`] to get the sprite-aware plan.
 pub fn vehicle_sprite_plan(design: &VehicleDesign, heading: u8) -> VehicleSpritePlan {
+    vehicle_sprite_plan_internal(design, heading, None)
+}
+
+/// Same as [`vehicle_sprite_plan`] but with [`VehicleData`] in hand so each
+/// cell carries the right sprite key (kind + variant + view) and weapon
+/// modules collapse to one composite sprite at their anchor cell.
+pub fn vehicle_sprite_plan_with_data(
+    design: &VehicleDesign,
+    heading: u8,
+    data: &VehicleData,
+) -> VehicleSpritePlan {
+    vehicle_sprite_plan_internal(design, heading, Some(data))
+}
+
+fn vehicle_sprite_plan_internal(
+    design: &VehicleDesign,
+    heading: u8,
+    data: Option<&VehicleData>,
+) -> VehicleSpritePlan {
+    use crate::rendering::vehicle_part_sprites::{
+        module_anchor_cell, module_footprint_extent, vehicle_module_sprite_key,
+        vehicle_part_sprite_key, view_for_heading,
+    };
+
     let bounds = design.grid.bounds();
     let stock_flat = design.author_faction.is_none()
         && bounds.map(|(lo, hi)| hi.z - lo.z == 0).unwrap_or(true);
@@ -457,23 +501,108 @@ pub fn vehicle_sprite_plan(design: &VehicleDesign, heading: u8) -> VehicleSprite
     // would double-compress the body in Tilted mode and *under*-compress
     // it in TopDown.
     const CELL_PX: f32 = 16.0;
-    let mut cells = Vec::with_capacity(design.grid.cells.len());
-    for (p, c) in &design.grid.cells {
-        let gx = (p.x - lo.x) as f32;
-        let gy = (p.y - lo.y) as f32;
-        let gz = (p.z - lo.z) as f32;
-        // Centre-relative XY, then rotate by heading.
+    let (view, flip_x) = view_for_heading(heading);
+
+    // Pre-compute each weapon module's anchor cell so we can skip the
+    // non-anchor members and emit one composite at the anchor.
+    let module_anchors: ahash::AHashMap<crate::simulation::vehicle::VehicleModuleId, bevy::math::IVec3> =
+        design
+            .grid
+            .modules
+            .iter()
+            .filter_map(|inst| module_anchor_cell(&inst.cells).map(|a| (inst.id, a)))
+            .collect();
+
+    // Project a (gx, gy, gz) cell-grid coord into entity-local screen offset.
+    let project = |gx: f32, gy: f32, gz: f32| -> Vec3 {
         let cx = (gx - (w - 1.0) / 2.0) * CELL_PX;
         let cy_in_plane = (gy - (depth - 1.0) / 2.0) * CELL_PX;
         let (rx, ry) = rotate_xy(cx, cy_in_plane, heading);
-        // Vertical lift from Z stays out of the rotation (it's screen-up).
         let sx = rx;
         let sy = -8.0 + gz * CELL_PX + ry;
         let zorder = 0.1 + gz * 0.002 + gy * 0.0003;
+        Vec3::new(sx, sy, zorder)
+    };
+
+    let mut cells = Vec::with_capacity(design.grid.cells.len());
+    for (p, c) in &design.grid.cells {
+        // Module-composite anchor cell: emit ONE sprite spanning the
+        // module's footprint, sized to (extent_x × extent_y) cells.
+        if let Some(mid) = c.module_id {
+            if module_anchors.get(&mid) != Some(p) {
+                // Non-anchor cell of a multi-cell module — the anchor
+                // already drew the composite for this module.
+                continue;
+            }
+            if let Some(data) = data {
+                if let Some(inst) =
+                    design.grid.modules.iter().find(|m| m.id == mid)
+                {
+                    let (ext_x, ext_y) = module_footprint_extent(&inst.cells);
+                    if let Some(def) = data.module_def(inst.def) {
+                        // Position the composite at the footprint centre
+                        // so a 2×2 module sits over its 4 grid cells.
+                        let center_x =
+                            (inst.cells.iter().map(|c| c.x).sum::<i32>() as f32)
+                                / (inst.cells.len() as f32)
+                                - lo.x as f32;
+                        let center_y =
+                            (inst.cells.iter().map(|c| c.y).sum::<i32>() as f32)
+                                / (inst.cells.len() as f32)
+                                - lo.y as f32;
+                        let center_z = (p.z - lo.z) as f32;
+                        let local = project(center_x, center_y, center_z);
+                        let size = Vec2::new(
+                            ext_x as f32 * CELL_PX,
+                            ext_y as f32 * CELL_PX,
+                        );
+                        cells.push(VehicleSpriteCell {
+                            local_offset: local,
+                            size,
+                            color: vehicle_cell_color(c.kind),
+                            sprite_key: Some(vehicle_module_sprite_key(
+                                &def.label, view,
+                            )),
+                            // Module composites have no per-kind base
+                            // fallback; an unregistered module silently
+                            // drops to the colour quad.
+                            fallback_sprite_key: None,
+                            flip_x,
+                        });
+                        continue;
+                    }
+                }
+            }
+            // No data available (designer preview / fallback): treat the
+            // module cells like ordinary tinted cells.
+        }
+
+        let gx = (p.x - lo.x) as f32;
+        let gy = (p.y - lo.y) as f32;
+        let gz = (p.z - lo.z) as f32;
+        let local = project(gx, gy, gz);
+        let (sprite_key, fallback_sprite_key) = if let Some(d) = data {
+            let variant_label = c
+                .variant
+                .and_then(|vid| d.variant(vid))
+                .map(|v| v.label.as_str());
+            let primary = vehicle_part_sprite_key(c.kind, variant_label, view);
+            let fallback = if variant_label.is_some() {
+                Some(vehicle_part_sprite_key(c.kind, None, view))
+            } else {
+                None
+            };
+            (Some(primary), fallback)
+        } else {
+            (None, None)
+        };
         cells.push(VehicleSpriteCell {
-            local_offset: Vec3::new(sx, sy, zorder),
+            local_offset: local,
             size: Vec2::splat(CELL_PX),
             color: vehicle_cell_color(c.kind),
+            sprite_key,
+            fallback_sprite_key,
+            flip_x,
         });
     }
     VehicleSpritePlan::Composed { cells }
@@ -490,6 +619,7 @@ pub fn spawn_vehicle_sprites(
     query: Query<(Entity, &Vehicle), Without<VehicleVisual>>,
     registry: Res<VehicleDesignRegistry>,
     sprite_lib: Res<SpriteLibrary>,
+    data: Res<VehicleData>,
 ) {
     for (entity, vehicle) in query.iter() {
         commands
@@ -499,7 +629,7 @@ pub fn spawn_vehicle_sprites(
         let Some(design) = registry.get(vehicle.design_id) else {
             continue;
         };
-        match vehicle_sprite_plan(design, vehicle.heading) {
+        match vehicle_sprite_plan_with_data(design, vehicle.heading, &data) {
             VehicleSpritePlan::Stock => {
                 let Some(handle) = sprite_lib.get("entity_cart") else {
                     continue;
@@ -520,7 +650,31 @@ pub fn spawn_vehicle_sprites(
             VehicleSpritePlan::Composed { cells } => {
                 commands.entity(entity).with_children(|parent| {
                     for cell in cells {
-                        let mut sprite = Sprite::from_color(cell.color, cell.size);
+                        // Try the per-cell sprite key first; chain
+                        // variant→base if the variant has no distinct
+                        // art. On total miss, fall back to a colour
+                        // quad so unregistered parts still render.
+                        let resolved = cell
+                            .sprite_key
+                            .as_deref()
+                            .and_then(|key| sprite_lib.get(key).cloned())
+                            .or_else(|| {
+                                cell.fallback_sprite_key
+                                    .as_deref()
+                                    .and_then(|key| sprite_lib.get(key).cloned())
+                            });
+                        let mut sprite = match resolved {
+                            Some(img) => {
+                                let mut s = Sprite::from_image(img);
+                                s.flip_x = cell.flip_x;
+                                // Custom size makes a 16×16 source render at
+                                // the requested footprint (matters for
+                                // module composites that span >1 cell).
+                                s.custom_size = Some(cell.size);
+                                s
+                            }
+                            None => Sprite::from_color(cell.color, cell.size),
+                        };
                         sprite.anchor = Anchor::BottomCenter;
                         parent.spawn((
                             VisualChild,
@@ -546,6 +700,7 @@ pub fn spawn_vehicle_sprites(
         }
     }
 }
+
 
 pub fn spawn_workbench_sprites(
     mut commands: Commands,

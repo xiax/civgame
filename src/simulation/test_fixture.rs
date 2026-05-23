@@ -17957,14 +17957,6 @@ mod onenter_era_seeding {
     /// after `OnEnter` *and* after enough ticks for at least one runtime
     /// `settlement_planner_system` + `carve_plots_system` cycle so we'd see
     /// the historical orphaning-by-belt-shift if it returned.
-    // FLAKE: under the unified seed→runtime pipeline the runtime survey at
-    // tick 60+ can emit a slightly different `brain.parcels.Agricultural`
-    // rect than the OnEnter resurvey, exposing a downstream gap between
-    // `PlotIndex.ag_tiles` (stale plot still tracks the old tile) and
-    // `SettlementPlans` Agricultural zones (only emits current
-    // `brain.parcels`). See `plans/carve-plan-sync-followup.md` for the
-    // carve teardown / plan-from-PlotIndex options to fix the gap.
-    #[ignore]
     #[test]
     fn seeded_cropland_stays_inside_agricultural_plots() {
         use crate::simulation::settlement::{SettlementPlans, ZoneKind};
@@ -18009,6 +18001,175 @@ mod onenter_era_seeding {
         // bug returned the belt would shift and orphan some Cropland.
         sim.tick_n(180);
         check_invariant(&sim, "post-tick180");
+    }
+
+    /// Regression for `plans/carve-plan-sync-followup.md`: a shifted
+    /// Agricultural zone rect with an *unchanged* `culture_hash` (the
+    /// position-blind `layout_hash` bug) must still be reconciled by
+    /// `carve_plots_system`. Unchanged plots keep their entity + durable
+    /// state (`plowed_year`); the shifted plot is torn down and re-carved;
+    /// the abandoned columns of the old rect leave `ag_tiles`.
+    #[test]
+    fn carve_plots_reconciles_shifted_agricultural_rect() {
+        use crate::simulation::land::{carve_plots_system, Plot, PlotIndex};
+        use crate::simulation::settlement::{SettlementPlans, TileRect, ZoneKind};
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        trigger_onenter(&mut sim);
+
+        // 1. Find any faction with at least one Agricultural plot AND at
+        //    least one other plot. Pick one Agricultural plot to shift and
+        //    one other plot to keep — the kept plot's entity + plowed_year
+        //    stamp is the durability evidence (under legacy wholesale
+        //    teardown both would have been despawned).
+        let (target_fid, shift_rect, kept_pid, kept_entity, kept_rect): (
+            u32,
+            TileRect,
+            u32,
+            Entity,
+            TileRect,
+        ) = {
+            // Group plots by faction, then find a faction with both an
+            // Agricultural plot and any other plot to use as the durability
+            // evidence target.
+            let mut by_faction: ahash::AHashMap<u32, Vec<(u32, Entity, TileRect, ZoneKind)>> =
+                ahash::AHashMap::new();
+            {
+                let world = sim.app.world();
+                let plot_index = world.resource::<PlotIndex>();
+                for (&pid, &entity) in plot_index.by_id.iter() {
+                    let Some(plot) = world.get::<Plot>(entity) else {
+                        continue;
+                    };
+                    by_faction
+                        .entry(plot.faction_id)
+                        .or_default()
+                        .push((pid, entity, plot.rect, plot.zone_kind));
+                }
+            }
+            let mut chosen: Option<(u32, TileRect, u32, Entity, TileRect)> = None;
+            for (&fid, plots) in by_faction.iter() {
+                let Some(ag) = plots
+                    .iter()
+                    .find(|(_, _, _, k)| *k == ZoneKind::Agricultural)
+                else {
+                    continue;
+                };
+                if let Some((kpid, kent, krect, _)) = plots
+                    .iter()
+                    .find(|(_, _, r, _)| *r != ag.2)
+                    .cloned()
+                {
+                    chosen = Some((fid, ag.2, kpid, kent, krect));
+                    break;
+                }
+            }
+            let (fid, ag_rect, kpid, kent, krect) = chosen.expect(
+                "the seeded world should have at least one faction with an Agricultural \
+                 plot + another plot (any kind)",
+            );
+            // Stamp `plowed_year` on the kept plot so we can verify durable
+            // state survives the per-plot reconcile.
+            if let Some(mut p) = sim.app.world_mut().get_mut::<Plot>(kent) {
+                p.plowed_year = Some(42);
+            }
+            (fid, ag_rect, kpid, kent, krect)
+        };
+
+        // 2. Shift the Agricultural zone by +2 in x, keeping `culture_hash`
+        //    identical. Under the legacy gate, `(fid, culture_hash)` matched
+        //    so `carve_plots_system` skipped the settlement — leaving the
+        //    old Plot in place while the plan emitted the new rect. The
+        //    fixed system reconciles per-plot regardless of the hash.
+        let new_rect = TileRect::new(shift_rect.x0 + 2, shift_rect.y0, shift_rect.w, shift_rect.h);
+        {
+            let mut plans = sim.app.world_mut().resource_mut::<SettlementPlans>();
+            let plan = plans
+                .0
+                .get_mut(&target_fid)
+                .expect("target faction should have a SettlementPlan");
+            let zone = plan
+                .zones
+                .iter_mut()
+                .find(|z| z.kind == ZoneKind::Agricultural && z.rect == shift_rect)
+                .expect("the captured Agricultural rect should match a zone");
+            zone.rect = new_rect;
+        }
+
+        // 3. Drive carve_plots_system directly. Going through the full
+        //    schedule risks `settlement_planner_system` rebuilding the plan
+        //    from `SettlementBrains` (which still holds the old rect) and
+        //    overwriting our manual shift. Isolating the system under test
+        //    is the point of this regression.
+        sim.app
+            .world_mut()
+            .run_system_once(carve_plots_system)
+            .expect("carve_plots_system run");
+
+        // 4. The kept plot survived as the *same* entity with its
+        //    plowed_year stamp intact.
+        let world = sim.app.world();
+        let plot_index = world.resource::<PlotIndex>();
+        assert_eq!(
+            plot_index.by_id.get(&kept_pid).copied(),
+            Some(kept_entity),
+            "unchanged Plot's entity id must survive reconciliation"
+        );
+        let kept_plot = world
+            .get::<Plot>(kept_entity)
+            .expect("kept plot entity should still exist");
+        assert_eq!(
+            kept_plot.plowed_year,
+            Some(42),
+            "durable Plot state must survive reconciliation (Option B vs Option A)"
+        );
+        assert_eq!(kept_plot.rect, kept_rect);
+
+        // 5. The shifted-away columns left `ag_tiles`. The rect shifted by
+        //    +2 of width 16, so columns `[shift.x0, shift.x0+2)` are now
+        //    abandoned and the new columns `[shift.x0+16, shift.x0+18)` got
+        //    carved.
+        let abandoned_cols = shift_rect.x0..shift_rect.x0 + 2;
+        for x in abandoned_cols {
+            for y in shift_rect.y0..shift_rect.y0 + shift_rect.h as i32 {
+                assert!(
+                    !plot_index.ag_tiles.contains(&(x, y)),
+                    "abandoned column ({x},{y}) should have left ag_tiles"
+                );
+            }
+        }
+        let new_only_cols = (new_rect.x0 + new_rect.w as i32 - 2)..(new_rect.x0 + new_rect.w as i32);
+        for x in new_only_cols {
+            for y in new_rect.y0..new_rect.y0 + new_rect.h as i32 {
+                assert!(
+                    plot_index.ag_tiles.contains(&(x, y)),
+                    "freshly-carved column ({x},{y}) should be in ag_tiles"
+                );
+            }
+        }
+
+        // 6. `SettlementPlans` and `PlotIndex.ag_tiles` agree on every tile
+        //    in the rectangle — the test's prime invariant. (The
+        //    `seeded_cropland_stays_inside_agricultural_plots` test checks
+        //    this on the seeded patch; we check it on the synthetic shift.)
+        let plans = world.resource::<SettlementPlans>();
+        let plan_covers = |x: i32, y: i32| -> bool {
+            plans.0.values().any(|p| {
+                p.zones
+                    .iter()
+                    .any(|z| z.kind == ZoneKind::Agricultural && z.rect.contains(x, y))
+            })
+        };
+        for x in new_rect.x0..new_rect.x0 + new_rect.w as i32 {
+            for y in new_rect.y0..new_rect.y0 + new_rect.h as i32 {
+                assert!(
+                    plot_index.ag_tiles.contains(&(x, y)) && plan_covers(x, y),
+                    "tile ({x},{y}) should be tracked by both PlotIndex.ag_tiles and SettlementPlans"
+                );
+            }
+        }
     }
 
     fn assert_perm_settlement_adopted(sim: &TestSim, label: &str) {

@@ -19,13 +19,10 @@ use crate::simulation::settlement::{
     Settlement, SettlementMap, SettlementPlans, StreetSegment, StreetSpine, TileRect, ZoneKind,
 };
 use crate::world::chunk::{ChunkMap, Z_MIN};
-#[allow(unused_imports)]
 use crate::world::chunk_streaming::TileChangedEvent;
 use crate::world::globe::Globe;
 use crate::world::seasons::TICKS_PER_DAY;
 use crate::world::terrain::{tile_at_3d, WorldGen};
-#[allow(unused_imports)]
-use crate::world::tile::{TileData, TileKind};
 
 pub type PlotId = u32;
 
@@ -226,8 +223,9 @@ impl TenureHolder {
 
 /// Per-faction registry of carved plots. `by_tile` is the primary
 /// lookup hot path — `tile_buildable_by` and the future farm-job gate
-/// both index here. `by_faction_hash` lets the carve system skip work
-/// when the upstream `SettlementPlan` hasn't changed.
+/// both index here. `carve_plots_system` reconciles per-plot every tick
+/// against the current `SettlementPlan.zones` — no coarse faction-level
+/// hash gate; correctness rides on `(zone_kind, rect)` identity.
 #[derive(Resource, Default)]
 pub struct PlotIndex {
     pub by_id: AHashMap<PlotId, Entity>,
@@ -244,7 +242,6 @@ pub struct PlotIndex {
     /// resolving the `Plot` component (so `road_carve_system` /
     /// `write_road_tile` need only `Res<PlotIndex>`, not a `Query<&Plot>`).
     pub ag_tiles: AHashSet<(i32, i32)>,
-    pub by_faction_hash: AHashMap<u32, u64>,
     pub next_id: u32,
 }
 
@@ -675,33 +672,86 @@ fn slice_starts(start: i32, end: i32, stride: i32) -> Vec<i32> {
     starts
 }
 
-/// Carve plots out of every faction's current `SettlementPlan` zones.
-/// Idempotent: a faction whose `culture_hash` matches the value last
-/// carved is skipped. Re-plans tear down the faction's existing plots
-/// and rebuild — Phase 1 simplicity; the diff path lands later.
+/// Tear down a single Plot: despawn the entity and drop its `by_id`,
+/// `by_tile`, `ag_tiles`, and `FieldTileIndex` entries. The caller is
+/// responsible for removing the pid from `PlotIndex.by_settlement`. Any
+/// Agricultural tile removed from `ag_tiles` is recorded in
+/// `dropped_ag_tiles` so the post-reconcile pass can revert orphaned
+/// Cropland that no longer falls inside any current Agricultural plot.
+fn tear_down_plot(
+    pid: PlotId,
+    rect: TileRect,
+    zone_kind: ZoneKind,
+    plot_index: &mut PlotIndex,
+    field_tiles: &mut crate::simulation::farm::FieldTileIndex,
+    commands: &mut Commands,
+    dropped_ag_tiles: &mut AHashSet<(i32, i32)>,
+) {
+    let Some(entity) = plot_index.by_id.remove(&pid) else {
+        return;
+    };
+    commands.entity(entity).despawn();
+    let is_ag = zone_kind == ZoneKind::Agricultural;
+    for ty in rect.y0..rect.y0 + rect.h as i32 {
+        for tx in rect.x0..rect.x0 + rect.w as i32 {
+            let t = (tx, ty);
+            // Only release `by_tile` if this plot still owns the cell —
+            // defends against an unexpected overlapping carve.
+            if plot_index.by_tile.get(&t) == Some(&pid) {
+                plot_index.by_tile.remove(&t);
+            }
+            if is_ag {
+                if plot_index.ag_tiles.remove(&t) {
+                    dropped_ag_tiles.insert(t);
+                }
+                field_tiles.remove(t);
+            }
+        }
+    }
+}
+
+/// Carve plots out of every faction's current `SettlementPlan` zones and
+/// reconcile against the existing `PlotIndex`. Per-plot identity is
+/// `(zone_kind, rect)` — a plot whose key matches a canonical subdivision
+/// of a current zone is kept (preserving `plowed_year`, `tenure`, valuation,
+/// etc.); a plot whose key is no longer in the canonical set is torn down.
+/// Fresh plots are carved for canonical entries with no surviving match.
 ///
-/// Plots are valued at carve time (Phase 2) — `compute_plot_value`
-/// reads each plot's centre / corner fertility from the world. Re-plans
-/// recompute valuations naturally; live revaluation under demand
-/// pressure lands with the listings system in Phase 4+.
+/// The system is idempotent: with stable `plan.zones` it does nothing on
+/// subsequent ticks (kept-set fully covers desired-set). The previous
+/// `culture_hash` early-return was the bug — `layout_hash` does NOT include
+/// parcel rect positions, so position drift between two surveys passed the
+/// gate while `compat_plan_from_brain` emitted the new rects, orphaning the
+/// old Plots.
+///
+/// After reconciliation, the orphaned-Cropland revert pass walks tiles
+/// dropped from `ag_tiles` and rewrites any tile no longer in any current
+/// Agricultural plot from `TileKind::Cropland` back to its natural surface
+/// kind, so a belt-shift doesn't leave tilled tiles haunting the wilderness.
 pub fn carve_plots_system(
     mut commands: Commands,
     plans: Res<SettlementPlans>,
     settlement_map: Res<SettlementMap>,
     settlement_q: Query<&Settlement>,
     registry: Res<FactionRegistry>,
-    chunk_map: Res<ChunkMap>,
+    mut chunk_map: ResMut<ChunkMap>,
     gen: Res<WorldGen>,
     globe: Res<Globe>,
     mut plot_index: ResMut<PlotIndex>,
     mut field_tiles: ResMut<crate::simulation::farm::FieldTileIndex>,
+    plot_q: Query<&Plot>,
+    mut tile_changed: EventWriter<TileChangedEvent>,
 ) {
-    // Stage replan inputs first so we don't borrow `plans` while
+    // Phase 1: surface-only plots. Underground plot variants come with
+    // the tunneling-aware land model in a later phase.
+    const PLOT_Z: i8 = 0;
+
+    // Stage settlement-level inputs first so we don't borrow `plans` while
     // mutating `plot_index`.
     struct CarveJob {
         fid: u32,
         sid: u32,
-        new_hash: u64,
+        culture_hash: u64,
         zones: Vec<(ZoneKind, TileRect)>,
         faction_home: (i32, i32),
         market_tile: (i32, i32),
@@ -713,9 +763,6 @@ pub fn carve_plots_system(
             continue;
         }
         if plan.zones.is_empty() {
-            continue;
-        }
-        if plot_index.by_faction_hash.get(&fid).copied() == Some(plan.culture_hash) {
             continue;
         }
         let Some(sid) = settlement_map.first_for_faction(fid) else {
@@ -735,7 +782,7 @@ pub fn carve_plots_system(
         work.push(CarveJob {
             fid,
             sid: sid.0,
-            new_hash: plan.culture_hash,
+            culture_hash: plan.culture_hash,
             zones,
             faction_home: faction.home_tile,
             market_tile: sett.market_tile,
@@ -743,115 +790,165 @@ pub fn carve_plots_system(
         });
     }
 
-    // Phase 1: surface-only plots. Underground plot variants come with
-    // the tunneling-aware land model in a later phase.
-    const PLOT_Z: i8 = 0;
+    let mut dropped_ag_tiles: AHashSet<(i32, i32)> = AHashSet::new();
 
     for CarveJob {
         fid,
         sid: sid_u32,
-        new_hash,
+        culture_hash,
         zones,
         faction_home,
         market_tile,
         spine,
     } in work
     {
-        // Tear down stale plots tied to this settlement.
-        let stale_ids: Vec<PlotId> = plot_index
-            .by_settlement
-            .remove(&sid_u32)
-            .unwrap_or_default();
-        if !stale_ids.is_empty() {
-            for pid in &stale_ids {
-                if let Some(entity) = plot_index.by_id.remove(pid) {
-                    commands.entity(entity).despawn();
-                }
-            }
-            let stale_set: AHashSet<PlotId> = stale_ids.into_iter().collect();
-            // Drop ag-tile entries for the torn-down plots before retaining
-            // `by_tile`, so `tile_is_farm_protected` doesn't keep guarding a
-            // field that no longer exists. (Tiles already stamped `Cropland`
-            // intentionally stay tilled-looking — see plan risk note.)
-            let stale_ag: Vec<(i32, i32)> = plot_index
-                .by_tile
-                .iter()
-                .filter(|(_, pid)| stale_set.contains(pid))
-                .map(|(t, _)| *t)
-                .collect();
-            for t in stale_ag {
-                plot_index.ag_tiles.remove(&t);
-                // Drop per-tile field state too — abandoned plots release
-                // their nutrient history. Tile kind (Cropland or natural soil)
-                // stays as-is.
-                field_tiles.remove(t);
-            }
-            plot_index.by_tile.retain(|_, pid| !stale_set.contains(pid));
-        }
-
-        // Carve fresh plots.
-        let mut new_ids: Vec<PlotId> = Vec::new();
-        for (kind, rect) in zones {
-            let rects = match plot_size_for(kind) {
-                Some((pw, ph)) => subdivide(rect, pw, ph),
-                None => vec![rect],
+        // 1. Compute the canonical desired plot set from current zones.
+        //    Each zone subdivides into one or more (kind, rect) plots — the
+        //    canonical key. A settlement with no zones emits an empty set
+        //    so all its plots are torn down.
+        let mut desired: AHashSet<(ZoneKind, TileRect)> = AHashSet::new();
+        for (kind, rect) in &zones {
+            let rects = match plot_size_for(*kind) {
+                Some((pw, ph)) => subdivide(*rect, pw, ph),
+                None => vec![*rect],
             };
             for r in rects {
-                let pid = plot_index.alloc_id();
-                let base_value = compute_plot_value(
-                    r,
-                    kind,
-                    faction_home,
-                    market_tile,
-                    &chunk_map,
-                    &gen,
-                    &globe,
+                desired.insert((*kind, r));
+            }
+        }
+
+        // 2. Reconcile against existing plots. A plot whose key still maps
+        //    into `desired` is kept (and removed from `desired` so we don't
+        //    re-carve it); a plot whose key is gone gets torn down.
+        let existing_pids: Vec<PlotId> = plot_index
+            .by_settlement
+            .get(&sid_u32)
+            .cloned()
+            .unwrap_or_default();
+        let mut kept_pids: Vec<PlotId> = Vec::with_capacity(existing_pids.len());
+        for pid in existing_pids {
+            let Some(&entity) = plot_index.by_id.get(&pid) else {
+                continue;
+            };
+            let Ok(plot) = plot_q.get(entity) else {
+                continue;
+            };
+            let key = (plot.zone_kind, plot.rect);
+            if desired.remove(&key) {
+                kept_pids.push(pid);
+            } else {
+                tear_down_plot(
+                    pid,
+                    plot.rect,
+                    plot.zone_kind,
+                    &mut plot_index,
+                    &mut field_tiles,
+                    &mut commands,
+                    &mut dropped_ag_tiles,
                 );
-                let (frontage_edge, access_tile) = frontage_for_rect(r, &spine);
-                let plot = Plot {
-                    id: pid,
-                    settlement_id: sid_u32,
-                    faction_id: fid,
-                    rect: r,
-                    z: PLOT_Z,
-                    zone_kind: kind,
-                    tenure: Tenure::StateOwned,
-                    holder: TenureHolder::State { faction_id: fid },
-                    base_value,
-                    last_valued_tick: 0,
-                    missed_payments: 0,
-                    frontage_edge,
-                    access_tile,
-                    parent_plot: None,
-                    plowed_year: None,
-                };
-                let entity = commands.spawn(plot).id();
-                plot_index.by_id.insert(pid, entity);
-                new_ids.push(pid);
-                let is_ag = kind == ZoneKind::Agricultural;
-                for ty in r.y0..r.y0 + r.h as i32 {
-                    for tx in r.x0..r.x0 + r.w as i32 {
-                        plot_index.by_tile.insert((tx, ty), pid);
-                        if !is_ag {
-                            continue;
-                        }
-                        plot_index.ag_tiles.insert((tx, ty));
-                        // Seasonal-farming jellyfish: the carve pass NO
-                        // LONGER stamps Cropland. Founders pay for tilling
-                        // in Spring 1 via `prepare_field_task_system`. Tile
-                        // role is preserved for visual ordering by callers
-                        // that consult `field_tile_role(...)`, but the
-                        // ChunkMap stays untouched here.
-                        let z = chunk_map.surface_z_at(tx, ty);
-                        let cur = chunk_map.tile_at(tx, ty, z);
-                        let _ = field_tile_role(new_hash, fid, (tx, ty), r);
-                        field_tiles.ensure_entry((tx, ty), pid, cur.fertility);
+            }
+        }
+
+        // 3. Carve the remaining desired plots.
+        let chunk_map_ref = &*chunk_map;
+        for (kind, r) in desired {
+            let pid = plot_index.alloc_id();
+            let base_value = compute_plot_value(
+                r,
+                kind,
+                faction_home,
+                market_tile,
+                chunk_map_ref,
+                &gen,
+                &globe,
+            );
+            let (frontage_edge, access_tile) = frontage_for_rect(r, &spine);
+            let plot = Plot {
+                id: pid,
+                settlement_id: sid_u32,
+                faction_id: fid,
+                rect: r,
+                z: PLOT_Z,
+                zone_kind: kind,
+                tenure: Tenure::StateOwned,
+                holder: TenureHolder::State { faction_id: fid },
+                base_value,
+                last_valued_tick: 0,
+                missed_payments: 0,
+                frontage_edge,
+                access_tile,
+                parent_plot: None,
+                plowed_year: None,
+            };
+            let entity = commands.spawn(plot).id();
+            plot_index.by_id.insert(pid, entity);
+            kept_pids.push(pid);
+            let is_ag = kind == ZoneKind::Agricultural;
+            for ty in r.y0..r.y0 + r.h as i32 {
+                for tx in r.x0..r.x0 + r.w as i32 {
+                    plot_index.by_tile.insert((tx, ty), pid);
+                    if !is_ag {
+                        continue;
                     }
+                    plot_index.ag_tiles.insert((tx, ty));
+                    // Seasonal-farming jellyfish: the carve pass NO LONGER
+                    // stamps Cropland. Founders pay for tilling in Spring 1
+                    // via `prepare_field_task_system`. Tile role is preserved
+                    // for visual ordering by callers that consult
+                    // `field_tile_role(...)`, but the ChunkMap stays
+                    // untouched here.
+                    let z = chunk_map_ref.surface_z_at(tx, ty);
+                    let cur = chunk_map_ref.tile_at(tx, ty, z);
+                    let _ = field_tile_role(culture_hash, fid, (tx, ty), r);
+                    field_tiles.ensure_entry((tx, ty), pid, cur.fertility);
                 }
             }
         }
-        plot_index.by_settlement.insert(sid_u32, new_ids);
-        plot_index.by_faction_hash.insert(fid, new_hash);
+
+        if kept_pids.is_empty() {
+            plot_index.by_settlement.remove(&sid_u32);
+        } else {
+            plot_index.by_settlement.insert(sid_u32, kept_pids);
+        }
+    }
+
+    // 4. Orphaned-Cropland revert. Any tile dropped from `ag_tiles` that is
+    //    still NOT in `ag_tiles` after carving (i.e. no replacement plot
+    //    covers it) gets reverted from `Cropland` back to its natural
+    //    surface kind. Tiles still inside a current Agricultural plot stay
+    //    `Cropland`. Done in one pass at the end so an intra-tick teardown
+    //    + re-carve over the same tile doesn't flicker.
+    if !dropped_ag_tiles.is_empty() {
+        use crate::world::biome::classify_at_tile;
+        use crate::world::terrain::{biome_bands, surface_v};
+        use crate::world::tile::{TileData, TileKind};
+        for tile in dropped_ag_tiles {
+            if plot_index.ag_tiles.contains(&tile) {
+                continue;
+            }
+            let (tx, ty) = tile;
+            let z = chunk_map.surface_z_at(tx, ty);
+            let cur = chunk_map.tile_at(tx, ty, z);
+            if cur.kind != TileKind::Cropland {
+                continue;
+            }
+            let biome = classify_at_tile(&globe, tx, ty);
+            let v = surface_v(tx, ty, &gen, &globe);
+            let natural_kind = biome_bands(biome).pick(v);
+            chunk_map.set_tile(
+                tx,
+                ty,
+                z,
+                TileData {
+                    kind: natural_kind,
+                    elevation: cur.elevation,
+                    fertility: cur.fertility,
+                    flags: cur.flags,
+                    ore: cur.ore,
+                },
+            );
+            tile_changed.send(TileChangedEvent { tx, ty });
+        }
     }
 }
 
