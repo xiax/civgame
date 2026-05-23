@@ -294,12 +294,25 @@ pub fn compute_priority(
     // `Stockpile` still wins.
     if posting_kind == JobKind::Farm {
         if let JobProgress::FieldWork {
+            phase,
             assigned_farmer: None,
             ..
         } = progress
         {
             if (food_pressure(faction) as f32) < CRITICAL_FOOD_TRIGGER {
                 priority = priority.max(SEASONAL_FARM_PRIORITY.min(PRIORITY_PLAYER - 1));
+                // Balanced-farming: tie-break bias for Spring Plant over
+                // Prepare. The per-phase cap split (jobs.rs) already
+                // guarantees Plant a worker share; this bias settles the
+                // case where one worker is equidistant from a Prepare and
+                // a Plant tile — Plant wins. `< PRIORITY_PLAYER` preserved.
+                if matches!(calendar.season, crate::world::seasons::Season::Spring)
+                    && *phase == crate::simulation::farm::FarmWorkPhase::Plant
+                {
+                    let bumped = priority
+                        .saturating_add(crate::simulation::farm::SPRING_PLANT_PRIORITY_BIAS);
+                    priority = bumped.min(PRIORITY_PLAYER - 1);
+                }
             }
         }
     }

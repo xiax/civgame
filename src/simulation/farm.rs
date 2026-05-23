@@ -68,9 +68,56 @@ pub const SUPPLY_SAFETY_DENOM: u32 = 4;
 /// Phase-weighted seasonal `FieldWork` claim-share floors — the fraction of
 /// the village that may pile onto open seasonal field work, overriding the
 /// normal Farm workforce-budget cap. Heavier in Spring (prep + planting rush)
-/// than Autumn (harvest).
-pub const SEASONAL_FARM_CLAIM_SHARE_SPRING: f32 = 0.65;
+/// than Autumn (harvest). Spring is split per phase so Prepare can't lock
+/// Plant out of the shared cap (the chokepoint behind the balanced-farming
+/// plan); when only one Spring phase has open postings, the other phase's
+/// share carries over so the full Spring envelope (0.65) is still used.
+pub const SPRING_FARM_PLANT_SHARE: f32 = 0.30;
+pub const SPRING_FARM_PREPARE_SHARE: f32 = 0.35;
 pub const SEASONAL_FARM_CLAIM_SHARE_AUTUMN: f32 = 0.45;
+
+/// Priority bias added to a Spring `Plant` posting on top of the seasonal
+/// hard-priority floor — defence-in-depth tie-break when a single worker is
+/// equidistant from a Prepare and Plant posting. Plant always wins ties.
+/// With the unpaid claim-score `priority * 0.01`, +5 = +0.05, which beats the
+/// `dist * 0.001` term within ~50 tiles. Kept `< PRIORITY_PLAYER`.
+pub const SPRING_PLANT_PRIORITY_BIAS: u8 = 5;
+
+/// Pure helper: the seasonal `FieldWork` claim-cap floor share for an open
+/// posting of `phase` in `season`. Returns 0.0 when no seasonal floor lifts
+/// (Summer / Winter / off-season phases). `any_open_plant` / `any_open_prepare`
+/// drive the Spring carryover rule — when only one of the two phases has open
+/// postings the active phase absorbs the inactive one's share so the full
+/// Spring envelope (0.65) is still consumed.
+///
+/// Acute food-pressure suppression is the caller's responsibility — this is
+/// the pure share-of-members curve.
+#[inline]
+pub fn seasonal_field_work_floor_share(
+    season: Season,
+    phase: FarmWorkPhase,
+    any_open_plant: bool,
+    any_open_prepare: bool,
+) -> f32 {
+    match (season, phase) {
+        (Season::Spring, FarmWorkPhase::Plant) => {
+            if any_open_prepare {
+                SPRING_FARM_PLANT_SHARE
+            } else {
+                SPRING_FARM_PLANT_SHARE + SPRING_FARM_PREPARE_SHARE
+            }
+        }
+        (Season::Spring, FarmWorkPhase::Prepare) => {
+            if any_open_plant {
+                SPRING_FARM_PREPARE_SHARE
+            } else {
+                SPRING_FARM_PLANT_SHARE + SPRING_FARM_PREPARE_SHARE
+            }
+        }
+        (Season::Autumn, FarmWorkPhase::Harvest) => SEASONAL_FARM_CLAIM_SHARE_AUTUMN,
+        _ => 0.0,
+    }
+}
 /// Summer caretaker pressure is a fraction of the full annual deficit — fields
 /// are mostly planted, only stragglers remain.
 pub const SUMMER_FARM_PRESSURE_SCALE: f32 = 0.35;
@@ -964,6 +1011,144 @@ mod tests {
             (((naive_active + 95) / 96).max(1)).min(12),
             1,
             "without the floor an active 6-plot village would shrink-plan to 1"
+        );
+    }
+
+    // --- Balanced-farming: per-phase Spring claim-floor with carryover ----
+
+    /// Inline helper: convert a share + member count to the integer floor
+    /// the claim system would compute. Mirrors `((s * n).ceil() as u32).max(1)`.
+    fn share_to_floor(share: f32, members: u32) -> u32 {
+        ((share * members as f32).ceil() as u32).max(1)
+    }
+
+    #[test]
+    fn spring_split_reserves_plant_share_when_both_phases_open() {
+        // Both phases open: Plant gets 0.30, Prepare gets 0.35, summing to
+        // the legacy Spring envelope (0.65). 20 members → Plant cap floor 6,
+        // Prepare cap floor 7.
+        let plant_share = seasonal_field_work_floor_share(
+            Season::Spring,
+            FarmWorkPhase::Plant,
+            /* any_open_plant */ true,
+            /* any_open_prepare */ true,
+        );
+        let prep_share = seasonal_field_work_floor_share(
+            Season::Spring,
+            FarmWorkPhase::Prepare,
+            true,
+            true,
+        );
+        assert!((plant_share - SPRING_FARM_PLANT_SHARE).abs() < f32::EPSILON);
+        assert!((prep_share - SPRING_FARM_PREPARE_SHARE).abs() < f32::EPSILON);
+        assert_eq!(share_to_floor(plant_share, 20), 6);
+        assert_eq!(share_to_floor(prep_share, 20), 7);
+        // Combined envelope preserved.
+        assert!(
+            (plant_share + prep_share - 0.65).abs() < 1e-6,
+            "Spring envelope drift: {} + {} != 0.65",
+            plant_share,
+            prep_share
+        );
+    }
+
+    #[test]
+    fn spring_prepare_only_carries_over_plants_share() {
+        // Early Spring (no plantable tiles yet) → only Prepare is postable.
+        // Prepare absorbs the full Spring envelope so the village isn't
+        // throttled below today's behaviour.
+        let prep_share = seasonal_field_work_floor_share(
+            Season::Spring,
+            FarmWorkPhase::Prepare,
+            /* any_open_plant */ false,
+            /* any_open_prepare */ true,
+        );
+        assert!(
+            (prep_share - (SPRING_FARM_PLANT_SHARE + SPRING_FARM_PREPARE_SHARE)).abs()
+                < f32::EPSILON
+        );
+        assert_eq!(share_to_floor(prep_share, 20), 13);
+    }
+
+    #[test]
+    fn spring_plant_only_carries_over_prepares_share() {
+        // Mid-Spring after every tile is prepared — Prepare posting cleared,
+        // only Plant remains. Plant absorbs the full envelope so the village
+        // doesn't sit idle when Plant is the bottleneck.
+        let plant_share = seasonal_field_work_floor_share(
+            Season::Spring,
+            FarmWorkPhase::Plant,
+            /* any_open_plant */ true,
+            /* any_open_prepare */ false,
+        );
+        assert!(
+            (plant_share - (SPRING_FARM_PLANT_SHARE + SPRING_FARM_PREPARE_SHARE)).abs()
+                < f32::EPSILON
+        );
+        assert_eq!(share_to_floor(plant_share, 20), 13);
+    }
+
+    #[test]
+    fn autumn_harvest_share_unchanged() {
+        // The Autumn floor is single-phase (only Harvest is postable). The
+        // `any_open_*` arguments are irrelevant — Plant/Prepare aren't
+        // postable in Autumn — but the helper still returns the legacy
+        // share so the regression covers both extremes.
+        let s_open = seasonal_field_work_floor_share(
+            Season::Autumn,
+            FarmWorkPhase::Harvest,
+            true,
+            true,
+        );
+        let s_alone = seasonal_field_work_floor_share(
+            Season::Autumn,
+            FarmWorkPhase::Harvest,
+            false,
+            false,
+        );
+        assert!((s_open - SEASONAL_FARM_CLAIM_SHARE_AUTUMN).abs() < f32::EPSILON);
+        assert!((s_alone - SEASONAL_FARM_CLAIM_SHARE_AUTUMN).abs() < f32::EPSILON);
+        assert_eq!(share_to_floor(s_alone, 20), 9);
+    }
+
+    #[test]
+    fn off_season_phases_have_no_floor() {
+        // Summer / Winter have no seasonal floor — the normal Farm
+        // workforce-budget cap holds. A Spring Harvest or Autumn Plant
+        // shouldn't lift either (those phases don't exist in those seasons,
+        // but the helper must answer 0.0 defensively).
+        for (season, phase) in [
+            (Season::Summer, FarmWorkPhase::Prepare),
+            (Season::Summer, FarmWorkPhase::Plant),
+            (Season::Summer, FarmWorkPhase::Harvest),
+            (Season::Winter, FarmWorkPhase::Prepare),
+            (Season::Winter, FarmWorkPhase::Plant),
+            (Season::Winter, FarmWorkPhase::Harvest),
+            (Season::Spring, FarmWorkPhase::Harvest),
+            (Season::Autumn, FarmWorkPhase::Prepare),
+            (Season::Autumn, FarmWorkPhase::Plant),
+        ] {
+            let s = seasonal_field_work_floor_share(season, phase, true, true);
+            assert_eq!(
+                s, 0.0,
+                "expected no floor for ({:?}, {:?}), got {}",
+                season, phase, s
+            );
+        }
+    }
+
+    #[test]
+    fn spring_plant_priority_bias_kept_under_player() {
+        // The bias is `+5` on top of `SEASONAL_FARM_PRIORITY=170` — well
+        // under `PRIORITY_PLAYER` and stays well clear of u8 saturation.
+        // Defence in depth against future tuning.
+        let bumped =
+            crate::simulation::projects::SEASONAL_FARM_PRIORITY.saturating_add(SPRING_PLANT_PRIORITY_BIAS);
+        assert!(
+            bumped < crate::simulation::projects::PRIORITY_PLAYER,
+            "Spring Plant bias must stay below PRIORITY_PLAYER ({} >= {})",
+            bumped,
+            crate::simulation::projects::PRIORITY_PLAYER
         );
     }
 }

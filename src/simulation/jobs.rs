@@ -4048,20 +4048,26 @@ fn profession_bias(p: Profession, kind: JobKind) -> f32 {
 }
 
 /// Distinguishing key for claim-cap accounting. Stockpile postings split by
-/// the targeted resource so wood/stone caps are independent of food's. All
-/// other kinds (Haul, Build, Farm, Craft) cap as a single bucket per JobKind.
+/// the targeted resource so wood/stone caps are independent of food's;
+/// `FieldWork` postings split by `FarmWorkPhase` so Spring Prepare can't lock
+/// Plant out of the shared seasonal cap (the balanced-farming fix). All other
+/// kinds (Haul, Build, Farm/Plow, Craft) cap as a single bucket per JobKind.
 fn cap_bucket(
     p: &JobPosting,
 ) -> (
     JobKind,
     Option<crate::economy::resource_catalog::ResourceId>,
+    Option<crate::simulation::farm::FarmWorkPhase>,
 ) {
     match (&p.kind, &p.progress) {
         (JobKind::Stockpile, JobProgress::Stockpile { resource_id, .. }) => {
-            (JobKind::Stockpile, Some(*resource_id))
+            (JobKind::Stockpile, Some(*resource_id), None)
         }
-        (JobKind::Stockpile, JobProgress::Calories { .. }) => (JobKind::Stockpile, None),
-        _ => (p.kind, None),
+        (JobKind::Stockpile, JobProgress::Calories { .. }) => (JobKind::Stockpile, None, None),
+        (JobKind::Farm, JobProgress::FieldWork { phase, .. }) => {
+            (JobKind::Farm, None, Some(*phase))
+        }
+        _ => (p.kind, None, None),
     }
 }
 
@@ -4156,13 +4162,16 @@ pub fn job_claim_system(
             u32,
             JobKind,
             Option<crate::economy::resource_catalog::ResourceId>,
+            Option<crate::simulation::farm::FarmWorkPhase>,
         ),
         u32,
     > = AHashMap::new();
     for (faction_id, postings) in board.postings.iter() {
         for p in postings.iter() {
-            let (kind, rid) = cap_bucket(p);
-            *claim_counts.entry((*faction_id, kind, rid)).or_insert(0) += p.claimants.len() as u32;
+            let (kind, rid, phase) = cap_bucket(p);
+            *claim_counts
+                .entry((*faction_id, kind, rid, phase))
+                .or_insert(0) += p.claimants.len() as u32;
         }
     }
 
@@ -4208,48 +4217,74 @@ pub fn job_claim_system(
         // Score every eligible posting and pick the best.
         let mut best: Option<(usize, f32)> = None;
         let postings = board.faction_postings(faction_id);
+        // Spring carryover predicate: when only one of Prepare/Plant has an
+        // open posting, that phase absorbs the other's share so the full
+        // Spring envelope (PLANT + PREPARE) is still usable. Computed once
+        // per worker iteration (board state doesn't change mid-loop).
+        let (any_open_plant, any_open_prepare) = {
+            let mut p_plant = false;
+            let mut p_prep = false;
+            for q in postings.iter() {
+                if let JobProgress::FieldWork {
+                    phase,
+                    assigned_farmer: None,
+                    ..
+                } = q.progress
+                {
+                    match phase {
+                        crate::simulation::farm::FarmWorkPhase::Plant => p_plant = true,
+                        crate::simulation::farm::FarmWorkPhase::Prepare => p_prep = true,
+                        _ => {}
+                    }
+                }
+            }
+            (p_plant, p_prep)
+        };
         for (idx, p) in postings.iter().enumerate() {
             // Cap: per-bucket allocation is the workforce budget share applied
             // to current member count, floored at 1 so even small factions
             // can keep one worker on each role. Stockpile postings cap by
             // Good so food can't crowd out wood/stone slots.
-            let (kind, rid) = cap_bucket(p);
+            let (kind, rid, phase) = cap_bucket(p);
             let share = bucket_share(&budget, kind, rid);
             let mut cap = ((share * faction.member_count as f32).round() as u32).max(1);
             // Phase-weighted seasonal claim floor: an open seasonal `FieldWork`
             // posting (`assigned_farmer == None` — Spring prep/plant, Autumn
             // harvest) pulls a phase-weighted fraction of the village onto
-            // field work, overriding the normal Farm budget cap. Suppressed
-            // under acute food pressure so emergency foraging wins; the Plow
-            // and Summer-caretaker (`assigned_farmer == Some`) postings are
+            // field work, overriding the normal Farm budget cap. Spring is
+            // split per phase (Plant 0.30 / Prepare 0.35) so Prepare can't
+            // lock Plant out of a shared cap; when only one Spring phase is
+            // active, the other phase's share carries over so the full
+            // Spring envelope (0.65) is still consumed. Suppressed under
+            // acute food pressure so emergency foraging wins; Plow and
+            // Summer-caretaker (`assigned_farmer == Some`) postings are
             // untouched (they don't match this pattern).
             if kind == JobKind::Farm {
                 if let JobProgress::FieldWork {
+                    phase: this_phase,
                     assigned_farmer: None,
                     ..
                 } = p.progress
                 {
                     if (food_pressure(faction) as f32) < CRITICAL_FOOD_TRIGGER {
-                        let season_share = match calendar.season {
-                            crate::world::seasons::Season::Spring => {
-                                Some(crate::simulation::farm::SEASONAL_FARM_CLAIM_SHARE_SPRING)
-                            }
-                            crate::world::seasons::Season::Autumn => {
-                                Some(crate::simulation::farm::SEASONAL_FARM_CLAIM_SHARE_AUTUMN)
-                            }
-                            // Summer / Winter keep the normal Farm budget cap.
-                            _ => None,
-                        };
-                        if let Some(ss) = season_share {
-                            let floor =
-                                ((ss * faction.member_count as f32).ceil() as u32).max(1);
+                        let floor_share =
+                            crate::simulation::farm::seasonal_field_work_floor_share(
+                                calendar.season,
+                                this_phase,
+                                any_open_plant,
+                                any_open_prepare,
+                            );
+                        if floor_share > 0.0 {
+                            let floor = ((floor_share * faction.member_count as f32).ceil()
+                                as u32)
+                                .max(1);
                             cap = cap.max(floor);
                         }
                     }
                 }
             }
             let count = claim_counts
-                .get(&(faction_id, kind, rid))
+                .get(&(faction_id, kind, rid, phase))
                 .copied()
                 .unwrap_or(0);
             if count >= cap {
@@ -4395,9 +4430,11 @@ pub fn job_claim_system(
         // Apply the claim: insert component, push claimant, bump cap counter.
         let postings = board.faction_postings_mut(faction_id);
         let posting = &mut postings[idx];
-        let (kind, rid) = cap_bucket(posting);
+        let (kind, rid, phase) = cap_bucket(posting);
         posting.claimants.push(worker);
-        *claim_counts.entry((faction_id, kind, rid)).or_insert(0) += 1;
+        *claim_counts
+            .entry((faction_id, kind, rid, phase))
+            .or_insert(0) += 1;
         commands.entity(worker).insert(JobClaim {
             job_id: posting.id,
             faction_id,
