@@ -8,6 +8,7 @@ pub mod hover;
 pub mod hud;
 pub mod inspector;
 pub mod job_board;
+pub mod manual_drive;
 pub mod migration_panel;
 pub mod orders;
 pub mod selection;
@@ -64,6 +65,7 @@ impl Plugin for UiPlugin {
                     (
                         tech_panel::tech_panel_system,
                         vehicle_designer::vehicle_designer_system,
+                        manual_drive::manual_drive_input_system,
                     ),
                     debug_panel::debug_panel_system,
                     job_board::job_board_panel_system,

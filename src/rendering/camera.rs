@@ -82,6 +82,7 @@ pub fn position_camera_for_spawn(
     info!("Camera repositioned to mega-chunk ({mx},{my}) tile ({tx},{ty})");
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn camera_input_system(
     mut contexts: EguiContexts,
     time: Res<Time>,
@@ -95,6 +96,7 @@ pub fn camera_input_system(
     mut camera_query: Query<(&mut Transform, &mut OrthographicProjection), With<Camera>>,
     map_view_mode: Res<MapViewMode>,
     map_projection: Res<MapProjection>,
+    manual_drive: Res<crate::simulation::vehicle::ManualDriveState>,
 ) {
     let Ok((mut transform, mut projection)) = camera_query.get_single_mut() else {
         return;
@@ -116,25 +118,29 @@ pub fn camera_input_system(
     let dt = time.delta_secs();
     let speed = PAN_SPEED * projection.scale;
 
-    // WASD panning
-    let mut pan = Vec2::ZERO;
-    if keys.pressed(KeyCode::KeyW) || keys.pressed(KeyCode::ArrowUp) {
-        pan.y += 1.0;
-    }
-    if keys.pressed(KeyCode::KeyS) || keys.pressed(KeyCode::ArrowDown) {
-        pan.y -= 1.0;
-    }
-    if keys.pressed(KeyCode::KeyA) || keys.pressed(KeyCode::ArrowLeft) {
-        pan.x -= 1.0;
-    }
-    if keys.pressed(KeyCode::KeyD) || keys.pressed(KeyCode::ArrowRight) {
-        pan.x += 1.0;
-    }
-
-    if pan != Vec2::ZERO {
-        let delta = pan.normalize() * speed * dt;
-        transform.translation.x += delta.x;
-        transform.translation.y += delta.y * pan_y_factor;
+    // WASD panning — suppressed while a debug Test-Drive session is
+    // active (those keys steer the vehicle instead). Egui keyboard focus
+    // suppresses too, so typing in a panel doesn't pan the camera.
+    let egui_wants_kb = contexts.ctx_mut().wants_keyboard_input();
+    if manual_drive.active.is_none() && !egui_wants_kb {
+        let mut pan = Vec2::ZERO;
+        if keys.pressed(KeyCode::KeyW) || keys.pressed(KeyCode::ArrowUp) {
+            pan.y += 1.0;
+        }
+        if keys.pressed(KeyCode::KeyS) || keys.pressed(KeyCode::ArrowDown) {
+            pan.y -= 1.0;
+        }
+        if keys.pressed(KeyCode::KeyA) || keys.pressed(KeyCode::ArrowLeft) {
+            pan.x -= 1.0;
+        }
+        if keys.pressed(KeyCode::KeyD) || keys.pressed(KeyCode::ArrowRight) {
+            pan.x += 1.0;
+        }
+        if pan != Vec2::ZERO {
+            let delta = pan.normalize() * speed * dt;
+            transform.translation.x += delta.x;
+            transform.translation.y += delta.y * pan_y_factor;
+        }
     }
 
     // Middle-mouse drag

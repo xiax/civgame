@@ -260,6 +260,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(vehicle::VehicleAssemblyQueue::default())
             .insert_resource(vehicle::VehicleOccupancyIndex::default())
             .insert_resource(vehicle::PendingVehicleOps::default())
+            .insert_resource(vehicle::ManualDriveState::default())
             .insert_resource(construction::StructureIndex::default())
             .insert_resource(construction::BlueprintMap::default())
             .insert_resource(construction::ConstructionPosterPool::default())
@@ -1333,6 +1334,11 @@ impl Plugin for SimulationPlugin {
                     vehicle::vehicle_movement_system,
                     vehicle::vehicle_rollover_system,
                     vehicle::vehicle_crew_sync_system,
+                    // Debug Test-Drive housekeeping: when a debug-spawned
+                    // vehicle despawns, its synthesised ghost draft cows go
+                    // with it. Cheap; runs unconditionally (no-op when no
+                    // ghosts exist).
+                    vehicle::cleanup_debug_ghost_draft_system,
                 )
                     .chain()
                     .after(movement::movement_system)

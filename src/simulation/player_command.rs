@@ -193,6 +193,28 @@ pub enum PlayerCommand {
         tile: (i32, i32),
         z: i8,
     },
+    /// **Debug only.** Spawn the given freeform design as a permanent,
+    /// player-faction `Vehicle` for free at a validated spawn site, then
+    /// arm manual drive on it. Skips tech gates, the resource bill, and
+    /// the `VehicleYard` requirement; synthesises ghost draft animals if
+    /// the design needs them. The variant is compile-present in release
+    /// but the dispatcher arm is `cfg!(debug_assertions)`-gated so a
+    /// release build never spawns one even if an event is synthesised.
+    /// Empty `actors` — faction-level.
+    DebugSpawnTestVehicle {
+        name: String,
+        grid: crate::simulation::vehicle::VehicleGrid,
+        purpose: crate::simulation::vehicle::VehiclePurpose,
+        required_animals: u8,
+        /// Where the camera was pointing when the player clicked Test
+        /// Drive. The dispatcher uses this as the **primary** spawn
+        /// anchor (the player is looking at the spot they want to test
+        /// in), with `home_tile` + yards as fallbacks. Threaded through
+        /// the event instead of being read from a camera query inside
+        /// the dispatcher because the system is already at Bevy's
+        /// 16-param ceiling.
+        spawn_near: (i32, i32),
+    },
 }
 
 /// Per-actor authority marker. Replaces `PlayerOrder` once Commit 3 lands.
@@ -265,6 +287,7 @@ impl PlayerCommandIdGen {
 ///
 /// Runs in `SimulationSet::Input` so the dispatcher (ParallelB) sees fresh
 /// `Pending` markers the same FixedUpdate tick the event was emitted in.
+#[allow(clippy::too_many_arguments)]
 pub fn drain_player_command_events_system(
     mut commands: Commands,
     mut reader: EventReader<PlayerCommandEvent>,
@@ -277,6 +300,13 @@ pub fn drain_player_command_events_system(
     mut vehicle_registry: ResMut<crate::simulation::vehicle::VehicleDesignRegistry>,
     vehicle_data: Res<crate::simulation::vehicle::VehicleData>,
     mut pending_vehicle_ops: ResMut<crate::simulation::vehicle::PendingVehicleOps>,
+    // Debug Test-Drive dependencies — only consumed by the
+    // `DebugSpawnTestVehicle` arm (which is `cfg!(debug_assertions)`-gated).
+    chunk_map: Res<ChunkMap>,
+    vehicle_occupancy: Res<crate::simulation::vehicle::VehicleOccupancyIndex>,
+    yards: Query<&crate::simulation::vehicle::VehicleYard>,
+    factions: Res<crate::simulation::faction::FactionRegistry>,
+    mut manual_drive: ResMut<crate::simulation::vehicle::ManualDriveState>,
 ) {
     let now = clock.tick as u32;
     for ev in reader.read() {
@@ -328,6 +358,120 @@ pub fn drain_player_command_events_system(
                 }
                 PlayerCommand::VehicleOrder { vehicle, kind } => {
                     pending_vehicle_ops.ops.push((vehicle, kind));
+                }
+                PlayerCommand::DebugSpawnTestVehicle {
+                    ref name,
+                    ref grid,
+                    purpose,
+                    required_animals,
+                    spawn_near,
+                } => {
+                    if !cfg!(debug_assertions) {
+                        // Release builds ignore the event entirely — the
+                        // designer's button is also compile-gated, but a
+                        // hostile event injection is dropped here as
+                        // defence in depth.
+                        continue;
+                    }
+                    use crate::simulation::vehicle::{
+                        collect_design_tech_gates, find_debug_spawn_site, spawn_ghost_draft_for,
+                        spawn_vehicle_at, DebugTestDriveVehicle, VehicleDesign, VehicleDesignId,
+                    };
+                    let fid = player_faction.faction_id;
+                    let home_tile = factions
+                        .factions
+                        .get(&fid)
+                        .map(|f| f.home_tile)
+                        .unwrap_or((0, 0));
+                    // The player's camera tile (filled in by the UI when
+                    // emitting the event) is the primary anchor — that's
+                    // where the player is looking and wants to test.
+                    let camera_focus = spawn_near;
+                    let tech_gates = collect_design_tech_gates(
+                        grid,
+                        std::iter::empty(),
+                        &vehicle_data,
+                    );
+                    let design_id = vehicle_registry.insert(VehicleDesign {
+                        id: VehicleDesignId(0),
+                        name: name.clone(),
+                        grid: grid.clone(),
+                        allowed_purpose: purpose,
+                        required_animals,
+                        tech_gates,
+                        author_faction: Some(fid),
+                        revision: 0,
+                    });
+                    let design = vehicle_registry
+                        .get(design_id)
+                        .cloned()
+                        .expect("just inserted");
+                    let Some((tile, z, heading)) = find_debug_spawn_site(
+                        &design,
+                        fid,
+                        home_tile,
+                        &chunk_map,
+                        &vehicle_occupancy,
+                        &yards,
+                        camera_focus,
+                    ) else {
+                        let footprint =
+                            crate::simulation::vehicle::VehicleFootprint::from_grid(
+                                &design.grid,
+                            );
+                        warn!(
+                            "DebugSpawnTestVehicle: no valid spawn site for \
+                             design '{}' (footprint cells={}, height_z={}, \
+                             home_tile=({}, {}), yards={}) — try moving the \
+                             camera to open ground (a meadow / field) and \
+                             clicking Test Drive again, or build a Vehicle \
+                             Yard for a guaranteed clear anchor.",
+                            design.name,
+                            footprint.offsets_by_heading[0].len(),
+                            footprint.height_z,
+                            home_tile.0,
+                            home_tile.1,
+                            yards.iter().filter(|y| y.faction_id == fid).count(),
+                        );
+                        continue;
+                    };
+                    let vehicle_e =
+                        spawn_vehicle_at(&mut commands, fid, &design, tile, z, heading);
+                    commands.entity(vehicle_e).insert(DebugTestDriveVehicle);
+                    if required_animals > 0 {
+                        let ghosts = spawn_ghost_draft_for(
+                            &mut commands,
+                            vehicle_e,
+                            tile,
+                            fid,
+                            required_animals,
+                        );
+                        // Queue the hitch for next tick — `VehicleDraft`
+                        // exists on the spawned entity but Commands defers
+                        // insertion, so we cannot fetch it from
+                        // `vehicle_drafts` this same tick. Use a deferred
+                        // closure to push the cow entities onto
+                        // `VehicleDraft.hitched` once it lands.
+                        let entities = ghosts.clone();
+                        commands.queue(move |world: &mut World| {
+                            if let Some(mut draft) =
+                                world.get_mut::<crate::simulation::vehicle::VehicleDraft>(
+                                    vehicle_e,
+                                )
+                            {
+                                for e in entities {
+                                    draft.hitched.push(e);
+                                }
+                            }
+                        });
+                    }
+                    manual_drive.active = Some(vehicle_e);
+                    manual_drive.last_status =
+                        Some(format!("Test driving '{}'", design.name));
+                    info!(
+                        "DebugSpawnTestVehicle: spawned '{}' at ({}, {}) z={} heading={}",
+                        design.name, tile.0, tile.1, z, heading
+                    );
                 }
                 _ => {
                     // Other commands need actors; skip a malformed event.
@@ -552,7 +696,8 @@ pub fn player_command_lifecycle_system(
             | PlayerCommand::SetPackedAutonomy { .. }
             | PlayerCommand::QueueVehicle { .. }
             | PlayerCommand::QueueCustomVehicle { .. }
-            | PlayerCommand::VehicleOrder { .. } => Some(CommandStatus::Completed),
+            | PlayerCommand::VehicleOrder { .. }
+            | PlayerCommand::DebugSpawnTestVehicle { .. } => Some(CommandStatus::Completed),
             // Lookout never auto-completes — the worker holds the anchor
             // until the player supersedes the command or `aq.cancel`
             // drops the chain via another dispatch.
@@ -1258,7 +1403,10 @@ fn dispatch_one(
             }
             DispatchOutcome::Active
         }
-        QueueVehicle { .. } | QueueCustomVehicle { .. } | VehicleOrder { .. } => {
+        QueueVehicle { .. }
+        | QueueCustomVehicle { .. }
+        | VehicleOrder { .. }
+        | DebugSpawnTestVehicle { .. } => {
             // Faction-level — applied directly in
             // `drain_player_command_events_system` (empty `actors`). If an
             // event ever arrives carrying actors, the dispatch is a no-op.

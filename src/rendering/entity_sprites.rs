@@ -3,7 +3,7 @@ use crate::rendering::pixel_art::{AnimalTextures, ArtMode, EntityTextures};
 use crate::rendering::sprite_library::SpriteLibrary;
 use crate::simulation::animals::{Cat, Cow, Deer, Fox, Horse, Pig, Rabbit, Wolf};
 use crate::simulation::vehicle::{
-    Vehicle, VehicleDesignRegistry, VehiclePartKind, VehicleVisual,
+    Vehicle, VehicleDesign, VehicleDesignRegistry, VehiclePartKind, VehicleVisual,
 };
 use crate::simulation::construction::{
     Bed, Blueprint, BuildSiteKind, Campfire, Chair, Door, Loom, Table, Wall, WallMaterial, Well,
@@ -118,6 +118,14 @@ pub struct GroundItemVisual;
 /// sex-based coloring while still applying fog darkening.
 #[derive(Component, Clone, Copy)]
 pub struct AnimalSexTint(pub Color);
+
+/// Base tint color on a vehicle cell `VisualChild` — `apply_entity_fog_tint_system`
+/// multiplies it by the fog factor so the part-kind palette
+/// (`vehicle_cell_color`) survives instead of being clobbered to white.
+/// Mirrors `AnimalSexTint`; per-cell because every cell carries its own
+/// `vehicle_cell_color(kind)` colour.
+#[derive(Component, Clone, Copy)]
+pub struct VehicleCellTint(pub Color);
 
 #[derive(Component)]
 pub struct VisualChild;
@@ -374,7 +382,7 @@ pub fn spawn_chair_sprites(
 
 /// Flat tint for one vehicle cell, keyed by part kind — the freeform
 /// composed-sprite renderer's palette.
-fn vehicle_cell_color(kind: VehiclePartKind) -> Color {
+pub fn vehicle_cell_color(kind: VehiclePartKind) -> Color {
     match kind {
         VehiclePartKind::Frame => Color::srgb(0.45, 0.30, 0.16),
         VehiclePartKind::Deck => Color::srgb(0.62, 0.46, 0.28),
@@ -390,6 +398,85 @@ fn vehicle_cell_color(kind: VehiclePartKind) -> Color {
         | VehiclePartKind::ArmorPlate
         | VehiclePartKind::Turret => Color::srgb(0.40, 0.42, 0.46),
     }
+}
+
+/// One painted quad in a composed vehicle render.
+#[derive(Clone, Copy, Debug)]
+pub struct VehicleSpriteCell {
+    /// Entity-local offset (x, y, z-order).
+    pub local_offset: Vec3,
+    /// Quad size in pixels.
+    pub size: Vec2,
+    pub color: Color,
+}
+
+/// The render plan for one vehicle design at a given heading. Both
+/// `spawn_vehicle_sprites` (world entity) and the egui inset preview in the
+/// vehicle designer consume this, so cell composition can never drift.
+#[derive(Clone, Debug)]
+pub enum VehicleSpritePlan {
+    /// Hand-drawn `entity_cart` sprite (stock flat designs).
+    Stock,
+    /// Composed body — one colored quad per cell, already heading-rotated.
+    Composed { cells: Vec<VehicleSpriteCell> },
+}
+
+/// Rotate an entity-local (x, y) offset by `heading` quarter-turns CCW.
+/// Heading 0 = forward +Y; matches `VehicleFootprint::offsets_by_heading`.
+fn rotate_xy(x: f32, y: f32, heading: u8) -> (f32, f32) {
+    match heading % 4 {
+        0 => (x, y),
+        1 => (-y, x),
+        2 => (-x, -y),
+        _ => (y, -x),
+    }
+}
+
+/// Pure helper: build the sprite plan for `design` facing `heading`. No Bevy
+/// resources required. The composed branch reproduces the layout
+/// `spawn_vehicle_sprites` used pre-extraction, with explicit heading rotation
+/// applied to the in-plane (x, y) cell offsets (the legacy renderer assumed
+/// heading 0 because the parent `Transform` had no rotation).
+pub fn vehicle_sprite_plan(design: &VehicleDesign, heading: u8) -> VehicleSpritePlan {
+    let bounds = design.grid.bounds();
+    let stock_flat = design.author_faction.is_none()
+        && bounds.map(|(lo, hi)| hi.z - lo.z == 0).unwrap_or(true);
+    if stock_flat {
+        return VehicleSpritePlan::Stock;
+    }
+    let Some((lo, hi)) = bounds else {
+        return VehicleSpritePlan::Composed { cells: Vec::new() };
+    };
+    let w = (hi.x - lo.x + 1) as f32;
+    let depth = (hi.y - lo.y + 1) as f32;
+    // One grid cell ≈ one world tile (`TILE_SIZE = 16 px`). A 5-wide tank
+    // reads ~5 tiles wide, a 1-wide handcart ~1 tile — i.e. each design
+    // renders at its real footprint scale instead of being collapsed
+    // into a pixel cluster.
+    const CELL_PX: f32 = 12.0;
+    // Depth uses a shorter per-cell projection so a deep body doesn't
+    // shear into the row above.
+    const DEPTH_PX: f32 = 6.0;
+    let mut cells = Vec::with_capacity(design.grid.cells.len());
+    for (p, c) in &design.grid.cells {
+        let gx = (p.x - lo.x) as f32;
+        let gy = (p.y - lo.y) as f32;
+        let gz = (p.z - lo.z) as f32;
+        // Centre-relative XY, then rotate by heading.
+        let cx = (gx - (w - 1.0) / 2.0) * CELL_PX;
+        let cy_in_plane = (gy - (depth - 1.0) / 2.0) * DEPTH_PX;
+        let (rx, ry) = rotate_xy(cx, cy_in_plane, heading);
+        // Vertical lift from Z stays out of the rotation (it's screen-up).
+        let sx = rx;
+        let sy = -8.0 + gz * CELL_PX + ry;
+        let zorder = 0.1 + gz * 0.002 + gy * 0.0003;
+        cells.push(VehicleSpriteCell {
+            local_offset: Vec3::new(sx, sy, zorder),
+            size: Vec2::splat(CELL_PX),
+            color: vehicle_cell_color(c.kind),
+        });
+    }
+    VehicleSpritePlan::Composed { cells }
 }
 
 /// Vehicle system: reactively attach the child sprite(s) to every `Vehicle`.
@@ -409,69 +496,53 @@ pub fn spawn_vehicle_sprites(
             .entity(entity)
             .insert((VehicleVisual, EntityFogState::default()));
 
-        let design = registry.get(vehicle.design_id);
-        // Bounding box of the design grid (used by both render paths).
-        let bounds = design.and_then(|d| d.grid.bounds());
-        let stock_flat = design
-            .map(|d| {
-                d.author_faction.is_none()
-                    && bounds.map(|(lo, hi)| hi.z - lo.z == 0).unwrap_or(true)
-            })
-            .unwrap_or(true);
-
-        if stock_flat {
-            // Hand-drawn stock sprite.
-            let Some(handle) = sprite_lib.get("entity_cart") else {
-                continue;
-            };
-            let mut sprite = Sprite::from_image(handle.clone());
-            sprite.anchor = Anchor::BottomCenter;
-            commands.entity(entity).with_children(|parent| {
-                parent.spawn((
-                    VisualChild,
-                    sprite,
-                    Transform::from_xyz(0.0, -8.0, 0.1),
-                    GlobalTransform::default(),
-                    Visibility::Inherited,
-                    InheritedVisibility::default(),
-                ));
-            });
-            continue;
-        }
-
-        // Composed freeform render — one colored quad per cell.
-        let (Some(d), Some((lo, hi))) = (design, bounds) else {
+        let Some(design) = registry.get(vehicle.design_id) else {
             continue;
         };
-        let w = (hi.x - lo.x + 1) as f32;
-        let depth = (hi.y - lo.y + 1) as f32;
-        // Cell size shrinks as the design widens so it stays roughly tile-sized.
-        let cell_px = (14.0 / w.max(3.0)).clamp(3.0, 5.0);
-        let cells: Vec<(IVec3, VehiclePartKind)> =
-            d.grid.cells.iter().map(|(p, c)| (*p, c.kind)).collect();
-        commands.entity(entity).with_children(|parent| {
-            for (p, kind) in cells {
-                let gx = (p.x - lo.x) as f32;
-                let gy = (p.y - lo.y) as f32;
-                let gz = (p.z - lo.z) as f32;
-                let sx = (gx - (w - 1.0) / 2.0) * cell_px;
-                // Z lifts the cell upward; deeper (higher y) cells nudge up
-                // slightly for a shallow 3/4 read.
-                let sy = -8.0 + 2.0 + gz * cell_px + (gy - (depth - 1.0) / 2.0) * 1.5;
-                let zorder = 0.1 + gz * 0.002 + gy * 0.0003;
-                let mut sprite =
-                    Sprite::from_color(vehicle_cell_color(kind), Vec2::splat(cell_px * 0.95));
+        match vehicle_sprite_plan(design, vehicle.heading) {
+            VehicleSpritePlan::Stock => {
+                let Some(handle) = sprite_lib.get("entity_cart") else {
+                    continue;
+                };
+                let mut sprite = Sprite::from_image(handle.clone());
                 sprite.anchor = Anchor::BottomCenter;
-                parent.spawn((
-                    VisualChild,
-                    sprite,
-                    Transform::from_xyz(sx, sy, zorder),
-                    GlobalTransform::default(),
-                    Visibility::Inherited,
-                    InheritedVisibility::default(),
-                ));
+                commands.entity(entity).with_children(|parent| {
+                    parent.spawn((
+                        VisualChild,
+                        sprite,
+                        Transform::from_xyz(0.0, -8.0, 0.1),
+                        GlobalTransform::default(),
+                        Visibility::Inherited,
+                        InheritedVisibility::default(),
+                    ));
+                });
             }
-        });
+            VehicleSpritePlan::Composed { cells } => {
+                commands.entity(entity).with_children(|parent| {
+                    for cell in cells {
+                        let mut sprite = Sprite::from_color(cell.color, cell.size);
+                        sprite.anchor = Anchor::BottomCenter;
+                        parent.spawn((
+                            VisualChild,
+                            // `apply_entity_fog_tint_system` writes a white
+                            // base every frame; without this marker the
+                            // per-cell `vehicle_cell_color(kind)` colour
+                            // gets clobbered to fog-darkened white.
+                            VehicleCellTint(cell.color),
+                            sprite,
+                            Transform::from_xyz(
+                                cell.local_offset.x,
+                                cell.local_offset.y,
+                                cell.local_offset.z,
+                            ),
+                            GlobalTransform::default(),
+                            Visibility::Inherited,
+                            InheritedVisibility::default(),
+                        ));
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -1733,7 +1804,12 @@ pub fn apply_entity_fog_tint_system(
         With<EntityFogState>,
     >,
     mut child_sprites: Query<
-        (&mut Sprite, Option<&AnimalSexTint>, Option<&VisualLayer>),
+        (
+            &mut Sprite,
+            Option<&AnimalSexTint>,
+            Option<&VehicleCellTint>,
+            Option<&VisualLayer>,
+        ),
         With<VisualChild>,
     >,
 ) {
@@ -1750,9 +1826,12 @@ pub fn apply_entity_fog_tint_system(
         let hit_flash = anim_opt.map(|a| a.hit_timer > 0.0).unwrap_or(false);
 
         for &child in children.iter() {
-            if let Ok((mut sprite, sex_tint, layer_opt)) = child_sprites.get_mut(child) {
-                let base = sex_tint
+            if let Ok((mut sprite, sex_tint, vehicle_tint, layer_opt)) = child_sprites.get_mut(child) {
+                // Per-cell vehicle tint takes precedence over the
+                // sex-tint base; otherwise white.
+                let base = vehicle_tint
                     .map(|t| t.0.to_srgba())
+                    .or_else(|| sex_tint.map(|t| t.0.to_srgba()))
                     .unwrap_or(bevy::color::Srgba::WHITE);
                 let (mut r, mut g, mut b) = (base.red, base.green, base.blue);
                 if hit_flash {

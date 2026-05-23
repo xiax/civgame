@@ -15,6 +15,7 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::economy::resource_catalog::ResourceId;
+use crate::rendering::entity_sprites::{vehicle_sprite_plan, VehicleSpritePlan};
 use crate::simulation::faction::{FactionRegistry, FactionTechs, PlayerFaction};
 use crate::simulation::player_command::{PlayerCommand, PlayerCommandEvent};
 use crate::simulation::vehicle::{
@@ -74,6 +75,10 @@ pub struct VehicleDesignerState {
     pub module_rotation: u8,
     pub purpose: VehiclePurpose,
     pub required_animals: u8,
+    /// Heading shown in the inset world-sprite preview (`0..4`,
+    /// N/E/S/W). Drives the rotation applied to composed cells via the
+    /// shared `vehicle_sprite_plan` helper.
+    pub preview_heading: u8,
 }
 
 impl Default for VehicleDesignerState {
@@ -91,6 +96,7 @@ impl Default for VehicleDesignerState {
             module_rotation: 0,
             purpose: VehiclePurpose::Cargo,
             required_animals: 0,
+            preview_heading: 0,
         }
     }
 }
@@ -307,6 +313,10 @@ pub fn vehicle_designer_system(
     player_faction: Res<PlayerFaction>,
     factions: Res<FactionRegistry>,
     mut cmd_events: EventWriter<PlayerCommandEvent>,
+    // Threaded into `PlayerCommand::DebugSpawnTestVehicle.spawn_near` so
+    // the dispatcher spawns the test vehicle on open ground in front of
+    // the player rather than inside the (always-crowded) home tile.
+    camera_q: Query<&Transform, With<Camera>>,
 ) {
     if !state.open {
         return;
@@ -365,7 +375,7 @@ pub fn vehicle_designer_system(
             ui.columns(3, |cols| {
                 draw_palette_column(&mut cols[0], &mut state, &data, materials, player_techs, &registry);
                 draw_grid_column(&mut cols[1], &mut state, &data, materials);
-                draw_preview_column(&mut cols[2], &state, &data, player_techs);
+                draw_preview_column(&mut cols[2], &mut state, &data, player_techs);
             });
 
             // ── Actions ─────────────────────────────────────────────────
@@ -407,6 +417,80 @@ pub fn vehicle_designer_system(
                 if ui.button("Clear grid").clicked() {
                     state.grid.cells.clear();
                     state.grid.modules.clear();
+                }
+                // Save-to-disk: persist the design as a RON template in
+                // `assets/data/vehicles/user_<slug>.ron`. The loader picks
+                // it up on next game start (it walks every `*.ron` in the
+                // dir), so the design survives across runs and can be
+                // shared by copying the file.
+                let save_valid = validation.is_ok()
+                    && !state.name.trim().is_empty()
+                    && !state.grid.cells.is_empty();
+                let save_btn = egui::Button::new("Save to disk")
+                    .fill(egui::Color32::from_rgb(70, 90, 120));
+                let save_resp = ui.add_enabled(save_valid, save_btn).on_hover_text(
+                    "Write this design to assets/data/vehicles/user_<slug>.ron \
+                     so it loads automatically next time the game starts. \
+                     Files with the same slug overwrite.",
+                );
+                if save_resp.clicked() {
+                    let preview = crate::simulation::vehicle::VehicleDesign {
+                        id: crate::simulation::vehicle::VehicleDesignId(0),
+                        name: state.name.trim().to_string(),
+                        grid: state.grid.clone(),
+                        allowed_purpose: state.purpose,
+                        required_animals: state.required_animals,
+                        tech_gates: collect_design_tech_gates(
+                            &state.grid,
+                            std::iter::empty(),
+                            &data,
+                        ),
+                        author_faction: None,
+                        revision: 0,
+                    };
+                    match crate::simulation::vehicle::save_custom_design(&preview, &data) {
+                        Ok(path) => info!("Saved vehicle design to {:?}", path),
+                        Err(e) => warn!("Failed to save vehicle design: {}", e),
+                    }
+                }
+                // Debug Test Drive — present only in debug builds. Bypasses
+                // tech gates and the resource bill; ghost draft animals are
+                // synthesised if `required_animals > 0`. See
+                // `~/.claude/plans/evaluate-the-users-xiao1-civgame-plans-v-optimized-squirrel.md`.
+                if cfg!(debug_assertions) {
+                    let drive_valid = validation.is_ok()
+                        && !state.name.trim().is_empty()
+                        && !state.grid.cells.is_empty();
+                    let btn = egui::Button::new("Test Drive (debug)")
+                        .fill(egui::Color32::from_rgb(120, 80, 40));
+                    let resp = ui.add_enabled(drive_valid, btn).on_hover_text(
+                        "Spawn this design as a permanent player-faction \
+                         vehicle for free, near a Vehicle Yard if you own \
+                         one. Bypasses tech gates and resource costs. \
+                         Manual drive: W=forward, A/D=turn, Q/E=diagonal, \
+                         S=stop, Esc=release.",
+                    );
+                    if resp.clicked() {
+                        let spawn_near = camera_q
+                            .get_single()
+                            .ok()
+                            .map(|t| {
+                                crate::world::terrain::world_to_tile(
+                                    t.translation.truncate(),
+                                )
+                            })
+                            .unwrap_or((0, 0));
+                        cmd_events.send(PlayerCommandEvent {
+                            actors: Vec::new(),
+                            command: PlayerCommand::DebugSpawnTestVehicle {
+                                name: state.name.trim().to_string(),
+                                grid: state.grid.clone(),
+                                purpose: state.purpose,
+                                required_animals: state.required_animals,
+                                spawn_near,
+                            },
+                        });
+                    }
                 }
             });
         });
@@ -810,7 +894,7 @@ fn cell_tooltip(ui: &mut egui::Ui, c: &VehicleCell, pos: IVec3, data: &VehicleDa
 /// Right column — stats, summary, bill, validation, tech gate.
 fn draw_preview_column(
     ui: &mut egui::Ui,
-    state: &VehicleDesignerState,
+    state: &mut VehicleDesignerState,
     data: &VehicleData,
     player_techs: FactionTechs,
 ) {
@@ -940,6 +1024,38 @@ fn draw_preview_column(
     }
 
     ui.separator();
+    // ── Inset world-sprite preview ───────────────────────────────────
+    // Paints the same `vehicle_sprite_plan` the spawned `Vehicle` would
+    // render with — so a tall composed body in the inset reads exactly
+    // like the body Test-Drive (or assembly) will spawn. Heading buttons
+    // pick the facing; egui's painter does the work (no Bevy sprite).
+    egui::CollapsingHeader::new(egui::RichText::new("Preview").strong())
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Heading:");
+                for (h, label) in [(0u8, "N"), (1, "W"), (2, "S"), (3, "E")] {
+                    ui.selectable_value(&mut state.preview_heading, h, label)
+                        .on_hover_text("Rotate the preview to see the design from that facing.");
+                }
+            });
+            draw_inset_preview(ui, &preview, state.preview_heading);
+            if let Some((lo, hi)) = state.grid.bounds() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Footprint: {}×{}  ·  Height: {}",
+                        hi.x - lo.x + 1,
+                        hi.y - lo.y + 1,
+                        hi.z - lo.z + 1
+                    ))
+                    .small(),
+                );
+            } else {
+                ui.label(egui::RichText::new("(empty grid)").small());
+            }
+        });
+
+    ui.separator();
     match &validation {
         Ok(()) => {
             ui.colored_label(egui::Color32::from_rgb(120, 200, 120), "\u{2713} Valid design");
@@ -956,6 +1072,107 @@ fn draw_preview_column(
                         .color(egui::Color32::from_rgb(210, 140, 120)),
                 )
                 .on_hover_text(describe_error(e));
+            }
+        }
+    }
+}
+
+/// Paint the current design as colored quads inside a fixed-size egui canvas.
+/// Reuses `vehicle_sprite_plan` so the inset never drifts from what
+/// `spawn_vehicle_sprites` produces for a real vehicle.
+fn draw_inset_preview(ui: &mut egui::Ui, design: &VehicleDesign, heading: u8) {
+    use bevy::prelude::Vec3;
+    const CANVAS_W: f32 = 200.0;
+    const CANVAS_H: f32 = 140.0;
+    let (rect, _resp) = ui.allocate_exact_size(
+        egui::vec2(CANVAS_W, CANVAS_H),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter_at(rect);
+    // Subtle background so the preview is visually distinct from the
+    // surrounding stats panel.
+    painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(28, 28, 32));
+    let plan = vehicle_sprite_plan(design, heading);
+    // Adaptive scale: fit the design's local extent inside the canvas
+    // with some padding. Without this, a Tank-sized design overflows;
+    // a single-cell Hut underuses the space.
+    let scale = match &plan {
+        VehicleSpritePlan::Composed { cells } if !cells.is_empty() => {
+            let max_abs_x = cells
+                .iter()
+                .map(|c| c.local_offset.x.abs())
+                .fold(0.0_f32, f32::max);
+            let max_abs_y = cells
+                .iter()
+                .map(|c| c.local_offset.y.abs())
+                .fold(0.0_f32, f32::max);
+            let extent_x = max_abs_x * 2.0 + cells[0].size.x;
+            let extent_y = max_abs_y * 2.0 + cells[0].size.y;
+            let pad = 16.0;
+            let sx = (CANVAS_W - pad) / extent_x.max(1.0);
+            let sy = (CANVAS_H - pad) / extent_y.max(1.0);
+            sx.min(sy).clamp(1.0, 6.0)
+        }
+        _ => 4.0,
+    };
+    let centre = rect.center();
+    match plan {
+        VehicleSpritePlan::Stock => {
+            // Hand-drawn stock cart isn't easy to render in egui without
+            // pulling the texture handle in here. Approximate with the
+            // same brown trapezoid + two wheels.
+            let body = egui::Rect::from_center_size(
+                centre + egui::vec2(0.0, -scale * 2.0),
+                egui::vec2(scale * 12.0, scale * 6.0),
+            );
+            painter.rect_filled(body, 2.0, egui::Color32::from_rgb(160, 110, 60));
+            for x in [-scale * 5.0, scale * 5.0] {
+                painter.circle_filled(
+                    centre + egui::vec2(x, scale * 2.0),
+                    scale * 1.5,
+                    egui::Color32::from_rgb(28, 24, 24),
+                );
+            }
+            ui.label(
+                egui::RichText::new("(stock cart preview)")
+                    .small()
+                    .color(egui::Color32::from_rgb(160, 160, 160)),
+            );
+        }
+        VehicleSpritePlan::Composed { cells } => {
+            // Map each plan cell's entity-local (x, y, z) into the canvas.
+            // `+y` in entity-local is screen-up, so we negate y for the
+            // canvas. Z is encoded into the local_offset's y already
+            // (cells lift upward by Z); use it for paint order only.
+            let mut sorted: Vec<_> = cells.iter().collect();
+            sorted.sort_by(|a, b| {
+                a.local_offset
+                    .z
+                    .partial_cmp(&b.local_offset.z)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for cell in sorted {
+                let Vec3 { x, y, .. } = cell.local_offset;
+                let centre_pt = centre + egui::vec2(x * scale, -y * scale);
+                let size = egui::vec2(cell.size.x * scale, cell.size.y * scale);
+                let r = egui::Rect::from_center_size(centre_pt, size);
+                let c = cell.color.to_srgba();
+                let rgba = egui::Color32::from_rgba_premultiplied(
+                    (c.red * 255.0) as u8,
+                    (c.green * 255.0) as u8,
+                    (c.blue * 255.0) as u8,
+                    255,
+                );
+                painter.rect_filled(r, 0.0, rgba);
+            }
+            if cells.is_empty() {
+                painter.text(
+                    centre,
+                    egui::Align2::CENTER_CENTER,
+                    "(place parts to preview)",
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_rgb(140, 140, 140),
+                );
             }
         }
     }
