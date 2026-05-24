@@ -812,7 +812,11 @@ pub fn gather_system(
             // posting's area. `record_fieldwork_progress` no-ops unless the
             // backing posting is `FieldWork { phase: Harvest }`, so a
             // Prepare/Plant claim can't be cross-credited by a harvest.
-            if matches!(kind, PlantKind::Grain) {
+            // Crop-agnostic: any farm-plantable kind (Grain, Berry, …) reaped
+            // inside the claimed posting's area credits the posting — the
+            // `planting_area_contains` rect guard already restricts credit to
+            // the plot, so a wild berry forage can't cross-credit.
+            if kind.is_farm_plantable() {
                 if let Some(claim) = job_claim {
                     if matches!(claim.kind, crate::simulation::jobs::JobKind::Farm) {
                         let in_area = routing

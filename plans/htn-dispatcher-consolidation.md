@@ -1,68 +1,58 @@
 # HTN Dispatcher Consolidation
 
-**Status:** Skeleton — awaiting planning session.
-**Parent plan:** `~/.claude/plans/evaluate-this-plan-please-tingly-catmull.md` (Goal+HTN Behavioural Richness), Follow-up 4.
-**Depends on:** Phase E + Phase F of parent plan shipped (so `dispatch_for_goal` helper exists and `Scored` mode is default-on).
+**Status:** Multi-method batch shipped (2026-05-23). Single-method promotion + side-channel rename deferred as enumerated below — both worth doing per `feedback_future_proof_ok.md`, both separable from this batch.
 
-## Trigger
+## What landed in this batch (7 dispatchers)
 
-Pick up after Phase F lands (`Scored` mode default, Legacy cascade removed). Migrate in batches of ~7 to bound review.
+All seven now route through `dispatch_for_goal` (htn.rs:585). The hand-rolled `methods_for(...).iter().filter(...).max_by(...)` argmax pattern is gone from each.
 
-## Scope
+- `htn_dispatch_system` (legacy Sleep) → renamed `htn_sleep_dispatch_system` (htn.rs:~3540).
+- `htn_engage_prey_dispatch_system` (htn.rs:~8290).
+- `htn_join_hunt_party_dispatch_system` (htn.rs:~8653).
+- `htn_combat_faction_dispatch_system` (htn.rs:~9039) — dropped the unused `AbstractTaskKind` tuple field at the per-goal match.
+- `htn_acquire_food_dispatch_system` (htn.rs:~3996).
+- `htn_acquire_good_dispatch_system` (htn.rs:~4686, two argmax sites: Stockpile + Haul).
+- `htn_stockpile_food_dispatch_system` (htn.rs:~5423).
 
-Phase E of the parent plan migrates 2 of the 23 `htn_*_dispatch_system` functions onto the new `dispatch_for_goal` helper. The remaining 21 are mechanical migrations — same pattern, no behaviour change. Total ~600 lines deleted from `htn.rs` once complete.
+The terminal-`Explore` synthetic backstop in `htn_acquire_food_dispatch_system` + `htn_stockpile_food_dispatch_system` stays — fires when even the `MF_FALLBACK_ONLY` Explore method's precondition fails. `score_method_with_history_and_disposition`'s "Phase E / 3 dispatchers" doc comment was rewritten.
 
-## Current state (from survey)
+## Concrete-vs-fallback partition: now declarative
 
-23 `htn_*_dispatch_system` functions all colocated in `src/simulation/htn.rs`. Each one:
-1. Queries for agents with matching `AgentGoal`.
-2. Builds a partial `PlannerCtx` (only the fields it needs).
-3. Lists candidate methods for the goal (hardcoded).
-4. Calls `score_method_with_history` per candidate.
-5. Picks the argmax and expands into `ActionQueue`.
+`MethodFlags::MF_FALLBACK_ONLY` (htn.rs:340) is the new flag. `dispatch_for_goal` does a two-pass pick: concretes first, then fallback methods only if no concrete picked. Encodes `feedback_live_preconditions_no_bias` on the method itself so future dispatchers can't accidentally let an Explore win against a history-biased concrete. Set on `ExploreForFoodMethod`, `ExploreForMaterialMethod`, `ExploreForFoodForStorageMethod`. `htn_acquire_food_dispatch_system`'s explicit `MethodId::EXPLORE_FOR_FOOD` exclusion list is gone.
 
-After Phase E of parent plan, `dispatch_for_goal(goal, ctx, commands)` does steps 3–5 generically by reading `MethodRegistry`.
+## Acceptance vs targets
 
-## The 21 dispatchers
+- `htn_dispatch_system` (legacy Sleep): deleted (renamed; the misleading name is gone). ✓
+- Seven in-scope dispatchers route through `dispatch_for_goal`. ✓
+- `wc -l src/simulation/htn.rs`: **14627 → 14539 (-88)**. Plan target was ≥300 — missed. The hand-rolled argmax block was only ~12 lines per site; the win is structural (one canonical pattern + declarative partition), not line count.
+- All 1077 tests pass. No behaviour change on baseline / hunt / raid / combat / wage-aware / smoke fixtures.
 
-`htn_acquire_food`, `htn_acquire_good`, `htn_stockpile_food`, `htn_equip_hunting_spear` (goal-agnostic — special-case), `htn_scout`, `htn_return_surplus`, `htn_tame_horse`, `htn_plant_from_storage`, `htn_build_claimed_blueprint`, `htn_deliver_hunt_kill`, `htn_engage_prey`, `htn_join_hunt_party`, `htn_combat_faction`, `htn_deliver_material_to_craft_order`, `htn_work_on_craft_order`, `htn_harvest_grain_for_craft_order`, `htn_harvest_plant`, `htn_play`, `htn_clear_obstacle` (goal-agnostic), `htn_dispatch_system` (legacy fallback — delete after all migrations), `htn_eat_dispatch_system`.
+## Follow-ups (good future-proofing moves, separable from this batch)
 
-## Batches (suggested order, low-risk first)
+### Single-method promotion to registry-driven
 
-**Batch 1 (simple, side-effect-free):** `htn_scout`, `htn_return_surplus`, `htn_play`, `htn_tame_horse`, `htn_plant_from_storage`, `htn_harvest_plant`.
+Six dispatchers today are "direct dispatch" — one inline expand, no method. Per `feedback_future_proof_ok.md`, route them through the registry too (one `Method` impl wrapping today's inline expand, one `reg.register(...)` line):
 
-**Batch 2 (craft pipeline — interdependent):** `htn_deliver_material_to_craft_order`, `htn_work_on_craft_order`, `htn_harvest_grain_for_craft_order`. Migrate together; they share `target_craft_order` context.
+- `htn_prepare_field_dispatch_system` (htn.rs:7521)
+- `htn_plant_from_storage_dispatch_system` (htn.rs:7154) — single `WithdrawAndPlantSeedMethod` already registered; dispatcher still has bespoke argmax to drop
+- `htn_build_claimed_blueprint_dispatch_system` (htn.rs:7660)
+- `htn_work_on_craft_order_dispatch_system` (htn.rs:9922)
+- `htn_harvest_grain_for_craft_order_dispatch_system` (htn.rs:10160)
+- `htn_deliver_material_to_craft_order_dispatch_system` (htn.rs:9542)
 
-**Batch 3 (hunt pipeline):** `htn_join_hunt_party`, `htn_engage_prey`, `htn_deliver_hunt_kill`, `htn_combat_faction`. Share hunt-related `PlannerCtx` sub-struct.
+For each: one `Method` impl, one register call, dispatcher body shrinks to the `dispatch_for_goal` template. Adding a second method later (e.g. ox-drawn prepare-field, skill-tiered craft variant) becomes a one-line registration.
 
-**Batch 4 (gather pipeline):** `htn_acquire_food`, `htn_acquire_good`, `htn_stockpile_food`, `htn_eat_dispatch_system`. Highest traffic — migrate last.
+### Side-channel rename (cosmetic, no logic change)
 
-**Special handling:** `htn_equip_hunting_spear` + `htn_clear_obstacle` are goal-agnostic (fire on condition, not on `AgentGoal`). Either:
-- (a) Leave as side-channel systems outside the `dispatch_for_goal` flow.
-- (b) Model as new `AgentGoal::Equip` / `AgentGoal::ClearObstacle` and register via `MethodRegistry`.
-- Recommend (a) — they're orthogonal to goal selection.
+These fire on world state, not on `AgentGoal` — the `_dispatch_` suffix is misleading. Drop it:
 
-**Final cleanup:** Delete `htn_dispatch_system` (legacy fallback) once all 21 are migrated and no callers remain.
+- `htn_equip_hunting_spear_dispatch_system` → `equip_hunting_spear_system`
+- `htn_deliver_hunt_kill_dispatch_system` → `deliver_hunt_kill_system`
+- `htn_clear_obstacle_dispatch_system` → `clear_obstacle_system`
+- `bureaucrat_admin_dispatch_system` → `bureaucrat_admin_system`
 
-## Per-migration recipe
+Touches `src/simulation/mod.rs` scheduling chain. No behaviour change.
 
-For each dispatcher:
-1. Register its methods in `MethodRegistry` at startup (one-line entry in `simulation_plugin_setup`).
-2. Replace dispatcher body with `dispatch_for_goal(goal, &mut planner_ctx, &mut commands)` call.
-3. Verify the `PlannerCtx` sub-fields it relied on are populated by upstream context-builders. If a field is missing, extend the relevant sub-struct populator.
-4. Calibration test: queue identical agent state pre- and post-migration; assert same method selected.
+## Reference template
 
-## Open questions a real plan must resolve
-
-- **Method ordering inside `MethodRegistry[goal]`.** Does insertion order matter, or is scoring fully deterministic? If order-sensitive, document why.
-- **PlannerCtx sub-struct boundary.** Where exactly do hunt fields end and combat fields begin? Some fields (e.g. `prey_target_entity`) span both. Decide on duplication vs shared sub-struct.
-- **Legacy `htn_dispatch_system` deletion safety.** It's the fallback path — grep for any system that still routes through it before deletion.
-- **System scheduling.** Today all 23 are in `ParallelB` and individually scheduled. After consolidation, is there one parent system that fans out per-goal, or 23 thin wrappers that each call `dispatch_for_goal`? Recommend: thin wrappers initially to preserve Bevy schedule debugability.
-
-## Acceptance criteria
-
-- All 21 dispatchers migrated to `dispatch_for_goal`.
-- `htn_dispatch_system` (legacy) deleted.
-- `htn.rs` line count drops by ~600.
-- No behaviour change on calibration tests.
-- Adding a new method = registering it in `MethodRegistry` + implementing `Method` trait — no new dispatch system.
+`htn_socialize_dispatch_system` (htn.rs:~8858) is the canonical shape: goal gate → idle gate → build `PlannerCtx` → `dispatch_for_goal(..)` → expand head → route via `assign_task_with_routing` → record `MethodOutcome::FailedRouting` on failure → enqueue tail. Migrate any new goal off this template.

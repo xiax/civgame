@@ -654,7 +654,8 @@ pub fn raid_prep_dispatch_system(
         let _ = aq.dispatch(Task::WithdrawMaterial {
             resource_id: weapon_id,
             qty: 1,
-        });
+                source_faction_id: None,
+            });
         let _ = aq.enqueue(Task::Equip {
             slot: crate::simulation::items::EquipmentSlot::MainHand,
             resource_id: weapon_id,

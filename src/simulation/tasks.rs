@@ -581,6 +581,7 @@ pub fn find_nearest_item(
 pub fn find_nearest_unplanted_farmland(
     chunk_map: &ChunkMap,
     plant_map: &PlantMap,
+    reservations: &crate::simulation::plants::PlantingReservations,
     from: (i32, i32),
     radius: i32,
 ) -> Option<(i32, i32)> {
@@ -592,6 +593,9 @@ pub fn find_nearest_unplanted_farmland(
             let tx = from.0 + dx;
             let ty = from.1 + dy;
             if plant_map.0.contains_key(&(tx, ty)) {
+                continue;
+            }
+            if reservations.is_reserved((tx, ty)) {
                 continue;
             }
             let plantable = match chunk_map.tile_kind_at(tx, ty) {
@@ -618,6 +622,7 @@ pub fn find_nearest_unplanted_farmland(
 pub fn find_nearest_unplanted_in_rect(
     chunk_map: &ChunkMap,
     plant_map: &PlantMap,
+    reservations: &crate::simulation::plants::PlantingReservations,
     from: (i32, i32),
     rect_min: (i32, i32),
     rect_max: (i32, i32),
@@ -627,6 +632,9 @@ pub fn find_nearest_unplanted_in_rect(
     for ty in rect_min.1..=rect_max.1 {
         for tx in rect_min.0..=rect_max.0 {
             if plant_map.0.contains_key(&(tx, ty)) {
+                continue;
+            }
+            if reservations.is_reserved((tx, ty)) {
                 continue;
             }
             let plantable = match chunk_map.tile_kind_at(tx, ty) {

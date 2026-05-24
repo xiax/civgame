@@ -95,7 +95,22 @@ pub enum Task {
     /// every cleanup path goes through `release_reservation` — Phase 3
     /// collapses that into a `Drop` guard once the loose-target fields are
     /// fully retired.
-    WithdrawMaterial { resource_id: ResourceId, qty: u8 },
+    ///
+    /// `source_faction_id` overrides the ownership check at the storage
+    /// tile. `None` defaults to the worker's `FactionMember.faction_id`
+    /// (legacy behaviour — village storage owned by the worker's faction).
+    /// `Some(fid)` is needed when the dispatcher routes the worker to a
+    /// storage tile owned by a different faction than the worker's
+    /// `FactionMember` — notably household-private storage, which is owned
+    /// by the household sub-faction while the worker's `FactionMember.faction_id`
+    /// still points at the village. The `FarmScope::Private` planting path
+    /// is the original motivating site; any chain that draws from a
+    /// not-strictly-self faction should set this.
+    WithdrawMaterial {
+        resource_id: ResourceId,
+        qty: u8,
+        source_faction_id: Option<u32>,
+    },
     /// Market-procurement counterpart of `WithdrawMaterial` (Step 5). The
     /// agent walks to the faction's market `node` (Settlement/Camp entity)
     /// and buys `qty` of `resource_id` with treasury-funded escrow capital,
@@ -257,17 +272,25 @@ pub enum Task {
     /// for chain-integrity inspection. Replaces the legacy `TameHorse` plan
     /// (PlanId 10).
     TameAnimal { target: bevy::prelude::Entity },
-    /// Plant one seed (Grain / Berry / …) from the agent's inventory or hands
-    /// onto an unplanted Farmland tile. The executor (`production_system`'s
-    /// Planter branch) walks `PlantKind::ALL` to pick the matching plant for
-    /// whichever seed is held, so the variant only needs the destination tile.
-    /// Routing happens via `assign_task_with_routing` (set up by the HTN chain
-    /// handoff in `production::finish_withdraw_material`); the legacy executor
-    /// reads `dest_tile` for backwards compatibility — the typed variant is
-    /// what the HTN dispatcher (`htn_plant_from_storage_dispatch_system`)
-    /// emits for chain-integrity inspection. Replaces the dead legacy
-    /// `PlantFromStorage` / `PlantBerryFromStorage` plans (PlanIds 4, 66).
-    Planter { tile: (i32, i32) },
+    /// Plant one unit of `seed_resource` from the agent's inventory or hands
+    /// onto a plantable tile. The executor (`production_system`'s Planter
+    /// branch) resolves the matching `PlantKind` via
+    /// `PlantKind::from_seed_resource(seed_resource)` and consumes exactly
+    /// that resource — no `PlantKind::ALL` guess, so a worker carrying both
+    /// grain and berry seeds plants the kind the dispatcher committed to,
+    /// not whichever happens to be first in iteration order.
+    ///
+    /// Routing happens via `assign_task_with_routing` (set up by the HTN
+    /// chain handoff in `production::finish_withdraw_material`); the legacy
+    /// executor reads `dest_tile` for backwards compatibility — the typed
+    /// variant is what the HTN dispatcher
+    /// (`htn_plant_from_storage_dispatch_system`) emits for chain-integrity
+    /// inspection. Replaces the dead legacy `PlantFromStorage` /
+    /// `PlantBerryFromStorage` plans (PlanIds 4, 66).
+    Planter {
+        tile: (i32, i32),
+        seed_resource: ResourceId,
+    },
     /// Agent is tired and is either routing toward a bed / faction home or
     /// already asleep in place. The Sleep "executor" is a state transition
     /// (`AiState::Sleeping`) rather than a per-tick task system, so this
@@ -344,19 +367,29 @@ pub enum Task {
     /// throw is in-place, no routing required.
     PlayThrow,
     /// Recreational seed-planting on an unplanted grass tile. Consumes one
-    /// Grain or Berry seed from inventory or hands, spawns the matching
-    /// `PlantKind` at `tile`, awards Farming XP + `ActivityKind::Farming`,
-    /// bursts willpower. Shares `production_system`'s Planter branch with
-    /// `Task::Planter { tile }` — the only difference is `is_play = true`
-    /// for the willpower burst on completion. Produced by
+    /// unit of `seed_resource` from inventory or hands, spawns the matching
+    /// `PlantKind` (via `PlantKind::from_seed_resource(seed_resource)`) at
+    /// `tile`, awards Farming XP + `ActivityKind::Farming`, bursts willpower.
+    /// Shares `production_system`'s Planter branch with
+    /// `Task::Planter { tile, seed_resource }` — the only difference is
+    /// `is_play = true` for the willpower burst on completion. Produced by
     /// `WithdrawAndPlantSeedAsPlayMethod` / `WithdrawAndPlantBerrySeedAsPlayMethod`
     /// (Phase 5e-xii-d — replaces the legacy `PlayByPlanting` plan, PlanId 30,
     /// and `PlayByPlantingBerry` plan, PlanId 67) as the trailing leg of a
-    /// `[WithdrawMaterial { seed, 1 }, PlayPlant { tile }]` chain. The chain
-    /// handoff in `production::finish_withdraw_material` routes via
-    /// `TaskKind::PlayPlant` to the destination grass tile carried by the
-    /// typed variant once the seed is in hand.
-    PlayPlant { tile: (i32, i32) },
+    /// `[WithdrawMaterial { seed, 1 }, PlayPlant { tile, seed_resource }]`
+    /// chain. The chain handoff in `production::finish_withdraw_material`
+    /// routes via `TaskKind::PlayPlant` to the destination grass tile carried
+    /// by the typed variant once the seed is in hand.
+    ///
+    /// `seed_resource` is the authoritative seed identity — the executor
+    /// consumes exactly this resource (no `PlantKind::ALL` guess), so a
+    /// worker carrying both grain and berry seeds plants whichever the
+    /// dispatcher committed to, not whichever happens to be first in
+    /// `PlantKind::ALL`.
+    PlayPlant {
+        tile: (i32, i32),
+        seed_resource: ResourceId,
+    },
     /// Work adjacent to a satisfied `CraftOrder` until the recipe completes.
     /// Produced by `WorkOnSatisfiedCraftOrderMethod` (Phase 5e-xi-b — replaces
     /// the legacy `WorkOnCraft` plan, PlanId 16) as the head of a
@@ -705,6 +738,12 @@ impl ActionQueue {
         }
     }
 
+    /// Iterate the prefetched (queued) tasks in order, oldest first. Skips
+    /// `current` — use `aq.current` directly for that.
+    pub fn queued_iter(&self) -> impl Iterator<Item = Task> + '_ {
+        self.queued.iter().take(self.queued_len as usize).copied()
+    }
+
     /// Push a task onto the back of the prefetched queue. Returns `false`
     /// without modifying the queue if it is at capacity — callers should treat
     /// a full queue as a producer bug (the dispatcher should not be enqueuing
@@ -977,7 +1016,22 @@ impl Task {
     /// Convenience accessor for the WithdrawMaterial variant.
     pub fn as_withdraw_material(&self) -> Option<(ResourceId, u8)> {
         match *self {
-            Task::WithdrawMaterial { resource_id, qty } => Some((resource_id, qty)),
+            Task::WithdrawMaterial {
+                resource_id, qty, ..
+            } => Some((resource_id, qty)),
+            _ => None,
+        }
+    }
+
+    /// Convenience accessor for the WithdrawMaterial source override.
+    /// `None` means "use the worker's faction" (legacy default); `Some(fid)`
+    /// pins to a specific storage owner (e.g. household private storage
+    /// drawn by a village-faction worker).
+    pub fn as_withdraw_material_source(&self) -> Option<Option<u32>> {
+        match *self {
+            Task::WithdrawMaterial {
+                source_faction_id, ..
+            } => Some(source_faction_id),
             _ => None,
         }
     }
@@ -1173,10 +1227,32 @@ impl Task {
         matches!(*self, Task::Butcher)
     }
 
-    /// Convenience accessor for the TameAnimal variant.
+    /// Convenience accessor for the Planter variant.
     pub fn as_planter(&self) -> Option<(i32, i32)> {
         match self {
-            Task::Planter { tile } => Some(*tile),
+            Task::Planter { tile, .. } => Some(*tile),
+            _ => None,
+        }
+    }
+
+    /// Returns the typed planter (tile + seed) when the task is a `Planter`.
+    pub fn as_planter_full(&self) -> Option<((i32, i32), ResourceId)> {
+        match *self {
+            Task::Planter {
+                tile,
+                seed_resource,
+            } => Some((tile, seed_resource)),
+            _ => None,
+        }
+    }
+
+    /// Returns the typed play-plant (tile + seed) when the task is a `PlayPlant`.
+    pub fn as_play_plant_full(&self) -> Option<((i32, i32), ResourceId)> {
+        match *self {
+            Task::PlayPlant {
+                tile,
+                seed_resource,
+            } => Some((tile, seed_resource)),
             _ => None,
         }
     }
@@ -1266,7 +1342,7 @@ impl Task {
     /// grass tile the agent should plant on.
     pub fn as_play_plant(&self) -> Option<(i32, i32)> {
         match *self {
-            Task::PlayPlant { tile } => Some(tile),
+            Task::PlayPlant { tile, .. } => Some(tile),
             _ => None,
         }
     }

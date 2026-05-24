@@ -2996,10 +2996,14 @@ pub fn chief_job_posting_system(
                         continue;
                     }
 
-                    // Tile-state classification.
+                    // Tile-state classification. `mature_crop` counts any
+                    // farm-plantable kind (`PlantKind::is_farm_plantable()`)
+                    // at Mature inside the plot — so a Berry bush growing in
+                    // an Agricultural plot creates an Autumn Harvest posting
+                    // alongside Grain.
                     let mut unprepared = 0u32;
                     let mut plantable = 0u32;
-                    let mut mature_grain = 0u32;
+                    let mut mature_crop = 0u32;
                     for ty in rect.y0..rect.y0 + rect.h as i32 {
                         for tx in rect.x0..rect.x0 + rect.w as i32 {
                             let kind_opt = farm_params.chunk_map.tile_kind_at(tx, ty);
@@ -3016,34 +3020,31 @@ pub fn chief_job_posting_system(
                             {
                                 if let Some(pent) = farm_params.plant_map.0.get(&(tx, ty)) {
                                     if let Ok(pl) = farm_params.plant_q.get(*pent) {
-                                        if matches!(
-                                            pl.kind,
-                                            crate::simulation::plants::PlantKind::Grain
-                                        ) && pl.stage
-                                            == crate::simulation::plants::GrowthStage::Mature
+                                        if pl.kind.is_farm_plantable()
+                                            && pl.stage
+                                                == crate::simulation::plants::GrowthStage::Mature
                                         {
-                                            mature_grain += 1;
+                                            mature_crop += 1;
                                         }
                                     }
                                 } else {
                                     plantable += 1;
                                 }
                             }
-                            // Mature grain check on Cropland tiles below the
+                            // Mature-crop check on Cropland tiles below the
                             // plantable threshold (eg. tile yield dropped
-                            // mid-season).
+                            // mid-season but the standing crop is still
+                            // harvestable).
                             if is_cropland
                                 && nutrients < crate::simulation::farm::MIN_PLANTABLE_NUTRIENTS
                             {
                                 if let Some(pent) = farm_params.plant_map.0.get(&(tx, ty)) {
                                     if let Ok(pl) = farm_params.plant_q.get(*pent) {
-                                        if matches!(
-                                            pl.kind,
-                                            crate::simulation::plants::PlantKind::Grain
-                                        ) && pl.stage
-                                            == crate::simulation::plants::GrowthStage::Mature
+                                        if pl.kind.is_farm_plantable()
+                                            && pl.stage
+                                                == crate::simulation::plants::GrowthStage::Mature
                                         {
-                                            mature_grain += 1;
+                                            mature_crop += 1;
                                         }
                                     }
                                 }
@@ -3126,13 +3127,13 @@ pub fn chief_job_posting_system(
                             }
                         }
                         crate::simulation::farm::FarmSeasonPhase::AutumnHarvest => {
-                            if mature_grain > 0
+                            if mature_crop > 0
                                 && !posted_by_phase.contains_key(&(*pid, FarmWorkPhase::Harvest))
                             {
                                 emit(JobProgress::FieldWork {
                                     phase: FarmWorkPhase::Harvest,
                                     completed: 0,
-                                    target: mature_grain,
+                                    target: mature_crop,
                                     area,
                                     plot_id: Some(*pid),
                                     assigned_farmer: None,

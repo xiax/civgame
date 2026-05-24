@@ -214,13 +214,15 @@ impl FieldTileIndex {
 
 /// Find the nearest plantable tile in `rect` for the seasonal pipeline.
 /// "Plantable" means: tile kind is `Cropland` (prepared), tile is not already
-/// carrying a plant (PlantMap), and `FieldTileIndex[tile].nutrients >=
-/// MIN_PLANTABLE_NUTRIENTS`. Falls back to no result if every candidate is
-/// either unprepared, exhausted, or already planted. Manhattan distance.
+/// carrying a plant (PlantMap), not held by an in-flight `PlantingReservations`
+/// entry, and `FieldTileIndex[tile].nutrients >= MIN_PLANTABLE_NUTRIENTS`.
+/// Falls back to no result if every candidate is either unprepared, exhausted,
+/// already planted, or already reserved by a peer. Manhattan distance.
 pub fn find_nearest_plantable_in_rect(
     chunk_map: &crate::world::chunk::ChunkMap,
     plant_map: &crate::simulation::plants::PlantMap,
     field_tiles: &FieldTileIndex,
+    reservations: &crate::simulation::plants::PlantingReservations,
     from: (i32, i32),
     rect_min: (i32, i32),
     rect_max: (i32, i32),
@@ -230,6 +232,9 @@ pub fn find_nearest_plantable_in_rect(
     for ty in rect_min.1..=rect_max.1 {
         for tx in rect_min.0..=rect_max.0 {
             if plant_map.0.contains_key(&(tx, ty)) {
+                continue;
+            }
+            if reservations.is_reserved((tx, ty)) {
                 continue;
             }
             if !matches!(

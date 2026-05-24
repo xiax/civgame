@@ -93,6 +93,7 @@ pub fn production_system(
     plot_q: Query<&crate::simulation::land::Plot>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
+    mut plant_reservations: ResMut<crate::simulation::plants::PlantingReservations>,
     mut faction_registry: ResMut<FactionRegistry>,
     mut board: ResMut<JobBoard>,
     mut job_completed: EventWriter<JobCompletedEvent>,
@@ -145,15 +146,19 @@ pub fn production_system(
             let is_play = task == TaskKind::PlayPlant as u16;
             if ai.work_progress >= TICKS_FARMER_PLANT {
                 ai.work_progress = 0;
-                // Walk PlantKind::ALL so adding a new seed/plant pair only
-                // requires editing PlantKind::seed_good(). Seeds may live in
-                // hands (harvest co-yields route through Carrier) OR
-                // inventory (withdrawn from storage), so check both stores.
-                let seed_and_plant = PlantKind::ALL.iter().copied().find_map(|kind| {
-                    let seed_id = kind.seed_resource()?;
+                // Read the authoritative seed identity off the typed task —
+                // no `PlantKind::ALL` guess. A worker carrying both grain and
+                // berry seeds plants whichever the dispatcher committed to.
+                let typed_seed = if is_play {
+                    aq.current.as_play_plant_full().map(|(_, s)| s)
+                } else {
+                    aq.current.as_planter_full().map(|(_, s)| s)
+                };
+                let seed_and_plant = typed_seed.and_then(|seed_id| {
+                    let plant_kind = PlantKind::from_seed_resource(seed_id)?;
                     let held =
                         agent.quantity_of_resource(seed_id) + carrier.quantity_of_resource(seed_id);
-                    (held > 0).then_some((seed_id, kind))
+                    (held > 0).then_some((seed_id, plant_kind))
                 });
                 if !plant_map.0.contains_key(&(tx, ty)) {
                     if let Some((seed_id, plant_kind)) = seed_and_plant {
@@ -263,6 +268,11 @@ pub fn production_system(
                         }
                     }
                 }
+                // Release the destination-tile reservation now that the
+                // plant slot has either been filled (success) or proven
+                // unplantable (race lost / no seed) — either way no other
+                // worker should keep waiting on it.
+                plant_reservations.release((tx, ty));
                 ai.state = AiState::Idle;
                 // Phase 5e-v: drain the typed channel so an HTN
                 // PlantFromStorage chain (or PlayPlant — both use this branch)
@@ -273,6 +283,10 @@ pub fn production_system(
             } else {
                 // Check if tile is still valid for planting
                 if plant_map.0.contains_key(&(tx, ty)) {
+                    // Lost the race during walk — release the reservation
+                    // so a future planter can use the slot once the current
+                    // crop clears.
+                    plant_reservations.release((tx, ty));
                     ai.state = AiState::Idle;
                     aq.advance();
                 }
@@ -315,10 +329,21 @@ pub fn production_system(
                 || x == TaskKind::PlayThrow as u16
         ) && agent.is_inventory_full()
         {
-            // Inventory full — abort the chain. Without `aq.cancel_chain` the
-            // typed task stays in `current` and the next dispatcher tick
-            // re-enqueues a duplicate (Planter chain has a queued tail under
-            // PlantFromStorage), risking ACTION_QUEUE_CAP overflow.
+            // Inventory full — abort the chain. Release the planting
+            // reservation (if any) before dropping the chain so the slot
+            // doesn't leak.
+            let reserved_tile = aq
+                .current
+                .as_planter_full()
+                .map(|(t, _)| t)
+                .or_else(|| aq.current.as_play_plant_full().map(|(t, _)| t));
+            if let Some(t) = reserved_tile {
+                plant_reservations.release(t);
+            }
+            // Without `aq.cancel_chain` the typed task stays in `current`
+            // and the next dispatcher tick re-enqueues a duplicate (Planter
+            // chain has a queued tail under PlantFromStorage), risking
+            // ACTION_QUEUE_CAP overflow.
             aq.cancel_chain(&mut ai);
         }
     }
@@ -432,6 +457,7 @@ pub fn withdraw_material_task_system(
     spatial: Res<SpatialIndex>,
     storage_tile_map: Res<StorageTileMap>,
     storage_reservations: Res<StorageReservations>,
+    mut plant_reservations: ResMut<crate::simulation::plants::PlantingReservations>,
     chunk_map: Res<crate::world::chunk::ChunkMap>,
     chunk_graph: Res<crate::pathfinding::chunk_graph::ChunkGraph>,
     chunk_router: Res<crate::pathfinding::chunk_router::ChunkRouter>,
@@ -565,6 +591,7 @@ pub fn withdraw_material_task_system(
                 &mut method_history,
                 clock.tick,
                 &storage_reservations,
+                &mut plant_reservations,
                 &chunk_map,
                 &chunk_graph,
                 &chunk_router,
@@ -573,6 +600,8 @@ pub fn withdraw_material_task_system(
                 &co_query,
                 cur_tile,
                 cur_chunk,
+            &carrier,
+            &agent,
             );
             continue;
         };
@@ -584,6 +613,7 @@ pub fn withdraw_material_task_system(
                 &mut method_history,
                 clock.tick,
                 &storage_reservations,
+                &mut plant_reservations,
                 &chunk_map,
                 &chunk_graph,
                 &chunk_router,
@@ -592,20 +622,35 @@ pub fn withdraw_material_task_system(
                 &co_query,
                 cur_tile,
                 cur_chunk,
+            &carrier,
+            &agent,
             );
             continue;
         }
 
         let (tx, ty) = ai.dest_tile;
 
-        if storage_tile_map.tiles.get(&(tx, ty)) != Some(&member.faction_id) {
-            // Storage tile is no longer owned by our faction — abort.
+        // The typed task may carry an explicit `source_faction_id` override
+        // when the worker is drawing from a faction OTHER than its own
+        // `FactionMember.faction_id` (e.g. a household member drawing from
+        // household-private storage — `member.faction_id` is the village,
+        // but the storage tile is owned by the household sub-faction).
+        // `None` falls back to the worker's faction (legacy behaviour).
+        let expected_owner = aq
+            .current
+            .as_withdraw_material_source()
+            .flatten()
+            .unwrap_or(member.faction_id);
+
+        if storage_tile_map.tiles.get(&(tx, ty)) != Some(&expected_owner) {
+            // Storage tile is no longer owned by the expected source faction — abort.
             finish_withdraw_material(
                 &mut ai,
                 &mut aq,
                 &mut method_history,
                 clock.tick,
                 &storage_reservations,
+                &mut plant_reservations,
                 &chunk_map,
                 &chunk_graph,
                 &chunk_router,
@@ -614,6 +659,8 @@ pub fn withdraw_material_task_system(
                 &co_query,
                 cur_tile,
                 cur_chunk,
+            &carrier,
+            &agent,
             );
             continue;
         }
@@ -706,6 +753,7 @@ pub fn withdraw_material_task_system(
             &mut method_history,
             clock.tick,
             &storage_reservations,
+            &mut plant_reservations,
             &chunk_map,
             &chunk_graph,
             &chunk_router,
@@ -714,6 +762,8 @@ pub fn withdraw_material_task_system(
             &co_query,
             cur_tile,
             cur_chunk,
+        &carrier,
+        &agent,
         );
     }
 }
@@ -960,6 +1010,7 @@ fn finish_withdraw_material(
     method_history: &mut crate::simulation::htn::MethodHistory,
     now: u64,
     storage_reservations: &StorageReservations,
+    plant_reservations: &mut crate::simulation::plants::PlantingReservations,
     chunk_map: &crate::world::chunk::ChunkMap,
     chunk_graph: &crate::pathfinding::chunk_graph::ChunkGraph,
     chunk_router: &crate::pathfinding::chunk_router::ChunkRouter,
@@ -968,6 +1019,8 @@ fn finish_withdraw_material(
     co_query: &Query<&crate::simulation::crafting::CraftOrder>,
     cur_tile: (i32, i32),
     cur_chunk: crate::world::chunk::ChunkCoord,
+    carrier: &Carrier,
+    agent: &EconomicAgent,
 ) {
     use crate::simulation::tasks::assign_task_with_routing;
     use crate::simulation::typed_task::Task;
@@ -1036,14 +1089,33 @@ fn finish_withdraw_material(
             ai.state = AiState::Working;
             ai.work_progress = 0;
         }
-        Task::Planter { tile } => {
+        Task::Planter {
+            tile,
+            seed_resource,
+        } => {
             // Phase 5e-v: PlantFromStorage chain. `WithdrawAndPlantSeedMethod`
-            // expands to [WithdrawMaterial, Planter { tile }]; once the seed is
-            // in hand (or inventory) the agent walks to the destination
-            // farmland tile picked at dispatch time, then plants.
+            // expands to [WithdrawMaterial, Planter { tile, seed_resource }];
+            // once the seed is in hand (or inventory) the agent walks to the
+            // destination farmland tile picked at dispatch time, then plants.
             // Routing is required because the planter executor works on the
             // tile itself (not in-place) and the destination differs from the
             // storage tile.
+            //
+            // No-seed precheck (race): the storage stack we reserved may have
+            // been emptied between dispatch and arrival. Without the seed in
+            // hand the trailing Planter leg is doomed — walk would succeed
+            // but the plant action would silently no-op. Cancel the chain
+            // instead so the worker re-evaluates next tick.
+            if carrier.quantity_of_resource(seed_resource)
+                + agent.quantity_of_resource(seed_resource)
+                == 0
+            {
+                plant_reservations.release(tile);
+                crate::simulation::htn::record_target_failure(method_history, ai, now);
+                aq.cancel_chain(ai);
+                ai.target_entity = None;
+                return;
+            }
             let dispatched = assign_task_with_routing(
                 ai,
                 cur_tile,
@@ -1057,6 +1129,7 @@ fn finish_withdraw_material(
                 chunk_connectivity,
             );
             if !dispatched {
+                plant_reservations.release(tile);
                 crate::simulation::htn::record_routing_failure(method_history, ai, now);
                 aq.cancel();
                 ai.state = AiState::Idle;
@@ -1090,16 +1163,31 @@ fn finish_withdraw_material(
             // to the held-item path.
             ai.target_entity = None;
         }
-        Task::PlayPlant { tile } => {
+        Task::PlayPlant {
+            tile,
+            seed_resource,
+        } => {
             // Phase 5e-xii-d: PlayByPlanting / PlayByPlantingBerry chain.
             // `WithdrawAndPlantGrainSeedAsPlayMethod` /
             // `WithdrawAndPlantBerrySeedAsPlayMethod` expand to
-            // [WithdrawMaterial { seed, 1 }, PlayPlant { tile }]; once the
-            // seed is in hand, the agent walks to the destination grass tile
-            // picked at dispatch time and plants. Mirrors the Planter chain
-            // handoff but routes via `TaskKind::PlayPlant` so the
-            // production_system Planter branch fires the willpower burst
+            // [WithdrawMaterial { seed, 1 }, PlayPlant { tile, seed_resource }];
+            // once the seed is in hand, the agent walks to the destination
+            // grass tile picked at dispatch time and plants. Mirrors the
+            // Planter chain handoff but routes via `TaskKind::PlayPlant` so
+            // the production_system Planter branch fires the willpower burst
             // (`is_play = true`).
+            //
+            // No-seed precheck (race) — same rationale as Planter above.
+            if carrier.quantity_of_resource(seed_resource)
+                + agent.quantity_of_resource(seed_resource)
+                == 0
+            {
+                plant_reservations.release(tile);
+                crate::simulation::htn::record_target_failure(method_history, ai, now);
+                aq.cancel_chain(ai);
+                ai.target_entity = None;
+                return;
+            }
             let dispatched = assign_task_with_routing(
                 ai,
                 cur_tile,
@@ -1113,6 +1201,7 @@ fn finish_withdraw_material(
                 chunk_connectivity,
             );
             if !dispatched {
+                plant_reservations.release(tile);
                 crate::simulation::htn::record_routing_failure(method_history, ai, now);
                 aq.cancel();
                 ai.state = AiState::Idle;

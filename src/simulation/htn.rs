@@ -336,6 +336,13 @@ impl AbstractTask {
 /// 5a-i's lone Sleep method.
 pub type MethodFlags = u8;
 pub const MF_UNINTERRUPTIBLE: MethodFlags = 1 << 0;
+/// `MF_FALLBACK_ONLY` partitions a method out of the primary `dispatch_for_goal`
+/// argmax. The helper does a two-pass pick: first over concrete (non-fallback)
+/// methods whose preconditions pass; then, only if no concrete picked, over
+/// fallback methods. Encodes the `feedback_live_preconditions_no_bias`
+/// invariant on the method itself so dispatchers don't have to reproduce a
+/// per-MethodId exclusion list. Set on `Explore*` "last-resort" methods.
+pub const MF_FALLBACK_ONLY: MethodFlags = 1 << 1;
 
 /// Stable per-method identity. Mirrors `PlanId` in `plan/mod.rs` — newtype
 /// over `u16` with one `pub const` per registered method. Method dispatchers
@@ -553,13 +560,12 @@ pub fn score_method_with_history(
     raw - failures * METHOD_FAILURE_PENALTY
 }
 
-/// Phase E: disposition-aware variant of `score_method_with_history`.
-/// Multiplies the method's `utility()` by `disposition_lift(...)` (default
-/// 1.0 — no lift) before applying the failure penalty. Used by the
-/// 3 migrated dispatchers (Socialize / Hunt / Play); the other ~21
-/// stay on the legacy `score_method_with_history` until the
-/// dispatch_for_goal consolidation lands (see
-/// `civgame/plans/htn-dispatcher-consolidation.md`).
+/// Disposition-aware variant of `score_method_with_history`. Multiplies
+/// the method's `utility()` by `disposition_lift(...)` (default 1.0 — no
+/// lift) before applying the failure penalty. `dispatch_for_goal` reaches
+/// for this when its caller passes a `Disposition` (today: Socialize,
+/// EngagePrey, Play). Other goals pass `None` and stay on the plain
+/// `score_method_with_history`.
 pub fn score_method_with_history_and_disposition(
     method: &dyn Method,
     abstract_task: AbstractTask,
@@ -582,6 +588,12 @@ pub struct DispatchForGoalPick<'a> {
 /// Shared method argmax for goal-specific HTN wrappers. The wrapper still
 /// owns context construction and task routing; this helper owns the common
 /// "methods for abstract task → precondition → history-aware utility" shape.
+///
+/// Partitions on `MF_FALLBACK_ONLY`: first argmax over concrete methods
+/// (no fallback flag) whose precondition passes; only if no concrete picked,
+/// argmax over fallback methods. Encodes
+/// `feedback_live_preconditions_no_bias` so an `Explore`-style last-resort
+/// method can't beat a heavily-history-biased concrete in the same argmax.
 pub fn dispatch_for_goal<'a>(
     method_registry: &'a MethodRegistry,
     abstract_task: AbstractTask,
@@ -590,15 +602,11 @@ pub fn dispatch_for_goal<'a>(
     now: u64,
     disposition: Option<crate::simulation::goal_scorers::Disposition>,
 ) -> Option<DispatchForGoalPick<'a>> {
-    let mut best: Option<DispatchForGoalPick<'a>> = None;
-    for method in method_registry.methods_for(abstract_task.kind()) {
-        let method_ref = method.as_ref();
-        if !method_ref.precondition(abstract_task, ctx) {
-            continue;
-        }
-        let score = if let Some(disposition) = disposition {
+    let methods = method_registry.methods_for(abstract_task.kind());
+    let score_one = |m: &dyn Method| -> f32 {
+        if let Some(disposition) = disposition {
             score_method_with_history_and_disposition(
-                method_ref,
+                m,
                 abstract_task,
                 ctx,
                 disposition,
@@ -606,21 +614,36 @@ pub fn dispatch_for_goal<'a>(
                 now,
             )
         } else {
-            score_method_with_history(method_ref, abstract_task, ctx, history, now)
-        };
-        // Match the legacy per-dispatcher `Iterator::max_by` behavior: when
-        // utilities tie, the later registered method wins. Several Play
-        // methods intentionally sit at UTIL_BASELINE and rely on registration
-        // order for parity with the old plan ranking.
-        if best.as_ref().map_or(true, |b| score >= b.score) {
-            best = Some(DispatchForGoalPick {
-                method: method_ref,
-                method_id: method_ref.id(),
-                score,
-            });
+            score_method_with_history(m, abstract_task, ctx, history, now)
         }
-    }
-    best
+    };
+    let pass = |include_fallback: bool| -> Option<DispatchForGoalPick<'a>> {
+        let mut best: Option<DispatchForGoalPick<'a>> = None;
+        for method in methods {
+            let method_ref = method.as_ref();
+            let is_fallback = method_ref.flags() & MF_FALLBACK_ONLY != 0;
+            if is_fallback != include_fallback {
+                continue;
+            }
+            if !method_ref.precondition(abstract_task, ctx) {
+                continue;
+            }
+            let score = score_one(method_ref);
+            // Match the legacy per-dispatcher `Iterator::max_by` behavior:
+            // when utilities tie, the later registered method wins. Several
+            // Play methods intentionally sit at UTIL_BASELINE and rely on
+            // registration order for parity with the old plan ranking.
+            if best.as_ref().map_or(true, |b| score >= b.score) {
+                best = Some(DispatchForGoalPick {
+                    method: method_ref,
+                    method_id: method_ref.id(),
+                    score,
+                });
+            }
+        }
+        best
+    };
+    pass(false).or_else(|| pass(true))
 }
 
 /// Pluralist Economy R4: check whether a method's `policy_gate` is
@@ -1734,7 +1757,8 @@ impl Method for WithdrawMaterialFromStorageMethod {
         vec![Task::WithdrawMaterial {
             resource_id,
             qty: 1,
-        }]
+        source_faction_id: None,
+            }]
     }
 
     fn name(&self) -> &'static str {
@@ -1814,6 +1838,7 @@ impl Method for WithdrawAndHaulToBlueprintMethod {
             Task::WithdrawMaterial {
                 resource_id,
                 qty: 1,
+            source_faction_id: None,
             },
             Task::HaulToBlueprint { blueprint },
         ]
@@ -2084,6 +2109,10 @@ impl Method for ExploreForFoodMethod {
     fn id(&self) -> MethodId {
         MethodId::EXPLORE_FOR_FOOD
     }
+
+    fn flags(&self) -> MethodFlags {
+        MF_FALLBACK_ONLY
+    }
 }
 
 /// Phase 5c-ii-d-iv-i fallback method for `AbstractTask::AcquireGood { good }`.
@@ -2166,6 +2195,10 @@ impl Method for ExploreForMaterialMethod {
 
     fn id(&self) -> MethodId {
         MethodId::EXPLORE_FOR_MATERIAL
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_FALLBACK_ONLY
     }
 }
 
@@ -2290,6 +2323,10 @@ impl Method for ExploreForFoodForStorageMethod {
 
     fn id(&self) -> MethodId {
         MethodId::EXPLORE_FOR_FOOD_FOR_STORAGE
+    }
+
+    fn flags(&self) -> MethodFlags {
+        MF_FALLBACK_ONLY
     }
 }
 
@@ -2589,6 +2626,7 @@ impl Method for WithdrawAndEquipHuntingSpearMethod {
             Task::WithdrawMaterial {
                 resource_id: weapon,
                 qty: 1,
+                source_faction_id: None,
             },
             Task::Equip {
                 slot: crate::simulation::items::EquipmentSlot::MainHand,
@@ -2753,8 +2791,12 @@ impl Method for WithdrawAndPlantSeedMethod {
             Task::WithdrawMaterial {
                 resource_id,
                 qty: 1,
+                source_faction_id: None,
             },
-            Task::Planter { tile },
+            Task::Planter {
+                tile,
+                seed_resource: resource_id,
+            },
         ]
     }
 
@@ -2895,6 +2937,7 @@ impl Method for WithdrawAndHaulToPersonalBlueprintMethod {
             Task::WithdrawMaterial {
                 resource_id,
                 qty: 1,
+            source_faction_id: None,
             },
             Task::HaulToBlueprint { blueprint },
         ]
@@ -3501,37 +3544,40 @@ fn pick_explore_tile(
     None
 }
 
-/// Phase 5a-ii dispatcher. Owns `AgentGoal::Sleep` end-to-end — the legacy
-/// match arm in `goal_dispatch_system` is gone. For each non-Drafted,
-/// non-PlayerOrder agent whose goal is Sleep this system:
+/// `AgentGoal::Sleep` dispatcher. Drives the standard `dispatch_for_goal`
+/// shape: gate goal+idle+non-Dormant, build `PlannerCtx`, argmax the
+/// `MethodRegistry[Sleep]` (only `SleepMethod` today), and route the head
+/// `Task::Sleep { bed }`. The head routing is bespoke because Sleep has
+/// three legal anchors: own bed (`Some(bed)`), faction home (`None` +
+/// outside 5-tile disc), or sleep-in-place (`None` + already home or no
+/// home). Any tail tasks are pushed onto the prefetch ring.
 ///
-/// 1. Short-circuits the in-progress states (already `Sleeping`, just arrived
-///    `Working` on the Sleep tile, or still `Seeking`/`Routing` toward one).
-/// 2. Snapshots the agent into a `PlannerCtx` (tile, faction, faction home,
-///    home-bed claim + the bed's tile if the claim is still live).
-/// 3. Picks the highest-utility applicable `Method` from the Sleep registry.
-///    Today that is always `SleepMethod`; the loop is in place for 5b+ where
-///    multiple methods will compete on utility.
-/// 4. Reads the expansion's first `Task::Sleep { bed }` and routes the legacy
-///    channel accordingly: route to bed tile (`Some(_)`), route to faction
-///    home (within 5-tile disc check), or sleep in place. Any further tasks
-///    in the expansion are pushed onto the prefetch ring.
+/// `sleep::sleep_task_system` (Sequential) owns the entire downstream
+/// lifecycle (arrival `Working`→`Sleeping` flip, recovery, retirement,
+/// orphan self-heal). The `aq.current_task_kind() != UNEMPLOYED_TASK_KIND`
+/// gate via the standard idle check prevents re-planning while a Sleep
+/// chain is in flight (would desync `ai.state == Idle` with `current ==
+/// Sleep` per `ActionQueue::dispatch`'s debug-assert).
 ///
-/// Behaviour parity with the deleted arm is the migration's only contract —
+/// Sleep is a maintenance goal — exempt from `chronic_failure_release` and
+/// not covered by `goal_contract::blocked`. Routing failures still record
+/// `MethodOutcome::FailedRouting` so `MethodHistory` bias works.
 /// `sleep_goal_dispatches_typed_sleep_task` in `test_fixture` is the
 /// regression test.
-pub fn htn_dispatch_system(
+pub fn htn_sleep_dispatch_system(
     chunk_map: Res<ChunkMap>,
     chunk_graph: Res<ChunkGraph>,
     chunk_router: Res<ChunkRouter>,
     chunk_connectivity: Res<ChunkConnectivity>,
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
+    clock: Res<SimClock>,
     bed_query: Query<&Transform, With<Bed>>,
     mut query: Query<
         (
             &mut PersonAI,
             &mut ActionQueue,
+            &mut MethodHistory,
             &AgentGoal,
             &FactionMember,
             &Transform,
@@ -3541,229 +3587,180 @@ pub fn htn_dispatch_system(
         Without<Drafted>,
     >,
 ) {
-    query.par_iter_mut().for_each(
-        |(mut ai, mut aq, goal, member, transform, lod, home_bed_opt)| {
-            if *lod == LodLevel::Dormant {
-                return;
+    let now = clock.tick;
+    for (mut ai, mut aq, mut history, goal, member, transform, lod, home_bed_opt) in
+        query.iter_mut()
+    {
+        if *lod == LodLevel::Dormant {
+            continue;
+        }
+        if !matches!(*goal, AgentGoal::Sleep) {
+            continue;
+        }
+        if ai.state != AiState::Idle || aq.current_task_kind() != UNEMPLOYED_TASK_KIND {
+            continue;
+        }
+
+        let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let cur_chunk = ChunkCoord(
+            cur_tx.div_euclid(CHUNK_SIZE as i32),
+            cur_ty.div_euclid(CHUNK_SIZE as i32),
+        );
+
+        let home_bed = home_bed_opt.and_then(|h| h.0);
+        let home_bed_tile = home_bed.and_then(|b| bed_query.get(b).ok()).map(|t| {
+            (
+                (t.translation.x / TILE_SIZE).floor() as i32,
+                (t.translation.y / TILE_SIZE).floor() as i32,
+            )
+        });
+        let faction_home = if member.faction_id != SOLO {
+            faction_registry.home_tile(member.faction_id)
+        } else {
+            None
+        };
+
+        let ctx = PlannerCtx {
+            scope: ScoringScope::Geometric,
+            tile: (cur_tx, cur_ty),
+            faction_id: member.faction_id,
+            faction_home,
+            home_bed,
+            home_bed_tile,
+            edible_count: 0,
+            hunger: 0.0,
+            nearest_storage_tile: None,
+            faction_food_stock: 0,
+            material_storage_tile: None,
+            material_stock_for_target: 0,
+            claimed_blueprint: None,
+            claimed_blueprint_tile: None,
+            gather_target_tile: None,
+            scavenge_target_entity: None,
+            scavenge_target_tile: None,
+            scavenge_food_good: None,
+            gather_deposit_tile: None,
+            scavenge_deposit_tile: None,
+            forage_food_good: None,
+            butcher_site_tile: None,
+            prey_target_entity: None,
+            prey_target_tile: None,
+            fresh_corpse_entity: None,
+            fresh_corpse_tile: None,
+            hunt_hearth_tile: None,
+            hunt_area_tile: None,
+            hunt_party_deployed: false,
+            hunt_party_stale: false,
+            target_craft_order: None,
+            craft_output_resource: None,
+            play_partner_entity: None,
+            play_solo_eligible: false,
+            play_stone_storage_tile: None,
+            play_toy_storage_tile: None,
+            play_toy_resource: None,
+            play_grain_seed_storage_tile: None,
+            play_berry_seed_storage_tile: None,
+            play_plant_destination_tile: None,
+            personal_bp_resource: None,
+            agent_has_weapon: false,
+            deposit_target_faction_override: None,
+            fish_spot_tile: None,
+        };
+
+        let abstract_task = AbstractTask::Sleep;
+        let Some(pick) =
+            dispatch_for_goal(&method_registry, abstract_task, &ctx, &history, now, None)
+        else {
+            continue;
+        };
+        let method = pick.method;
+        let chosen_id = pick.method_id;
+        ai.active_method = Some(chosen_id);
+        let mut tasks = method.expand(abstract_task, &ctx);
+        if tasks.is_empty() {
+            ai.active_method = None;
+            continue;
+        }
+        let head = tasks.remove(0);
+
+        match head {
+            Task::Sleep {
+                bed: Some(bed_entity),
+            } => {
+                if let Some(bed_tile) = home_bed_tile {
+                    let routed = assign_task_with_routing(
+                        &mut ai,
+                        (cur_tx, cur_ty),
+                        cur_chunk,
+                        bed_tile,
+                        TaskKind::Sleep,
+                        Some(bed_entity),
+                        &chunk_graph,
+                        &chunk_router,
+                        &chunk_map,
+                        &chunk_connectivity,
+                    );
+                    if routed {
+                        aq.dispatch(Task::Sleep {
+                            bed: Some(bed_entity),
+                        });
+                    } else {
+                        // Bed unreachable — fall back to in-place so AiState
+                        // tracks the dispatched task (otherwise the next tick
+                        // re-dispatches and overflows the prefetch ring).
+                        history.push(chosen_id, MethodOutcome::FailedRouting, now);
+                        ai.state = AiState::Sleeping;
+                        aq.dispatch(Task::Sleep { bed: None });
+                    }
+                } else {
+                    // Defensive: the method already filters bed by
+                    // home_bed_tile.is_some(); drop to in-place if a future
+                    // method skips that filter.
+                    ai.state = AiState::Sleeping;
+                    aq.dispatch(Task::Sleep { bed: None });
+                }
             }
-            if !matches!(*goal, AgentGoal::Sleep) {
-                return;
-            }
-
-            // A Sleep task is already live — this dispatcher only does the
-            // *initial* plan+route+dispatch. Its entire downstream lifecycle
-            // (arrival `Working`→`Sleeping` flip, recovery, retirement, and
-            // orphan recovery when an external preempt resets `ai.state`) is
-            // owned by `sleep::sleep_task_system` (Sequential), keyed on the
-            // typed `Task::Sleep` rather than on `ai.state`. Re-planning here
-            // while `current == Sleep` is exactly the desync the
-            // `ActionQueue::dispatch` assert guards against (an external
-            // resetter could leave `state == Idle` with `current == Sleep`
-            // mid-flight), so never touch an agent whose Sleep task is live —
-            // subsumes the old Sleeping / in-flight / arrival guards.
-            if aq.current_task_kind() == TaskKind::Sleep as u16 {
-                return;
-            }
-
-            // Build the PlannerCtx. `home_bed_tile` reads the bed's Transform;
-            // if the bed entity has been despawned or unloaded the lookup
-            // fails and we drop to `None`, which the SleepMethod translates
-            // into `Task::Sleep { bed: None }` (faction-home / in-place
-            // fallback path).
-            let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
-            let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
-            let cur_chunk = ChunkCoord(
-                cur_tx.div_euclid(CHUNK_SIZE as i32),
-                cur_ty.div_euclid(CHUNK_SIZE as i32),
-            );
-
-            let home_bed = home_bed_opt.and_then(|h| h.0);
-            let home_bed_tile = home_bed.and_then(|b| bed_query.get(b).ok()).map(|t| {
-                (
-                    (t.translation.x / TILE_SIZE).floor() as i32,
-                    (t.translation.y / TILE_SIZE).floor() as i32,
-                )
-            });
-            let faction_home = if member.faction_id != SOLO {
-                faction_registry.home_tile(member.faction_id)
-            } else {
-                None
-            };
-
-            let ctx = PlannerCtx {
-                scope: ScoringScope::Geometric,
-                tile: (cur_tx, cur_ty),
-                faction_id: member.faction_id,
-                faction_home,
-                home_bed,
-                home_bed_tile,
-                // Sleep dispatch path doesn't read the hunger fields; leave
-                // them at zero. The future `htn_eat_dispatch_system` (5b-ii)
-                // will populate them from `EconomicAgent` + `Carrier` +
-                // `Needs` when it lands.
-                edible_count: 0,
-                hunger: 0.0,
-                // Sleep dispatch path doesn't read the storage fields either.
-                // The future `htn_acquire_food_dispatch_system` (5b-iii-ii)
-                // will populate them from `StorageTileMap` + `FactionStorage`.
-                nearest_storage_tile: None,
-                faction_food_stock: 0,
-                // 5c-i material-storage fields. Sleep doesn't consume them.
-                material_storage_tile: None,
-                material_stock_for_target: 0,
-                claimed_blueprint: None,
-                claimed_blueprint_tile: None,
-                gather_target_tile: None,
-                scavenge_target_entity: None,
-                scavenge_target_tile: None,
-                scavenge_food_good: None,
-                gather_deposit_tile: None,
-                scavenge_deposit_tile: None,
-                forage_food_good: None,
-                butcher_site_tile: None,
-                prey_target_entity: None,
-                prey_target_tile: None,
-                fresh_corpse_entity: None,
-                fresh_corpse_tile: None,
-                hunt_hearth_tile: None,
-                hunt_area_tile: None,
-                hunt_party_deployed: false,
-                hunt_party_stale: false,
-                target_craft_order: None,
-                craft_output_resource: None,
-                play_partner_entity: None,
-                play_solo_eligible: false,
-                play_stone_storage_tile: None,
-                play_toy_storage_tile: None,
-                play_toy_resource: None,
-                play_grain_seed_storage_tile: None,
-                play_berry_seed_storage_tile: None,
-                play_plant_destination_tile: None,
-                personal_bp_resource: None,
-                agent_has_weapon: false,
-                deposit_target_faction_override: None,
-                fish_spot_tile: None,
-            };
-
-            // Argmax over applicable methods. f32 has no total order; ties
-            // break on declaration order via `partial_cmp(...).unwrap_or(Equal)`.
-            let abstract_task = AbstractTask::Sleep;
-            let methods = method_registry.methods_for(AbstractTaskKind::Sleep);
-            let chosen = methods
-                .iter()
-                .filter(|m| m.precondition(abstract_task, &ctx))
-                .max_by(|a, b| {
-                    let ua = a.utility(abstract_task, &ctx);
-                    let ub = b.utility(abstract_task, &ctx);
-                    ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
-                });
-
-            let Some(method) = chosen else {
-                return;
-            };
-            let mut tasks = method.expand(abstract_task, &ctx);
-            if tasks.is_empty() {
-                return;
-            }
-            let head = tasks.remove(0);
-
-            // Route the legacy channel based on the typed task. Future
-            // methods that return non-Sleep heads (e.g. a `WalkTo` chain
-            // ahead of a Sleep) will land as new arms here.
-            match head {
-                Task::Sleep {
-                    bed: Some(bed_entity),
-                } => {
-                    if let Some(bed_tile) = home_bed_tile {
+            Task::Sleep { bed: None } => {
+                if let Some(home) = faction_home {
+                    let dx = cur_tx - home.0;
+                    let dy = cur_ty - home.1;
+                    if dx * dx + dy * dy > 5 * 5 {
                         let routed = assign_task_with_routing(
                             &mut ai,
                             (cur_tx, cur_ty),
                             cur_chunk,
-                            bed_tile,
+                            home,
                             TaskKind::Sleep,
-                            Some(bed_entity),
+                            None,
                             &chunk_graph,
                             &chunk_router,
                             &chunk_map,
                             &chunk_connectivity,
                         );
                         if routed {
-                            aq.dispatch(Task::Sleep {
-                                bed: Some(bed_entity),
-                            });
+                            aq.dispatch(Task::Sleep { bed: None });
                         } else {
-                            // Bed unreachable (walled in, sealed by blueprints,
-                            // wrong connectivity component). Falling back to
-                            // in-place sleep keeps the agent's AiState in sync
-                            // with the dispatched task — without this, the
-                            // routing failure leaves AiState::Idle and the
-                            // next tick re-dispatches Task::Sleep, piling up
-                            // in the prefetch ring until it overflows.
+                            history.push(chosen_id, MethodOutcome::FailedRouting, now);
                             ai.state = AiState::Sleeping;
                             aq.dispatch(Task::Sleep { bed: None });
                         }
-                    } else {
-                        // Defensive: the method already filters bed by
-                        // home_bed_tile.is_some(), so this branch shouldn't
-                        // fire. If it ever does (e.g. a future method that
-                        // skips the filter), drop to in-place to avoid a
-                        // null-route panic.
-                        ai.state = AiState::Sleeping;
-                        aq.dispatch(Task::Sleep { bed: None });
+                        continue;
                     }
                 }
-                Task::Sleep { bed: None } => {
-                    // Faction-home branch: route home if we're outside the
-                    // 5-tile disc; once at home, the in-place branch fires.
-                    if let Some(home) = faction_home {
-                        let dx = cur_tx - home.0;
-                        let dy = cur_ty - home.1;
-                        if dx * dx + dy * dy > 5 * 5 {
-                            let routed = assign_task_with_routing(
-                                &mut ai,
-                                (cur_tx, cur_ty),
-                                cur_chunk,
-                                home,
-                                TaskKind::Sleep,
-                                None,
-                                &chunk_graph,
-                                &chunk_router,
-                                &chunk_map,
-                                &chunk_connectivity,
-                            );
-                            if routed {
-                                aq.dispatch(Task::Sleep { bed: None });
-                            } else {
-                                // Home unreachable from here. Sleep in place
-                                // so AiState matches the dispatched task and
-                                // the next tick doesn't re-dispatch Sleep.
-                                ai.state = AiState::Sleeping;
-                                aq.dispatch(Task::Sleep { bed: None });
-                            }
-                            return;
-                        }
-                    }
-                    // Solo, no home, or already at home with no bed: sleep
-                    // here.
-                    ai.state = AiState::Sleeping;
-                    aq.dispatch(Task::Sleep { bed: None });
-                }
-                _ => {
-                    // No registered Sleep method returns a non-Sleep head
-                    // today. Leave the agent untouched so the next tick
-                    // re-runs dispatch.
-                }
+                ai.state = AiState::Sleeping;
+                aq.dispatch(Task::Sleep { bed: None });
             }
+            _ => {
+                ai.active_method = None;
+                continue;
+            }
+        }
 
-            // Push any remaining tasks onto the prefetch ring. Today the
-            // Sleep method returns a single-element vec, so this is a no-op,
-            // but the path is here so multi-step Sleep expansions (e.g.
-            // future "drink water → sleep" chains) flow without code change.
-            for task in tasks {
-                let _ = aq.enqueue(task);
-            }
-        },
-    );
+        for task in tasks {
+            let _ = aq.enqueue(task);
+        }
+    }
 }
 
 /// Phase 5b-ii dispatcher. Owns `AgentGoal::Survive` end-to-end *only* for the
@@ -4334,37 +4331,21 @@ pub fn htn_acquire_food_dispatch_system(
             };
 
             let abstract_task = AbstractTask::AcquireFood;
-            let methods = method_registry.methods_for(AbstractTaskKind::AcquireFood);
-            // Concrete-first partition: enumerate `AcquireFood` methods whose
-            // precondition passes, excluding `ExploreForFoodMethod`. If any
-            // concrete is viable, argmax over concretes only — Explore is
-            // never compared against them. This is what the user's plan in
-            // `plans/food-pickup.md` calls "Explore as a true last resort":
-            // failure-bias on concretes (e.g. depleted fish spots) still
-            // reorders them among themselves, but a heavily-biased concrete
-            // can no longer fall below `UTIL_EXPLORE_FALLBACK` and let
-            // Explore win against a perfectly good live storage / scavenge
-            // target. Falls through to `ExploreForFoodMethod` (and the
-            // terminal-Explore backstop beneath) only when no concrete's
-            // precondition holds.
-            let concrete_chosen = methods
-                .iter()
-                .filter(|m| m.id() != MethodId::EXPLORE_FOR_FOOD)
-                .filter(|m| m.precondition(abstract_task, &ctx))
-                .max_by(|a, b| {
-                    let ua =
-                        score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
-                    let ub =
-                        score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
-                    ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
-                });
-            let chosen = concrete_chosen.or_else(|| {
-                methods
-                    .iter()
-                    .filter(|m| m.id() == MethodId::EXPLORE_FOR_FOOD)
-                    .find(|m| m.precondition(abstract_task, &ctx))
-            });
-            let Some(method) = chosen else {
+            // `dispatch_for_goal` partitions concretes from `MF_FALLBACK_ONLY`
+            // methods (`ExploreForFoodMethod`), so a heavily-history-biased
+            // concrete can't fall below Explore's `UTIL_EXPLORE_FALLBACK` and
+            // let it win against a live storage/scavenge target. Falls through
+            // to the terminal-Explore backstop below only when no concrete
+            // *and* no fallback method's precondition holds.
+            let chosen = dispatch_for_goal(
+                &method_registry,
+                abstract_task,
+                &ctx,
+                &history,
+                now,
+                None,
+            );
+            let Some(pick) = chosen else {
                 // Phase 3 terminal Explore fallback: every AcquireFood
                 // method's precondition failed (no inventory, no storage,
                 // no scavenge target, no known forage tile). Rather than
@@ -4410,7 +4391,8 @@ pub fn htn_acquire_food_dispatch_system(
                 }
                 return;
             };
-            let chosen_id = method.id();
+            let method = pick.method;
+            let chosen_id = pick.method_id;
             // Phase 6b-ii: stamp the active method so `htn_method_completion_system`
             // can record `MethodOutcome::Success` when the chain naturally
             // drains to `Task::Idle`. Failure paths below clear it before
@@ -4938,29 +4920,18 @@ pub fn htn_acquire_good_dispatch_system(
                 let abstract_task = AbstractTask::AcquireGood {
                     resource_id: target_rid,
                 };
-                let methods = method_registry.methods_for(AbstractTaskKind::AcquireGood);
-                let chosen = methods
-                    .iter()
-                    .filter(|m| m.precondition(abstract_task, &ctx))
-                    .max_by(|a, b| {
-                        let ua = score_method_with_history(
-                            a.as_ref(),
-                            abstract_task,
-                            &ctx,
-                            &history,
-                            now,
-                        );
-                        let ub = score_method_with_history(
-                            b.as_ref(),
-                            abstract_task,
-                            &ctx,
-                            &history,
-                            now,
-                        );
-                        ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                let Some(method) = chosen else { continue };
-                let chosen_id = method.id();
+                let Some(pick) = dispatch_for_goal(
+                    &method_registry,
+                    abstract_task,
+                    &ctx,
+                    &history,
+                    now,
+                    None,
+                ) else {
+                    continue;
+                };
+                let method = pick.method;
+                let chosen_id = pick.method_id;
                 // Phase 6b-ii: stamp active method for chain-completion
                 // success recording; failure paths clear it explicitly.
                 ai.active_method = Some(chosen_id);
@@ -5302,17 +5273,13 @@ pub fn htn_acquire_good_dispatch_system(
         };
 
         let abstract_task = AbstractTask::AcquireGood { resource_id };
-        let methods = method_registry.methods_for(AbstractTaskKind::AcquireGood);
-        let chosen = methods
-            .iter()
-            .filter(|m| m.precondition(abstract_task, &ctx))
-            .max_by(|a, b| {
-                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
-                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
-                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        let Some(method) = chosen else { continue };
-        let chosen_id = method.id();
+        let Some(pick) =
+            dispatch_for_goal(&method_registry, abstract_task, &ctx, &history, now, None)
+        else {
+            continue;
+        };
+        let method = pick.method;
+        let chosen_id = pick.method_id;
         // Phase 6b-ii: stamp active method for chain-completion success
         // recording; failure paths clear it explicitly.
         ai.active_method = Some(chosen_id);
@@ -5327,6 +5294,7 @@ pub fn htn_acquire_good_dispatch_system(
             Task::WithdrawMaterial {
                 resource_id: head_resource,
                 qty,
+            source_faction_id: _,
             } => {
                 let dispatched = assign_task_with_routing(
                     &mut ai,
@@ -5357,7 +5325,8 @@ pub fn htn_acquire_good_dispatch_system(
                 aq.dispatch(Task::WithdrawMaterial {
                     resource_id: head_resource,
                     qty,
-                });
+                source_faction_id: None,
+            });
             }
             _ => {
                 // No registered AcquireGood method returns a non-WithdrawMaterial
@@ -5743,19 +5712,16 @@ pub fn htn_stockpile_food_dispatch_system(
             };
 
             let abstract_task = AbstractTask::StockpileFood;
-            let methods = method_registry.methods_for(AbstractTaskKind::StockpileFood);
-            let chosen = methods
-                .iter()
-                .filter(|m| m.precondition(abstract_task, &ctx))
-                .max_by(|a, b| {
-                    let ua =
-                        score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
-                    let ub =
-                        score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
-                    ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
-                });
+            let chosen = dispatch_for_goal(
+                &method_registry,
+                abstract_task,
+                &ctx,
+                &history,
+                now,
+                None,
+            );
 
-            let Some(method) = chosen else {
+            let Some(pick) = chosen else {
                 // Phase 3 terminal Explore fallback (StockpileFood): every
                 // method's precondition failed (no scavengeable, no known
                 // forage tile). Walk somewhere new; the next sighting fed
@@ -5798,7 +5764,8 @@ pub fn htn_stockpile_food_dispatch_system(
                 }
                 return;
             };
-            let chosen_id = method.id();
+            let method = pick.method;
+            let chosen_id = pick.method_id;
             // Phase 6b-ii: stamp active method for chain-completion success
             // recording; failure paths clear it explicitly.
             ai.active_method = Some(chosen_id);
@@ -6177,6 +6144,7 @@ pub fn htn_equip_hunting_spear_dispatch_system(
             Task::WithdrawMaterial {
                 resource_id: head_resource,
                 qty,
+            source_faction_id: _,
             } => {
                 let dispatched = assign_task_with_routing(
                     &mut ai,
@@ -6203,7 +6171,8 @@ pub fn htn_equip_hunting_spear_dispatch_system(
                 aq.dispatch(Task::WithdrawMaterial {
                     resource_id: head_resource,
                     qty,
-                });
+                source_faction_id: None,
+            });
             }
             _ => {
                 ai.active_method = None;
@@ -6905,6 +6874,16 @@ pub struct FarmScopeParams<'w, 's> {
     pub plot_q: Query<'w, 's, &'static crate::simulation::land::Plot>,
 }
 
+/// Bundle the two plant resources every planting dispatcher consults
+/// (read the live `PlantMap` for occupancy, mutate `PlantingReservations`
+/// to commit/release a destination tile) — keeps `htn_play_dispatch_system`
+/// under Bevy's 16-system-param ceiling.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct PlantingDispatchParams<'w> {
+    pub plant_map: Res<'w, crate::simulation::plants::PlantMap>,
+    pub plant_reservations: ResMut<'w, crate::simulation::plants::PlantingReservations>,
+}
+
 /// Where a `AgentGoal::Farm` worker should source seeds / harvest crops, and
 /// where deposits should land. Resolved once per dispatch by
 /// [`resolve_farm_scope`] and consumed by both farm dispatchers.
@@ -7139,6 +7118,7 @@ pub fn htn_plant_from_storage_dispatch_system(
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
     plant_map: Res<crate::simulation::plants::PlantMap>,
+    mut plant_reservations: ResMut<crate::simulation::plants::PlantingReservations>,
     spatial: Res<crate::world::spatial::SpatialIndex>,
     clock: Res<SimClock>,
     item_query: Query<&crate::simulation::items::GroundItem>,
@@ -7242,9 +7222,17 @@ pub fn htn_plant_from_storage_dispatch_system(
         // seeds and no grain still finds something to plant; adding a new
         // plantable seed = new PlantKind::ALL entry + arm in
         // `PlantKind::seed_resource()`.
+        // `resolved` carries the seed, the storage tile, the effective
+        // stock at that tile, AND the source faction id the tile belongs
+        // to. The source id is threaded into `Task::WithdrawMaterial.
+        // source_faction_id` so the executor's ownership gate passes when
+        // the source faction is the household and the worker's
+        // `FactionMember.faction_id` is the village (legacy gate would
+        // silently abort the withdraw).
         let mut resolved: Option<(
             crate::economy::resource_catalog::ResourceId,
             (i32, i32),
+            u32,
             u32,
         )> = None;
         'sources: for src_opt in scope.seed_source_candidates() {
@@ -7297,11 +7285,11 @@ pub fn htn_plant_from_storage_dispatch_system(
                 }
             }
             if let Some(storage_tile) = best_tile {
-                resolved = Some((seed_id, storage_tile, best_tile_stock));
+                resolved = Some((seed_id, storage_tile, best_tile_stock, source_fid));
                 break 'sources;
             }
         }
-        let Some((seed_id, storage_tile, best_tile_stock)) = resolved else {
+        let Some((seed_id, storage_tile, best_tile_stock, source_fid)) = resolved else {
             continue;
         };
 
@@ -7318,12 +7306,19 @@ pub fn htn_plant_from_storage_dispatch_system(
                 &chunk_map,
                 &plant_map,
                 &field_tiles,
+                &plant_reservations,
                 (cur_tx, cur_ty),
                 rmin,
                 rmax,
             )
         } else {
-            find_nearest_unplanted_farmland(&chunk_map, &plant_map, (cur_tx, cur_ty), VIEW_RADIUS)
+            find_nearest_unplanted_farmland(
+                &chunk_map,
+                &plant_map,
+                &plant_reservations,
+                (cur_tx, cur_ty),
+                VIEW_RADIUS,
+            )
         };
         let Some(plant_tile) = plant_tile else {
             continue;
@@ -7401,11 +7396,26 @@ pub fn htn_plant_from_storage_dispatch_system(
             ai.active_method = None;
             continue;
         }
+        // Reserve the destination tile before routing. Two parallel
+        // dispatches in the same tick that picked the same plant tile would
+        // otherwise both walk over and only the first would actually spawn
+        // a plant — the loser silently performs the planting motion and
+        // no-ops. The search helper already skips reserved tiles for any
+        // OTHER worker dispatched earlier in this tick; this guards the
+        // tick's first commit. `try_reserve` is essentially a no-op here
+        // (the search above already filtered), but it future-proofs against
+        // an in-tick collision and is the single dispatch-time hook every
+        // teardown path can release.
+        if !plant_reservations.try_reserve(plant_tile, actor, seed_id, now) {
+            continue;
+        }
+
         let head = tasks.remove(0);
         match head {
             Task::WithdrawMaterial {
                 resource_id: head_resource,
                 qty,
+            source_faction_id: _,
             } => {
                 let dispatched = assign_task_with_routing(
                     &mut ai,
@@ -7421,6 +7431,7 @@ pub fn htn_plant_from_storage_dispatch_system(
                 );
                 if !dispatched {
                     ai.active_method = None;
+                    plant_reservations.release(plant_tile);
                     history.push(chosen_id, MethodOutcome::FailedRouting, now);
                     continue;
                 }
@@ -7428,13 +7439,24 @@ pub fn htn_plant_from_storage_dispatch_system(
                 ai.reserved_tile = storage_tile;
                 ai.reserved_resource = Some(head_resource);
                 ai.reserved_qty = qty;
+                // Pin the storage owner so the executor's ownership gate
+                // accepts a household-private tile drawn by a village-faction
+                // worker (FarmScope::Private). For Communal/Bootstrap the
+                // override is redundant but harmless.
+                let source_override = if source_fid != member.faction_id {
+                    Some(source_fid)
+                } else {
+                    None
+                };
                 aq.dispatch(Task::WithdrawMaterial {
                     resource_id: head_resource,
                     qty,
+                    source_faction_id: source_override,
                 });
             }
             _ => {
                 ai.active_method = None;
+                plant_reservations.release(plant_tile);
                 continue;
             }
         }
@@ -7961,6 +7983,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             Task::WithdrawMaterial {
                 resource_id: head_resource,
                 qty,
+            source_faction_id: _,
             } => {
                 // Path B haul leg. Route to the resolved storage tile, reserve
                 // the qty against `StorageReservations`, dispatch the head.
@@ -7995,7 +8018,8 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
                 aq.dispatch(Task::WithdrawMaterial {
                     resource_id: head_resource,
                     qty,
-                });
+                source_faction_id: None,
+            });
             }
             Task::Gather { tile } => {
                 // Phase 5e-xiii-b gather leg. Route to the memory-known
@@ -8473,33 +8497,18 @@ pub fn htn_engage_prey_dispatch_system(
         };
 
         let abstract_task = AbstractTask::EngagePrey;
-        let methods = method_registry.methods_for(AbstractTaskKind::EngagePrey);
-        let chosen = methods
-            .iter()
-            .filter(|m| m.precondition(abstract_task, &ctx))
-            .max_by(|a, b| {
-                let ua = score_method_with_history_and_disposition(
-                    a.as_ref(),
-                    abstract_task,
-                    &ctx,
-                    disposition,
-                    &history,
-                    now,
-                );
-                let ub = score_method_with_history_and_disposition(
-                    b.as_ref(),
-                    abstract_task,
-                    &ctx,
-                    disposition,
-                    &history,
-                    now,
-                );
-                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        let Some(method) = chosen else {
+        let Some(pick) = dispatch_for_goal(
+            &method_registry,
+            abstract_task,
+            &ctx,
+            &history,
+            now,
+            Some(disposition),
+        ) else {
             continue;
         };
-        let chosen_id = method.id();
+        let method = pick.method;
+        let chosen_id = pick.method_id;
         ai.active_method = Some(chosen_id);
         let mut tasks = method.expand(abstract_task, &ctx);
         if tasks.is_empty() {
@@ -8739,19 +8748,13 @@ pub fn htn_join_hunt_party_dispatch_system(
         };
 
         let abstract_task = AbstractTask::JoinHuntParty;
-        let methods = method_registry.methods_for(AbstractTaskKind::JoinHuntParty);
-        let chosen = methods
-            .iter()
-            .filter(|m| m.precondition(abstract_task, &ctx))
-            .max_by(|a, b| {
-                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
-                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
-                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        let Some(method) = chosen else {
+        let Some(pick) =
+            dispatch_for_goal(&method_registry, abstract_task, &ctx, &history, now, None)
+        else {
             continue;
         };
-        let chosen_id = method.id();
+        let method = pick.method;
+        let chosen_id = pick.method_id;
         ai.active_method = Some(chosen_id);
         let mut tasks = method.expand(abstract_task, &ctx);
         if tasks.is_empty() {
@@ -9073,7 +9076,7 @@ pub fn htn_combat_faction_dispatch_system(
         }
 
         // Per-goal target resolution.
-        let (abstract_task, abstract_kind, dest, target_entity, task_kind) = match *goal {
+        let (abstract_task, dest, target_entity, task_kind) = match *goal {
             AgentGoal::Raid => {
                 // Only march once the faction has finished preparing. While
                 // `Preparing`, `raid_prep_dispatch_system` arms the party.
@@ -9094,25 +9097,13 @@ pub fn htn_combat_faction_dispatch_system(
                 let Some(dest) = faction_registry.home_tile(target_faction) else {
                     continue;
                 };
-                (
-                    AbstractTask::Raid,
-                    AbstractTaskKind::Raid,
-                    dest,
-                    None,
-                    TaskKind::Raid,
-                )
+                (AbstractTask::Raid, dest, None, TaskKind::Raid)
             }
             AgentGoal::Defend => {
                 let Some(dest) = faction_registry.home_tile(member.faction_id) else {
                     continue;
                 };
-                (
-                    AbstractTask::Defend,
-                    AbstractTaskKind::Defend,
-                    dest,
-                    None,
-                    TaskKind::Defend,
-                )
+                (AbstractTask::Defend, dest, None, TaskKind::Defend)
             }
             AgentGoal::Lead => {
                 if chief_query.get(agent).is_err() {
@@ -9121,13 +9112,7 @@ pub fn htn_combat_faction_dispatch_system(
                 let Some(dest) = faction_registry.home_tile(member.faction_id) else {
                     continue;
                 };
-                (
-                    AbstractTask::Lead,
-                    AbstractTaskKind::Lead,
-                    dest,
-                    None,
-                    TaskKind::Lead,
-                )
+                (AbstractTask::Lead, dest, None, TaskKind::Lead)
             }
             AgentGoal::Rescue => {
                 let Ok(rt) = rescue_query.get(agent) else {
@@ -9135,7 +9120,6 @@ pub fn htn_combat_faction_dispatch_system(
                 };
                 (
                     AbstractTask::RescueAlly,
-                    AbstractTaskKind::RescueAlly,
                     rt.attacker_tile,
                     Some(rt.attacker),
                     // RescueAlly's legacy step used TaskKind::Defend so the
@@ -9214,19 +9198,13 @@ pub fn htn_combat_faction_dispatch_system(
             fish_spot_tile: None,
         };
 
-        let methods = method_registry.methods_for(abstract_kind);
-        let chosen = methods
-            .iter()
-            .filter(|m| m.precondition(abstract_task, &ctx))
-            .max_by(|a, b| {
-                let ua = score_method_with_history(a.as_ref(), abstract_task, &ctx, &history, now);
-                let ub = score_method_with_history(b.as_ref(), abstract_task, &ctx, &history, now);
-                ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        let Some(method) = chosen else {
+        let Some(pick) =
+            dispatch_for_goal(&method_registry, abstract_task, &ctx, &history, now, None)
+        else {
             continue;
         };
-        let chosen_id = method.id();
+        let method = pick.method;
+        let chosen_id = pick.method_id;
         ai.active_method = Some(chosen_id);
         let mut tasks = method.expand(abstract_task, &ctx);
         if tasks.is_empty() {
@@ -9427,6 +9405,7 @@ impl Method for WithdrawAndHaulToCraftOrderMethod {
             Task::WithdrawMaterial {
                 resource_id,
                 qty: 1,
+            source_faction_id: None,
             },
             Task::HaulToCraftOrder { order },
         ]
@@ -9733,6 +9712,7 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
             Task::WithdrawMaterial {
                 resource_id: head_resource,
                 qty,
+            source_faction_id: _,
             } => {
                 let dispatched = assign_task_with_routing(
                     &mut ai,
@@ -9760,7 +9740,8 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
                 aq.dispatch(Task::WithdrawMaterial {
                     resource_id: head_resource,
                     qty,
-                });
+                source_faction_id: None,
+            });
             }
             _ => {
                 ai.active_method = None;
@@ -10793,6 +10774,7 @@ impl Method for WithdrawAndThrowStonesAsPlayMethod {
             Task::WithdrawMaterial {
                 resource_id: stone_id,
                 qty: 1,
+                source_faction_id: None,
             },
             Task::PlayThrow,
         ]
@@ -10852,6 +10834,7 @@ impl Method for WithdrawAndPlayWithToyMethod {
             Task::WithdrawMaterial {
                 resource_id: rid,
                 qty: 1,
+                source_faction_id: None,
             },
             Task::Play { partner: None },
         ]
@@ -10907,8 +10890,12 @@ impl Method for WithdrawAndPlantGrainSeedAsPlayMethod {
             Task::WithdrawMaterial {
                 resource_id: crate::economy::core_ids::grain_seed(),
                 qty: 1,
+                source_faction_id: None,
             },
-            Task::PlayPlant { tile },
+            Task::PlayPlant {
+                tile,
+                seed_resource: crate::economy::core_ids::grain_seed(),
+            },
         ]
     }
 
@@ -10950,8 +10937,12 @@ impl Method for WithdrawAndPlantBerrySeedAsPlayMethod {
             Task::WithdrawMaterial {
                 resource_id: crate::economy::core_ids::berry_seed(),
                 qty: 1,
+                source_faction_id: None,
             },
-            Task::PlayPlant { tile },
+            Task::PlayPlant {
+                tile,
+                seed_resource: crate::economy::core_ids::berry_seed(),
+            },
         ]
     }
 
@@ -10993,7 +10984,7 @@ pub fn htn_play_dispatch_system(
     storage_reservations: Res<crate::simulation::faction::StorageReservations>,
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
-    plant_map: Res<crate::simulation::plants::PlantMap>,
+    mut planting: PlantingDispatchParams,
     spatial: Res<crate::world::spatial::SpatialIndex>,
     person_query: Query<(), With<crate::simulation::person::Person>>,
     bp_query: Query<(), With<crate::simulation::construction::Blueprint>>,
@@ -11245,7 +11236,12 @@ pub fn htn_play_dispatch_system(
                 for dx in -GRASS_RADIUS..=GRASS_RADIUS {
                     let tx = cur_tx + dx;
                     let ty = cur_ty + dy;
-                    if plant_map.0.contains_key(&(tx, ty)) {
+                    if planting.plant_map.0.contains_key(&(tx, ty)) {
+                        continue;
+                    }
+                    // Skip tiles another player-planting chain has already
+                    // committed to this tick (race protection).
+                    if planting.plant_reservations.is_reserved((tx, ty)) {
                         continue;
                     }
                     if chunk_map.tile_kind_at(tx, ty) != Some(crate::world::tile::TileKind::Grass) {
@@ -11391,6 +11387,7 @@ pub fn htn_play_dispatch_system(
             Task::WithdrawMaterial {
                 resource_id: head_resource,
                 qty,
+            source_faction_id: _,
             } => {
                 // Phase 5e-xii-b/c: storage-fed Play chains. Routes the agent
                 // to the storage tile picked at decision time, reserves the qty
@@ -11415,6 +11412,31 @@ pub fn htn_play_dispatch_system(
                     ai.active_method = None;
                     continue;
                 };
+                // If the chosen Play chain is a seed-planting one
+                // (head_resource == seed) the trailing leg is a
+                // `Task::PlayPlant { tile, seed_resource }` aimed at
+                // `play_plant_destination_tile`. Reserve that tile before
+                // routing so a concurrent farm-Planter or another Play-
+                // planter can't pick the same tile in the same tick.
+                let is_seed_play = head_resource == crate::economy::core_ids::grain_seed()
+                    || head_resource == crate::economy::core_ids::berry_seed();
+                let reserved_play_tile = if is_seed_play {
+                    match play_plant_destination_tile {
+                        Some(t) => {
+                            if !planting.plant_reservations.try_reserve(t, agent, head_resource, now) {
+                                ai.active_method = None;
+                                continue;
+                            }
+                            Some(t)
+                        }
+                        None => {
+                            ai.active_method = None;
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let dispatched = assign_task_with_routing(
                     &mut ai,
                     (cur_tx, cur_ty),
@@ -11429,6 +11451,9 @@ pub fn htn_play_dispatch_system(
                 );
                 if !dispatched {
                     ai.active_method = None;
+                    if let Some(t) = reserved_play_tile {
+                        planting.plant_reservations.release(t);
+                    }
                     history.push(chosen_id, MethodOutcome::FailedRouting, now);
                     continue;
                 }
@@ -11439,7 +11464,8 @@ pub fn htn_play_dispatch_system(
                 aq.dispatch(Task::WithdrawMaterial {
                     resource_id: head_resource,
                     qty,
-                });
+                source_faction_id: None,
+            });
             }
             _ => {
                 ai.active_method = None;
@@ -12307,6 +12333,8 @@ mod tests {
             vec![Task::WithdrawMaterial {
                 resource_id: crate::economy::core_ids::stone(),
                 qty: 1
+            ,
+                source_faction_id: None,
             }]
         );
     }
@@ -12335,6 +12363,8 @@ mod tests {
             vec![Task::WithdrawMaterial {
                 resource_id: crate::economy::core_ids::wood(),
                 qty: 1
+            ,
+                source_faction_id: None,
             }]
         );
         assert_eq!(
@@ -12342,6 +12372,8 @@ mod tests {
             vec![Task::WithdrawMaterial {
                 resource_id: crate::economy::core_ids::iron(),
                 qty: 1
+            ,
+                source_faction_id: None,
             }]
         );
     }

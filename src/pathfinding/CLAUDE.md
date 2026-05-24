@@ -12,10 +12,10 @@ Graph node = **`(ChunkCoord, ComponentId)`** — `ComponentId` is a chunk-local 
 
 ### Rebuild pipeline
 
-- **Startup** (after `terrain::spawn_world_system`): `startup_initial_build_system` runs a synchronous full rebuild of the pre-generated 32×32 spawn area — one-time main-thread cost.
-- **Runtime**: events drive an **async incremental** pipeline. `enqueue_graph_dirty_system` (PostUpdate) drains `TileChangedEvent` / `ChunkLoadedEvent` / `ChunkUnloadedEvent` into `GraphDirty { classify, unloaded }`. `spawn_rebuild_task_system` snapshots at most `PerfWorkBudget.graph_classify_chunks_per_task` classify chunks (default 16) plus all pending unloads, then hands the snapshot to `AsyncComputeTaskPool`. Remaining classify work stays queued for later ticks. `poll_rebuild_task_system` (PreUpdate) merges the result into `ChunkGraph` and records compute/apply timings in `BackgroundWorkDiagnostics`.
-- **Connectivity** is now its own async snapshot/poll/apply pipeline. `spawn_connectivity_rebuild_task_system` clones the graph summary for `AsyncComputeTaskPool`; `poll_connectivity_rebuild_task_system` applies only if the result generation still matches the live graph, otherwise it increments the stale-drop diagnostic. `tile_reachable` treats stale connectivity as temporarily unknown/reachable so producers avoid hard false failures while the async snapshot catches up.
-- **Tests** that populate `ChunkMap` directly call `rebuild_chunk_graph_sync` (`TestSim::flat_world`) since they bypass chunk streaming.
+- **Startup** (after `terrain::spawn_world_system`): `startup_initial_build_system` synchronously rebuilds the pre-generated 32×32 spawn area.
+- **Runtime async**: `enqueue_graph_dirty_system` (PostUpdate) drains `TileChangedEvent` / `ChunkLoadedEvent` / `ChunkUnloadedEvent` into `GraphDirty { classify, unloaded }`. `spawn_rebuild_task_system` snapshots up to `PerfWorkBudget.graph_classify_chunks_per_task` (default 16) + all unloads onto `AsyncComputeTaskPool`; `poll_rebuild_task_system` (PreUpdate) merges into `ChunkGraph`, records timings in `BackgroundWorkDiagnostics`.
+- **Connectivity** has its own async snapshot/poll/apply pair (`spawn_connectivity_rebuild_task_system` / `poll_connectivity_rebuild_task_system`); applies only if generation still matches, else bumps stale-drop diagnostic. `tile_reachable` treats stale connectivity as reachable so producers don't hard-fail mid-rebuild.
+- **Tests** bypass streaming and call `rebuild_chunk_graph_sync` directly (`TestSim::flat_world`).
 - `ChunkGraph::generation` bump invalidates every cached router tree.
 
 ## Router (`chunk_router.rs`)
@@ -31,7 +31,7 @@ Z-mismatch penalty is gone — components are exact, no "wrong z" choice to pena
 
 ## Detour estimator (`detour.rs`)
 
-`DetourEstimator { router, graph }` — river-aware distance in **chebyshev-equivalent tiles**, a drop-in replacement for the straight-line term every target-selection site used to use. `tiles(o_tile, o_z, c_tile, c_z) = max(chebyshev, round(with_tree_from(o_node).dist[c_node] × ROUTER_UNITS_TO_TILES))`; `ROUTER_UNITS_TO_TILES = CHUNK_SIZE / BASE_STEP_COST` (derived, not hardcoded). Same chunk-component ⇒ plain chebyshev (tree never consulted); any resolution failure (chunk unloaded / not standable / unreachable) ⇒ chebyshev fallback (never 0, never panic — degrades to old behaviour). `from(o_tile, o_z, z_of)` curries the origin for the closure-shaped call sites (mirrors the existing `reach_from_agent` `nearest_standable_z` z-resolution). One agent-rooted Dijkstra per re-planning agent (bucketed 200-tick cadence), shared across spatially-clustered factions, generation-only invalidation — not per-tick recompute. Consumers: `memory.rs` vision/scavenge pickers, `shared_knowledge.rs` cluster picker (via `GatherKnowledge`), `faction.rs::nearest_for_faction_reachable`, `jobs.rs` U_bid `C_action`.
+`DetourEstimator { router, graph }` — river-aware distance in **chebyshev-equivalent tiles** for target-selection sites. `tiles(o_tile, o_z, c_tile, c_z) = max(chebyshev, round(with_tree_from(o_node).dist[c_node] × ROUTER_UNITS_TO_TILES))`; `ROUTER_UNITS_TO_TILES = CHUNK_SIZE / BASE_STEP_COST` (derived). Same chunk-component ⇒ plain chebyshev; any resolution failure ⇒ chebyshev fallback (never 0, never panic). `from(o_tile, o_z, z_of)` curries the origin for closure-shaped call sites. One agent-rooted Dijkstra per re-planning agent (200-tick bucketed), generation-only invalidation. Consumers: `memory.rs` vision/scavenge pickers, `shared_knowledge.rs` cluster picker (via `GatherKnowledge`), `faction.rs::nearest_for_faction_reachable`, `jobs.rs` U_bid `C_action`.
 
 ## Connectivity (`connectivity.rs`)
 
@@ -70,7 +70,7 @@ Pre-built per-chunk flow fields for popular destinations (faction centres, stora
 
 `PathRequest`/`PathFollow` carry `profile`; `PathRequestQueue::enqueue_with_profile` (plain `enqueue` stays `Land`). `movement_system` enqueues `Amphibious` for humans on foot, `Land` for mounted humans (animals never reach it), and uses `passable_step_for(.., pf.profile)` for the boundary check so a swimmer isn't snapped back off a water tile.
 
-**The amphibious worker path is land-first.** `compute_outcome` always runs the full chunk-graph route (`compute_land`) first; for an `Amphibious` request it falls back to `compute_amphibious` **only** when land routing fails `Unreachable`/`NoRoute` (banks split by water). So a dry route never swims and the hierarchical pathfinder is preserved with zero regression. `compute_amphibious` is a single bounded full-route A* over `passable_for(Amphibious)` stuffed into one segment (`chunk_route` = `[start_chunk]`). **This deliberately is *not* the dual-layer chunk graph** from `plans/swimming.md` — the bounded-A* fallback is a complete, lower-risk alternative that delivers the same behaviour (humans swim short crossings); a long swim exceeding the A* budget fails gracefully.
+**Amphibious worker path is land-first.** `compute_outcome` runs the chunk-graph route (`compute_land`) first; for `Amphibious` requests it falls back to `compute_amphibious` **only** when land routing returns `Unreachable`/`NoRoute` (banks split by water). `compute_amphibious` is a single bounded full-route A* over `passable_for(Amphibious)` packed into one segment (`chunk_route = [start_chunk]`); a swim exceeding the A* budget fails gracefully.
 
 ## Conventions
 

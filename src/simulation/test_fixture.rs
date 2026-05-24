@@ -7944,7 +7944,10 @@ mod smoke {
             ai.dest_tile = tile;
             ai.work_progress = TICKS_FARMER_PLANT;
             let mut aq = world.get_mut::<ActionQueue>(worker).unwrap();
-            aq.current = Task::Planter { tile };
+            aq.current = Task::Planter {
+                tile,
+                seed_resource: seed,
+            };
             worker
         };
         arm_planter(&mut sim, tilled_tile);
@@ -9953,6 +9956,7 @@ mod baseline_behaviour {
             aq.current = Task::WithdrawMaterial {
                 resource_id: crate::economy::core_ids::wood(),
                 qty: 1,
+                source_faction_id: None,
             };
         }
         sim.tick();
@@ -10733,7 +10737,9 @@ mod baseline_behaviour {
             .expect("ActionQueue missing");
 
         match aq.current {
-            Task::WithdrawMaterial { resource_id, qty } => {
+            Task::WithdrawMaterial { resource_id, qty,
+                source_faction_id: None,
+            } => {
                 assert_eq!(
                     resource_id,
                     crate::economy::core_ids::wood(),
@@ -11789,7 +11795,9 @@ mod baseline_behaviour {
             .get::<ActionQueue>(person)
             .expect("ActionQueue missing");
         match aq.current {
-            Task::WithdrawMaterial { resource_id, qty } => {
+            Task::WithdrawMaterial { resource_id, qty,
+                source_faction_id: None,
+            } => {
                 assert_eq!(
                     resource_id,
                     crate::economy::core_ids::wood(),
@@ -12983,7 +12991,9 @@ mod baseline_behaviour {
             .expect("ActionQueue missing");
 
         match aq.current {
-            Task::WithdrawMaterial { resource_id, qty } => {
+            Task::WithdrawMaterial { resource_id, qty,
+                source_faction_id: None,
+            } => {
                 assert_eq!(
                     resource_id,
                     crate::economy::core_ids::wood(),
@@ -14474,7 +14484,9 @@ mod baseline_behaviour {
             .expect("ActionQueue missing");
 
         match aq.current {
-            Task::WithdrawMaterial { resource_id, qty } => {
+            Task::WithdrawMaterial { resource_id, qty,
+                source_faction_id: None,
+            } => {
                 assert_eq!(
                     resource_id,
                     crate::economy::core_ids::stone(),
@@ -14556,7 +14568,9 @@ mod baseline_behaviour {
             .expect("ActionQueue missing");
 
         match aq.current {
-            Task::WithdrawMaterial { resource_id, qty } => {
+            Task::WithdrawMaterial { resource_id, qty,
+                source_faction_id: None,
+            } => {
                 assert_eq!(
                     resource_id,
                     crate::economy::core_ids::luxury(),
@@ -14636,7 +14650,9 @@ mod baseline_behaviour {
             .expect("ActionQueue missing");
 
         match aq.current {
-            Task::WithdrawMaterial { resource_id, qty } => {
+            Task::WithdrawMaterial { resource_id, qty,
+                source_faction_id: None,
+            } => {
                 assert_eq!(
                     resource_id,
                     crate::economy::core_ids::grain_seed(),

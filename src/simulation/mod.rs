@@ -225,6 +225,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(production::TileDepletion::default())
             .insert_resource(plants::PlantMap::default())
             .insert_resource(plants::PlantSpriteIndex::default())
+            .insert_resource(plants::PlantingReservations::default())
             .insert_resource(method_registry)
             .insert_resource(construction::AutonomousBuildingToggle(true))
             .insert_resource(wild_herd::WildHerdRegistry::default())
@@ -663,11 +664,11 @@ impl Plugin for SimulationPlugin {
                     jobs::job_claim_system.before(jobs::job_goal_lock_system),
                     jobs::job_board_command_system.before(jobs::job_claim_system),
                     tasks::goal_dispatch_system,
-                    htn::htn_dispatch_system.after(tasks::goal_dispatch_system),
+                    htn::htn_sleep_dispatch_system.after(tasks::goal_dispatch_system),
                     // Equip-hunting-spear runs ahead of the food dispatchers
                     // so an unarmed hunter prefers fetching their spear over
                     // eating (mirrors legacy plan bias 5.0 + PF_UNINTERRUPTIBLE).
-                    htn::htn_equip_hunting_spear_dispatch_system.after(htn::htn_dispatch_system),
+                    htn::htn_equip_hunting_spear_dispatch_system.after(htn::htn_sleep_dispatch_system),
                     htn::htn_eat_dispatch_system
                         .after(htn::htn_equip_hunting_spear_dispatch_system),
                     htn::htn_acquire_food_dispatch_system.after(htn::htn_eat_dispatch_system),
@@ -722,7 +723,7 @@ impl Plugin for SimulationPlugin {
                 FixedUpdate,
                 (terraform::terraform_dispatch_system
                     .after(tasks::goal_dispatch_system)
-                    .after(htn::htn_dispatch_system)
+                    .after(htn::htn_sleep_dispatch_system)
                     .after(htn::htn_equip_hunting_spear_dispatch_system)
                     .after(tools::htn_acquire_tool_dispatch_system)
                     .after(htn::htn_eat_dispatch_system)
@@ -1263,7 +1264,14 @@ impl Plugin for SimulationPlugin {
                 // Seasonal-farming jellyfish: per-season-edge nutrient
                 // recovery on rested ag tiles. Cheap (`Local<Option<Season>>`
                 // gate, only walks `FieldTileIndex`).
-                (farm::fallow_recovery_system,).in_set(SimulationSet::Economy),
+                (
+                    farm::fallow_recovery_system,
+                    // Daily GC for planting-tile reservations — drops
+                    // stale entries (worker died / Dormant-demoted / goal
+                    // flipped without releasing).
+                    plants::planting_reservation_gc_system,
+                )
+                    .in_set(SimulationSet::Economy),
             )
             .add_systems(
                 FixedUpdate,

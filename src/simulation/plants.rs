@@ -120,6 +120,28 @@ impl PlantKind {
         }
     }
 
+    /// Inverse of `seed_resource` — walks `PlantKind::ALL` to find the kind
+    /// whose `seed_resource()` matches `rid`. Returns `None` for resources
+    /// that aren't a plantable seed (or for kinds whose seed resource hasn't
+    /// been registered in the catalog yet).
+    pub fn from_seed_resource(
+        rid: crate::economy::resource_catalog::ResourceId,
+    ) -> Option<PlantKind> {
+        PlantKind::ALL
+            .iter()
+            .copied()
+            .find(|k| k.seed_resource() == Some(rid))
+    }
+
+    /// `true` when this plant kind can be deliberately sown via the farm
+    /// pipeline — i.e. it has a registered seed resource. Used by farm
+    /// posting classification, harvest-credit, and seed-stock accounting so
+    /// adding a new plantable seed = one `PlantKind` entry + one arm in
+    /// `seed_resource()`, no scattered crop-specific checks.
+    pub fn is_farm_plantable(self) -> bool {
+        self.seed_resource().is_some()
+    }
+
     /// Ticks the agent must spend Working before a harvest triggers.
     /// Plants are harvested instantly (0); this mirrors how tile-based gathering uses work_ticks.
     pub fn harvest_work_ticks(self) -> u8 {
@@ -647,6 +669,71 @@ pub struct PlantSpriteIndex {
     pub by_chunk: AHashMap<ChunkCoord, Vec<(Entity, (i32, i32))>>,
 }
 
+/// Per-tile reservation for an in-flight planting chain
+/// (`Task::Planter` / `Task::PlayPlant`). Multiple workers dispatched in
+/// the same tick used to race for the nearest plantable tile and only one
+/// would actually spawn a plant — the others walked, performed the planting
+/// motion, and silently no-op'd. Reserving the destination tile at
+/// dispatch-time and releasing on success/cancel makes the race impossible.
+///
+/// Reservation is keyed by tile only — one planting attempt per tile at a
+/// time, regardless of seed/worker. `worker` + `seed_resource` are recorded
+/// for the daily GC pass to detect stale entries (worker died /
+/// Dormant-demoted / chain dropped without releasing).
+#[derive(Resource, Default)]
+pub struct PlantingReservations {
+    pub by_tile: AHashMap<(i32, i32), PlantingReservation>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PlantingReservation {
+    pub worker: Entity,
+    pub seed_resource: crate::economy::resource_catalog::ResourceId,
+    pub reserved_tick: u64,
+}
+
+impl PlantingReservations {
+    /// Returns `true` if `tile` already carries a live reservation.
+    pub fn is_reserved(&self, tile: (i32, i32)) -> bool {
+        self.by_tile.contains_key(&tile)
+    }
+
+    /// Attempts to reserve `tile` for `worker`. Returns `true` on success,
+    /// `false` if another worker already holds the slot.
+    pub fn try_reserve(
+        &mut self,
+        tile: (i32, i32),
+        worker: Entity,
+        seed_resource: crate::economy::resource_catalog::ResourceId,
+        now: u64,
+    ) -> bool {
+        if self.by_tile.contains_key(&tile) {
+            return false;
+        }
+        self.by_tile.insert(
+            tile,
+            PlantingReservation {
+                worker,
+                seed_resource,
+                reserved_tick: now,
+            },
+        );
+        true
+    }
+
+    /// Drops the reservation at `tile`. No-op if `tile` isn't reserved.
+    /// Idempotent — every teardown path can call this without checking.
+    pub fn release(&mut self, tile: (i32, i32)) {
+        self.by_tile.remove(&tile);
+    }
+
+    /// Drops every reservation held by `worker`. Used by the GC pass when a
+    /// worker died / Dormant-demoted / dropped its chain without releasing.
+    pub fn release_for_worker(&mut self, worker: Entity) {
+        self.by_tile.retain(|_, r| r.worker != worker);
+    }
+}
+
 /// Despawn a plant entity and clean up the spatial / sprite indices that
 /// every plant-removing system relies on. Caller handles yields and any
 /// `SharedKnowledge::report_depleted` reporting (those need contextual
@@ -1005,4 +1092,67 @@ fn adjacent_offset() -> (i32, i32) {
         2 => (0, 1),
         _ => (0, -1),
     }
+}
+
+/// Daily GC for `PlantingReservations`. Drops any reservation whose holder
+/// (a) no longer exists (died / despawned), (b) is no longer running or
+/// queueing a `Planter`/`PlayPlant` task for the reserved tile, or (c) was
+/// reserved more than `RESERVATION_MAX_AGE_TICKS` ticks ago (catches goal-
+/// flip cancels, Dormant LOD demotions, and any other release path the
+/// executor / chain-handoff didn't cover).
+///
+/// Without this backstop a stale reservation pins a plantable tile out of
+/// reach forever — the per-task release sites cover the common cases but a
+/// goal-flip mid-walk drops the chain without notifying us. A daily sweep
+/// is plenty: the worst-case latency on a leaked slot is one game-day.
+pub fn planting_reservation_gc_system(
+    clock: Res<SimClock>,
+    mut reservations: ResMut<PlantingReservations>,
+    aq_q: Query<&crate::simulation::typed_task::ActionQueue>,
+) {
+    const RESERVATION_MAX_AGE_TICKS: u64 = 3600; // one game-day
+    let now = clock.tick;
+    if now % RESERVATION_MAX_AGE_TICKS != 0 {
+        return;
+    }
+    reservations.by_tile.retain(|tile, r| {
+        if now.saturating_sub(r.reserved_tick) > RESERVATION_MAX_AGE_TICKS {
+            return false;
+        }
+        let Ok(aq) = aq_q.get(r.worker) else {
+            // Worker entity gone.
+            return false;
+        };
+        // Reservation is live iff the worker's current or any queued task is
+        // a Planter/PlayPlant aimed at *this* tile. Match by tile so a
+        // worker that chained from one planting task to another at a
+        // different tile drops the stale slot.
+        let cur_matches = aq
+            .current
+            .as_planter_full()
+            .map(|(t, _)| t == *tile)
+            .unwrap_or(false)
+            || aq
+                .current
+                .as_play_plant_full()
+                .map(|(t, _)| t == *tile)
+                .unwrap_or(false);
+        if cur_matches {
+            return true;
+        }
+        // Walk the prefetch ring for a queued planting leg.
+        for slot in aq.queued_iter() {
+            if let Some((t, _)) = slot.as_planter_full() {
+                if t == *tile {
+                    return true;
+                }
+            }
+            if let Some((t, _)) = slot.as_play_plant_full() {
+                if t == *tile {
+                    return true;
+                }
+            }
+        }
+        false
+    });
 }

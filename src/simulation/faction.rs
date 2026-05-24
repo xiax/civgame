@@ -2023,8 +2023,18 @@ impl FactionStorage {
             .and_then(|id| self.totals.get(id).copied())
             .unwrap_or(0)
     }
+    /// Total deposited stock across every plantable-seed resource (every
+    /// `PlantKind` whose `seed_resource()` is `Some`). Drives the farm Plant
+    /// posting target cap and any other "do we have *any* seed?" check —
+    /// adding a new plantable seed picks this up automatically without
+    /// touching call sites.
     pub fn seed_total(&self) -> u32 {
-        self.grain_seed_total() + self.berry_seed_total()
+        use crate::simulation::plants::PlantKind;
+        PlantKind::ALL
+            .iter()
+            .filter_map(|k| k.seed_resource())
+            .map(|rid| self.totals.get(&rid).copied().unwrap_or(0))
+            .sum()
     }
 }
 
