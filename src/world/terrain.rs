@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use super::biome as biome_mod;
 use super::chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_HEIGHT, CHUNK_SIZE, Z_MAX, Z_MIN};
+use super::geomorph::{ReliefClass, ReliefSample};
 use super::globe::{Biome, Globe, ReservoirKind, GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH};
 use super::tile::{OreKind, TileData, TileKind};
 
@@ -178,6 +179,23 @@ impl BiomeBands {
             self.kinds[4]
         }
     }
+
+    /// Pick the surface kind for `v ∈ [0, 1]` but collapse the top two stone
+    /// bands into the middle vegetated band. Used when relief class doesn't
+    /// permit a bare-rock outcrop (`ReliefClass::permits_stone_outcrop()`
+    /// returns false): prairies stay grass even when surface noise lands
+    /// high enough to cross the Stone/Granite threshold.
+    pub fn pick_grounded(&self, v: f32) -> TileKind {
+        if v < self.thresholds[0] {
+            self.kinds[0]
+        } else if v < self.thresholds[1] {
+            self.kinds[1]
+        } else {
+            // Collapse upper bands into the dominant vegetated kind so
+            // outcrops disappear on plains/floodplains.
+            self.kinds[2]
+        }
+    }
 }
 
 /// Per-biome surface bands. Threshold tuples preserve the original
@@ -186,35 +204,40 @@ impl BiomeBands {
 /// band paints.
 pub fn biome_bands(biome: Biome) -> BiomeBands {
     use TileKind::*;
+    // **Water removed from land biomes.** Reservoir basin stamp (Pass 4) and
+    // aquifer-marsh (Pass 4.5) are the only ways a land tile becomes wet;
+    // surface noise crossing a low band must NOT paint Water. Each land
+    // biome's `kinds[0]` is now its dominant low-elevation cover.
     match biome {
         Biome::Ocean => BiomeBands {
             thresholds: [0.90, 0.95, 0.97, 0.99],
             // Below sea level: water; thin beach band; high crests: granite.
+            // Ocean cells are reservoir-stamped anyway; this is harmless.
             kinds: [Water, Sand, Sand, Granite, Granite],
         },
         Biome::Tundra => BiomeBands {
             thresholds: [0.18, 0.55, 0.80, 0.95],
-            kinds: [Water, Snow, Scrub, Granite, Granite],
+            kinds: [Snow, Snow, Scrub, Granite, Granite],
         },
         Biome::Taiga => BiomeBands {
             thresholds: [0.18, 0.35, 0.55, 0.85],
-            kinds: [Water, Grass, Forest, Forest, Granite],
+            kinds: [Grass, Grass, Forest, Forest, Granite],
         },
         Biome::Temperate => BiomeBands {
             thresholds: [0.26, 0.45, 0.60, 0.85],
-            kinds: [Water, Grass, Grass, Forest, Limestone],
+            kinds: [Grass, Grass, Grass, Forest, Limestone],
         },
         Biome::Grassland => BiomeBands {
             thresholds: [0.18, 0.60, 0.75, 0.88],
-            kinds: [Water, Grass, Grass, Forest, Limestone],
+            kinds: [Grass, Grass, Grass, Forest, Limestone],
         },
         Biome::Tropical => BiomeBands {
             thresholds: [0.25, 0.30, 0.40, 0.88],
-            kinds: [Water, Marsh, Grass, Forest, Basalt],
+            kinds: [Marsh, Marsh, Grass, Forest, Basalt],
         },
         Biome::Desert => BiomeBands {
             thresholds: [0.10, 0.55, 0.70, 0.85],
-            kinds: [Water, Sand, Scrub, Sandstone, Sandstone],
+            kinds: [Sand, Sand, Scrub, Sandstone, Sandstone],
         },
         Biome::Mountain => BiomeBands {
             thresholds: [0.12, 0.25, 0.50, 0.80],
@@ -222,11 +245,11 @@ pub fn biome_bands(biome: Biome) -> BiomeBands {
         },
         Biome::Wetland => BiomeBands {
             thresholds: [0.20, 0.45, 0.65, 0.90],
-            kinds: [Water, Marsh, Grass, Forest, Forest],
+            kinds: [Marsh, Marsh, Grass, Forest, Forest],
         },
         Biome::Steppe => BiomeBands {
             thresholds: [0.15, 0.45, 0.70, 0.90],
-            kinds: [Water, Scrub, Grass, Scrub, Sandstone],
+            kinds: [Scrub, Scrub, Grass, Scrub, Sandstone],
         },
         Biome::Badlands => BiomeBands {
             thresholds: [0.10, 0.40, 0.65, 0.90],
@@ -262,31 +285,38 @@ pub fn topsoil_kind(biome: Biome, river_d: u8) -> TileKind {
     }
 }
 
-/// Local-detail amplitude for `surface_v`: the per-tile Perlin field can
-/// only push the macro value by ±this much. Lower = terrain hugs globe
-/// elevation more tightly; higher = more within-biome variation.
-/// Per-biome amplitude for the local Perlin detail layered on top of the
-/// globe's macro elevation. Lower values keep gameplay terrain tightly
-/// anchored to the world-map preview; higher values let mountain ridges and
-/// badland scree retain jagged character. Bounded so even the noisiest biome
-/// can't drift more than ±~5 Z from the macro signal.
-fn local_detail_amp(biome: Biome) -> f32 {
-    // Per-tile detail amplitudes calibrated against our 1.5 m tile scale.
-    // Numbers are in v-units (`v ∈ [0,1]` → `Z = -16 + v·32`), so multiplying
-    // by 32 gives the Z range (and by 48 the metres range). Halved from the
-    // legacy ±3–7 m values, which produced unrealistic micro-topography at
-    // tile scale.
-    match biome {
-        // Coasts, lowlands, dry flats: ±1.12 Z ≈ ±1.7 m.
-        Biome::Ocean | Biome::Wetland | Biome::Desert | Biome::Steppe => 0.035,
-        // Generic vegetated belts: ±1.6 Z ≈ ±2.4 m.
-        Biome::Grassland | Biome::Temperate | Biome::Taiga | Biome::Tropical | Biome::Tundra => {
-            0.05
-        }
-        // Mountain ridges, badland uplift: ±2.4 Z ≈ ±3.6 m — still rugged
-        // without absurd per-tile 6 m cliffs.
-        Biome::Mountain | Biome::Badlands => 0.075,
-    }
+/// Per-tile detail amplitude driven by **relief class**, not biome. Replaces
+/// the legacy `local_detail_amp(biome)` so plains stay flat even when the
+/// surface biome would otherwise suggest rolling terrain. Continuous lift
+/// from `local_relief` softens class boundaries.
+///
+/// Numbers in v-units (`v ∈ [0,1]` → `Z = -16 + v·32`). MountainRidge is
+/// deliberately tuned to saturate the Z ceiling — the 32-Z slice is just the
+/// playable band of a much taller real mountain, so ridge cells should hit
+/// `Z_MAX` and read as impassable cliff walls.
+fn relief_detail_amp(s: &ReliefSample) -> f32 {
+    use ReliefClass::*;
+    let base = match s.class {
+        OceanShelf | BasinWetland => 0.005, // ±0.16 Z, basin floors flat
+        Floodplain | CoastalPlain | LowlandPlain => 0.015, // ±0.5 Z
+        UplandPlateau => 0.025,             // mostly flat with eroded edges
+        RollingHills => 0.035,              // ±1.1 Z
+        Foothills => 0.070,                 // ±2.2 Z
+        Badlands => 0.080,                  // ±2.6 Z, chopped channels
+        MountainSlope => 0.130,             // ±4.2 Z, dramatic step terrain
+        MountainRidge => 0.200,             // ±6.4 Z, saturates Z budget — cliff faces
+    };
+    // Continuous attenuation so a plain that scores just over the
+    // RollingHills line doesn't snap to +1 Z range.
+    let lr_lift = s.local_relief.clamp(0.0, 0.15) * 0.4;
+    (base + lr_lift).min(0.30)
+}
+
+/// Force basin floors absolutely flat — `BasinWetland` and `OceanShelf` ride
+/// the macro elevation only.
+#[inline]
+fn relief_forces_flat(class: ReliefClass) -> bool {
+    matches!(class, ReliefClass::BasinWetland | ReliefClass::OceanShelf)
 }
 
 /// Fractional surface noise value at (tx, ty). Range [0, 1].
@@ -306,21 +336,45 @@ fn local_detail_amp(biome: Biome) -> f32 {
 pub fn surface_v(tx: i32, ty: i32, gen: &WorldGen, globe: &Globe) -> f32 {
     let (elev_u, _temp_c, _rain_u) = globe.sample_climate(tx, ty);
     let macro_f = (elev_u / 255.0).clamp(0.0, 1.0);
-    // Relief amplitude follows the *surface* biome so the per-tile detail
-    // amplitude doesn't snap at a visual border (e.g. Grassland 0.05 →
-    // Mountain 0.075) ahead of the kind change. Surface classifier keeps
-    // the Ocean/Mountain elevation gates on true elevation so this still
-    // resolves to the same biome the band-picker will choose.
-    let biome = biome_mod::classify_surface_at_tile(globe, tx, ty);
-    let amp = local_detail_amp(biome);
+
+    // Per-tile relief drives both amplitude and noise composition. The class
+    // is re-derived from interpolated numerics so it's continuous across
+    // climate-cell seams. Falls back gracefully to a flat profile when the
+    // relief layer is empty (pre-generation / tests).
+    let relief = globe.sample_relief(tx, ty);
+
+    // Force basin floors absolutely flat — Pass 4 of chunk-gen stamps the
+    // water column from the reservoir's spill level, the bed should match
+    // the macro elevation cleanly.
+    if relief_forces_flat(relief.class) {
+        return macro_f.clamp(0.0, 1.0);
+    }
+
+    let amp = relief_detail_amp(&relief);
 
     let nx = tx as f64 * 0.04;
     let ny = ty as f64 * 0.04;
     let d0 = gen.surface.get([nx, ny]);
     let d1 = gen.surface.get([nx * 2.0, ny * 2.0]);
     let d2 = gen.surface.get([nx * 4.0, ny * 4.0]);
-    // Weighted sum normalised so output stays roughly in [-1, 1].
-    let detail = (d0 * 0.60 + d1 * 0.28 + d2 * 0.12) as f32;
+
+    // Mountain ridges use a ridged-multifractal mix on the same noise field —
+    // produces ridge-and-valley lines instead of round bumps. `1 - |d|` peaks
+    // at the zero crossings of Perlin, so cells stack into thin ridges that
+    // saturate against the Z ceiling.
+    let detail = if matches!(
+        relief.class,
+        ReliefClass::MountainSlope | ReliefClass::MountainRidge
+    ) {
+        // Ridged: invert magnitude and re-center to roughly [-1, 1].
+        let r0 = 1.0 - d0.abs();
+        let r1 = 1.0 - d1.abs();
+        let r2 = 1.0 - d2.abs();
+        ((r0 * 0.55 + r1 * 0.30 + r2 * 0.15) * 2.0 - 1.0) as f32
+    } else {
+        // Smooth: weighted sum normalised to roughly [-1, 1].
+        (d0 * 0.60 + d1 * 0.28 + d2 * 0.12) as f32
+    };
 
     (macro_f + detail * amp).clamp(0.0, 1.0)
 }
@@ -368,8 +422,16 @@ pub fn proc_tile(
     }
 
     if tz == surf_z {
-        let kind = biome_bands(biome).pick(v);
-        let fertility = surface_fertility_of(kind, v);
+        let bands = biome_bands(biome);
+        // Stone exposure gated on relief class. Plains/floodplains/basins
+        // never paint bare rock even when noise crosses the high band.
+        let relief = globe.sample_relief(tx, ty);
+        let kind = if relief.class.permits_stone_outcrop() {
+            bands.pick(v)
+        } else {
+            bands.pick_grounded(v)
+        };
+        let fertility = surface_fertility_of(kind, v, relief.class);
         return TileData {
             kind,
             elevation: (v * 255.0) as u8,
@@ -536,22 +598,27 @@ pub fn generate_chunk_from_globe(coord: ChunkCoord, globe: &Globe, gen: &WorldGe
             let z = (Z_MIN as f32 + v * CHUNK_HEIGHT as f32).round() as i32;
             let z = z.clamp(Z_MIN, Z_MAX);
             // Pick surface kind by dithering base vs accent palette across
-            // the transition band. `base` always drives `biome_cache` (and
-            // therefore relief amp + topsoil + Pass-3 riparian shift); the
-            // accent only contributes its `BiomeBands::kinds` palette so the
-            // surface material reads ecotonal (e.g. a Scrub speckle in a
-            // Grassland-Desert seam) without dragging soil depth or
-            // riparian logic with it.
+            // the transition band. Relief class gates bare-rock outcrops so
+            // a plain stays grass even when noise crosses the stone band.
+            let relief_class = globe.sample_relief(global_tx, global_ty).class;
+            let permit_stone = relief_class.permits_stone_outcrop();
+            let pick_kind = |b: BiomeBands, v: f32| -> TileKind {
+                if permit_stone {
+                    b.pick(v)
+                } else {
+                    b.pick_grounded(v)
+                }
+            };
             let bands_base = biome_bands(sample.base);
             let kind = if sample.accent != sample.base {
                 let dither = biome_mod::surface_band_dither(globe.seed, global_tx, global_ty);
                 if dither < sample.accent_weight() {
-                    biome_bands(sample.accent).pick(v)
+                    pick_kind(biome_bands(sample.accent), v)
                 } else {
-                    bands_base.pick(v)
+                    pick_kind(bands_base, v)
                 }
             } else {
-                bands_base.pick(v)
+                pick_kind(bands_base, v)
             };
             surface_z[ly][lx] = z as i8;
             surface_kind[ly][lx] = kind;
@@ -669,7 +736,10 @@ pub fn generate_chunk_from_globe(coord: ChunkCoord, globe: &Globe, gen: &WorldGe
             }
             let kind = surface_kind[ly][lx];
             let v = v_cache[ly][lx];
-            let base = surface_fertility_of(kind, v) as f32;
+            let global_tx = chunk_tx0 + lx as i32;
+            let global_ty = chunk_ty0 + ly as i32;
+            let relief_class = globe.sample_relief(global_tx, global_ty).class;
+            let base = surface_fertility_of(kind, v, relief_class) as f32;
             if base <= 0.0 {
                 continue;
             }
@@ -751,7 +821,8 @@ pub fn generate_chunk_from_globe(coord: ChunkCoord, globe: &Globe, gen: &WorldGe
             surface_water_depth[ly][lx] = depth;
             // reservoir_id stays u32::MAX — these aren't part of any globe reservoir.
             let v = v_cache[ly][lx];
-            let base = surface_fertility_of(TileKind::Marsh, v) as f32;
+            let relief_class = globe.sample_relief(tx, ty).class;
+            let base = surface_fertility_of(TileKind::Marsh, v, relief_class) as f32;
             let mult = river_fertility_mult(surface_river_distance[ly][lx]);
             surface_fertility[ly][lx] = (base * mult).min(255.0) as u8;
         }
@@ -814,16 +885,19 @@ pub fn kind_fertility_factor(kind: TileKind) -> f32 {
     }
 }
 
-/// Composite per-tile fertility: kind × elevation curve, clamped to `u8`.
-/// Use this in both chunk-gen and the climate-only estimator so the two
-/// stay in lockstep.
+/// Composite per-tile fertility: kind × elevation curve × relief multiplier,
+/// clamped to `u8`. Use this in both chunk-gen and the climate-only estimator
+/// so the two stay in lockstep. Relief multiplier (Floodplain 1.3×,
+/// Lowland/Coastal 1.1×, Hills 1.0×, Plateau 0.85×, Foothills 0.6×, Badlands
+/// 0.4×, Mountain 0.15×, Basin 1.1×, Ocean 0×) compounds with
+/// `river_fertility_mult` at call sites that still apply it.
 #[inline]
-pub fn surface_fertility_of(kind: TileKind, v: f32) -> u8 {
+pub fn surface_fertility_of(kind: TileKind, v: f32, relief_class: ReliefClass) -> u8 {
     let f = kind_fertility_factor(kind);
     if f <= 0.0 {
         return 0;
     }
-    (f * elevation_fertility_curve(v)).min(255.0) as u8
+    (f * elevation_fertility_curve(v) * relief_class.fertility_mult()).min(255.0) as u8
 }
 
 /// Climate-only expected fertility at a tile. Mirrors the chunk-gen formula
@@ -841,8 +915,14 @@ pub fn climate_fertility_estimate_at(globe: &Globe, tx: i32, ty: i32) -> u8 {
     // *expected* fertility uses `base` only — same `BiomeBands::pick(v)`
     // call as Pass 1's base path.
     let biome = biome_mod::classify_surface_at_tile(globe, tx, ty);
-    let kind = biome_bands(biome).pick(v);
-    let base = surface_fertility_of(kind, v) as f32;
+    let relief_class = globe.sample_relief(tx, ty).class;
+    let bands = biome_bands(biome);
+    let kind = if relief_class.permits_stone_outcrop() {
+        bands.pick(v)
+    } else {
+        bands.pick_grounded(v)
+    };
+    let base = surface_fertility_of(kind, v, relief_class) as f32;
     if base <= 0.0 {
         return 0;
     }
@@ -1092,6 +1172,67 @@ mod tests {
         let g = test_globe();
         let z = surface_height(0, 0, &gen, &g);
         assert!((Z_MIN..=Z_MAX).contains(&z));
+    }
+
+    #[test]
+    fn plain_chunk_z_range_is_tight() {
+        // Find a LowlandPlain-classified tile in the seed-42 globe and
+        // generate the chunk containing it. The chunk's z-range should be
+        // very tight (Pass 1 detail amp = 0.015 → ±0.5 Z, well within ±2 Z
+        // chunk span) and adjacent-tile Δz should rarely exceed 1.
+        let gen = WorldGen::new();
+        let g = test_globe();
+        let mut found: Option<(i32, i32)> = None;
+        // Sample a wide swathe so we land on a LowlandPlain cell.
+        'outer: for cy in 30..60 {
+            for cx in 30..60 {
+                let tx = cx * CHUNK_SIZE as i32 + 8;
+                let ty = cy * CHUNK_SIZE as i32 + 8;
+                if g.sample_relief(tx, ty).class == ReliefClass::LowlandPlain {
+                    found = Some((cx, cy));
+                    break 'outer;
+                }
+            }
+        }
+        let (ccx, ccy) = found.expect("no LowlandPlain chunk in seed-42 sample window");
+        let chunk = generate_chunk_from_globe(ChunkCoord(ccx, ccy), &g, &gen);
+        let mut z_min = i8::MAX;
+        let mut z_max = i8::MIN;
+        let mut big_delta = 0;
+        for ly in 0..CHUNK_SIZE {
+            for lx in 0..CHUNK_SIZE {
+                let z = chunk.surface_z[ly][lx];
+                if z < z_min {
+                    z_min = z;
+                }
+                if z > z_max {
+                    z_max = z;
+                }
+                if lx + 1 < CHUNK_SIZE {
+                    let dz = (chunk.surface_z[ly][lx + 1] as i32 - z as i32).abs();
+                    if dz >= 2 {
+                        big_delta += 1;
+                    }
+                }
+                if ly + 1 < CHUNK_SIZE {
+                    let dz = (chunk.surface_z[ly + 1][lx] as i32 - z as i32).abs();
+                    if dz >= 2 {
+                        big_delta += 1;
+                    }
+                }
+            }
+        }
+        let range = z_max as i32 - z_min as i32;
+        assert!(
+            range <= 2,
+            "LowlandPlain chunk ({ccx},{ccy}) z-range {range} exceeds 2 (min={z_min}, max={z_max})"
+        );
+        // Adjacent ±2 deltas should be rare on a plain.
+        let total_edges = CHUNK_SIZE * (CHUNK_SIZE - 1) * 2;
+        assert!(
+            big_delta < total_edges / 20,
+            "LowlandPlain chunk ({ccx},{ccy}) has {big_delta} adjacent Δz≥2 (>5% of {total_edges})"
+        );
     }
 
     #[test]

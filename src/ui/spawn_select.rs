@@ -318,7 +318,15 @@ pub fn spawn_select_system(
                     let (elev_min, elev_max, elev_mean) =
                         sample_elevation_stats(&globe, tx0, ty0, tx1, ty1);
                     let avg_fertility = average_fertility_in_megachunk(&globe, mx, my);
-                    let habitable = center_biome.is_habitable();
+                    let dominant_relief =
+                        crate::world::geomorph::dominant_relief_in_megachunk(&globe.relief, mx, my);
+                    let center_relief = globe.sample_relief(tx, ty);
+                    // Mountain/ocean cells are non-habitable even if biome
+                    // would otherwise pass — they reject settlement.
+                    let habitable = center_biome.is_habitable()
+                        && !dominant_relief
+                            .map(|r| r.rejects_settlement())
+                            .unwrap_or(false);
                     let stroke_color = if habitable {
                         egui::Color32::WHITE
                     } else {
@@ -355,6 +363,14 @@ pub fn spawn_select_system(
                             ty1 - 1
                         ));
                         ui.label(format!("Dominant biome: {}", center_biome.name()));
+                        if let Some(r) = dominant_relief {
+                            ui.label(format!("Dominant relief: {}", r.name()));
+                        }
+                        ui.label(format!(
+                            "Centre relief: {} (slope {:.0}%)",
+                            center_relief.class.name(),
+                            center_relief.slope * 100.0,
+                        ));
                         let elev_label = if elev_u < 56.0 {
                             "below sea level"
                         } else if elev_u < 140.0 {

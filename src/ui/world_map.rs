@@ -200,6 +200,9 @@ pub fn world_map_system(
                     // is reserved for AI / salinity / world-sim).
                     let biome = crate::world::biome::classify_surface_at_tile(&globe, tx, ty);
                     let fert = average_fertility_in_megachunk(&globe, mx, my);
+                    let dominant_relief =
+                        crate::world::geomorph::dominant_relief_in_megachunk(&globe.relief, mx, my);
+                    let center_relief = globe.sample_relief(tx, ty);
                     let settled_here = settled.by_megachunk.contains_key(&(mx, my));
                     egui::show_tooltip(
                         ctx,
@@ -208,6 +211,14 @@ pub fn world_map_system(
                         |ui| {
                             ui.label(format!("Mega-chunk ({}, {})", mx, my));
                             ui.label(format!("Centre biome: {}", biome.name()));
+                            if let Some(r) = dominant_relief {
+                                ui.label(format!("Dominant relief: {}", r.name()));
+                            }
+                            ui.label(format!(
+                                "Centre relief: {} (slope {:.0}%)",
+                                center_relief.class.name(),
+                                center_relief.slope * 100.0,
+                            ));
                             ui.label(format!("Avg fertility: {}/255", fert));
                             if settled_here {
                                 ui.colored_label(

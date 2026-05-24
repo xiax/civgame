@@ -7,7 +7,7 @@ const SAVE_PATH: &str = "world.bin";
 /// On-disk schema version for `world.bin`. Bump whenever `Globe`, `WorldCell`,
 /// or any serialized geo-data layout changes — `load_or_generate` will discard
 /// older caches and regenerate.
-pub const GLOBE_FILE_VERSION: u32 = 9;
+pub const GLOBE_FILE_VERSION: u32 = 10;
 
 /// Climate-sample grid resolution. Each cell holds elevation/climate/biome
 /// samples; per-tile values are bilinearly interpolated. Resolution is
@@ -353,6 +353,13 @@ pub struct Globe {
     /// via the version bump.
     #[serde(default)]
     pub hydrology: HydrologyMap,
+    /// Per-cell geomorphology classification (slope/relief/coast/mountain
+    /// distance + `ReliefClass`). Drives per-tile detail amplitude, palette
+    /// gating, fertility multiplier, and settlement scoring. Built once in
+    /// `generate_globe` after `build_hydrology`. `#[serde(default)]` so v9
+    /// caches deserialize empty and trigger the version-bump regenerate path.
+    #[serde(default)]
+    pub relief: super::geomorph::ReliefMap,
 }
 
 impl Globe {
@@ -363,6 +370,7 @@ impl Globe {
             rivers: RiverNetwork::default(),
             lakes: LakeMap::default(),
             hydrology: HydrologyMap::default(),
+            relief: super::geomorph::ReliefMap::default(),
         }
     }
 
@@ -475,6 +483,143 @@ impl Globe {
         let tt = lerp(lerp(t00, t10, tx), lerp(t01, t11, tx), ty);
         let rx = lerp(lerp(r00, r10, tx), lerp(r01, r11, tx), ty);
         (ex, tt, rx)
+    }
+
+    /// Bilinearly interpolate the per-cell `ReliefCell` numerics at a world
+    /// tile, then re-derive `ReliefClass` from the interpolated values so the
+    /// classification is continuous across cell boundaries (no 64-tile patches
+    /// at climate-cell seams). X wraps; Y clamps to poles. Returns a
+    /// safe-default sample when the relief layer is empty (e.g. before
+    /// generation or in tests that bypass `generate_globe`).
+    pub fn sample_relief(&self, tile_x: i32, tile_y: i32) -> super::geomorph::ReliefSample {
+        use super::geomorph::{classify, ReliefClass, ReliefSample};
+
+        if self.relief.cells.is_empty() {
+            return ReliefSample {
+                slope: 0.0,
+                local_relief: 0.0,
+                mountain_distance: u16::MAX as f32,
+                coast_distance: u16::MAX as f32,
+                aquifer_depth_norm: 0.5,
+                topographic_position: 0.0,
+                class: ReliefClass::LowlandPlain,
+            };
+        }
+
+        let tiles_per_cell = (GLOBE_CELL_CHUNKS * super::chunk::CHUNK_SIZE as i32) as f32;
+        let fx = tile_x as f32 / tiles_per_cell;
+        let fy = tile_y as f32 / tiles_per_cell;
+        let gx0 = fx.floor() as i32;
+        let gy0 = fy.floor() as i32;
+        let tx = fx - gx0 as f32;
+        let ty = fy - gy0 as f32;
+
+        let sample = |gx: i32, gy: i32| -> super::geomorph::ReliefCell {
+            let gx = gx.rem_euclid(GLOBE_WIDTH);
+            let gy = gy.clamp(0, GLOBE_HEIGHT - 1);
+            self.relief.cells[(gy * GLOBE_WIDTH + gx) as usize]
+        };
+        let c00 = sample(gx0, gy0);
+        let c10 = sample(gx0 + 1, gy0);
+        let c01 = sample(gx0, gy0 + 1);
+        let c11 = sample(gx0 + 1, gy0 + 1);
+
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        let lerp_u16 = |a: u16, b: u16, t: f32| (a as f32) + ((b as i32 - a as i32) as f32) * t;
+        let bilerp = |a: f32, b: f32, c: f32, d: f32| lerp(lerp(a, b, tx), lerp(c, d, tx), ty);
+        let bilerp_u16 = |a: u16, b: u16, c: u16, d: u16| {
+            lerp(lerp_u16(a, b, tx), lerp_u16(c, d, tx), ty)
+        };
+
+        let slope = bilerp(c00.slope_norm, c10.slope_norm, c01.slope_norm, c11.slope_norm);
+        let local_relief = bilerp(
+            c00.local_relief,
+            c10.local_relief,
+            c01.local_relief,
+            c11.local_relief,
+        );
+        let tpi = bilerp(
+            c00.topographic_position,
+            c10.topographic_position,
+            c01.topographic_position,
+            c11.topographic_position,
+        );
+        let coast_distance = bilerp_u16(
+            c00.coast_distance,
+            c10.coast_distance,
+            c01.coast_distance,
+            c11.coast_distance,
+        );
+        let mountain_distance = bilerp_u16(
+            c00.mountain_distance,
+            c10.mountain_distance,
+            c01.mountain_distance,
+            c11.mountain_distance,
+        );
+        let aquifer_depth_norm = bilerp(
+            c00.aquifer_depth_norm,
+            c10.aquifer_depth_norm,
+            c01.aquifer_depth_norm,
+            c11.aquifer_depth_norm,
+        );
+
+        // Pull supporting inputs for class re-derivation from the climate
+        // field directly. Avoid `nearest_river_chebyshev` (O(total river
+        // vertices) per call — too slow at chunk-gen frequency); the
+        // Floodplain/BasinWetland classes inherit from the corner cells
+        // themselves (build_relief did the river-distance work once).
+        let (elev_u, _temp, rain_u) = self.sample_climate(tile_x, tile_y);
+        let elev_norm = (elev_u / 255.0).clamp(0.0, 1.0);
+        let rain_norm = (rain_u / 255.0).clamp(0.0, 1.0);
+        let res_kind = self.reservoir_at(tile_x, tile_y).map(|r| r.kind);
+
+        // Start from numeric re-classification (continuous across cell
+        // boundaries).
+        let numeric_class = classify(
+            elev_norm,
+            slope,
+            local_relief,
+            tpi,
+            coast_distance.round().max(0.0) as u16,
+            mountain_distance.round().max(0.0) as u16,
+            u32::MAX,
+            0,
+            aquifer_depth_norm,
+            rain_norm,
+            res_kind,
+        );
+
+        // Inherit "wet" classes from the closest corner cell when the per-
+        // tile numerics still support that class — this keeps Floodplain
+        // shoulder tiles classified correctly without the per-tile river
+        // distance walk.
+        let corners = [c00, c10, c01, c11];
+        let class = {
+            let mut c = numeric_class;
+            if corners.iter().any(|cc| cc.relief == ReliefClass::Floodplain)
+                && slope < 0.020
+                && !matches!(
+                    c,
+                    ReliefClass::OceanShelf
+                        | ReliefClass::BasinWetland
+                        | ReliefClass::MountainSlope
+                        | ReliefClass::MountainRidge
+                )
+            {
+                c = ReliefClass::Floodplain;
+            }
+            c
+        };
+
+        ReliefSample {
+            slope,
+            local_relief,
+            mountain_distance,
+            coast_distance,
+            aquifer_depth_norm,
+            topographic_position: tpi,
+            class,
+        }
     }
 
     /// Chebyshev distance in tiles from `(tx, ty)` to the nearest river
@@ -824,6 +969,42 @@ pub fn generate_globe(seed: u64) -> Globe {
         globe.hydrology = hydro;
     }
 
+    // ── 8. Geomorphology (relief classification) ──────────────────────────
+    // After hydrology so we have the finalised `filled_height`, reservoirs,
+    // and aquifer table. Drives per-tile detail amplitude, palette gating,
+    // fertility, settlement scoring, and the world-map tooltip.
+    {
+        let rain_norm: Vec<f32> = globe
+            .cells
+            .iter()
+            .map(|c| c.rainfall as f32 / 255.0)
+            .collect();
+        let river_cell_mask: Vec<bool> = globe.cells.iter().map(|c| c.is_river).collect();
+        // Per-cell Strahler proxy: max stream order of any edge that touches
+        // the cell. River edges store order at their downstream endpoint; we
+        // stamp the same order on both endpoints so headwater cells inherit
+        // their trunk's classification.
+        let mut strahler_at_cell = vec![0u8; (GLOBE_WIDTH * GLOBE_HEIGHT) as usize];
+        let w_usize = GLOBE_WIDTH as usize;
+        for e in &globe.rivers.edges {
+            let fi = e.from.1 as usize * w_usize + e.from.0 as usize;
+            let ti = e.to.1 as usize * w_usize + e.to.0 as usize;
+            if e.order > strahler_at_cell[fi] {
+                strahler_at_cell[fi] = e.order;
+            }
+            if e.order > strahler_at_cell[ti] {
+                strahler_at_cell[ti] = e.order;
+            }
+        }
+        globe.relief = super::geomorph::build_relief(
+            &elev_norm,
+            &globe.hydrology,
+            &rain_norm,
+            &river_cell_mask,
+            &strahler_at_cell,
+        );
+    }
+
     info!(
         "Globe generated: {}×{} cells, {} river edges, {} lakes",
         GLOBE_WIDTH,
@@ -1025,6 +1206,81 @@ mod tests {
         // span (no hard step at the cell boundary).
         assert!((e0 - e1).abs() < 30.0, "discontinuity at cell boundary");
         assert!((e1 - e2).abs() < 30.0, "discontinuity at cell boundary");
+    }
+
+    #[test]
+    fn relief_layer_populates_with_lowland_majority() {
+        // After the geomorph pass the relief layer should be the same length
+        // as the cell grid, and habitable land (non-Ocean cells) should
+        // contain a meaningful share of arable classes.
+        for seed in [42u64, 123] {
+            let g = generate_globe(seed);
+            let n = g.cells.len();
+            assert_eq!(g.relief.cells.len(), n, "seed {seed}: relief len mismatch");
+            let mut land_cells = 0usize;
+            let mut arable = 0usize;
+            let mut mountain = 0usize;
+            for (cell, rcell) in g.cells.iter().zip(g.relief.cells.iter()) {
+                if cell.biome == Biome::Ocean {
+                    continue;
+                }
+                land_cells += 1;
+                use super::super::geomorph::ReliefClass::*;
+                match rcell.relief {
+                    LowlandPlain | CoastalPlain | Floodplain | RollingHills => arable += 1,
+                    MountainSlope | MountainRidge => mountain += 1,
+                    _ => {}
+                }
+            }
+            assert!(land_cells > 0, "seed {seed}: no land cells");
+            let arable_pct = arable as f32 / land_cells as f32;
+            assert!(
+                arable_pct >= 0.20,
+                "seed {seed}: only {:.0}% of {} land cells classify arable (lowland/coastal/floodplain/rolling)",
+                arable_pct * 100.0,
+                land_cells
+            );
+            // Mountain slope/ridge should appear but not dominate land.
+            let mountain_pct = mountain as f32 / land_cells as f32;
+            assert!(
+                mountain_pct <= 0.35,
+                "seed {seed}: mountain land fraction {:.0}% exceeds 35%",
+                mountain_pct * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn sample_relief_continuous_across_cell_boundary() {
+        // The per-tile class is re-derived from interpolated numerics, so
+        // crossing a cell boundary should not flip the class on the very
+        // next tile when the surrounding cells share the same class.
+        let g = generate_globe(7);
+        let tiles_per_cell = (GLOBE_CELL_CHUNKS * super::super::chunk::CHUNK_SIZE as i32) as i32;
+        let mut flips_at_boundary = 0;
+        let mut samples = 0;
+        for k in 0..32 {
+            let edge_tx = tiles_per_cell * (k + 4);
+            let ty = 80 + k * 3;
+            let s0 = g.sample_relief(edge_tx - 1, ty).class;
+            let s1 = g.sample_relief(edge_tx, ty).class;
+            let s2 = g.sample_relief(edge_tx + 1, ty).class;
+            // A "flip" we worry about: identical-class neighbours surround a
+            // single-tile transition right at the cell boundary.
+            if s0 == s2 && s0 != s1 {
+                flips_at_boundary += 1;
+            }
+            samples += 1;
+        }
+        // Allow a few legitimate transitions (terrain genuinely changes at
+        // some cell borders), but a wholesale flipping pattern would mean
+        // class is nearest-cell rather than interpolation-derived.
+        assert!(
+            flips_at_boundary < samples / 2,
+            "{}/{} cell-boundary samples flipped — class likely nearest-cell, not interpolated",
+            flips_at_boundary,
+            samples
+        );
     }
 
     #[test]

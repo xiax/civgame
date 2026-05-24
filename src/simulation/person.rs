@@ -337,6 +337,7 @@ fn faction_spacing_score(tx: i32, ty: i32, others: &[(i32, i32)]) -> i32 {
 pub fn spawn_population(
     mut commands: Commands,
     chunk_map: Res<ChunkMap>,
+    globe: Res<crate::world::globe::Globe>,
     mut clock: ResMut<SimClock>,
     mut registry: ResMut<FactionRegistry>,
     mut player_faction: ResMut<PlayerFaction>,
@@ -400,7 +401,15 @@ pub fn spawn_population(
             13..=16 => 60,
             _ => 0,
         };
-        spacing + river_score
+        let relief_score = globe.sample_relief(tx, ty).class.settlement_score_bonus();
+        spacing + river_score + relief_score
+    };
+
+    // AI factions get the same hard reject as the player: never seed on
+    // mountain slopes/ridges or ocean shelf. Treats rejected tiles like
+    // impassable for the AI search loop.
+    let tile_landform_ok = |tx: i32, ty: i32| -> bool {
+        !globe.sample_relief(tx, ty).class.rejects_settlement()
     };
 
     for group_idx in 0..near_factions {
@@ -412,6 +421,7 @@ pub fn spawn_population(
             if let Some((mx, my)) = pending.0 {
                 let pick = crate::simulation::region::pick_player_home_in_megachunk(
                     &chunk_map,
+                    &globe,
                     mx,
                     my,
                     world_seed.0,
@@ -432,6 +442,7 @@ pub fn spawn_population(
                 let ty = start_ty + rng.gen_range(0..total_tiles_y);
                 if !chunk_map.is_passable(tx, ty)
                     || matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone))
+                    || !tile_landform_ok(tx, ty)
                 {
                     continue;
                 }
@@ -440,7 +451,8 @@ pub fn spawn_population(
                     best = Some(((tx, ty), score));
                 }
             }
-            // Fallback: if no candidate scored well, take any passable tile.
+            // Fallback: if no candidate scored well, take any passable tile
+            // (still landform-OK so we don't drop the AI onto a cliff face).
             best.map(|(t, _)| t).or_else(|| {
                 let mut result = None;
                 for _ in 0..500 {
@@ -448,6 +460,7 @@ pub fn spawn_population(
                     let ty = start_ty + rng.gen_range(0..total_tiles_y);
                     if chunk_map.is_passable(tx, ty)
                         && !matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone))
+                        && tile_landform_ok(tx, ty)
                     {
                         result = Some((tx, ty));
                         break;

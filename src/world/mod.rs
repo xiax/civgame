@@ -7,6 +7,7 @@ pub mod chunk;
 pub mod chunk_streaming;
 pub mod climate;
 pub mod erosion;
+pub mod geomorph;
 pub mod globe;
 pub mod hydrology;
 pub mod plates;

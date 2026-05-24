@@ -244,6 +244,7 @@ const HOME_PICK_MIN_SCORE: i32 = -49;
 /// then a forced centre with a warning.
 pub fn pick_player_home_in_megachunk(
     chunk_map: &ChunkMap,
+    globe: &Globe,
     mx: i32,
     my: i32,
     world_seed: u64,
@@ -261,9 +262,12 @@ pub fn pick_player_home_in_megachunk(
             return false;
         }
         match chunk_map.tile_kind_at(tx, ty) {
-            Some(TileKind::Stone) | Some(TileKind::River) | Some(TileKind::Water) => false,
-            _ => true,
+            Some(TileKind::Stone) | Some(TileKind::River) | Some(TileKind::Water) => return false,
+            _ => {}
         }
+        // Hard reject mountain slopes/ridges and ocean shelf — those tiles
+        // can't host a settlement at all.
+        !globe.sample_relief(tx, ty).class.rejects_settlement()
     };
 
     let score_tile = |tx: i32, ty: i32| -> i32 {
@@ -284,7 +288,8 @@ pub fn pick_player_home_in_megachunk(
         let dnorm = ((tx - cx).abs().max((ty - cy).abs())) as f32 / half as f32;
         let dnorm = dnorm.min(1.0);
         let center_score = ((1.0 - dnorm) * 10.0) as i32;
-        50 + river_score + center_score
+        let relief_score = globe.sample_relief(tx, ty).class.settlement_score_bonus();
+        50 + river_score + center_score + relief_score
     };
 
     let mut best: Option<HomePick> = None;
@@ -473,6 +478,13 @@ mod tests {
         map
     }
 
+    /// Empty-relief Globe — sample_relief returns LowlandPlain everywhere,
+    /// so `pick_player_home_in_megachunk` falls back to river / centre /
+    /// passability scoring (matches legacy test expectations).
+    fn empty_globe() -> Globe {
+        Globe::new(0)
+    }
+
     #[test]
     fn megachunk_coord_roundtrip() {
         let (mx, my) = MegaChunkCoord::from_tile(700, -50);
@@ -525,8 +537,9 @@ mod tests {
     #[test]
     fn home_pick_stays_inside_megachunk() {
         let map = flat_map_for_megachunks(2);
+        let globe = empty_globe();
         for &(mx, my) in &[(0, 0), (-1, 0), (1, -1)] {
-            let pick = pick_player_home_in_megachunk(&map, mx, my, 1234);
+            let pick = pick_player_home_in_megachunk(&map, &globe, mx, my, 1234);
             assert!(
                 MegaChunkCoord::contains_tile(mx, my, pick.tile.0, pick.tile.1),
                 "home {:?} not inside mega-chunk ({},{})",
@@ -540,10 +553,11 @@ mod tests {
     #[test]
     fn home_pick_deterministic_for_same_inputs() {
         let map = flat_map_for_megachunks(2);
-        let a = pick_player_home_in_megachunk(&map, 0, 0, 42);
-        let b = pick_player_home_in_megachunk(&map, 0, 0, 42);
+        let globe = empty_globe();
+        let a = pick_player_home_in_megachunk(&map, &globe, 0, 0, 42);
+        let b = pick_player_home_in_megachunk(&map, &globe, 0, 0, 42);
         assert_eq!(a.tile, b.tile);
-        let c = pick_player_home_in_megachunk(&map, 0, 0, 43);
+        let c = pick_player_home_in_megachunk(&map, &globe, 0, 0, 43);
         // Different seed should usually move the home; not strictly required
         // but a regression check that the seed actually flows through.
         assert_ne!(a.tile, c.tile);
