@@ -11,6 +11,7 @@
 
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::net_id::{NetId, NetIdMap};
 use crate::pathfinding::chunk_graph::ChunkGraph;
@@ -50,7 +51,7 @@ pub struct PlayerCommandEvent {
 ///   2. Match arm in `dispatch_player_command_system`.
 ///   3. Match arm in `player_command_lifecycle_system` (terminal-state check).
 ///   4. UI button emits the event.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PlayerCommand {
     Move {
         tile: (i32, i32),
@@ -834,6 +835,13 @@ pub struct CommandSender<'w, 's> {
 impl<'w, 's> CommandSender<'w, 's> {
     pub fn send(&mut self, actors: Vec<Entity>, command: PlayerCommand) {
         let fid = self.player_faction.faction_id;
+        // Translate entities → NetIds at the wire boundary so the event
+        // is fully shape-serializable. Allocates on the fly for entities
+        // that weren't tagged with `NeedsNetId` at spawn.
+        let actors: Vec<NetId> = actors
+            .into_iter()
+            .map(|e| self.net_ids.lookup_or_alloc(e, &mut self.commands))
+            .collect();
         self.events.send(crate::net::NetPlayerCommandEvent {
             sender_faction_id: fid,
             actors,

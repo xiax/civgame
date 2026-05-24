@@ -28,6 +28,7 @@ use crate::world::terrain::{tile_to_world, TILE_SIZE};
 use crate::world::tile::{TileData, TileKind};
 use ahash::{AHashMap, AHashSet};
 use bevy::prelude::*;
+use serde::{Deserialize, Serialize};
 
 /// Safety cap: prevents the blueprint queue growing unbounded due to bugs.
 pub const MAX_BLUEPRINTS_SAFETY_CAP: usize = 20;
@@ -298,7 +299,7 @@ pub struct HomeBed(pub Option<Entity>);
 /// Wall construction material. Each tier requires a tech and resource mix;
 /// see `BUILD_RECIPES`. All variants render as a `Wall` entity that overwrites
 /// the underlying tile with `TileKind::Wall`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WallMaterial {
     Palisade,
     WattleDaub,
@@ -569,7 +570,7 @@ pub struct Monument {
 }
 
 /// What kind of structure is being built.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BuildSiteKind {
     Wall(WallMaterial),
     Door,

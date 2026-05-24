@@ -200,15 +200,15 @@ impl VehicleDisableFlags {
 
 /// Stable identity of a `PartVariantDef` within `VehicleData::variants` —
 /// the load-order index.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct VehiclePartVariantId(pub u16);
 
 /// Stable identity of a `VehicleModuleDef` within `VehicleData::modules`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct VehicleModuleDefId(pub u16);
 
 /// Identity of one placed module *instance* within a single `VehicleGrid`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct VehicleModuleId(pub u16);
 
 /// Firing arc of a weapon module. `Front90` weapons fire only within ±45° of
@@ -229,7 +229,7 @@ pub enum FiringArc {
 /// `ResourceId`; `durability` is the cell's health ceiling. `variant` is an
 /// optional behavioural variant (`None` = pure part-base behaviour);
 /// `module_id` back-references the weapon module the cell belongs to.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct VehicleCell {
     pub kind: VehiclePartKind,
     pub material: ResourceId,
@@ -256,7 +256,7 @@ impl VehicleCell {
 /// One placed weapon-module instance within a `VehicleGrid`. `cells` is the
 /// concrete occupied-cell list (the authoritative grouping — not re-derived
 /// from an anchor + rotation); `facing` is the module's heading offset.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VehicleModuleInstance {
     pub id: VehicleModuleId,
     pub def: VehicleModuleDefId,
@@ -269,7 +269,7 @@ pub struct VehicleModuleInstance {
 /// One grid Z-cell maps to one world Z-level (clearance is load-bearing).
 /// `modules` is grouping metadata only; `cells` stays the single source for
 /// footprint / mass / health / pathing / rendering.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct VehicleGrid {
     pub cells: Vec<(IVec3, VehicleCell)>,
     pub modules: Vec<VehicleModuleInstance>,
@@ -3840,7 +3840,7 @@ pub fn vehicle_ai_design_proposal_system(
 
 /// One queued player vehicle order. `MoveTo` plans a `footprint_astar` route;
 /// the rest are immediate state changes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VehicleOrderKind {
     /// Drive the (idle, upright) vehicle to a destination tile.
     MoveTo((i32, i32)),

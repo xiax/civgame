@@ -27,6 +27,7 @@ use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
 use ahash::AHashMap;
 use bevy::prelude::*;
+use serde::{Deserialize, Serialize};
 
 pub const SOLO: u32 = 0;
 pub const BOND_THRESHOLD: u8 = 180;
@@ -2357,7 +2358,7 @@ pub enum MigrationPhase {
 /// component-score weights. AI factions default to `FreeRoute`
 /// (uniform weights, matching the pre-Phase 3 baseline). Players
 /// change this from the migration panel before scouting / committing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum MigrationIntent {
     #[default]
     FreeRoute,
@@ -2375,7 +2376,7 @@ pub enum MigrationIntent {
 /// socialize / etc. like the pre-existing behaviour. Every `PackCamp`
 /// resets this to `Hold`. Only consulted for player-driven nomadic
 /// factions (`nomad_autopilot == false`); AI nomads ignore it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PackedMigrationAutonomy {
     /// Strict: workers wait at their current tile and only execute
     /// explicit `PlayerCommand` orders / `Pack Camp` labor / manual

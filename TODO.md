@@ -161,7 +161,11 @@ X - Import new animal sprites
 
 X - Faction queues way too many crafting jobs for stuff the faction doesn't even need.
 
-Mining and digging should be incremental work. Each tile can be dug to up to 7 levels, completing the 7th removes the tile. At each level you get incremental resources. Without tools you can't dig past level 3. Digging down has effects even at incremental levels since it can provide cover and slow down people passing through the tile.
+X - Workers spend too much time preparing fields that they miss the chance to actually plant seeds.
+
+X - Mining and digging should be incremental work. Each tile can be dug to up to 7 levels, completing the 7th removes the tile. At each level you get incremental resources. Without tools you can't dig past level 3. Digging down has effects even at incremental levels since it can provide cover and slow down people passing through the tile.
+
+X - The amount of game map z level variability should depend on the biome and status in the world map. Currently we can't even properly simulate plains. Our game map generation needs to be more realistic.
 
 Add initial food and resources and stone tools to spawn appropriate for each era.
 
@@ -171,12 +175,9 @@ Need UI overhaul to add commands for all actions players can take, in a way that
 
 Need debug menu overhaul that works with the current version of the game and contains all important tools a developer needs to debug and test the game like entity spawners and ways to give resources to factions, etc.
 
-Workers spend too much time preparing fields that they miss the chance to actually plant seeds.
 
-Diplomacy
+I want to add diplomacy and territory to the game. Each faction should exert influence over a certain amount of territory based on each of their settlements and era, and they should try and protect their territory. Factions can also form agreements with other factions, whether that is trade, alliance, or war. By default factions should not like strangers trespassing on their land.
 
 Barter economies
 
 Add volume to items and carrying capacity, remove hard number limit
-
-X - The amount of game map z level variability should depend on the biome and status in the world map. Currently we can't even properly simulate plains. Our game map generation needs to be more realistic.

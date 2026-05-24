@@ -102,6 +102,15 @@ pub fn setup_fog_tile_materials(
 /// `CachedVisionSet.tiles` — a pure set-union here, no LOS work.
 /// LOS uses `has_vision_los` so the player faction can see through its
 /// own constructed walls and doors. See `plans/lookout-base.md`.
+///
+/// Phase 3d (multiplayer): in `NetMode::Client` the agent_query is
+/// empty (the client doesn't own live Person/PersonAI entities), so
+/// fog would degrade to "only landmarks". To keep client fog correct
+/// we additionally scan `ReplicatedEntity` stubs flagged
+/// `ReplicatedEntityKind::Person` and run the same per-agent LOS sweep
+/// over their replicated `tile` / `z` / `faction_id`. On the host the
+/// query is empty (no `ReplicatedEntity` exists) so the union is free.
+#[allow(clippy::too_many_arguments)]
 pub fn fog_update_system(
     player_faction: Res<PlayerFaction>,
     chunk_map: Res<ChunkMap>,
@@ -111,6 +120,7 @@ pub fn fog_update_system(
     agent_query: Query<(&Transform, &PersonAI, &FactionMember, &LodLevel, Option<&ActiveLookout>)>,
     landmark_query: Query<&Transform, With<PlayerFactionMarker>>,
     cached_sources: Query<&CachedVisionSet>,
+    replicated_persons: Query<&crate::net::client::ReplicatedEntity>,
     mut fog_map: ResMut<FogMap>,
 ) {
     let old_visible = std::mem::take(&mut fog_map.visible);
@@ -178,6 +188,50 @@ pub fn fog_update_system(
                     );
                 if in_los {
                     new_visible.insert((ttx as i32, tty as i32));
+                }
+            }
+        }
+    }
+
+    // Phase 3d: replicated agent stubs (client only). Same per-agent
+    // sweep as live agents but reading `ReplicatedEntity.{tile, z,
+    // faction_id}` instead of `Transform` + `PersonAI` + `FactionMember`.
+    // No `LodLevel` on stubs — treat as full-LOD. No `ActiveLookout` —
+    // active-lookout state isn't replicated yet, defer to standard
+    // radius. On the host this iterator is empty so the union is free.
+    for rep in replicated_persons.iter() {
+        if !matches!(rep.kind, crate::net::client::ReplicatedEntityKind::Person) {
+            continue;
+        }
+        if rep.faction_id != observer {
+            continue;
+        }
+        let (ax, ay) = rep.tile;
+        new_visible.insert((ax, ay));
+        let az = rep.z;
+        let view_radius = crate::simulation::vision::effective_vision_radius(None) as i32;
+        let view_radius_sq = view_radius * view_radius;
+        for dy in -view_radius..=view_radius {
+            for dx in -view_radius..=view_radius {
+                if dx * dx + dy * dy > view_radius_sq {
+                    continue;
+                }
+                let ttx = ax + dx;
+                let tty = ay + dy;
+                let raw_z = chunk_map.surface_z_at(ttx, tty);
+                let tz = raw_z.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
+                let in_los = dx * dx + dy * dy <= 1
+                    || has_vision_los(
+                        &chunk_map,
+                        &wall_map,
+                        &door_map,
+                        &wall_q,
+                        (ax, ay, az),
+                        (ttx, tty, tz),
+                        observer,
+                    );
+                if in_los {
+                    new_visible.insert((ttx, tty));
                 }
             }
         }

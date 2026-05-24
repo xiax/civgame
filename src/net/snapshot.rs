@@ -30,6 +30,10 @@ use crate::world::water_runtime::{RuntimeWater, RuntimeWaterCell};
 pub struct WallSnapshotEntry {
     pub tile: (i32, i32),
     pub entity_net_id: NetId,
+    /// Constructed wall owner, or `None` for natural bedrock. Threaded
+    /// through to client-side `Wall` stub so `has_vision_los` reads the
+    /// same owner-faction check on both sides of the wire.
+    pub owner_faction: Option<u32>,
 }
 
 /// One door entry — carries the live `open` flag and faction id so the
@@ -72,13 +76,18 @@ type NetworkedQuery<'w, 's> = Query<'w, 's, &'static Networked>;
 /// Pure map → snapshot. Drops entries whose entity is missing a
 /// `Networked` component — those aren't network-visible yet so they
 /// shouldn't appear in a bootstrap message either.
-pub fn snapshot_wall_map(map: &WallMap, q: &NetworkedQuery) -> Vec<WallSnapshotEntry> {
+pub fn snapshot_wall_map(
+    map: &WallMap,
+    q: &NetworkedQuery,
+    walls: &Query<&crate::simulation::construction::Wall>,
+) -> Vec<WallSnapshotEntry> {
     let mut out = Vec::with_capacity(map.0.len());
     for (tile, &entity) in map.0.iter() {
         if let Ok(net) = q.get(entity) {
             out.push(WallSnapshotEntry {
                 tile: *tile,
                 entity_net_id: net.0,
+                owner_faction: walls.get(entity).ok().and_then(|w| w.owner_faction),
             });
         }
     }
@@ -235,6 +244,7 @@ mod tests {
                 .filter_map(|(t, &e)| q.get(&world, e).ok().map(|n| WallSnapshotEntry {
                     tile: *t,
                     entity_net_id: n.0,
+                    owner_faction: None,
                 }))
                 .collect()
         };
@@ -325,6 +335,7 @@ mod tests {
         let snap = vec![WallSnapshotEntry {
             tile: (1, 1),
             entity_net_id: NetId(999),
+            owner_faction: None,
         }];
         let empty_ids = NetIdMap::default();
         let mut rebuilt = WallMap::default();

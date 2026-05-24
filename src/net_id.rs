@@ -41,6 +41,20 @@ impl NetIdMap {
         id
     }
 
+    /// Register a server-chosen `NetId` against a client-spawned stub
+    /// entity. Used by `net::client` when applying a `BootstrapSnapshot`
+    /// or `ChunkOverlayDelta` — the id originates server-side, so the
+    /// client must adopt it rather than allocate a fresh one. Bumps
+    /// `next` past the bound id so future client-side allocations stay
+    /// monotonic and never collide.
+    pub fn bind(&mut self, entity: Entity, id: NetId) {
+        self.entity_to_net.insert(entity, id);
+        self.net_to_entity.insert(id, entity);
+        if id.0 >= self.next {
+            self.next = id.0.saturating_add(1);
+        }
+    }
+
     pub fn release(&mut self, entity: Entity) -> Option<NetId> {
         let id = self.entity_to_net.remove(&entity)?;
         self.net_to_entity.remove(&id);
@@ -91,12 +105,24 @@ pub fn assign_net_ids_system(
     }
 }
 
+/// Emitted when a `Networked` entity despawns, **before** the mapping is
+/// dropped from `NetIdMap`. The server's entity-rep path reads these to
+/// ship `EntityRemoved` to clients; otherwise the despawn is invisible to
+/// remote stubs and they linger until the client garbage-collects them.
+#[derive(Event, Debug, Clone, Copy)]
+pub struct NetworkedRemovedEvent {
+    pub net_id: NetId,
+}
+
 pub fn release_net_ids_on_despawn(
     mut map: ResMut<NetIdMap>,
     mut removed: RemovedComponents<Networked>,
+    mut events: EventWriter<NetworkedRemovedEvent>,
 ) {
     for entity in removed.read() {
-        map.release(entity);
+        if let Some(id) = map.release(entity) {
+            events.send(NetworkedRemovedEvent { net_id: id });
+        }
     }
 }
 
@@ -104,10 +130,12 @@ pub struct NetIdPlugin;
 
 impl Plugin for NetIdPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<NetIdMap>().add_systems(
-            PostUpdate,
-            (assign_net_ids_system, release_net_ids_on_despawn).chain(),
-        );
+        app.init_resource::<NetIdMap>()
+            .add_event::<NetworkedRemovedEvent>()
+            .add_systems(
+                PostUpdate,
+                (assign_net_ids_system, release_net_ids_on_despawn).chain(),
+            );
     }
 }
 

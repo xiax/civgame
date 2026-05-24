@@ -19,22 +19,62 @@ pub use game_state::{
 fn main() {
     let is_sandbox = std::env::args().any(|a| a == "--sandbox");
 
-    let title = if is_sandbox {
-        "CivGame [sandbox]"
-    } else {
-        "CivGame"
+    let net_cfg = match net::parse_from_env() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("CLI error: {}", err);
+            std::process::exit(2);
+        }
     };
 
+    let title = match (is_sandbox, net_cfg.mode) {
+        (true, _) => "CivGame [sandbox]".to_string(),
+        (_, net::NetMode::ListenServer) => "CivGame [listen]".to_string(),
+        (_, net::NetMode::DedicatedServer) => "CivGame [server]".to_string(),
+        (_, net::NetMode::Client) => format!(
+            "CivGame [client → {}]",
+            net_cfg
+                .connect_addr
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "?".into())
+        ),
+        _ => "CivGame".to_string(),
+    };
+
+    // DedicatedServer runs the sim headlessly — no window, no rendering, no
+    // UI. Every other mode (Local / ListenServer / Client) keeps a window.
+    // ListenServer + Client also keep render/UI; the client App is what the
+    // user sees and the listen-server host wants to play the game too.
+    let is_headless = matches!(net_cfg.mode, net::NetMode::DedicatedServer);
+
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: title.into(),
-            resolution: (1280.0, 720.0).into(),
+    // Pre-insert NetMode so NetPlugin's init_resource doesn't overwrite our
+    // CLI choice. `NetConfig` itself becomes the canonical source for the
+    // bind / connect / player-name fields Phase 2 transports will read.
+    app.insert_resource(net_cfg.mode);
+    app.insert_resource(net_cfg.on_disconnect);
+    app.insert_resource(net_cfg.clone());
+
+    if is_headless {
+        // Headless: MinimalPlugins gives us TaskPool + Time +
+        // ScheduleRunnerPlugin (which drives the schedule outside a windowed
+        // event loop). LogPlugin keeps `info!` going to stderr. The fixed
+        // timestep below sets sim cadence; ScheduleRunnerPlugin defaults to
+        // a continuous loop, which suits a server with no frame cap.
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(bevy::log::LogPlugin::default());
+    } else {
+        app.add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                title: title.into(),
+                resolution: (1280.0, 720.0).into(),
+                ..default()
+            }),
             ..default()
-        }),
-        ..default()
-    }))
-    .init_state::<GameState>()
+        }));
+    }
+
+    app.init_state::<GameState>()
     .add_sub_state::<SimulationState>()
     .insert_resource(PendingSpawn::default())
     .insert_resource(GameStartOptions::default())
@@ -46,8 +86,6 @@ fn main() {
     .add_plugins(simulation::SimulationPlugin)
     .add_plugins(economy::EconomyPlugin)
     .add_plugins(pathfinding::PathfindingPlugin)
-    .add_plugins(rendering::RenderingPlugin)
-    .add_plugins(ui::UiPlugin)
     .insert_resource(Time::<Fixed>::from_hz(20.0))
     .add_systems(Startup, configure_time)
     .add_systems(PreUpdate, log_first_pre_update)
@@ -58,6 +96,14 @@ fn main() {
         PostUpdate,
         log_first_post_update_end.after(log_first_post_update),
     );
+
+    if !is_headless {
+        // Render + UI piggyback on `DefaultPlugins` (asset server, window,
+        // winit). Both reference graphics resources DedicatedServer doesn't
+        // have, so they're skipped under MinimalPlugins.
+        app.add_plugins(rendering::RenderingPlugin)
+            .add_plugins(ui::UiPlugin);
+    }
 
     if is_sandbox {
         app.add_plugins(sandbox::SandboxPlugin);

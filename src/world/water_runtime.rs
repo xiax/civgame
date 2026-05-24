@@ -34,7 +34,7 @@ use crate::world::water::{CellRole, WaterCell, WaterGrid, REST_EPS};
 /// never stored — a drained cell is *removed* (see [`RuntimeWater::set`]) so
 /// the regenerated dry terrain shows through and we never have to reconstruct
 /// the original surface kind.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeWaterCell {
     /// Solid bed Z (the land/rock floor under the water).
     pub ground_z: i8,

@@ -10,7 +10,7 @@
 
 use ahash::AHashMap;
 use bevy::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::goods::Bulk;
 
@@ -20,7 +20,7 @@ use super::goods::Bulk;
 /// games portable across resource additions.
 ///
 /// `ResourceId(u16::MAX)` is reserved as a sentinel for "no resource".
-#[derive(Copy, Clone, Eq, Hash, PartialEq, Debug)]
+#[derive(Copy, Clone, Eq, Hash, PartialEq, Debug, Serialize, Deserialize)]
 pub struct ResourceId(pub u16);
 
 /// Default resolves to the `NONE` sentinel so newtype consumers using
