@@ -3782,6 +3782,204 @@ mod craft_demand_tests {
 }
 
 /// Player override for crafting a specific tablet/book on demand. Inspector
+/// Returns `true` when this resource class is something the faction-level
+/// loose-cleanup pass is willing to sweep into storage. Excludes Currency
+/// (personal wealth, not spill) and Knowledge (clay tablets carry a
+/// `tech_payload` that the chief-tablet pipeline owns separately).
+pub fn loose_cleanup_eligible(class: crate::economy::resource_catalog::ResourceClass) -> bool {
+    use crate::economy::resource_catalog::ResourceClass as RC;
+    matches!(
+        class,
+        RC::Food
+            | RC::Material
+            | RC::Fuel
+            | RC::Ore
+            | RC::Hide
+            | RC::Cloth
+            | RC::Seed
+            | RC::Tool
+            | RC::Weapon
+            | RC::Armor
+            | RC::Shield
+            | RC::Luxury
+    )
+}
+
+/// Minimum bucket size before the loose-cleanup pass emits a posting. Tunes
+/// the trade-off between posting churn (low → posts for every drop) and
+/// timeliness (high → spill piles up before workers are routed).
+pub const LOOSE_POSTING_MIN_QTY: u32 = 6;
+
+/// Half-side of the per-faction loose-item scan square (in tiles) around the
+/// faction's `home_tile` and each owned `Settlement.market_tile`. Larger than
+/// `STANDARD_VIEW_RADIUS` so workers can be vectored to spill they've never
+/// personally seen.
+pub const LOOSE_SCAN_RADIUS: i32 = 32;
+
+/// Faction-level loose-resource cleanup. Scans the `SpatialIndex` within
+/// each materialised non-SOLO faction's interest zone (`home_tile` +
+/// `Settlement.market_tile` neighborhoods within `LOOSE_SCAN_RADIUS`),
+/// buckets every public `GroundItem` of an eligible class by `resource_id`,
+/// and emits or extends a `JobKind::Stockpile { resource_id }` posting per
+/// bucket. Respects per-resource `ResourceControlPolicy::chief_allocates_labor`
+/// and the faction's `caps.posting`; skips storage tiles and household-
+/// private spills.
+///
+/// Runs at `CHIEF_POSTING_INTERVAL` cadence alongside `chief_job_posting_system`
+/// so the workforce-budget snapshot is consistent across the two passes.
+pub fn chief_loose_stockpile_posting_system(
+    clock: Res<SimClock>,
+    registry: Res<FactionRegistry>,
+    settlement_map: Res<crate::simulation::settlement::SettlementMap>,
+    settlement_q: Query<&crate::simulation::settlement::Settlement>,
+    storage_tile_map: Res<crate::simulation::faction::StorageTileMap>,
+    projects: Res<Projects>,
+    calendar: Res<crate::world::seasons::Calendar>,
+    spatial: Res<crate::world::spatial::SpatialIndex>,
+    item_query: Query<&crate::simulation::items::GroundItem>,
+    mut board: ResMut<JobBoard>,
+) {
+    if clock.tick % CHIEF_POSTING_INTERVAL != 0 {
+        return;
+    }
+    let posted_tick = clock.tick as u32;
+
+    for (&faction_id, faction) in registry.factions.iter() {
+        if faction_id == SOLO {
+            continue;
+        }
+        if !faction.materialized {
+            continue;
+        }
+        // Household / sub-faction postings live on the parent faction's
+        // board; the chief-level cleanup is village-scope only.
+        if faction.parent_faction.is_some() {
+            continue;
+        }
+        if faction.caps.posting.is_disabled() {
+            continue;
+        }
+        if matches!(
+            faction.camp_state,
+            crate::simulation::faction::CampState::Packed { .. }
+        ) {
+            continue;
+        }
+
+        // Anchor set: home + every owned settlement's market_tile. Cap to
+        // bound scan cost on multi-settlement factions.
+        let mut anchors: Vec<(i32, i32)> = Vec::new();
+        anchors.push((faction.home_tile.0 as i32, faction.home_tile.1 as i32));
+        for sid in settlement_map.by_faction.get(&faction_id).into_iter().flatten() {
+            if let Some(&entity) = settlement_map.by_id.get(sid) {
+                if let Ok(s) = settlement_q.get(entity) {
+                    anchors.push(s.market_tile);
+                    if anchors.len() >= 8 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Walk anchor neighborhoods, bucketing by resource_id. Deduplicate
+        // entities across overlapping anchor discs via a visited set.
+        let mut buckets: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32> =
+            ahash::AHashMap::new();
+        let mut visited: ahash::AHashSet<Entity> = ahash::AHashSet::new();
+        for &(ax, ay) in &anchors {
+            for dy in -LOOSE_SCAN_RADIUS..=LOOSE_SCAN_RADIUS {
+                for dx in -LOOSE_SCAN_RADIUS..=LOOSE_SCAN_RADIUS {
+                    let tile = (ax + dx, ay + dy);
+                    if storage_tile_map.tiles.contains_key(&tile) {
+                        continue;
+                    }
+                    for &entity in spatial.get(tile.0, tile.1).iter() {
+                        if !visited.insert(entity) {
+                            continue;
+                        }
+                        let Ok(gi) = item_query.get(entity) else { continue };
+                        if !gi.is_public() || gi.qty == 0 {
+                            continue;
+                        }
+                        let rid = gi.item.resource_id;
+                        let Some(class) = rid.class() else { continue };
+                        if !loose_cleanup_eligible(class) {
+                            continue;
+                        }
+                        if !faction.policy_for(rid).chief_allocates_labor {
+                            continue;
+                        }
+                        let entry = buckets.entry(rid).or_insert(0);
+                        *entry = entry.saturating_add(gi.qty);
+                    }
+                }
+            }
+        }
+
+        // For each bucket, either bump an existing live Stockpile posting
+        // or emit a new one. Skip buckets under the min-batch threshold to
+        // avoid posting churn on tiny drops.
+        for (rid, mut bucket_qty) in buckets {
+            if bucket_qty < LOOSE_POSTING_MIN_QTY {
+                continue;
+            }
+            // Bump existing matching posting's target if any.
+            let mut bumped = false;
+            for p in board.faction_postings_mut(faction_id).iter_mut() {
+                if let JobProgress::Stockpile {
+                    resource_id,
+                    deposited,
+                    target,
+                } = &mut p.progress
+                {
+                    if *resource_id == rid {
+                        let outstanding = (*target).saturating_sub(*deposited);
+                        let needed = bucket_qty.saturating_sub(outstanding);
+                        if needed > 0 {
+                            *target = target.saturating_add(needed);
+                        }
+                        bumped = true;
+                        break;
+                    }
+                }
+            }
+            if bumped {
+                continue;
+            }
+            // No existing posting → emit one.
+            bucket_qty = bucket_qty.clamp(MATERIAL_GATHER_MIN, MATERIAL_GATHER_CAP);
+            let id = board.alloc_id();
+            let progress = JobProgress::Stockpile {
+                resource_id: rid,
+                deposited: 0,
+                target: bucket_qty,
+            };
+            let priority = crate::simulation::projects::compute_priority(
+                faction,
+                faction_id,
+                JobKind::Stockpile,
+                &progress,
+                &projects,
+                &calendar,
+            );
+            board.faction_postings_mut(faction_id).push(JobPosting {
+                id,
+                faction_id,
+                kind: JobKind::Stockpile,
+                progress,
+                claimants: Vec::new(),
+                priority,
+                source: JobSource::Chief,
+                posted_tick,
+                expiry_tick: None,
+                poster_class: PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            });
+        }
+    }
+}
+
 /// "Encode Tablet" writes the recipe + tech_payload here; the apply system
 /// posts a Craft job to the player faction at the next chief-posting tick.
 #[derive(Resource, Default)]

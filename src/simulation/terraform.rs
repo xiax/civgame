@@ -248,6 +248,7 @@ pub fn terraform_system(
                         GroundItem {
                             item,
                             qty: leftover,
+                            owner_household: None,
                         },
                         Transform::from_xyz(pos.x, pos.y, 0.3),
                         GlobalTransform::default(),

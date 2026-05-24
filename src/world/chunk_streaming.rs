@@ -938,6 +938,7 @@ pub fn spawn_chunk_loose_rocks(commands: &mut Commands, chunk_map: &ChunkMap, co
                 GroundItem {
                     item: Item::new_commodity(crate::economy::core_ids::stone()),
                     qty,
+                    owner_household: None,
                 },
                 Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
                 GlobalTransform::default(),

@@ -296,6 +296,36 @@ impl TestSim {
                 GroundItem {
                     item: Item::new_commodity(resource.into()),
                     qty,
+                    owner_household: None,
+                },
+                Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
+                GlobalTransform::default(),
+                Visibility::Hidden,
+                InheritedVisibility::default(),
+                Indexed::new(IndexedKind::GroundItem),
+            ))
+            .id()
+    }
+
+    /// Like `spawn_ground_item` but stamps `owner_household = Some(hid)`
+    /// so the loose-cleanup pass skips the spill. Mirrors a kitchen-garden
+    /// household-private harvest overflow.
+    pub fn spawn_private_ground_item(
+        &mut self,
+        tile: (i32, i32),
+        resource: impl Into<crate::economy::resource_catalog::ResourceId>,
+        qty: u32,
+        household_id: u32,
+    ) -> Entity {
+        use crate::simulation::items::GroundItem;
+        let world_pos = tile_to_world(tile.0, tile.1);
+        self.app
+            .world_mut()
+            .spawn((
+                GroundItem {
+                    item: Item::new_commodity(resource.into()),
+                    qty,
+                    owner_household: Some(household_id),
                 },
                 Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
                 GlobalTransform::default(),
@@ -8319,6 +8349,7 @@ mod smoke {
                 GroundItem {
                     item: stone_axe,
                     qty: 1,
+                    owner_household: None,
                 },
                 Transform::from_xyz(axe_world.x, axe_world.y, 0.4),
                 GlobalTransform::default(),
@@ -12434,6 +12465,7 @@ mod baseline_behaviour {
             GroundItem {
                 item: Item::new_commodity(weapon_id),
                 qty: 1,
+                owner_household: None,
             },
             Transform::from_xyz(weapon_world.x, weapon_world.y, 0.4),
             GlobalTransform::default(),
@@ -19938,5 +19970,271 @@ mod onenter_era_seeding {
             active_social < 100.0,
             "ambient-paired coworker DOES get relief, got {active_social}"
         );
+    }
+}
+
+#[cfg(test)]
+mod loose_resource_cleanup {
+    //! Acceptance tests for the loose-resource stockpile cleanup pipeline.
+    //!
+    //! Covers: the faction-level posting pass that scans `SpatialIndex` for
+    //! public ground spill (`chief_loose_stockpile_posting_system`), the
+    //! private-spill skip rule, the full-stack pickup gate, and the
+    //! per-resource deposit credit. Mirrors the test cadence used by
+    //! sibling stockpile / scavenge tests above.
+    use super::*;
+    use crate::simulation::carry::Carrier;
+    use crate::simulation::items::GroundItem;
+    use crate::simulation::jobs::{
+        JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource,
+    };
+    use crate::simulation::typed_task::{ActionQueue, Task};
+    use crate::world::tile::TileKind;
+
+    /// `chief_loose_stockpile_posting_system` must emit a fresh
+    /// `JobKind::Stockpile { grain }` posting when ≥ `LOOSE_POSTING_MIN_QTY`
+    /// units of public `grain` spill sit within `LOOSE_SCAN_RADIUS` of the
+    /// faction's home tile.
+    #[test]
+    fn loose_pass_emits_grain_posting_for_public_spill() {
+        let mut sim = TestSim::new(2026);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        let faction = sim.player_faction_id;
+        sim.spawn_storage_tile(faction, (0, 0));
+
+        // Public grain spill at (5, 0) — well inside LOOSE_SCAN_RADIUS = 32.
+        sim.spawn_ground_item((5, 0), crate::economy::core_ids::grain(), 12);
+
+        // Drive enough ticks that CHIEF_POSTING_INTERVAL (60) fires at least
+        // once. `tick_n(70)` gives plenty of margin.
+        sim.tick_n(70);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let posted: Vec<_> = board
+            .faction_postings(faction)
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.progress,
+                    JobProgress::Stockpile { resource_id, .. }
+                        if resource_id == crate::economy::core_ids::grain()
+                )
+            })
+            .collect();
+        assert!(
+            !posted.is_empty(),
+            "loose-cleanup pass should emit a Stockpile{{grain}} posting for \
+             public spill in interest zone; postings = {:?}",
+            board.faction_postings(faction).iter().map(|p| &p.progress).collect::<Vec<_>>()
+        );
+    }
+
+    /// Same scenario as above but the spill is household-private
+    /// (`owner_household = Some(hid)`). The pass must NOT emit a
+    /// faction-level posting.
+    #[test]
+    fn loose_pass_skips_household_private_spill() {
+        let mut sim = TestSim::new(2027);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        let faction = sim.player_faction_id;
+        sim.spawn_storage_tile(faction, (0, 0));
+
+        // Household-private grain spill — faction-level cleanup must ignore
+        // it. household_id = 999 is fine; the gate is purely `is_public()`.
+        sim.spawn_private_ground_item((5, 0), crate::economy::core_ids::grain(), 12, 999);
+
+        sim.tick_n(70);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let has_grain_posting = board
+            .faction_postings(faction)
+            .iter()
+            .any(|p| {
+                matches!(
+                    p.progress,
+                    JobProgress::Stockpile { resource_id, .. }
+                        if resource_id == crate::economy::core_ids::grain()
+                )
+            });
+        assert!(
+            !has_grain_posting,
+            "loose-cleanup pass MUST NOT post for household-private spill"
+        );
+    }
+
+    /// `item_pickup_system` should take the **full stack** when the scavenge
+    /// chain ends in `DepositToFactionStorage`, even for edible food. The
+    /// hunger-bites cap only applies when the next task is `Task::Eat`.
+    #[test]
+    fn pickup_full_stack_when_deposit_trailing() {
+        let mut sim = TestSim::new(2028);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        let faction = sim.player_faction_id;
+        sim.spawn_storage_tile(faction, (0, 0));
+
+        // Low hunger so the legacy hunger-bites path would clamp pickup.
+        let pile_qty: u32 = 10;
+        let pile = sim.spawn_ground_item((1, 0), crate::economy::core_ids::grain(), pile_qty);
+
+        // Chief at (3, 3) so the worker isn't auto-promoted.
+        let _chief = sim.spawn_person(faction, (3, 3), |_| {});
+
+        let worker = sim.spawn_person(faction, (0, 0), |b| {
+            b.hunger(0.0).drafted();
+        });
+        sim.tick_n(5);
+        sim.undraft(worker);
+
+        // Manually dispatch the canonical Scavenge → Deposit chain on the
+        // worker. Mirrors what `htn_acquire_good_dispatch_system`'s Stockpile
+        // arm would produce.
+        let grain_id = crate::economy::core_ids::grain();
+        {
+            let mut aq = sim.app.world_mut().get_mut::<ActionQueue>(worker).unwrap();
+            aq.current = Task::Scavenge { target: pile };
+            // Use the public API to enqueue the deposit so the queue
+            // invariants stay consistent.
+            let _ = aq.enqueue(Task::DepositToFactionStorage {
+                resource_id: grain_id,
+                target_faction_id: None,
+            });
+        }
+        // Pin the worker in Working state at the scavenge tile so
+        // `item_pickup_system` fires next tick.
+        {
+            use crate::simulation::person::{AiState, PersonAI};
+            let mut ai = sim.app.world_mut().get_mut::<PersonAI>(worker).unwrap();
+            ai.state = AiState::Working;
+            ai.dest_tile = (1, 0);
+        }
+        // Snap the worker's Transform onto the scavenge tile so the
+        // pickup precondition (chebyshev ≤ 1) holds.
+        {
+            let pos = tile_to_world(1, 0);
+            let mut tr = sim.app.world_mut().get_mut::<Transform>(worker).unwrap();
+            tr.translation.x = pos.x;
+            tr.translation.y = pos.y;
+        }
+
+        sim.tick();
+
+        // Expect the entire stack picked up (carrier + inventory total).
+        let carrier = sim.app.world().get::<Carrier>(worker).unwrap();
+        let agent = sim
+            .app
+            .world()
+            .get::<crate::economy::agent::EconomicAgent>(worker)
+            .unwrap();
+        let in_hand: u32 = [carrier.left, carrier.right]
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .filter(|s| s.item.resource_id == grain_id)
+            .map(|s| s.qty)
+            .sum();
+        let in_inv: u32 = agent
+            .inventory
+            .iter()
+            .filter(|(it, _)| it.resource_id == grain_id)
+            .map(|(_, q)| *q)
+            .sum();
+        assert_eq!(
+            in_hand + in_inv,
+            pile_qty,
+            "scavenge → DepositToFactionStorage should take the full {pile_qty}-unit stack (in_hand={in_hand}, in_inv={in_inv})"
+        );
+    }
+
+    /// `drop_items_at_destination_system` must credit a
+    /// `JobKind::Stockpile { skin }` claim when the worker deposits hide.
+    /// Previously only wood / stone hand drops and food calories credited.
+    #[test]
+    fn deposit_credits_hide_stockpile_claim() {
+        let mut sim = TestSim::new(2029);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        let faction = sim.player_faction_id;
+        let storage_tile = (0, 0);
+        sim.spawn_storage_tile(faction, storage_tile);
+
+        // Chief at (3, 3) so worker stays a worker.
+        let _chief = sim.spawn_person(faction, (3, 3), |_| {});
+
+        let skin_id = crate::economy::core_ids::skin();
+        let deposit_qty: u32 = 3;
+        let worker = sim.spawn_person(faction, storage_tile, |b| {
+            b.add_inventory(skin_id, deposit_qty);
+        });
+        // Drive a warm-up tick to settle indices.
+        sim.tick_n(2);
+
+        // Inject a Stockpile{skin} posting + claim on the worker.
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            board.postings.entry(faction).or_default().push(JobPosting {
+                id,
+                faction_id: faction,
+                kind: JobKind::Stockpile,
+                progress: JobProgress::Stockpile {
+                    resource_id: skin_id,
+                    deposited: 0,
+                    target: 10,
+                },
+                claimants: vec![worker],
+                priority: 100,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: crate::simulation::jobs::PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            });
+            id
+        };
+        sim.app.world_mut().entity_mut(worker).insert(JobClaim {
+            job_id,
+            faction_id: faction,
+            kind: JobKind::Stockpile,
+            posted_tick: 0,
+            fail_count: 0,
+        });
+
+        // Manually drive the worker into the DepositToFactionStorage task at
+        // the storage tile. `drop_items_at_destination_system` reads
+        // `aq.current_task_kind() == DepositResource` + `AiState::Working`.
+        {
+            let mut aq = sim.app.world_mut().get_mut::<ActionQueue>(worker).unwrap();
+            aq.current = Task::DepositToFactionStorage {
+                resource_id: skin_id,
+                target_faction_id: None,
+            };
+        }
+        {
+            use crate::simulation::person::{AiState, PersonAI};
+            let mut ai = sim.app.world_mut().get_mut::<PersonAI>(worker).unwrap();
+            ai.state = AiState::Working;
+            ai.dest_tile = storage_tile;
+        }
+
+        sim.tick();
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let posting = board
+            .faction_postings(faction)
+            .iter()
+            .find(|p| p.id == job_id)
+            .expect("posting should still exist (target=10, deposit=3)");
+        match posting.progress {
+            JobProgress::Stockpile { deposited, .. } => {
+                assert!(
+                    deposited >= deposit_qty,
+                    "deposit should credit ≥ {deposit_qty} units to Stockpile{{skin}}; got {deposited}"
+                );
+            }
+            ref other => panic!("expected Stockpile progress, got {:?}", other),
+        }
     }
 }

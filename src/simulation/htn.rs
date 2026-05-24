@@ -4820,8 +4820,52 @@ pub fn htn_acquire_good_dispatch_system(
                     |t| storage_tile_map.tiles.contains_key(&t),
                     reach_from_agent,
                 );
-                let scavenge_target_entity = scavenge.map(|(e, _)| e);
-                let scavenge_target_tile = scavenge.map(|(_, t)| t);
+                let (scavenge_target_entity, scavenge_target_tile) = match scavenge {
+                    Some((e, t)) => (Some(e), Some(t)),
+                    None => {
+                        // Vision-empty fallback: mirrors the food-side scan at
+                        // lines ~4179. When a Stockpile{rid} claim sends a
+                        // worker into the cleanup zone, the worker's vision
+                        // bucket may not yet show the loose pile; scan
+                        // `SpatialIndex` within standard view radius for any
+                        // GroundItem whose resource_id matches `target_rid`,
+                        // is public, has qty > 0, sits outside any storage
+                        // tile, and is reachable. Detour-ranked.
+                        let r = crate::simulation::vision::STANDARD_VIEW_RADIUS as i32;
+                        let mut best: Option<(Entity, (i32, i32), i32)> = None;
+                        for dy in -r..=r {
+                            for dx in -r..=r {
+                                let tx = cur_tx + dx;
+                                let ty = cur_ty + dy;
+                                let t = (tx, ty);
+                                if storage_tile_map.tiles.contains_key(&t) {
+                                    continue;
+                                }
+                                for &ent in spatial.get(tx, ty).iter() {
+                                    let Ok(gi) = item_query.get(ent) else { continue };
+                                    if gi.item.resource_id != target_rid
+                                        || gi.qty == 0
+                                        || !gi.is_public()
+                                    {
+                                        continue;
+                                    }
+                                    if !reach_from_agent(t) {
+                                        continue;
+                                    }
+                                    let d = detour_dist(t);
+                                    if best.as_ref().map_or(true, |(_, _, bd)| d < *bd) {
+                                        best = Some((ent, t, d));
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        match best {
+                            Some((e, t, _)) => (Some(e), Some(t)),
+                            None => (None, None),
+                        }
+                    }
+                };
 
                 // Phase 5c-ii-d-iv-ii: no early-return when both targets are
                 // None. The argmax now picks `ExploreForMaterialMethod`

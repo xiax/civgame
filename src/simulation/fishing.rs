@@ -434,7 +434,11 @@ fn spill_ground(commands: &mut Commands, tx: i32, ty: i32, item: Item, qty: u32)
     }
     let pos = tile_to_world(tx, ty);
     commands.spawn((
-        GroundItem { item, qty },
+        GroundItem {
+            item,
+            qty,
+            owner_household: None,
+        },
         Transform::from_xyz(pos.x, pos.y, 0.3),
         GlobalTransform::default(),
         Visibility::Visible,

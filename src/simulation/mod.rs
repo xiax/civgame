@@ -1249,6 +1249,14 @@ impl Plugin for SimulationPlugin {
                         .after(faction::compute_faction_storage_system)
                         .after(faction::chief_selection_system)
                         .after(projects::project_lifecycle_system),
+                    // Loose-resource cleanup: scan SpatialIndex for public
+                    // ground items in each faction's interest zone and post
+                    // `JobKind::Stockpile { resource_id }` for harvest spill
+                    // and other loose useful resources. Runs alongside the
+                    // main chief posting on the same cadence.
+                    jobs::chief_loose_stockpile_posting_system
+                        .after(jobs::chief_job_posting_system)
+                        .before(jobs::chief_post_funding_system),
                     jobs::worker_self_post_stockpile_system.after(jobs::chief_job_posting_system),
                     crafting::faction_craft_order_system.after(jobs::chief_job_posting_system),
                     jobs::chief_tablet_posting_system.after(jobs::chief_job_posting_system),

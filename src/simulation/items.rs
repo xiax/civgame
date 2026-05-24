@@ -23,6 +23,18 @@ pub struct TargetItem(pub Option<Entity>);
 pub struct GroundItem {
     pub item: Item,
     pub qty: u32,
+    /// `None` = public spill (sweepable by faction loose-stockpile cleanup).
+    /// `Some(household_id)` = household-private (e.g. harvest overflow from a
+    /// household's own kitchen-garden plot). Private spills merge only with
+    /// matching-owner stacks and are skipped by the faction-level
+    /// `chief_job_posting_system` loose-cleanup pass.
+    pub owner_household: Option<u32>,
+}
+
+impl GroundItem {
+    pub fn is_public(&self) -> bool {
+        self.owner_household.is_none()
+    }
 }
 
 #[repr(u8)]
@@ -93,9 +105,26 @@ pub fn spawn_or_merge_ground_item_full(
     item: Item,
     qty: u32,
 ) {
+    spawn_or_merge_ground_item_owned(commands, spatial, item_query, tx, ty, item, qty, None);
+}
+
+/// Like `spawn_or_merge_ground_item_full` but stamps the spill with an
+/// `owner_household` so the faction-level loose-cleanup posting pass skips
+/// it. Merges only into an existing stack whose `(item, owner_household)`
+/// pair matches exactly — public and private piles never merge.
+pub fn spawn_or_merge_ground_item_owned(
+    commands: &mut Commands,
+    spatial: &SpatialIndex,
+    item_query: &mut Query<&mut GroundItem>,
+    tx: i32,
+    ty: i32,
+    item: Item,
+    qty: u32,
+    owner_household: Option<u32>,
+) {
     for &entity in spatial.get(tx, ty) {
         if let Ok(mut gi) = item_query.get_mut(entity) {
-            if gi.item == item {
+            if gi.item == item && gi.owner_household == owner_household {
                 gi.qty = gi.qty.saturating_add(qty);
                 return;
             }
@@ -103,7 +132,11 @@ pub fn spawn_or_merge_ground_item_full(
     }
     let world_pos = tile_to_world(tx, ty);
     commands.spawn((
-        GroundItem { item, qty },
+        GroundItem {
+            item,
+            qty,
+            owner_household,
+        },
         Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
         GlobalTransform::default(),
         Visibility::Visible,
@@ -342,7 +375,13 @@ pub fn item_pickup_system(
         };
 
         if let Ok(mut item) = item_query.get_mut(target_ent) {
-            let take_qty = if item.item.resource_id.is_edible() {
+            // Scavenge sizing: take only what hunger needs **only when the
+            // chain ends in `Eat`** (personal foraging). Any scavenge chain
+            // followed by `DepositToFactionStorage` (loose-stockpile cleanup,
+            // chief food postings, etc.) takes the full stack so a worker
+            // doesn't tip-toe one bite at a time across a field of spill.
+            let next_is_eat = matches!(aq.peek_next(), Some(Task::Eat));
+            let take_qty = if next_is_eat && item.item.resource_id.is_edible() {
                 let nutrition = item.item.resource_id.nutrition();
                 if nutrition == 0 {
                     item.qty

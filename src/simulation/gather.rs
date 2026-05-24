@@ -109,7 +109,10 @@ pub const P6B_RETARGET_RADIUS: i32 = 2;
 /// (Resource(STONE) lives on the tile branch, not the plant branch).
 fn retarget_neighbor(
     plant_map: &PlantMap,
-    plant_query: &Query<&mut crate::simulation::plants::Plant>,
+    plant_query: &Query<(
+        &mut crate::simulation::plants::Plant,
+        Option<&crate::simulation::shared_knowledge::LandClaim>,
+    )>,
     kind: MemoryKind,
     from: (i32, i32),
     radius: i32,
@@ -139,7 +142,7 @@ fn retarget_neighbor(
                 continue;
             };
             // Read-only get — caller will mutate if and only if it commits.
-            let Ok(plant) = plant_query.get(entity) else {
+            let Ok((plant, _land_claim)) = plant_query.get(entity) else {
                 continue;
             };
             if plant.stage != GrowthStage::Mature {
@@ -412,7 +415,10 @@ pub fn gather_system(
     mut shared: ResMut<crate::simulation::shared_knowledge::SharedKnowledge>,
     mut routing: GatherRoutingResources,
     mut sharecrop: crate::simulation::land::SharecropResources,
-    mut plant_query: Query<&mut crate::simulation::plants::Plant>,
+    mut plant_query: Query<(
+        &mut crate::simulation::plants::Plant,
+        Option<&crate::simulation::shared_knowledge::LandClaim>,
+    )>,
     mut agent_query: Query<(
         Entity,
         &mut PersonAI,
@@ -500,7 +506,7 @@ pub fn gather_system(
             // (40-tick cooldown) so a depleted cluster doesn't loop forever.
             let stale = match plant_query.get(entity) {
                 Err(_) => true,
-                Ok(p) if p.stage != GrowthStage::Mature => true,
+                Ok((p, _)) if p.stage != GrowthStage::Mature => true,
                 _ => false,
             };
             if stale {
@@ -562,7 +568,7 @@ pub fn gather_system(
 
                 // Fall through: no neighbor / cooldown / no active claim.
                 // Original behavior — push FailedTarget + finish_gather.
-                let stale_plant_kind = plant_query.get(entity).ok().map(|p| p.kind);
+                let stale_plant_kind = plant_query.get(entity).ok().map(|(p, _)| p.kind);
                 if plant_query.get(entity).is_err() {
                     plant_map.0.remove(&(tx, ty));
                     shared.report_depleted(agent_tier, (tx, ty), MemoryKind::AnyEdible);
@@ -593,9 +599,17 @@ pub fn gather_system(
                 continue;
             }
             // Reborrow as &mut after the immutable peek above.
-            let mut plant = plant_query.get_mut(entity).unwrap();
+            let (mut plant, land_claim) = plant_query.get_mut(entity).unwrap();
 
             let kind = plant.kind;
+            // Spill owner: if the harvested plant carries a Household
+            // `LandClaim`, any carrier-overflow spill at the harvest tile is
+            // household-private (kitchen-garden harvest). Faction / Person /
+            // Public claims yield public spill.
+            let spill_owner_household: Option<u32> = land_claim.and_then(|lc| match lc.owner {
+                crate::simulation::shared_knowledge::ResourceOwner::Household(h) => Some(h),
+                _ => None,
+            });
 
             // ── Realistic Tool Overhaul: per-plant tool gate ──────────────
             // Tree → Axe (Chop). Grain → Sickle (HarvestCrop). BerryBush is
@@ -759,6 +773,7 @@ pub fn gather_system(
                     tenant_qty,
                     agent_tx,
                     agent_ty,
+                    spill_owner_household,
                 );
             }
 
@@ -771,6 +786,7 @@ pub fn gather_system(
                     extra_qty,
                     agent_tx,
                     agent_ty,
+                    spill_owner_household,
                 );
             }
 
@@ -948,6 +964,7 @@ pub fn gather_system(
                         scaled,
                         agent_tx,
                         agent_ty,
+                        None, // mining spills are public
                     );
                     if let Some(id) = faction_id {
                         if let Some(fd) = faction_registry.factions.get_mut(&id) {
@@ -1076,6 +1093,7 @@ fn route_yield(
     qty: u32,
     tx: i32,
     ty: i32,
+    owner_household: Option<u32>,
 ) {
     if qty == 0 {
         return;
@@ -1088,6 +1106,7 @@ fn route_yield(
             GroundItem {
                 item,
                 qty: leftover,
+                owner_household,
             },
             Transform::from_xyz(pos.x, pos.y, 0.3),
             GlobalTransform::default(),
@@ -1131,6 +1150,7 @@ pub(crate) fn spawn_ground_drop(
         GroundItem {
             item: Item::new_commodity(resource_id),
             qty,
+            owner_household: None,
         },
         Transform::from_xyz(pos.x, pos.y, 0.3),
         GlobalTransform::default(),

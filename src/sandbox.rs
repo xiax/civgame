@@ -207,6 +207,7 @@ fn setup_sandbox(
         GroundItem {
             item: Item::new_commodity(crate::economy::core_ids::fruit()),
             qty: 5,
+            owner_household: None,
         },
         Transform::from_xyz(food_pos.x, food_pos.y, 0.5),
         GlobalTransform::default(),
@@ -219,6 +220,7 @@ fn setup_sandbox(
         GroundItem {
             item: Item::new_commodity(crate::economy::core_ids::wood()),
             qty: 3,
+            owner_household: None,
         },
         Transform::from_xyz(wood_pos.x, wood_pos.y, 0.5),
         GlobalTransform::default(),

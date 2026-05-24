@@ -6281,6 +6281,7 @@ pub fn deconstruct_system(
                         crate::simulation::items::GroundItem {
                             item,
                             qty: after_inv,
+                            owner_household: None,
                         },
                         Transform::from_xyz(pos.x, pos.y, 0.3),
                         GlobalTransform::default(),

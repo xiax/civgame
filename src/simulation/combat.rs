@@ -1083,6 +1083,7 @@ pub fn death_system(
                     GroundItem {
                         item: Item::new_commodity(rid),
                         qty,
+                        owner_household: None,
                     },
                     loot_transform,
                     GlobalTransform::default(),
@@ -1122,7 +1123,11 @@ pub fn death_system(
             let mut loot_transform = *transform;
             loot_transform.translation.z = 0.3;
             commands.spawn((
-                GroundItem { item, qty },
+                GroundItem {
+                    item,
+                    qty,
+                    owner_household: None,
+                },
                 loot_transform,
                 GlobalTransform::default(),
                 Visibility::Visible,

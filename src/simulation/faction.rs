@@ -3339,19 +3339,24 @@ pub fn drop_items_at_destination_system(
         let deposit_tx = ai.dest_tile.0 as i32;
         let deposit_ty = ai.dest_tile.1 as i32;
 
-        // First: dump everything in hands. Hauling loads (Wood, Stone, Iron, ...) are
-        // exactly what storage wants; food/tools that ended up in hands also go here.
+        // Accumulate everything actually deposited at the storage tile in a
+        // per-`ResourceId` map. After all deposits land, walk the map once
+        // and credit any `JobKind::Stockpile { resource_id }` claim the
+        // worker holds. Generalises the legacy wood/stone-only hand credit
+        // and food calorie credit to every eligible class (seeds, hides,
+        // cloth, crafted goods, recovered wood, …).
+        use ahash::AHashMap;
         let wood_id = crate::economy::core_ids::wood();
-        let stone_id = crate::economy::core_ids::stone();
-        let mut hand_wood: u32 = 0;
-        let mut hand_stone: u32 = 0;
+        let mut deposited_by_rid: AHashMap<
+            crate::economy::resource_catalog::ResourceId,
+            u32,
+        > = AHashMap::new();
+
+        // 1. Dump everything in hands. Hauling loads (Wood, Stone, Iron, ...) are
+        //    exactly what storage wants; food/tools that ended up in hands also
+        //    go here.
         for stack in carrier.drop_all() {
             let rid = stack.item.resource_id;
-            if rid == wood_id {
-                hand_wood = hand_wood.saturating_add(stack.qty);
-            } else if rid == stone_id {
-                hand_stone = hand_stone.saturating_add(stack.qty);
-            }
             spawn_or_merge_ground_item(
                 &mut commands,
                 &spatial,
@@ -3361,35 +3366,13 @@ pub fn drop_items_at_destination_system(
                 rid,
                 stack.qty,
             );
-        }
-        // Credit any Material Gather posting this worker holds for the
-        // dropped wood/stone.
-        if let Some(claim) = claim_opt {
-            if hand_wood > 0 {
-                record_progress_filtered(
-                    &mut commands,
-                    &mut board,
-                    &mut job_completed,
-                    claim,
-                    JobKind::Stockpile,
-                    Some(wood_id),
-                    hand_wood,
-                );
-            }
-            if hand_stone > 0 {
-                record_progress_filtered(
-                    &mut commands,
-                    &mut board,
-                    &mut job_completed,
-                    claim,
-                    JobKind::Stockpile,
-                    Some(stone_id),
-                    hand_stone,
-                );
-            }
+            let entry = deposited_by_rid.entry(rid).or_insert(0);
+            *entry = entry.saturating_add(stack.qty);
         }
 
+        // 2. Drain edible food from inventory (preserves calorie crediting).
         let food_qty = agent.total_food();
+        let mut deposited_calories: u32 = 0;
         if food_qty > CAMP_KEEP {
             let mut deposit = food_qty - CAMP_KEEP;
             let mut drops: Vec<(crate::economy::resource_catalog::ResourceId, u32)> = Vec::new();
@@ -3404,9 +3387,6 @@ pub fn drop_items_at_destination_system(
                     break;
                 }
             }
-            // Sum calories of food deposited at faction storage so a Gather
-            // job posting (if this worker holds one) can be credited.
-            let mut deposited_calories: u32 = 0;
             for (rid, qty) in drops {
                 spawn_or_merge_ground_item(
                     &mut commands,
@@ -3419,28 +3399,14 @@ pub fn drop_items_at_destination_system(
                 );
                 deposited_calories =
                     deposited_calories.saturating_add(qty * rid.nutrition() as u32);
-            }
-            if deposited_calories > 0 {
-                if let Some(claim) = claim_opt {
-                    record_progress(
-                        &mut commands,
-                        &mut board,
-                        &mut job_completed,
-                        claim,
-                        JobKind::Stockpile,
-                        deposited_calories,
-                    );
-                }
+                let entry = deposited_by_rid.entry(rid).or_insert(0);
+                *entry = entry.saturating_add(qty);
             }
         }
         let _ = worker; // silence unused if no further use
 
-        // Deposit any seeds the agent is carrying in inventory. Hand seeds
-        // were already dumped via `carrier.drop_all()` above. Iterating
-        // `PlantKind::ALL` keeps this loop in sync with the seed↔plant table
-        // — adding a new seed only needs an arm in `PlantKind::seed_good()`.
-        // Farmers deposit too: PlantFromStorage withdraws seeds back as
-        // needed, which keeps the `SI_STORAGE_*_SEED` state slots meaningful.
+        // 3. Drain seeds from inventory (hand seeds already drained in step 1).
+        //    Adding a new seed only needs an arm in `PlantKind::seed_resource()`.
         let has_cultivation = registry
             .factions
             .get(&member.faction_id)
@@ -3465,13 +3431,15 @@ pub fn drop_items_at_destination_system(
                         seed_id,
                         qty,
                     );
+                    let entry = deposited_by_rid.entry(seed_id).or_insert(0);
+                    *entry = entry.saturating_add(qty);
                 }
             }
         }
 
-        // Deposit all crafted goods (Tools, Weapon, Armor, Shield, Cloth, Luxury).
-        // Preserve the full `Item` (material + quality + stats) through storage
-        // so an equipped Iron Spear keeps its damage_bonus after a withdraw.
+        // 4. Drain crafted goods (Tool/Weapon/Armor/Shield/Cloth/Luxury).
+        //    Preserves the full `Item` (material + quality + stats) so an
+        //    equipped Iron Spear keeps damage_bonus after a withdraw.
         let mut crafted_drops: Vec<(crate::economy::item::Item, u32)> = Vec::new();
         for (it, q) in agent.inventory.iter_mut() {
             if *q > 0
@@ -3492,6 +3460,7 @@ pub fn drop_items_at_destination_system(
             }
         }
         for (item, qty) in crafted_drops {
+            let rid = item.resource_id;
             crate::simulation::items::spawn_or_merge_ground_item_full(
                 &mut commands,
                 &spatial,
@@ -3501,22 +3470,93 @@ pub fn drop_items_at_destination_system(
                 item,
                 qty,
             );
+            let entry = deposited_by_rid.entry(rid).or_insert(0);
+            *entry = entry.saturating_add(qty);
         }
 
-        // Deposit recovered construction materials (Wood from deconstruction).
-        let wood_id = crate::economy::core_ids::wood();
-        let wood_qty = agent.quantity_of_resource(wood_id);
-        if wood_qty > 0 {
-            agent.remove_resource(wood_id, wood_qty);
+        // 5. Drain bulk raw commodities from inventory: Material (wood, stone,
+        //    grain seeds outside cultivation), Fuel, Ore, Hide. These are the
+        //    classes the loose-cleanup pipeline can legitimately stockpile.
+        //    Currency, Knowledge tablets, and non-classed items are left in
+        //    inventory.
+        use crate::economy::resource_catalog::ResourceClass;
+        let bulk_drops: Vec<(crate::economy::resource_catalog::ResourceId, u32)> = agent
+            .inventory
+            .iter()
+            .filter_map(|(it, q)| {
+                if *q == 0 {
+                    return None;
+                }
+                if it.resource_id.is_edible() {
+                    return None;
+                }
+                match it.resource_id.class() {
+                    Some(
+                        ResourceClass::Material
+                        | ResourceClass::Fuel
+                        | ResourceClass::Ore
+                        | ResourceClass::Hide,
+                    ) => Some((it.resource_id, *q)),
+                    _ => None,
+                }
+            })
+            .collect();
+        for (rid, qty) in bulk_drops {
+            if qty == 0 {
+                continue;
+            }
+            agent.remove_resource(rid, qty);
             spawn_or_merge_ground_item(
                 &mut commands,
                 &spatial,
                 &mut ground_items,
                 deposit_tx,
                 deposit_ty,
-                wood_id,
-                wood_qty,
+                rid,
+                qty,
             );
+            let entry = deposited_by_rid.entry(rid).or_insert(0);
+            *entry = entry.saturating_add(qty);
+        }
+        // Silence unused-variable lint when the bulk drain finds nothing —
+        // keeps the legacy `wood_id` symbol around for future readers.
+        let _ = wood_id;
+
+        // 6. Credit the worker's `JobKind::Stockpile` claim (if any). The
+        //    posting's `resource_id` carries via `JobProgress::Stockpile`;
+        //    `record_progress_filtered` matches per-rid via the posting's
+        //    inner key and silently no-ops if the deposited rid doesn't
+        //    match. The food-calorie path stays separate for Calorie-tracked
+        //    food postings.
+        if let Some(claim) = claim_opt {
+            for (rid, qty) in deposited_by_rid.iter() {
+                if *qty == 0 {
+                    continue;
+                }
+                record_progress_filtered(
+                    &mut commands,
+                    &mut board,
+                    &mut job_completed,
+                    claim,
+                    JobKind::Stockpile,
+                    Some(*rid),
+                    *qty,
+                );
+            }
+            if deposited_calories > 0 {
+                // Calorie-tracked `JobProgress::Calories` postings: credit
+                // total nutrition rather than per-rid item count. Distinct
+                // posting variant — `record_progress_filtered` above won't
+                // match because Calorie postings carry no resource_id.
+                record_progress(
+                    &mut commands,
+                    &mut board,
+                    &mut job_completed,
+                    claim,
+                    JobKind::Stockpile,
+                    deposited_calories,
+                );
+            }
         }
 
         ai.state = AiState::Idle;
