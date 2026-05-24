@@ -7109,7 +7109,45 @@ pub fn claimed_fieldwork_phase(
     }
 }
 
+/// Eager dispatcher-side Farm-claim release (Plan Change 3).
+///
+/// Called at every no-task `continue` in the three Farm dispatchers when the
+/// worker holds a `JobClaim::Farm` but the dispatcher could not find an
+/// executable target. Strips `JobClaim` + `ClaimTarget` immediately so the
+/// next `goal_update_system` tick re-scores Farm without the claim and the
+/// worker picks something else, instead of waiting ~900 ticks for
+/// `chronic_failure_release_system`. Also records a backstop entry on
+/// `MethodHistory` so downstream method-bias consumers see the failure.
+///
+/// No-op when the agent doesn't hold a Farm claim (autonomous Private /
+/// Bootstrap workers — `FarmWorkScorer` already seasonally-gates them).
+#[inline]
+pub fn release_farm_claim_eagerly(
+    commands: &mut Commands,
+    actor: Entity,
+    claim_opt: Option<&crate::simulation::jobs::JobClaim>,
+    history: &mut MethodHistory,
+    ai: &mut PersonAI,
+    now: u64,
+) {
+    use crate::simulation::jobs::{ClaimTarget, JobClaim, JobKind};
+    let Some(c) = claim_opt else { return };
+    if !matches!(c.kind, JobKind::Farm) {
+        return;
+    }
+    commands.entity(actor).remove::<JobClaim>();
+    commands.entity(actor).remove::<ClaimTarget>();
+    crate::simulation::goal_contract::blocked(
+        history,
+        ai,
+        now,
+        AgentGoal::Farm,
+        crate::simulation::goal_contract::BlockedReason::NoFarmPhaseWork,
+    );
+}
+
 pub fn htn_plant_from_storage_dispatch_system(
+    mut commands: Commands,
     chunk_map: Res<ChunkMap>,
     chunk_graph: Res<ChunkGraph>,
     chunk_router: Res<ChunkRouter>,
@@ -7118,8 +7156,7 @@ pub fn htn_plant_from_storage_dispatch_system(
     storage_reservations: Res<crate::simulation::faction::StorageReservations>,
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
-    plant_map: Res<crate::simulation::plants::PlantMap>,
-    mut plant_reservations: ResMut<crate::simulation::plants::PlantingReservations>,
+    mut planting: PlantingDispatchParams,
     spatial: Res<crate::world::spatial::SpatialIndex>,
     clock: Res<SimClock>,
     item_query: Query<&crate::simulation::items::GroundItem>,
@@ -7182,6 +7219,7 @@ pub fn htn_plant_from_storage_dispatch_system(
             .map(|k| k.has_learned(crate::simulation::technology::CROP_CULTIVATION))
             .unwrap_or(false);
         if !has_tech {
+            release_farm_claim_eagerly(&mut commands, actor, claim_opt, &mut history, &mut ai, now);
             continue;
         }
 
@@ -7192,6 +7230,8 @@ pub fn htn_plant_from_storage_dispatch_system(
         // planting continues, seasonally gated by `FarmWorkScorer`.
         if let Some(phase) = claimed_fieldwork_phase(claim_opt, &farm_plot_params.board) {
             if phase != crate::simulation::farm::FarmWorkPhase::Plant {
+                // Wrong-phase claim — a sibling dispatcher handles it; do NOT
+                // release here (this dispatcher just isn't the one).
                 continue;
             }
         }
@@ -7291,6 +7331,7 @@ pub fn htn_plant_from_storage_dispatch_system(
             }
         }
         let Some((seed_id, storage_tile, best_tile_stock, source_fid)) = resolved else {
+            release_farm_claim_eagerly(&mut commands, actor, claim_opt, &mut history, &mut ai, now);
             continue;
         };
 
@@ -7301,6 +7342,14 @@ pub fn htn_plant_from_storage_dispatch_system(
         // refuses defensively and yields to the harvest dispatcher.
         if let Some(plant_kind) = PlantKind::from_seed_resource(seed_id) {
             if !plant_kind.is_sowable_in(farm_plot_params.calendar.season) {
+                release_farm_claim_eagerly(
+                    &mut commands,
+                    actor,
+                    claim_opt,
+                    &mut history,
+                    &mut ai,
+                    now,
+                );
                 continue;
             }
         }
@@ -7316,9 +7365,9 @@ pub fn htn_plant_from_storage_dispatch_system(
             let rmax = (rect.x0 + rect.w as i32 - 1, rect.y0 + rect.h as i32 - 1);
             crate::simulation::farm::find_nearest_plantable_in_rect(
                 &chunk_map,
-                &plant_map,
+                &planting.plant_map,
                 &field_tiles,
-                &plant_reservations,
+                &planting.plant_reservations,
                 (cur_tx, cur_ty),
                 rmin,
                 rmax,
@@ -7326,13 +7375,14 @@ pub fn htn_plant_from_storage_dispatch_system(
         } else {
             find_nearest_unplanted_farmland(
                 &chunk_map,
-                &plant_map,
-                &plant_reservations,
+                &planting.plant_map,
+                &planting.plant_reservations,
                 (cur_tx, cur_ty),
                 VIEW_RADIUS,
             )
         };
         let Some(plant_tile) = plant_tile else {
+            release_farm_claim_eagerly(&mut commands, actor, claim_opt, &mut history, &mut ai, now);
             continue;
         };
 
@@ -7418,7 +7468,7 @@ pub fn htn_plant_from_storage_dispatch_system(
         // (the search above already filtered), but it future-proofs against
         // an in-tick collision and is the single dispatch-time hook every
         // teardown path can release.
-        if !plant_reservations.try_reserve(plant_tile, actor, seed_id, now) {
+        if !planting.plant_reservations.try_reserve(plant_tile, actor, seed_id, now) {
             continue;
         }
 
@@ -7443,7 +7493,7 @@ pub fn htn_plant_from_storage_dispatch_system(
                 );
                 if !dispatched {
                     ai.active_method = None;
-                    plant_reservations.release(plant_tile);
+                    planting.plant_reservations.release(plant_tile);
                     history.push(chosen_id, MethodOutcome::FailedRouting, now);
                     continue;
                 }
@@ -7468,7 +7518,7 @@ pub fn htn_plant_from_storage_dispatch_system(
             }
             _ => {
                 ai.active_method = None;
-                plant_reservations.release(plant_tile);
+                planting.plant_reservations.release(plant_tile);
                 continue;
             }
         }
@@ -7488,6 +7538,7 @@ pub fn htn_plant_from_storage_dispatch_system(
 /// `farm::find_nearest_unprepared_in_rect`) and dispatches
 /// `Task::PrepareField { tile }` routed adjacent.
 pub fn htn_prepare_field_dispatch_system(
+    mut commands: Commands,
     chunk_map: Res<ChunkMap>,
     chunk_graph: Res<ChunkGraph>,
     chunk_router: Res<ChunkRouter>,
@@ -7500,6 +7551,7 @@ pub fn htn_prepare_field_dispatch_system(
             Entity,
             &mut PersonAI,
             &mut ActionQueue,
+            &mut MethodHistory,
             &AgentGoal,
             &Transform,
             &FactionMember,
@@ -7512,8 +7564,8 @@ pub fn htn_prepare_field_dispatch_system(
     use crate::simulation::farm::FarmWorkPhase;
     use crate::simulation::jobs::{JobKind, JobProgress};
     use crate::simulation::tasks::TaskKind;
-    let _ = clock;
-    for (actor, mut ai, mut aq, goal, transform, member, lod, claim) in query.iter_mut() {
+    let now = clock.tick;
+    for (actor, mut ai, mut aq, mut history, goal, transform, member, lod, claim) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -7534,6 +7586,18 @@ pub fn htn_prepare_field_dispatch_system(
             .iter()
             .find(|p| p.id == claim.job_id)
         else {
+            // Backing posting vanished (likely by `fieldwork_expiry_system`
+            // earlier this tick) but the claim component hasn't yet been
+            // removed by deferred Commands. Release it now so the worker
+            // re-evaluates next tick.
+            release_farm_claim_eagerly(
+                &mut commands,
+                actor,
+                Some(claim),
+                &mut history,
+                &mut ai,
+                now,
+            );
             continue;
         };
         let JobProgress::FieldWork {
@@ -7543,9 +7607,18 @@ pub fn htn_prepare_field_dispatch_system(
             ..
         } = posting.progress
         else {
+            release_farm_claim_eagerly(
+                &mut commands,
+                actor,
+                Some(claim),
+                &mut history,
+                &mut ai,
+                now,
+            );
             continue;
         };
         if phase != FarmWorkPhase::Prepare {
+            // Wrong-phase claim — sibling dispatcher handles it.
             continue;
         }
         if let Some(assigned) = assigned_farmer {
@@ -7566,6 +7639,14 @@ pub fn htn_prepare_field_dispatch_system(
             area.min,
             area.max,
         ) else {
+            release_farm_claim_eagerly(
+                &mut commands,
+                actor,
+                Some(claim),
+                &mut history,
+                &mut ai,
+                now,
+            );
             continue;
         };
         let dispatched = dispatch_autonomous_task_with_routing(
@@ -10428,6 +10509,7 @@ impl Method for HarvestMaturePlantForStorageMethod {
 /// `forage_food_good` + `gather_deposit_tile` (+ override) into ctx and
 /// dispatches the head `Task::Gather { tile }`.
 pub fn htn_harvest_plant_dispatch_system(
+    mut commands: Commands,
     chunk_map: Res<ChunkMap>,
     chunk_graph: Res<ChunkGraph>,
     chunk_router: Res<ChunkRouter>,
@@ -10490,6 +10572,7 @@ pub fn htn_harvest_plant_dispatch_system(
             .map(|k| k.has_learned(crate::simulation::technology::CROP_CULTIVATION))
             .unwrap_or(false);
         if !has_tech {
+            release_farm_claim_eagerly(&mut commands, actor, claim_opt, &mut history, &mut ai, now);
             continue;
         }
 
@@ -10506,6 +10589,7 @@ pub fn htn_harvest_plant_dispatch_system(
         // autonomous harvest continues, seasonally gated by `FarmWorkScorer`.
         if let Some(phase) = claimed_fieldwork_phase(claim_opt, &farm_plot_params.board) {
             if phase != crate::simulation::farm::FarmWorkPhase::Harvest {
+                // Wrong-phase claim — sibling dispatcher handles.
                 continue;
             }
         }
@@ -10574,6 +10658,7 @@ pub fn htn_harvest_plant_dispatch_system(
                 })
             };
         let Some((plant_tile, harvest_id)) = harvest_candidate else {
+            release_farm_claim_eagerly(&mut commands, actor, claim_opt, &mut history, &mut ai, now);
             continue;
         };
         let deposit_fid = scope.source_faction_id();

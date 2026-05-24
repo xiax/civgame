@@ -1238,6 +1238,13 @@ impl Plugin for SimulationPlugin {
                     jobs::classify_construction_procurement_system
                         .after(faction::compute_faction_storage_system)
                         .before(jobs::chief_job_posting_system),
+                    // Unified FieldWork seasonal / capacity reconciliation.
+                    // Runs before workforce budgeting + chief posting so a
+                    // stale Spring Plant posting that just expired into
+                    // Autumn doesn't keep the Farm slot alive for one tick.
+                    farm::fieldwork_expiry_system
+                        .before(jobs::chief_job_posting_system)
+                        .before(projects::workforce_budget_system),
                     jobs::chief_job_posting_system
                         .after(faction::compute_faction_storage_system)
                         .after(faction::chief_selection_system)

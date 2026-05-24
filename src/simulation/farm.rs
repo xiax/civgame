@@ -170,6 +170,35 @@ pub enum FarmWorkPhase {
     Harvest,
 }
 
+/// Seasonal-validity table for `FieldWork` postings. Pure function — no state.
+///
+/// - Spring  → `Prepare` (open) + `Plant` (open) valid.
+/// - Summer  → only `Prepare` with an assigned caretaker farmer valid.
+///   Open `Prepare`, any `Plant`, any `Harvest` invalid.
+/// - Autumn  → `Harvest` valid.
+/// - Winter  → nothing valid.
+///
+/// `assigned` is whether the posting has `assigned_farmer.is_some()` —
+/// only meaningful for the Summer Prepare row.
+///
+/// Consumed by both `compute_priority` (defensive seasonal gate on the open
+/// seasonal hard-priority lift) and `fieldwork_expiry_system` (drops postings
+/// where this returns `false`).
+#[inline]
+pub fn fieldwork_phase_seasonally_valid(
+    phase: FarmWorkPhase,
+    season: Season,
+    assigned: bool,
+) -> bool {
+    match (season, phase) {
+        (Season::Spring, FarmWorkPhase::Prepare) => true,
+        (Season::Spring, FarmWorkPhase::Plant) => true,
+        (Season::Summer, FarmWorkPhase::Prepare) => assigned,
+        (Season::Autumn, FarmWorkPhase::Harvest) => true,
+        _ => false,
+    }
+}
+
 /// Per-tile dynamic state for any tile belonging to an Agricultural plot.
 /// Extensible: adding fertilizer = +1 field, rotation bonus = read last_crop,
 /// weeds = +1 field.
@@ -844,6 +873,276 @@ pub fn fallow_recovery_system(
             .saturating_add(FALLOW_NUTRIENTS_PER_SEASON)
             .min(cap);
         state.nutrients = new_nut;
+    }
+}
+
+/// Count tiles in `rect` that need Prepare work — see `find_nearest_unprepared_in_rect`.
+pub fn count_unprepared_in_rect(
+    chunk_map: &crate::world::chunk::ChunkMap,
+    field_tiles: &FieldTileIndex,
+    rect_min: (i32, i32),
+    rect_max: (i32, i32),
+) -> u32 {
+    let mut n = 0u32;
+    for ty in rect_min.1..=rect_max.1 {
+        for tx in rect_min.0..=rect_max.0 {
+            let is_cropland = matches!(
+                chunk_map.tile_kind_at(tx, ty),
+                Some(crate::world::tile::TileKind::Cropland)
+            );
+            let nut = field_tiles
+                .by_tile
+                .get(&(tx, ty))
+                .map(|s| s.nutrients)
+                .unwrap_or(0);
+            if !is_cropland || nut < EXHAUSTED_FLOOR {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Count tiles in `rect` that are currently plantable — see
+/// `find_nearest_plantable_in_rect`. Does NOT consult `PlantingReservations`
+/// (the reservation is for in-flight worker chains; the underlying tile is
+/// still "plantable" capacity from the posting's point of view).
+pub fn count_plantable_in_rect(
+    chunk_map: &crate::world::chunk::ChunkMap,
+    plant_map: &crate::simulation::plants::PlantMap,
+    field_tiles: &FieldTileIndex,
+    rect_min: (i32, i32),
+    rect_max: (i32, i32),
+) -> u32 {
+    let mut n = 0u32;
+    for ty in rect_min.1..=rect_max.1 {
+        for tx in rect_min.0..=rect_max.0 {
+            if plant_map.0.contains_key(&(tx, ty)) {
+                continue;
+            }
+            if !matches!(
+                chunk_map.tile_kind_at(tx, ty),
+                Some(crate::world::tile::TileKind::Cropland)
+            ) {
+                continue;
+            }
+            let nut = field_tiles
+                .by_tile
+                .get(&(tx, ty))
+                .map(|s| s.nutrients)
+                .unwrap_or(0);
+            if nut < MIN_PLANTABLE_NUTRIENTS {
+                continue;
+            }
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Count mature farm-plantable plants in `rect`. Mirrors the Autumn `mature_crop`
+/// scan in `chief_job_posting_system` so the expiry system's harvest capacity
+/// reads the same world the chief reads.
+pub fn count_mature_crop_in_rect(
+    plant_map: &crate::simulation::plants::PlantMap,
+    plant_q: &Query<&crate::simulation::plants::Plant>,
+    rect_min: (i32, i32),
+    rect_max: (i32, i32),
+) -> u32 {
+    let mut n = 0u32;
+    for ty in rect_min.1..=rect_max.1 {
+        for tx in rect_min.0..=rect_max.0 {
+            let Some(pent) = plant_map.0.get(&(tx, ty)) else {
+                continue;
+            };
+            let Ok(pl) = plant_q.get(*pent) else { continue };
+            if pl.kind.is_farm_plantable()
+                && pl.stage == crate::simulation::plants::GrowthStage::Mature
+            {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Unified FieldWork expiry + reconciliation.
+///
+/// Runs in `SimulationSet::Economy` **before** `workforce_budget_system` and
+/// `chief_job_posting_system`. Per faction posting, it computes
+///
+/// 1. **Seasonal validity** via `fieldwork_phase_seasonally_valid`. A
+///    Spring `Prepare`/`Plant` posting surviving into Autumn is invalid here
+///    (the worker can't do that work this season).
+/// 2. **Live capacity** via `count_*_in_rect`. A `Plant` posting whose seed
+///    pool has emptied or whose plantable tile count dropped below
+///    `target - completed` has no remaining capacity.
+///
+/// Outcomes per posting:
+/// - Seasonally invalid → **drop**: emit `JobCompletedEvent{completed:false}`,
+///   strip `JobClaim`/`ClaimTarget` from claimants, cancel chain per phase,
+///   release storage reservation.
+/// - `remaining_capacity == 0 && completed == 0` → same as above.
+/// - `remaining_capacity == 0 && completed > 0` → **shrink-to-completed +
+///   drop**: emit `JobCompletedEvent{completed:true}` so `job_payout_system`
+///   pays out the partial work, then drop the posting.
+/// - `0 < remaining_capacity < target - completed` → **in-place shrink**:
+///   `target = completed + remaining_capacity`. Claim retained, no event.
+/// - Otherwise → no-op.
+///
+/// Per-phase chain cancellation on a dropped posting (Plan Change 2 Step C):
+/// - `Prepare` → cancel `Task::PrepareField`.
+/// - `Plant`   → cancel `Task::WithdrawMaterial` + `Task::Planter`, release seed reservation.
+/// - `Harvest` → cancel pre-yield `Task::Gather`; leave `Task::DepositResource`
+///   (deposit-tail) alone — food already in hand is not destroyed.
+pub fn fieldwork_expiry_system(
+    mut commands: Commands,
+    calendar: Res<Calendar>,
+    chunk_map: Res<crate::world::chunk::ChunkMap>,
+    plant_map: Res<crate::simulation::plants::PlantMap>,
+    field_tiles: Res<FieldTileIndex>,
+    storage_reservations: Res<crate::simulation::faction::StorageReservations>,
+    faction_registry: Res<crate::simulation::faction::FactionRegistry>,
+    mut board: ResMut<crate::simulation::jobs::JobBoard>,
+    mut completed_events: EventWriter<crate::simulation::jobs::JobCompletedEvent>,
+    plant_q: Query<&crate::simulation::plants::Plant>,
+    mut workers: Query<(
+        &mut crate::simulation::person::PersonAI,
+        &mut crate::simulation::typed_task::ActionQueue,
+    )>,
+) {
+    use crate::simulation::faction::release_reservation;
+    use crate::simulation::jobs::{JobCompletedEvent, JobKind, JobProgress};
+    use crate::simulation::tasks::TaskKind;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Outcome {
+        DropFailed,
+        DropPartial,
+        Shrink(u32),
+    }
+
+    // Snapshot per-faction work first. Two-pass keeps borrowck happy: the
+    // first pass is a read-only walk over `board.postings`; the second pass
+    // mutates the same board.
+    let mut pending: Vec<(u32, crate::simulation::jobs::JobId, FarmWorkPhase, Outcome)> =
+        Vec::new();
+
+    for (faction_id, postings) in board.postings.iter() {
+        for p in postings.iter() {
+            if !matches!(p.kind, JobKind::Farm) {
+                continue;
+            }
+            let JobProgress::FieldWork {
+                phase,
+                completed,
+                target,
+                area,
+                assigned_farmer,
+                ..
+            } = p.progress
+            else {
+                continue;
+            };
+            let assigned = assigned_farmer.is_some();
+            let valid = fieldwork_phase_seasonally_valid(phase, calendar.season, assigned);
+            if !valid {
+                pending.push((*faction_id, p.id, phase, Outcome::DropFailed));
+                continue;
+            }
+            // In-season capacity probe.
+            let rect_min = area.min;
+            let rect_max = area.max;
+            let remaining_capacity: u32 = match phase {
+                FarmWorkPhase::Prepare => {
+                    count_unprepared_in_rect(&chunk_map, &field_tiles, rect_min, rect_max)
+                }
+                FarmWorkPhase::Plant => {
+                    let plantable =
+                        count_plantable_in_rect(&chunk_map, &plant_map, &field_tiles, rect_min, rect_max);
+                    let seed_pool = faction_registry
+                        .factions
+                        .get(faction_id)
+                        .map(|f| f.storage.seed_total())
+                        .unwrap_or(0);
+                    plantable.min(seed_pool)
+                }
+                FarmWorkPhase::Harvest => {
+                    count_mature_crop_in_rect(&plant_map, &plant_q, rect_min, rect_max)
+                }
+            };
+            let remaining_target = target.saturating_sub(completed);
+            if remaining_capacity == 0 {
+                if completed == 0 {
+                    pending.push((*faction_id, p.id, phase, Outcome::DropFailed));
+                } else {
+                    pending.push((*faction_id, p.id, phase, Outcome::DropPartial));
+                }
+            } else if remaining_capacity < remaining_target {
+                let new_target = completed + remaining_capacity;
+                pending.push((*faction_id, p.id, phase, Outcome::Shrink(new_target)));
+            }
+            // else: no-op
+        }
+    }
+
+    if pending.is_empty() {
+        return;
+    }
+
+    for (faction_id, job_id, phase, outcome) in pending {
+        let postings = board.postings.get_mut(&faction_id);
+        let Some(postings) = postings else { continue };
+        let Some(idx) = postings.iter().position(|p| p.id == job_id) else {
+            continue;
+        };
+        match outcome {
+            Outcome::Shrink(new_target) => {
+                if let JobProgress::FieldWork { target, .. } = &mut postings[idx].progress {
+                    *target = new_target;
+                }
+            }
+            Outcome::DropFailed | Outcome::DropPartial => {
+                let claimants: Vec<Entity> = std::mem::take(&mut postings[idx].claimants);
+                let target_rid = postings[idx].progress.target_rid();
+                let kind = postings[idx].kind;
+                postings.swap_remove(idx);
+                let completed_flag = matches!(outcome, Outcome::DropPartial);
+                completed_events.send(JobCompletedEvent {
+                    job_id,
+                    faction_id,
+                    kind,
+                    claimants: claimants.clone(),
+                    completed: completed_flag,
+                    target_rid,
+                });
+                for ent in &claimants {
+                    commands.entity(*ent).remove::<crate::simulation::jobs::JobClaim>();
+                    commands.entity(*ent).remove::<crate::simulation::jobs::ClaimTarget>();
+                    // Per-phase chain cancellation: leave deposit-tail tasks
+                    // alone (food in hand survives), drop pre-yield work.
+                    if let Ok((mut ai, mut aq)) = workers.get_mut(*ent) {
+                        let cur_kind = aq.current_task_kind();
+                        let on_deposit_tail = cur_kind == TaskKind::DepositResource as u16;
+                        let cancellable = match phase {
+                            FarmWorkPhase::Prepare => {
+                                cur_kind == TaskKind::PrepareField as u16 || cur_kind == 0
+                            }
+                            FarmWorkPhase::Plant => {
+                                cur_kind == TaskKind::WithdrawMaterial as u16
+                                    || cur_kind == TaskKind::Planter as u16
+                                    || cur_kind == 0
+                            }
+                            FarmWorkPhase::Harvest => !on_deposit_tail,
+                        };
+                        if cancellable && !on_deposit_tail {
+                            release_reservation(&storage_reservations, &mut ai);
+                            aq.cancel_chain(&mut ai);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

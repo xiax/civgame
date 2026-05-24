@@ -299,7 +299,20 @@ pub fn compute_priority(
             ..
         } = progress
         {
-            if (food_pressure(faction) as f32) < CRITICAL_FOOD_TRIGGER {
+            // Only lift open `FieldWork` to seasonal hard-priority when the
+            // phase is actually valid for the current season. A leftover
+            // Spring Plant posting surviving into Autumn does not get the
+            // boost so workers don't pile back onto unreachable Plant work.
+            // `fieldwork_expiry_system` will reap such postings shortly, but
+            // this guard is defensive against any tick window where the
+            // expiry hasn't fired yet.
+            let phase_valid_for_season =
+                crate::simulation::farm::fieldwork_phase_seasonally_valid(
+                    *phase,
+                    calendar.season,
+                    /*assigned*/ false,
+                );
+            if phase_valid_for_season && (food_pressure(faction) as f32) < CRITICAL_FOOD_TRIGGER {
                 priority = priority.max(SEASONAL_FARM_PRIORITY.min(PRIORITY_PLAYER - 1));
                 // Balanced-farming: tie-break bias for Spring Plant over
                 // Prepare. The per-phase cap split (jobs.rs) already

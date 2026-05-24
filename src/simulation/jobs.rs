@@ -2961,13 +2961,30 @@ pub fn chief_job_posting_system(
                     (crate::simulation::land::PlotId, FarmWorkPhase),
                     (),
                 > = ahash::AHashMap::default();
+                // Seed budget shared across all Plant postings — subtract
+                // remaining commitments on live Plant postings so a new plot
+                // emit cannot overcommit the faction's seed pool. Each plot's
+                // emit decrements `seed_remaining` so a multi-plot pass also
+                // self-budgets.
+                let mut seed_remaining: u32 = grain_seed_stock;
                 for p in board.faction_postings(faction_id).iter() {
                     if !matches!(p.kind, JobKind::Farm) {
                         continue;
                     }
-                    if let JobProgress::FieldWork { phase, plot_id, .. } = p.progress {
+                    if let JobProgress::FieldWork {
+                        phase,
+                        plot_id,
+                        target,
+                        completed,
+                        ..
+                    } = p.progress
+                    {
                         if let Some(pid) = plot_id {
                             posted_by_phase.insert((pid, phase), ());
+                        }
+                        if matches!(phase, FarmWorkPhase::Plant) {
+                            let remaining_commit = target.saturating_sub(completed);
+                            seed_remaining = seed_remaining.saturating_sub(remaining_commit);
                         }
                     }
                 }
@@ -3095,8 +3112,9 @@ pub fn chief_job_posting_system(
                                     assigned_farmer: None,
                                 });
                             }
-                            // Plant (capped by seed stock).
-                            let plant_target = plantable.min(grain_seed_stock);
+                            // Plant (capped by remaining seed budget shared
+                            // across this faction's plots).
+                            let plant_target = plantable.min(seed_remaining);
                             if plant_target > 0
                                 && !posted_by_phase.contains_key(&(*pid, FarmWorkPhase::Plant))
                             {
@@ -3108,12 +3126,17 @@ pub fn chief_job_posting_system(
                                     plot_id: Some(*pid),
                                     assigned_farmer: None,
                                 });
+                                seed_remaining = seed_remaining.saturating_sub(plant_target);
                             }
                         }
                         crate::simulation::farm::FarmSeasonPhase::SummerMaintenance => {
                             // Caretaker-only Prepare for tiles that didn't
-                            // make it into the Spring rush.
+                            // make it into the Spring rush. Skip the emit when
+                            // no caretaker is assigned — an open Summer
+                            // Prepare posting is seasonally invalid and would
+                            // be expired by `fieldwork_expiry_system` anyway.
                             if unprepared > 0
+                                && caretaker.is_some()
                                 && !posted_by_phase.contains_key(&(*pid, FarmWorkPhase::Prepare))
                             {
                                 emit(JobProgress::FieldWork {
@@ -3144,6 +3167,7 @@ pub fn chief_job_posting_system(
                     }
                 }
                 let _ = grain_seed_stock; // silence unused if no plots
+                let _ = seed_remaining;
             }
         }
 
