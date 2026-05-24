@@ -11,7 +11,7 @@
 //! - Multi-cell weapon modules: `vehicle_module_<module_label>_<view>`.
 //!
 //! Heading→view: side sprite drawn facing east (W flips it horizontally),
-//! front sprite drawn facing south; N and S share the front view.
+//! front sprite drawn facing south, back sprite drawn facing north.
 
 use crate::rendering::pixel_art::{ascii_to_image, WARM_PALETTE};
 use crate::rendering::sprite_library::SpriteLibrary;
@@ -23,28 +23,77 @@ use bevy::prelude::*;
 pub enum VehicleSpriteView {
     Side,
     Front,
+    Back,
 }
 
 impl VehicleSpriteView {
-    fn token(self) -> &'static str {
+    pub fn token(self) -> &'static str {
         match self {
             VehicleSpriteView::Side => "side",
             VehicleSpriteView::Front => "front",
+            VehicleSpriteView::Back => "back",
         }
     }
+
+    pub const ALL: [VehicleSpriteView; 3] = [
+        VehicleSpriteView::Side,
+        VehicleSpriteView::Front,
+        VehicleSpriteView::Back,
+    ];
 }
 
 /// Map a 0..4 heading to `(view, flip_x)`. Heading convention from
-/// `VehicleFootprint::offsets_by_heading`: 0=N, 1=W, 2=S, 3=E. With two
-/// views (no back sprite), N and S both render the front; E/W share the
-/// side sprite with W flipped horizontally.
+/// `VehicleFootprint::offsets_by_heading`: 0=N, 1=W, 2=S, 3=E. N renders
+/// the back-of-vehicle silhouette (viewer south of vehicle's tail looking
+/// north past the rear); S renders the front silhouette; E uses the
+/// side sprite (drawn east-facing); W flips it horizontally.
 pub fn view_for_heading(heading: u8) -> (VehicleSpriteView, bool) {
     match heading % 4 {
-        0 => (VehicleSpriteView::Front, false),
+        0 => (VehicleSpriteView::Back, false),
         1 => (VehicleSpriteView::Side, true),
         2 => (VehicleSpriteView::Front, false),
         _ => (VehicleSpriteView::Side, false),
     }
+}
+
+/// Connector overlay direction in **camera-space** — encodes which screen
+/// edge of the source cell the bridging hardware paints toward. Grid-space
+/// neighbours rotate through the active heading into one of these four
+/// before sprite-key resolution; chassis-forward likewise rotates into the
+/// matching screen direction for the seat-facing indicator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ConnectorDir {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+impl ConnectorDir {
+    pub fn token(self) -> &'static str {
+        match self {
+            ConnectorDir::Up => "up",
+            ConnectorDir::Down => "down",
+            ConnectorDir::Left => "left",
+            ConnectorDir::Right => "right",
+        }
+    }
+}
+
+/// Sprite key for a connector overlay. `label` identifies the seam family
+/// (e.g. `"axle_wheel"`, `"frame_seam"`, `"hitch_attach"`,
+/// `"crew_seat_facing"`).
+pub fn vehicle_connector_sprite_key(
+    label: &str,
+    view: VehicleSpriteView,
+    dir: ConnectorDir,
+) -> String {
+    format!(
+        "vehicle_connector_{}_{}_{}",
+        label,
+        view.token(),
+        dir.token()
+    )
 }
 
 fn kind_token(kind: VehiclePartKind) -> &'static str {
@@ -540,6 +589,28 @@ const HITCH_BASE_FRONT: &[&str] = &[
     "................",
 ];
 
+// HITCH viewed from behind: the drawbar is hidden behind the chassis end-cap
+// so we show the cap with the eye-loop opening (vs. front view's exposed
+// pin + cotter-key detail).
+const HITCH_BASE_BACK: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "...DDDDDDDDDD...",
+    "...DKKKKKKKKD...",
+    "...DKKlPlPKKD...",
+    "...DKPKKKKPKD...",
+    "...DKPKllKPKD...",
+    "...DKPKllKPKD...",
+    "...DKPKKKKPKD...",
+    "...DKKlPlPKKD...",
+    "...DKKKKKKKKD...",
+    "...DDDDDDDDDD...",
+    "................",
+    "................",
+    "................",
+];
+
 // Yoke: two attachment points on a crossbar.
 const YOKE_BASE_SIDE: &[&str] = &[
     "................",
@@ -573,6 +644,27 @@ const YOKE_BASE_FRONT: &[&str] = &[
     "...DKKDDDDKKD...",
     "...DKD....DKD...",
     "...DD......DD...",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+// YOKE from behind: viewer sees the inside of the harness — strap buckles
+// rather than the leading crossbar end-caps.
+const YOKE_BASE_BACK: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "....DD....DD....",
+    "...DBBDDDDBBD...",
+    "...DBTTTTTTBD...",
+    "...DBTKllPKBD...",
+    "...DBTKPKKPKBD..",
+    "...DBTKKKKKKBD..",
+    "...DBTTTTTTBD...",
+    "...DBBDDDDBBD...",
+    "....DD....DD....",
     "................",
     "................",
     "................",
@@ -661,6 +753,28 @@ const CREWSEAT_BASE_FRONT: &[&str] = &[
     "................",
 ];
 
+// CrewSeat from behind: viewer sees the rounded headrest top of the
+// backrest (front view shows the seat opening / cushion edge). Same
+// platform underneath so stacked-seats run continues.
+const CREWSEAT_BASE_BACK: &[&str] = &[
+    "................",
+    "....DDDDDDDD....",
+    "...DRRRRRRRRD...",
+    "...DRrRrRrRrD...",
+    "...DRRRRRRRRD...",
+    "...DRrRrRrRrD...",
+    "...DRRRRRRRRD...",
+    "...DRrRrRrRrD...",
+    "DDDDRRRRRRRRDDDD",
+    "DbBBRRRRRRRRBBBD",
+    "DBttttttttttttBD",
+    "DbBBBBBBBBBBBBbD",
+    "DDDDDDDDDDDDDDDD",
+    "................",
+    "................",
+    "................",
+];
+
 // ── WeaponMount ──────────────────────────────────────────────────────────
 
 // WeaponMount: stubby barrel rising from a reinforced base platform.
@@ -693,6 +807,27 @@ const WEAPONMOUNT_BASE_FRONT: &[&str] = &[
     "......XKKX......",
     ".....XKKKKX.....",
     "....XKKKKKKX....",
+    "DDDDXKKKKKKXDDDD",
+    "DKKKKKKKKKKKKKKD",
+    "DKlPlPlPlPlPlPKD",
+    "DKPKKKKKKKKKKPKD",
+    "DKKKKKKKKKKKKKKD",
+    "DDDDDDDDDDDDDDDD",
+    "................",
+];
+
+// WeaponMount from behind: no barrel forward of the platform — instead
+// the breech-block and recoil-dampener stand proud at chassis-rear.
+const WEAPONMOUNT_BASE_BACK: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    ".....XKKKKX.....",
+    "....XKllPlKX....",
+    "....XKPKKPKX....",
     "DDDDXKKKKKKXDDDD",
     "DKKKKKKKKKKKKKKD",
     "DKlPlPlPlPlPlPKD",
@@ -738,6 +873,27 @@ const ENGINE_BASE_FRONT: &[&str] = &[
     "XKlPRoXXXXXoRPKX",
     "XKlPRoooooooRPKX",
     "XKlPRRRRRRRRPlKX",
+    "XKKKKKKKKKKKKKKX",
+    "XXXXXXXXXXXXXXXX",
+    "................",
+];
+
+// Engine from behind: exhaust manifold + cooling louvers; no firebox
+// glow visible from the rear face.
+const ENGINE_BASE_BACK: &[&str] = &[
+    "................",
+    "....XKX..XKX....",
+    "....XoX..XoX....",
+    "....XKX..XKX....",
+    "....XKX..XKX....",
+    "XXXXXKXXXXKXXXXX",
+    "XKKKKKKKKKKKKKKX",
+    "XKlPlPlPlPlPlPKX",
+    "XKPKKKKKKKKKKPKX",
+    "XKlPlPlPlPlPlPKX",
+    "XKPKKKKKKKKKKPKX",
+    "XKlPlPlPlPlPlPKX",
+    "XKPKKKKKKKKKKPKX",
     "XKKKKKKKKKKKKKKX",
     "XXXXXXXXXXXXXXXX",
     "................",
@@ -883,6 +1039,26 @@ const TURRET_BASE_FRONT: &[&str] = &[
     "..XXkkkkkkkkXX..",
     "....XXXXXXXX....",
     "................",
+];
+
+// Turret from behind: no muzzle aperture; cooling-louver grille instead.
+const TURRET_BASE_BACK: &[&str] = &[
+    "....XXXXXXXX....",
+    "..XXkkkkkkkkXX..",
+    ".XkkKKKKKKKKkkX.",
+    ".XkKPlPlPlPlKkX.",
+    "XkKPlPlPlPlPlKkX",
+    "XkKKKKKKKKKKKKkX",
+    "XkKlPKKllKKlPKkX",
+    "XkKlPKllllKlPKkX",
+    "XkKlPKllllKlPKkX",
+    "XkKlPKKllKKlPKkX",
+    "XkKKKKKKKKKKKKkX",
+    "XkKPlPlPlPlPlKkX",
+    ".XkKPlPlPlPlKkX.",
+    ".XkkKKKKKKKKkkX.",
+    "..XXkkkkkkkkXX..",
+    "....XXXXXXXX....",
 ];
 
 // ── Multi-cell weapon modules ────────────────────────────────────────────
@@ -1311,6 +1487,572 @@ const HEAVY_TURRET_3X3_FRONT: &[&str] = &[
     "................................................",
 ];
 
+// ── Connector overlays ───────────────────────────────────────────────────
+// Each 16×16 sprite is mostly transparent, painting only the hardware that
+// bridges the seam to a same-direction neighbor. Drawn on the *source*
+// cell at +0.001 z-order so it lays over the source's transparent border
+// rows; the matching neighbor (when present) emits its own mirror overlay,
+// so a stacked-frame pair gets two overlays meeting at the seam.
+
+// Axle ↔ Wheel hub stub — wheel sits directly below the axle (screen-down).
+// Fills the bottom 4 transparent rows of the axle cell with a centred iron
+// stub aligning with the wheel hub at the next cell's top.
+const CONNECTOR_AXLE_WHEEL_DOWN: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "......XKKX......",
+    "......XKKX......",
+    "......XKKX......",
+    "......XKKX......",
+];
+
+// Axle ↔ Wheel hub stub — wheel sits directly above the axle (screen-up).
+const CONNECTOR_AXLE_WHEEL_UP: &[&str] = &[
+    "......XKKX......",
+    "......XKKX......",
+    "......XKKX......",
+    "......XKKX......",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+// Axle ↔ Wheel hub stub — wheel on chassis-left (camera-left) in front view.
+const CONNECTOR_AXLE_WHEEL_LEFT: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "XXXX............",
+    "KKKK............",
+    "KKKK............",
+    "XXXX............",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+// Axle ↔ Wheel hub stub — wheel on chassis-right in front view.
+const CONNECTOR_AXLE_WHEEL_RIGHT: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "............XXXX",
+    "............KKKK",
+    "............KKKK",
+    "............XXXX",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+// Frame seam — vertical stack (axisY): paint the cell's bottom 4 transparent
+// rows (rows 12-15) with beam continuation so the gap to the cell below
+// closes. Emitted on a cell whose grid −Z (screen-down) neighbour is also
+// a Frame.
+const CONNECTOR_FRAME_SEAM_DOWN: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "DDDDDDDDDDDDDDDD",
+    "DbbbbbbbbbbbbbbD",
+    "DBBBBBBBBBBBBBBD",
+    "DBttttttttttttBD",
+];
+
+// Frame seam — vertical stack (axisY): paint the cell's top 3 transparent
+// rows with beam continuation so the gap to the cell above closes.
+const CONNECTOR_FRAME_SEAM_UP: &[&str] = &[
+    "DbBBBBBBBBBBBBbD",
+    "DbbbbbbbbbbbbbbD",
+    "DDDDDDDDDDDDDDDD",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+// Frame seam — horizontal (axisX): replace the cell's right outline column
+// with beam fill so two horizontally-adjacent frames read as one beam.
+const CONNECTOR_FRAME_SEAM_RIGHT: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "...............D",
+    "...............b",
+    "...............B",
+    "...............t",
+    "...............b",
+    "...............t",
+    "...............B",
+    "...............b",
+    "...............D",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+const CONNECTOR_FRAME_SEAM_LEFT: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "D...............",
+    "b...............",
+    "B...............",
+    "t...............",
+    "b...............",
+    "t...............",
+    "B...............",
+    "b...............",
+    "D...............",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+// Deck seam — vertical stack: deck has rows 0-1 + 13-15 transparent, so
+// gap is 2 + 3 = 5 rows.
+const CONNECTOR_DECK_SEAM_DOWN: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "DDDDDDDDDDDDDDDD",
+    "DbbbbbbbbbbbbbbD",
+    "DTtTtTtTtTtTtTtD",
+];
+
+const CONNECTOR_DECK_SEAM_UP: &[&str] = &[
+    "DTtTtTtTtTtTtTtD",
+    "DbbbbbbbbbbbbbbD",
+    "DDDDDDDDDDDDDDDD",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+const CONNECTOR_DECK_SEAM_RIGHT: &[&str] = &[
+    "................",
+    "................",
+    "...............D",
+    "...............b",
+    "...............T",
+    "...............t",
+    "...............T",
+    "...............b",
+    "...............T",
+    "...............t",
+    "...............T",
+    "...............b",
+    "...............D",
+    "................",
+    "................",
+    "................",
+];
+
+const CONNECTOR_DECK_SEAM_LEFT: &[&str] = &[
+    "................",
+    "................",
+    "D...............",
+    "b...............",
+    "T...............",
+    "t...............",
+    "T...............",
+    "b...............",
+    "T...............",
+    "t...............",
+    "T...............",
+    "b...............",
+    "D...............",
+    "................",
+    "................",
+    "................",
+];
+
+// Wall already fills its cell edge-to-edge; only the inner seam between
+// two stacked walls benefits from a slim bridging course.
+const CONNECTOR_WALL_SEAM_DOWN: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "DDDDDDDDDDDDDDDD",
+    "DBtBtBtBtBtBtBtD",
+];
+
+const CONNECTOR_WALL_SEAM_UP: &[&str] = &[
+    "DBtBtBtBtBtBtBtD",
+    "DDDDDDDDDDDDDDDD",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+const CONNECTOR_WALL_SEAM_RIGHT: &[&str] = &[
+    "...............D",
+    "...............B",
+    "...............b",
+    "...............D",
+    "...............B",
+    "...............t",
+    "...............D",
+    "...............B",
+    "...............b",
+    "...............D",
+    "...............B",
+    "...............t",
+    "...............D",
+    "...............B",
+    "...............b",
+    "...............D",
+];
+
+const CONNECTOR_WALL_SEAM_LEFT: &[&str] = &[
+    "D...............",
+    "B...............",
+    "b...............",
+    "D...............",
+    "B...............",
+    "t...............",
+    "D...............",
+    "B...............",
+    "b...............",
+    "D...............",
+    "B...............",
+    "t...............",
+    "D...............",
+    "B...............",
+    "b...............",
+    "D...............",
+];
+
+// Hitch ↔ Frame attachment — tongue extends toward the frame neighbour.
+// One template per screen direction (the emission logic maps the
+// chassis-rear grid direction to camera-space).
+const CONNECTOR_HITCH_ATTACH_RIGHT: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "............DDDD",
+    "............DKKD",
+    "............DKKD",
+    "............DKKD",
+    "............DKKD",
+    "............DDDD",
+    "................",
+    "................",
+    "................",
+];
+
+const CONNECTOR_HITCH_ATTACH_LEFT: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "DDDD............",
+    "DKKD............",
+    "DKKD............",
+    "DKKD............",
+    "DKKD............",
+    "DDDD............",
+    "................",
+    "................",
+    "................",
+];
+
+const CONNECTOR_HITCH_ATTACH_UP: &[&str] = &[
+    "......DDDD......",
+    "......DKKD......",
+    "......DKKD......",
+    "......DKKD......",
+    "......DKKD......",
+    "......DDDD......",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+const CONNECTOR_HITCH_ATTACH_DOWN: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "......DDDD......",
+    "......DKKD......",
+    "......DKKD......",
+    "......DKKD......",
+    "......DKKD......",
+    "......DDDD......",
+];
+
+// Yoke ↔ Frame attachment — strap-buckle plate on the side facing the
+// frame neighbour.
+const CONNECTOR_YOKE_ATTACH_RIGHT: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "............DDDD",
+    "............DBBD",
+    "............DBKD",
+    "............DKKD",
+    "............DKKD",
+    "............DKKD",
+    "............DKKD",
+    "............DBKD",
+    "............DBBD",
+    "............DDDD",
+    "................",
+    "................",
+    "................",
+];
+
+const CONNECTOR_YOKE_ATTACH_LEFT: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "DDDD............",
+    "DBBD............",
+    "DKBD............",
+    "DKKD............",
+    "DKKD............",
+    "DKKD............",
+    "DKKD............",
+    "DKBD............",
+    "DBBD............",
+    "DDDD............",
+    "................",
+    "................",
+    "................",
+];
+
+const CONNECTOR_YOKE_ATTACH_UP: &[&str] = &[
+    "...DDBBKKKKBBDD.",
+    "...DBKKKKKKKKBD.",
+    "...DBKllPlPllKD.",
+    "...DDBBKKKKBBDD.",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+const CONNECTOR_YOKE_ATTACH_DOWN: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "...DDBBKKKKBBDD.",
+    "...DBKllPlPllKD.",
+    "...DBKKKKKKKKBD.",
+    "...DDBBKKKKBBDD.",
+];
+
+// Crew-seat facing indicator — small tiller/headrest stub pointing at
+// chassis-forward in screen coordinates, telling the player which way
+// the occupant is looking. The four directions cover the four heading
+// rotations after view selection.
+const CONNECTOR_CREW_SEAT_FACING_UP: &[&str] = &[
+    ".......XKKX.....",
+    "......XKllKX....",
+    "......XKllKX....",
+    ".......XKKX.....",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+const CONNECTOR_CREW_SEAT_FACING_DOWN: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    ".......XKKX.....",
+    "......XKllKX....",
+    "......XKllKX....",
+    ".......XKKX.....",
+    "................",
+];
+
+const CONNECTOR_CREW_SEAT_FACING_RIGHT: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "..............XK",
+    ".........XXXXXXX",
+    ".........XKKKKKK",
+    "..............XK",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
+const CONNECTOR_CREW_SEAT_FACING_LEFT: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "KX..............",
+    "XXXXXXX.........",
+    "KKKKKKKX........",
+    "KX..............",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+];
+
 // ── Registration ─────────────────────────────────────────────────────────
 
 pub fn register_vehicle_part_sprites(lib: &mut SpriteLibrary, images: &mut Assets<Image>) {
@@ -1322,34 +2064,53 @@ pub fn register_vehicle_part_sprites(lib: &mut SpriteLibrary, images: &mut Asset
     }
 
     // ── Per-kind base sprites ────────────────────────────────────────
+    // Symmetric parts (Frame, Deck, Wall, Axle, Wheel, CargoBay, Track,
+    // ArmorPlate) re-register Front art under the `_back` key — the rear
+    // silhouette is indistinguishable from the front. Asymmetric parts
+    // (Hitch, Yoke, CrewSeat, WeaponMount, Engine, Turret) ship distinct
+    // `_BACK` templates.
     insert!("vehicle_frame_base_side", FRAME_BASE_SIDE);
     insert!("vehicle_frame_base_front", FRAME_BASE_FRONT);
+    insert!("vehicle_frame_base_back", FRAME_BASE_FRONT);
     insert!("vehicle_deck_base_side", DECK_BASE_SIDE);
     insert!("vehicle_deck_base_front", DECK_BASE_FRONT);
+    insert!("vehicle_deck_base_back", DECK_BASE_FRONT);
     insert!("vehicle_wall_base_side", WALL_BASE_SIDE);
     insert!("vehicle_wall_base_front", WALL_BASE_FRONT);
+    insert!("vehicle_wall_base_back", WALL_BASE_FRONT);
     insert!("vehicle_axle_base_side", AXLE_BASE_SIDE);
     insert!("vehicle_axle_base_front", AXLE_BASE_FRONT);
+    insert!("vehicle_axle_base_back", AXLE_BASE_FRONT);
     insert!("vehicle_wheel_base_side", WHEEL_BASE_SIDE);
     insert!("vehicle_wheel_base_front", WHEEL_BASE_FRONT);
+    insert!("vehicle_wheel_base_back", WHEEL_BASE_FRONT);
     insert!("vehicle_hitch_base_side", HITCH_BASE_SIDE);
     insert!("vehicle_hitch_base_front", HITCH_BASE_FRONT);
+    insert!("vehicle_hitch_base_back", HITCH_BASE_BACK);
     insert!("vehicle_yoke_base_side", YOKE_BASE_SIDE);
     insert!("vehicle_yoke_base_front", YOKE_BASE_FRONT);
+    insert!("vehicle_yoke_base_back", YOKE_BASE_BACK);
     insert!("vehicle_cargo_bay_base_side", CARGOBAY_BASE_SIDE);
     insert!("vehicle_cargo_bay_base_front", CARGOBAY_BASE_FRONT);
+    insert!("vehicle_cargo_bay_base_back", CARGOBAY_BASE_FRONT);
     insert!("vehicle_crew_seat_base_side", CREWSEAT_BASE_SIDE);
     insert!("vehicle_crew_seat_base_front", CREWSEAT_BASE_FRONT);
+    insert!("vehicle_crew_seat_base_back", CREWSEAT_BASE_BACK);
     insert!("vehicle_weapon_mount_base_side", WEAPONMOUNT_BASE_SIDE);
     insert!("vehicle_weapon_mount_base_front", WEAPONMOUNT_BASE_FRONT);
+    insert!("vehicle_weapon_mount_base_back", WEAPONMOUNT_BASE_BACK);
     insert!("vehicle_engine_base_side", ENGINE_BASE_SIDE);
     insert!("vehicle_engine_base_front", ENGINE_BASE_FRONT);
+    insert!("vehicle_engine_base_back", ENGINE_BASE_BACK);
     insert!("vehicle_track_base_side", TRACK_BASE_SIDE);
     insert!("vehicle_track_base_front", TRACK_BASE_FRONT);
+    insert!("vehicle_track_base_back", TRACK_BASE_FRONT);
     insert!("vehicle_armor_plate_base_side", ARMORPLATE_BASE_SIDE);
     insert!("vehicle_armor_plate_base_front", ARMORPLATE_BASE_FRONT);
+    insert!("vehicle_armor_plate_base_back", ARMORPLATE_BASE_FRONT);
     insert!("vehicle_turret_base_side", TURRET_BASE_SIDE);
     insert!("vehicle_turret_base_front", TURRET_BASE_FRONT);
+    insert!("vehicle_turret_base_back", TURRET_BASE_BACK);
 
     // ── Visually distinct variants ───────────────────────────────────
     // Frame variants reuse the base (mass/support only; no readable
@@ -1357,37 +2118,52 @@ pub fn register_vehicle_part_sprites(lib: &mut SpriteLibrary, images: &mut Asset
     // distinct keys so the resolver hits them.
     insert!("vehicle_frame_light_chassis_side", FRAME_LIGHT_SIDE);
     insert!("vehicle_frame_light_chassis_front", FRAME_BASE_FRONT);
+    insert!("vehicle_frame_light_chassis_back", FRAME_BASE_FRONT);
     insert!("vehicle_frame_heavy_chassis_side", FRAME_HEAVY_SIDE);
     insert!("vehicle_frame_heavy_chassis_front", FRAME_BASE_FRONT);
+    insert!("vehicle_frame_heavy_chassis_back", FRAME_BASE_FRONT);
     insert!("vehicle_frame_truss_chassis_side", FRAME_TRUSS_SIDE);
     insert!("vehicle_frame_truss_chassis_front", FRAME_BASE_FRONT);
+    insert!("vehicle_frame_truss_chassis_back", FRAME_BASE_FRONT);
 
     // Wheel variants.
     insert!("vehicle_wheel_solid_wheel_side", WHEEL_SOLID_SIDE);
     insert!("vehicle_wheel_solid_wheel_front", WHEEL_BASE_FRONT);
+    insert!("vehicle_wheel_solid_wheel_back", WHEEL_BASE_FRONT);
     insert!("vehicle_wheel_spoked_wheel_side", WHEEL_SPOKED_SIDE);
     insert!("vehicle_wheel_spoked_wheel_front", WHEEL_BASE_FRONT);
+    insert!("vehicle_wheel_spoked_wheel_back", WHEEL_BASE_FRONT);
     insert!("vehicle_wheel_iron_rim_wheel_side", WHEEL_IRON_RIM_SIDE);
     insert!("vehicle_wheel_iron_rim_wheel_front", WHEEL_IRON_RIM_FRONT);
+    insert!("vehicle_wheel_iron_rim_wheel_back", WHEEL_IRON_RIM_FRONT);
 
     // Axle variants — fixed reuses base; steering + reinforced have
     // distinct silhouettes.
     insert!("vehicle_axle_fixed_axle_side", AXLE_BASE_SIDE);
     insert!("vehicle_axle_fixed_axle_front", AXLE_BASE_FRONT);
+    insert!("vehicle_axle_fixed_axle_back", AXLE_BASE_FRONT);
     insert!("vehicle_axle_steering_axle_side", AXLE_STEERING_SIDE);
     insert!("vehicle_axle_steering_axle_front", AXLE_BASE_FRONT);
+    insert!("vehicle_axle_steering_axle_back", AXLE_BASE_FRONT);
     insert!("vehicle_axle_reinforced_axle_side", AXLE_REINFORCED_SIDE);
     insert!("vehicle_axle_reinforced_axle_front", AXLE_BASE_FRONT);
+    insert!("vehicle_axle_reinforced_axle_back", AXLE_BASE_FRONT);
 
     // Track variants — wooden_track reuses base; metal_track distinct.
     insert!("vehicle_track_wooden_track_side", TRACK_BASE_SIDE);
     insert!("vehicle_track_wooden_track_front", TRACK_BASE_FRONT);
+    insert!("vehicle_track_wooden_track_back", TRACK_BASE_FRONT);
     insert!("vehicle_track_metal_track_side", TRACK_METAL_SIDE);
     insert!("vehicle_track_metal_track_front", TRACK_BASE_FRONT);
+    insert!("vehicle_track_metal_track_back", TRACK_BASE_FRONT);
 
     // ── Weapon module composites ─────────────────────────────────────
+    // Module composites stay symmetric front↔back at module-asset
+    // resolution (drawing 32×48 rear views per module would be a
+    // separate pass of pixel art); they reuse `_front` for `_back`.
     insert!("vehicle_module_ram_head_1x2_side", RAM_HEAD_1X2_SIDE);
     insert!("vehicle_module_ram_head_1x2_front", RAM_HEAD_1X2_FRONT);
+    insert!("vehicle_module_ram_head_1x2_back", RAM_HEAD_1X2_FRONT);
     insert!(
         "vehicle_module_battering_ram_2x3_side",
         BATTERING_RAM_2X3_SIDE
@@ -1396,8 +2172,13 @@ pub fn register_vehicle_part_sprites(lib: &mut SpriteLibrary, images: &mut Asset
         "vehicle_module_battering_ram_2x3_front",
         BATTERING_RAM_2X3_FRONT
     );
+    insert!(
+        "vehicle_module_battering_ram_2x3_back",
+        BATTERING_RAM_2X3_FRONT
+    );
     insert!("vehicle_module_ballista_2x2_side", BALLISTA_2X2_SIDE);
     insert!("vehicle_module_ballista_2x2_front", BALLISTA_2X2_FRONT);
+    insert!("vehicle_module_ballista_2x2_back", BALLISTA_2X2_FRONT);
     insert!(
         "vehicle_module_light_turret_2x2_side",
         LIGHT_TURRET_2X2_SIDE
@@ -1407,11 +2188,84 @@ pub fn register_vehicle_part_sprites(lib: &mut SpriteLibrary, images: &mut Asset
         LIGHT_TURRET_2X2_FRONT
     );
     insert!(
+        "vehicle_module_light_turret_2x2_back",
+        LIGHT_TURRET_2X2_FRONT
+    );
+    insert!(
         "vehicle_module_heavy_turret_3x3_side",
         HEAVY_TURRET_3X3_SIDE
     );
     insert!(
         "vehicle_module_heavy_turret_3x3_front",
         HEAVY_TURRET_3X3_FRONT
+    );
+    insert!(
+        "vehicle_module_heavy_turret_3x3_back",
+        HEAVY_TURRET_3X3_FRONT
+    );
+
+    // ── Connector overlays ───────────────────────────────────────────
+    // Naming: `vehicle_connector_<label>_<view>_<dir>`. Axle↔wheel and
+    // crew-seat-facing overlays are symmetric across views (down stub is
+    // down stub regardless of camera), so the same constant registers
+    // under all three views. Same-kind seams reuse the same per-axis
+    // template for every view too.
+    macro_rules! insert_for_views {
+        ($label:expr, $dir:expr, $art:expr) => {{
+            for view in &["side", "front", "back"] {
+                let key = format!("vehicle_connector_{}_{}_{}", $label, view, $dir);
+                let img = ascii_to_image($art, WARM_PALETTE);
+                lib.sprites.insert(key, images.add(img));
+            }
+        }};
+    }
+    insert_for_views!("axle_wheel", "down", CONNECTOR_AXLE_WHEEL_DOWN);
+    insert_for_views!("axle_wheel", "up", CONNECTOR_AXLE_WHEEL_UP);
+    insert_for_views!("axle_wheel", "left", CONNECTOR_AXLE_WHEEL_LEFT);
+    insert_for_views!("axle_wheel", "right", CONNECTOR_AXLE_WHEEL_RIGHT);
+
+    insert_for_views!("frame_seam", "down", CONNECTOR_FRAME_SEAM_DOWN);
+    insert_for_views!("frame_seam", "up", CONNECTOR_FRAME_SEAM_UP);
+    insert_for_views!("frame_seam", "right", CONNECTOR_FRAME_SEAM_RIGHT);
+    insert_for_views!("frame_seam", "left", CONNECTOR_FRAME_SEAM_LEFT);
+
+    insert_for_views!("deck_seam", "down", CONNECTOR_DECK_SEAM_DOWN);
+    insert_for_views!("deck_seam", "up", CONNECTOR_DECK_SEAM_UP);
+    insert_for_views!("deck_seam", "right", CONNECTOR_DECK_SEAM_RIGHT);
+    insert_for_views!("deck_seam", "left", CONNECTOR_DECK_SEAM_LEFT);
+
+    insert_for_views!("wall_seam", "down", CONNECTOR_WALL_SEAM_DOWN);
+    insert_for_views!("wall_seam", "up", CONNECTOR_WALL_SEAM_UP);
+    insert_for_views!("wall_seam", "right", CONNECTOR_WALL_SEAM_RIGHT);
+    insert_for_views!("wall_seam", "left", CONNECTOR_WALL_SEAM_LEFT);
+
+    insert_for_views!("hitch_attach", "up", CONNECTOR_HITCH_ATTACH_UP);
+    insert_for_views!("hitch_attach", "down", CONNECTOR_HITCH_ATTACH_DOWN);
+    insert_for_views!("hitch_attach", "left", CONNECTOR_HITCH_ATTACH_LEFT);
+    insert_for_views!("hitch_attach", "right", CONNECTOR_HITCH_ATTACH_RIGHT);
+    insert_for_views!("yoke_attach", "up", CONNECTOR_YOKE_ATTACH_UP);
+    insert_for_views!("yoke_attach", "down", CONNECTOR_YOKE_ATTACH_DOWN);
+    insert_for_views!("yoke_attach", "left", CONNECTOR_YOKE_ATTACH_LEFT);
+    insert_for_views!("yoke_attach", "right", CONNECTOR_YOKE_ATTACH_RIGHT);
+
+    insert_for_views!(
+        "crew_seat_facing",
+        "up",
+        CONNECTOR_CREW_SEAT_FACING_UP
+    );
+    insert_for_views!(
+        "crew_seat_facing",
+        "down",
+        CONNECTOR_CREW_SEAT_FACING_DOWN
+    );
+    insert_for_views!(
+        "crew_seat_facing",
+        "right",
+        CONNECTOR_CREW_SEAT_FACING_RIGHT
+    );
+    insert_for_views!(
+        "crew_seat_facing",
+        "left",
+        CONNECTOR_CREW_SEAT_FACING_LEFT
     );
 }

@@ -4,8 +4,8 @@
     "name": "deer",
     "prompt": "deer",
     "size": {
-      "width": 32,
-      "height": 32
+      "width": 48,
+      "height": 48
     },
     "template_id": "horse",
     "directions": 8,

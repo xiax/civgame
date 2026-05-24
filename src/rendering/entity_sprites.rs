@@ -605,7 +605,163 @@ fn vehicle_sprite_plan_internal(
             flip_x,
         });
     }
+
+    // ── Connector overlay pass ───────────────────────────────────────
+    // Adjacency-aware bridging hardware: axle↔wheel hubs, same-kind frame/
+    // deck/wall seams, hitch/yoke attachments, and per-cell crew-seat
+    // facing indicators. Overlays are 16×16, painted at +0.001 z so they
+    // sit just above the base cell, and use `flip_x = false` so the
+    // computed screen direction matches the registered ASCII regardless
+    // of the base-cell mirror (the screen-direction is already baked into
+    // the picked sprite key via `grid_delta_to_screen_dir`).
+    push_connector_overlays(
+        design, lo, heading, view, project, &module_anchors, &mut cells,
+    );
+
     VehicleSpritePlan::Composed { cells }
+}
+
+/// Map a 6-direction grid delta into the camera-space `ConnectorDir`
+/// (Up / Down / Left / Right) for the given heading. Returns `None` only
+/// for the zero vector; the six `NEIGHBORS_6` deltas always resolve.
+fn grid_delta_to_screen_dir(
+    delta: bevy::math::IVec3,
+    heading: u8,
+) -> Option<crate::rendering::vehicle_part_sprites::ConnectorDir> {
+    use crate::rendering::vehicle_part_sprites::ConnectorDir;
+    if delta.z != 0 {
+        return Some(if delta.z > 0 {
+            ConnectorDir::Up
+        } else {
+            ConnectorDir::Down
+        });
+    }
+    // In-plane (x, y) grid delta rotates with heading the same way
+    // `rotate_xy` rotates cell positions, so a +Y neighbour in the grid
+    // lands on the screen-edge that `rotate_xy(0, 1, heading)` projects to.
+    let (sx, sy) = rotate_xy(delta.x as f32, delta.y as f32, heading);
+    if sx.abs() > sy.abs() {
+        Some(if sx > 0.0 {
+            ConnectorDir::Right
+        } else {
+            ConnectorDir::Left
+        })
+    } else if sy.abs() > 0.0 {
+        Some(if sy > 0.0 {
+            ConnectorDir::Up
+        } else {
+            ConnectorDir::Down
+        })
+    } else {
+        None
+    }
+}
+
+fn push_connector_overlays<F: Fn(f32, f32, f32) -> Vec3>(
+    design: &VehicleDesign,
+    lo: bevy::math::IVec3,
+    heading: u8,
+    view: crate::rendering::vehicle_part_sprites::VehicleSpriteView,
+    project: F,
+    module_anchors: &ahash::AHashMap<
+        crate::simulation::vehicle::VehicleModuleId,
+        bevy::math::IVec3,
+    >,
+    cells: &mut Vec<VehicleSpriteCell>,
+) {
+    use crate::rendering::vehicle_part_sprites::vehicle_connector_sprite_key;
+    use bevy::math::IVec3;
+
+    // Six axis-aligned grid neighbours, same set `vehicle::validate_grid`
+    // walks for wheel↔axle connectivity validation.
+    const NEIGHBORS_6: [IVec3; 6] = [
+        IVec3::new(1, 0, 0),
+        IVec3::new(-1, 0, 0),
+        IVec3::new(0, 1, 0),
+        IVec3::new(0, -1, 0),
+        IVec3::new(0, 0, 1),
+        IVec3::new(0, 0, -1),
+    ];
+
+    let kind_at: ahash::AHashMap<IVec3, VehiclePartKind> = design
+        .grid
+        .cells
+        .iter()
+        .filter(|(_, c)| c.module_id.is_none())
+        .map(|(p, c)| (*p, c.kind))
+        .collect();
+
+    let chassis_forward_screen = grid_delta_to_screen_dir(IVec3::new(0, 1, 0), heading);
+
+    for (p, c) in &design.grid.cells {
+        // Skip module cells entirely — their composite sprite already
+        // covers the footprint; per-cell overlays would clash.
+        if let Some(mid) = c.module_id {
+            if module_anchors.get(&mid) != Some(p) {
+                continue;
+            }
+            // Anchor cells of multi-cell modules also skip overlay
+            // emission — the module composite owns its silhouette.
+            continue;
+        }
+
+        let gx = (p.x - lo.x) as f32;
+        let gy = (p.y - lo.y) as f32;
+        let gz = (p.z - lo.z) as f32;
+        let local = project(gx, gy, gz);
+        let mut overlay_z = local.z + 0.001;
+
+        // Per-cell seat-facing indicator — no neighbour required; the
+        // indicator points at chassis-forward in screen space.
+        if c.kind == VehiclePartKind::CrewSeat {
+            if let Some(dir) = chassis_forward_screen {
+                cells.push(VehicleSpriteCell {
+                    local_offset: Vec3::new(local.x, local.y, overlay_z),
+                    size: Vec2::splat(16.0),
+                    color: vehicle_cell_color(c.kind),
+                    sprite_key: Some(vehicle_connector_sprite_key(
+                        "crew_seat_facing",
+                        view,
+                        dir,
+                    )),
+                    fallback_sprite_key: None,
+                    flip_x: false,
+                });
+                overlay_z += 0.0005;
+            }
+        }
+
+        // Adjacency-driven overlays.
+        for delta in NEIGHBORS_6 {
+            let Some(&n_kind) = kind_at.get(&(*p + delta)) else {
+                continue;
+            };
+            let label: Option<&'static str> = match (c.kind, n_kind) {
+                (VehiclePartKind::Axle, VehiclePartKind::Wheel) => Some("axle_wheel"),
+                (VehiclePartKind::Frame, VehiclePartKind::Frame) => Some("frame_seam"),
+                (VehiclePartKind::Deck, VehiclePartKind::Deck) => Some("deck_seam"),
+                (VehiclePartKind::Wall, VehiclePartKind::Wall) => Some("wall_seam"),
+                (VehiclePartKind::Hitch, VehiclePartKind::Frame) => Some("hitch_attach"),
+                (VehiclePartKind::Yoke, VehiclePartKind::Frame) => Some("yoke_attach"),
+                _ => None,
+            };
+            let Some(label) = label else {
+                continue;
+            };
+            let Some(dir) = grid_delta_to_screen_dir(delta, heading) else {
+                continue;
+            };
+            cells.push(VehicleSpriteCell {
+                local_offset: Vec3::new(local.x, local.y, overlay_z),
+                size: Vec2::splat(16.0),
+                color: vehicle_cell_color(c.kind),
+                sprite_key: Some(vehicle_connector_sprite_key(label, view, dir)),
+                fallback_sprite_key: None,
+                flip_x: false,
+            });
+            overlay_z += 0.0005;
+        }
+    }
 }
 
 /// Vehicle system: reactively attach the child sprite(s) to every `Vehicle`.

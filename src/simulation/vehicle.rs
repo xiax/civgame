@@ -5546,6 +5546,218 @@ mod tests {
     }
 
     #[test]
+    fn view_for_heading_maps_to_three_distinct_views() {
+        use crate::rendering::vehicle_part_sprites::{view_for_heading, VehicleSpriteView};
+        assert_eq!(view_for_heading(0), (VehicleSpriteView::Back, false));
+        assert_eq!(view_for_heading(1), (VehicleSpriteView::Side, true));
+        assert_eq!(view_for_heading(2), (VehicleSpriteView::Front, false));
+        assert_eq!(view_for_heading(3), (VehicleSpriteView::Side, false));
+        // N (Back) and S (Front) must produce visually distinct sprites.
+        assert_ne!(view_for_heading(0).0, view_for_heading(2).0);
+    }
+
+    #[test]
+    fn sprite_plan_emits_axle_wheel_connector_overlay() {
+        let wood = core_ids::wood();
+        // Axle stacked atop a wheel (axle at z=1, wheel at z=0). The
+        // overlay pass must emit an `axle_wheel_*_down` connector on the
+        // axle cell so the visual gap closes.
+        let grid = VehicleGrid {
+            cells: vec![
+                (
+                    IVec3::new(0, 0, 0),
+                    VehicleCell::plain(VehiclePartKind::Wheel, wood, 100),
+                ),
+                (
+                    IVec3::new(0, 0, 1),
+                    VehicleCell::plain(VehiclePartKind::Axle, wood, 100),
+                ),
+            ],
+            modules: Vec::new(),
+        };
+        let design = VehicleDesign {
+            id: VehicleDesignId(99),
+            name: "TestAxleWheel".to_string(),
+            grid,
+            allowed_purpose: VehiclePurpose::Cargo,
+            required_animals: 0,
+            tech_gates: Vec::new(),
+            author_faction: Some(1),
+            from_user_file: false,
+            revision: 0,
+        };
+        let plan = crate::rendering::entity_sprites::vehicle_sprite_plan(&design, 0);
+        let cells = match plan {
+            crate::rendering::entity_sprites::VehicleSpritePlan::Composed { cells } => cells,
+            _ => panic!("expected Composed"),
+        };
+        let has_axle_wheel = cells.iter().any(|c| {
+            c.sprite_key
+                .as_deref()
+                .map(|k| k.starts_with("vehicle_connector_axle_wheel_") && k.ends_with("_down"))
+                .unwrap_or(false)
+        });
+        assert!(
+            has_axle_wheel,
+            "expected an axle_wheel_*_down connector overlay, got keys: {:?}",
+            cells
+                .iter()
+                .filter_map(|c| c.sprite_key.as_deref())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sprite_plan_emits_frame_seam_connector_on_stacked_frames() {
+        let wood = core_ids::wood();
+        // Two vertically-stacked frame cells. Each must emit a seam
+        // connector pointing at the other (one `up`, one `down`) so the
+        // transparent border rows are bridged.
+        let grid = VehicleGrid {
+            cells: vec![
+                (
+                    IVec3::new(0, 0, 0),
+                    VehicleCell::plain(VehiclePartKind::Frame, wood, 100),
+                ),
+                (
+                    IVec3::new(0, 0, 1),
+                    VehicleCell::plain(VehiclePartKind::Frame, wood, 100),
+                ),
+            ],
+            modules: Vec::new(),
+        };
+        let design = VehicleDesign {
+            id: VehicleDesignId(99),
+            name: "TestFrameSeam".to_string(),
+            grid,
+            allowed_purpose: VehiclePurpose::Cargo,
+            required_animals: 0,
+            tech_gates: Vec::new(),
+            author_faction: Some(1),
+            from_user_file: false,
+            revision: 0,
+        };
+        let plan = crate::rendering::entity_sprites::vehicle_sprite_plan(&design, 0);
+        let cells = match plan {
+            crate::rendering::entity_sprites::VehicleSpritePlan::Composed { cells } => cells,
+            _ => panic!("expected Composed"),
+        };
+        let keys: Vec<&str> = cells
+            .iter()
+            .filter_map(|c| c.sprite_key.as_deref())
+            .collect();
+        let up = keys
+            .iter()
+            .any(|k| k.starts_with("vehicle_connector_frame_seam_") && k.ends_with("_up"));
+        let down = keys
+            .iter()
+            .any(|k| k.starts_with("vehicle_connector_frame_seam_") && k.ends_with("_down"));
+        assert!(up, "expected frame_seam_*_up overlay, got {:?}", keys);
+        assert!(down, "expected frame_seam_*_down overlay, got {:?}", keys);
+    }
+
+    #[test]
+    fn sprite_plan_emits_seat_facing_indicator_per_heading() {
+        let wood = core_ids::wood();
+        let grid = VehicleGrid {
+            cells: vec![
+                (
+                    IVec3::new(0, 0, 0),
+                    VehicleCell::plain(VehiclePartKind::Frame, wood, 100),
+                ),
+                (
+                    IVec3::new(0, 0, 1),
+                    VehicleCell::plain(VehiclePartKind::CrewSeat, wood, 100),
+                ),
+            ],
+            modules: Vec::new(),
+        };
+        let design = VehicleDesign {
+            id: VehicleDesignId(99),
+            name: "TestSeatFacing".to_string(),
+            grid,
+            allowed_purpose: VehiclePurpose::Cargo,
+            required_animals: 0,
+            tech_gates: Vec::new(),
+            author_faction: Some(1),
+            from_user_file: false,
+            revision: 0,
+        };
+        // Each heading must produce a crew_seat_facing overlay; the
+        // direction suffix differs because chassis-forward rotates through
+        // the four heading slots.
+        let mut dirs = Vec::new();
+        for heading in 0..4 {
+            let plan = crate::rendering::entity_sprites::vehicle_sprite_plan(&design, heading);
+            let cells = match plan {
+                crate::rendering::entity_sprites::VehicleSpritePlan::Composed { cells } => cells,
+                _ => panic!("expected Composed"),
+            };
+            let facing_key = cells.iter().find_map(|c| {
+                c.sprite_key
+                    .as_deref()
+                    .filter(|k| k.starts_with("vehicle_connector_crew_seat_facing_"))
+                    .map(|s| s.to_string())
+            });
+            let key = facing_key.unwrap_or_else(|| {
+                panic!(
+                    "heading {}: expected a crew_seat_facing overlay, got keys: {:?}",
+                    heading,
+                    cells
+                        .iter()
+                        .filter_map(|c| c.sprite_key.as_deref())
+                        .collect::<Vec<_>>()
+                )
+            });
+            dirs.push(key);
+        }
+        // All four headings should pick at least two distinct direction
+        // tokens (chassis-forward rotates 0°/90°/180°/270°). If they
+        // collapse to one, the rotation math is broken.
+        let unique: std::collections::HashSet<&String> = dirs.iter().collect();
+        assert!(
+            unique.len() >= 2,
+            "expected ≥2 distinct facing directions across headings, got {:?}",
+            dirs
+        );
+    }
+
+    #[test]
+    fn sprite_plan_user_apcv2_emits_connector_overlays() {
+        let (data, registry) = load_vehicle_assets();
+        let Some(design) = registry.by_name("APCv2") else {
+            // user_apcv2.ron may be absent in some workspaces — skip
+            // rather than fail; the connector emission paths are exercised
+            // by the synthetic tests above.
+            eprintln!("APCv2 not present in registry; skipping");
+            return;
+        };
+        for heading in 0..4 {
+            let plan = crate::rendering::entity_sprites::vehicle_sprite_plan_with_data(
+                design, heading, &data,
+            );
+            let cells = match plan {
+                crate::rendering::entity_sprites::VehicleSpritePlan::Composed { cells } => cells,
+                _ => panic!("expected Composed for user-authored APCv2"),
+            };
+            let connectors = cells
+                .iter()
+                .filter(|c| {
+                    c.sprite_key
+                        .as_deref()
+                        .map(|k| k.starts_with("vehicle_connector_"))
+                        .unwrap_or(false)
+                })
+                .count();
+            assert!(
+                connectors > 0,
+                "heading {}: APCv2 should emit at least one connector overlay (axle/wheel/seam/seat-facing)",
+                heading
+            );
+        }
+    }
+
+    #[test]
     fn plan_manual_step_turn_succeeds_on_clear_origin() {
         let design = composed_test_design();
         let v = test_vehicle();

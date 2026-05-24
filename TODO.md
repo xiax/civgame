@@ -177,4 +177,4 @@ Diplomacy
 
 Barter economies
 
-The amount of game map z level variability should depend on the biome and status in the world map. Currently we can't even properly simulate plains. Our game map generation needs to be more realistic.
+X - The amount of game map z level variability should depend on the biome and status in the world map. Currently we can't even properly simulate plains. Our game map generation needs to be more realistic.
