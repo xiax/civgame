@@ -8227,7 +8227,7 @@ pub fn htn_deliver_hunt_kill_dispatch_system(
         // Mirrors `StepTarget::NearestButcherSite`.
         let mut best: Option<(i32, i32)> = None;
         let mut best_dist = i32::MAX;
-        for (&tile, _e) in campfire_map.0.iter() {
+        for (&tile, _entry) in campfire_map.0.iter() {
             let dist = (tile.0 - cur_tx).abs() + (tile.1 - cur_ty).abs();
             if dist < best_dist {
                 best_dist = dist;
@@ -8791,7 +8791,7 @@ pub fn htn_join_hunt_party_dispatch_system(
         // faction home_tile. Mirrors `StepTarget::HearthForHunt`.
         let mut best: Option<(i32, i32)> = None;
         let mut best_dist = i32::MAX;
-        for (&tile, _e) in campfire_map.0.iter() {
+        for (&tile, _entry) in campfire_map.0.iter() {
             let dist = (tile.0 - area_tile.0).abs() + (tile.1 - area_tile.1).abs();
             if dist < best_dist {
                 best_dist = dist;

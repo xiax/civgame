@@ -408,6 +408,10 @@ pub struct ConstructionIntent {
     pub sponsor: SettlementSponsor,
     pub priority: f32,
     pub reason: &'static str,
+    /// Role to stamp on the finished `Campfire`. Only meaningful when
+    /// `build_kind` resolves to `BuildSiteKind::Campfire`. `None` for
+    /// every non-Hearth intent (workbench, shrine, …).
+    pub hearth_role: Option<crate::simulation::construction::HearthRole>,
 }
 
 #[derive(Resource, Default)]
@@ -634,13 +638,16 @@ impl SurveyStructureSnapshot {
         let in_window = |(x, y): &(i32, i32)| -> bool {
             (x - centre.0).abs() <= half && (y - centre.1).abs() <= half
         };
-        let pick = |m: &AHashMap<(i32, i32), Entity>| -> AHashSet<(i32, i32)> {
+        fn pick<V>(
+            m: &AHashMap<(i32, i32), V>,
+            in_window: impl Fn(&(i32, i32)) -> bool,
+        ) -> AHashSet<(i32, i32)> {
             m.keys().filter(|t| in_window(t)).copied().collect()
-        };
+        }
         Self {
-            beds: pick(&maps.bed_map.0),
-            walls: pick(&maps.wall_map.0),
-            campfires: pick(&maps.campfire_map.0),
+            beds: pick(&maps.bed_map.0, in_window),
+            walls: pick(&maps.wall_map.0, in_window),
+            campfires: pick(&maps.campfire_map.0, in_window),
             doors: maps
                 .door_map
                 .0
@@ -648,15 +655,15 @@ impl SurveyStructureSnapshot {
                 .filter(|t| in_window(t))
                 .copied()
                 .collect(),
-            workbenches: pick(&maps.workbench_map.0),
-            looms: pick(&maps.loom_map.0),
-            tables: pick(&maps.table_map.0),
-            granaries: pick(&maps.granary_map.0),
-            shrines: pick(&maps.shrine_map.0),
-            markets: pick(&maps.market_map.0),
-            barracks: pick(&maps.barracks_map.0),
-            monuments: pick(&maps.monument_map.0),
-            wells: pick(&maps.well_map.0),
+            workbenches: pick(&maps.workbench_map.0, in_window),
+            looms: pick(&maps.loom_map.0, in_window),
+            tables: pick(&maps.table_map.0, in_window),
+            granaries: pick(&maps.granary_map.0, in_window),
+            shrines: pick(&maps.shrine_map.0, in_window),
+            markets: pick(&maps.market_map.0, in_window),
+            barracks: pick(&maps.barracks_map.0, in_window),
+            monuments: pick(&maps.monument_map.0, in_window),
+            wells: pick(&maps.well_map.0, in_window),
             structures: maps
                 .structure_index
                 .0
@@ -3019,6 +3026,30 @@ impl CivicGate {
     }
 }
 
+/// Which `HearthRole` the public-hearth pressure formula counts for `era`.
+/// Pre-Neolithic settled bands cluster around `Camp` hearths (no roofs);
+/// Neolithic+ has indoor cooking fires and one `Civic` plaza hearth is
+/// the public target. Pure function — keep in sync with
+/// `desired_public_hearths`.
+pub fn public_hearth_role_for_era(era: Era) -> crate::simulation::construction::HearthRole {
+    match era {
+        Era::Paleolithic | Era::Mesolithic => crate::simulation::construction::HearthRole::Camp,
+        _ => crate::simulation::construction::HearthRole::Civic,
+    }
+}
+
+/// How many public hearths a faction of `members` at `era` should have
+/// near its home. Paleo/Meso `ceil(members/6)` matches the band-camp
+/// crescent geometry. Neo+ is a constant `1` — extra fire comes from
+/// Longhouse interiors (`HearthRole::Domestic`), which don't count here.
+pub fn desired_public_hearths(era: Era, members: u32) -> u32 {
+    let members = members.max(1);
+    match era {
+        Era::Paleolithic | Era::Mesolithic => ((members + 5) / 6).max(1),
+        _ => 1,
+    }
+}
+
 pub(crate) fn append_pressures_for_faction(
     _faction_id: u32,
     faction: &FactionData,
@@ -3034,12 +3065,12 @@ pub(crate) fn append_pressures_for_faction(
     let era = current_era(&faction.techs);
     let home = faction.home_tile;
     let members = faction.member_count.max(1);
-    let built_hearths = count_near(&maps.campfire_map.0, home, 32) as u32;
-    let desired_hearths = match era {
-        Era::Paleolithic | Era::Mesolithic => ((members + 5) / 6).max(1),
-        Era::Neolithic => ((members + 7) / 8).max(1),
-        _ => 1,
-    };
+    // Hearth pressure is role-aware. See `public_hearth_role_for_era` /
+    // `desired_public_hearths` (below) for the contract that paleo/meso
+    // count Camp against `ceil(members/6)` and Neo+ count Civic against 1.
+    let counted_role = public_hearth_role_for_era(era);
+    let built_hearths = maps.campfire_map.count_role_near(home, 32, counted_role) as u32;
+    let desired_hearths = desired_public_hearths(era, members);
     if faction
         .techs
         .has(crate::simulation::technology::FIRE_MAKING)
@@ -3051,7 +3082,7 @@ pub(crate) fn append_pressures_for_faction(
             sponsor: SettlementSponsor::Chief,
             population_scope: members,
             material_budget: 1,
-            reason: "hearth coverage",
+            reason: "public hearth",
         });
     }
 
@@ -3363,6 +3394,20 @@ pub(crate) fn pressure_to_intent(
     occupied.insert(tile);
 
     let door_dir = parcel_for_tile(brain, tile).and_then(|p| p.frontage_edge);
+    // Tag civic-pressure Hearth intents with the appropriate role so the
+    // downstream blueprint/seed paths stamp the right `Campfire.role`.
+    // Pre-Neolithic = `Camp` (band crescent); Neolithic+ = `Civic` (one
+    // public hearth). Domestic hearths come from Longhouse interiors
+    // (`walled_house_tile_plan`), not from this Hearth intent.
+    let hearth_role = match pressure.kind {
+        SettlementPressureKind::Hearth => Some(match era {
+            Era::Paleolithic | Era::Mesolithic => {
+                crate::simulation::construction::HearthRole::Camp
+            }
+            _ => crate::simulation::construction::HearthRole::Civic,
+        }),
+        _ => None,
+    };
     Some(ConstructionIntent {
         template_id: archetype_id_for(pressure.kind, era, archetypes).to_string(),
         build_kind,
@@ -3371,6 +3416,7 @@ pub(crate) fn pressure_to_intent(
         sponsor: pressure.sponsor,
         priority: pressure.urgency + site_bonus(brain, district, tile),
         reason: pressure.reason,
+        hearth_role,
     })
 }
 
@@ -4621,6 +4667,76 @@ fn midpoint(a: (i32, i32), b: (i32, i32)) -> (i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::simulation::construction::{
+        CampfireEntry, CampfireMap, HearthRole,
+    };
+
+    // ── Hearth pressure formulas (Neolithic+ fix) ────────────────────────
+
+    #[test]
+    fn pressure_target_paleo_20_pop_is_4() {
+        assert_eq!(desired_public_hearths(Era::Paleolithic, 20), 4);
+    }
+
+    #[test]
+    fn pressure_target_meso_20_pop_is_4() {
+        assert_eq!(desired_public_hearths(Era::Mesolithic, 20), 4);
+    }
+
+    #[test]
+    fn pressure_target_neolithic_20_pop_is_1() {
+        assert_eq!(desired_public_hearths(Era::Neolithic, 20), 1);
+    }
+
+    #[test]
+    fn pressure_target_chalcolithic_20_pop_is_1() {
+        assert_eq!(desired_public_hearths(Era::Chalcolithic, 20), 1);
+    }
+
+    #[test]
+    fn pressure_target_bronze_20_pop_is_1() {
+        assert_eq!(desired_public_hearths(Era::BronzeAge, 20), 1);
+    }
+
+    #[test]
+    fn public_hearth_role_for_era_split() {
+        assert_eq!(public_hearth_role_for_era(Era::Paleolithic), HearthRole::Camp);
+        assert_eq!(public_hearth_role_for_era(Era::Mesolithic), HearthRole::Camp);
+        assert_eq!(public_hearth_role_for_era(Era::Neolithic), HearthRole::Civic);
+        assert_eq!(public_hearth_role_for_era(Era::Chalcolithic), HearthRole::Civic);
+        assert_eq!(public_hearth_role_for_era(Era::BronzeAge), HearthRole::Civic);
+    }
+
+    #[test]
+    fn domestic_hearths_do_not_count_toward_civic_pressure() {
+        // Stage three hearths at the home tile: two Domestic (Longhouse
+        // interiors) and zero Civic. Counting under the Neolithic+ rule
+        // must return 0, so pressure for one Civic hearth still fires.
+        let home = (0, 0);
+        let mut map = CampfireMap::default();
+        let dummy_entity = bevy::ecs::entity::Entity::from_raw(1);
+        map.0.insert(
+            home,
+            CampfireEntry {
+                entity: dummy_entity,
+                role: HearthRole::Domestic,
+            },
+        );
+        map.0.insert(
+            (1, 0),
+            CampfireEntry {
+                entity: bevy::ecs::entity::Entity::from_raw(2),
+                role: HearthRole::Domestic,
+            },
+        );
+        assert_eq!(
+            map.count_role_near(home, 32, HearthRole::Civic),
+            0,
+            "Domestic interior hearths must not satisfy Civic pressure",
+        );
+        assert_eq!(map.count_role_near(home, 32, HearthRole::Domestic), 2);
+        assert_eq!(map.count_any_near(home, 32), 2);
+    }
 
     fn dummy_faction(home: (i32, i32), members: u32) -> FactionData {
         let mut registry = FactionRegistry::default();

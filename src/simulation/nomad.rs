@@ -1972,9 +1972,9 @@ pub(crate) fn pack_camp_assets_atomic(world: &mut World, packs: &[(u32, (i32, i3
                 .filter(|t| chebyshev(*t, anchor) <= radius)
                 .collect();
             for tile in fire_tiles {
-                if let Some(entity) = campfire_map.0.remove(&tile) {
-                    commands.entity(entity).despawn_recursive();
-                    despawned.insert(entity);
+                if let Some(entry) = campfire_map.0.remove(&tile) {
+                    commands.entity(entry.entity).despawn_recursive();
+                    despawned.insert(entry.entity);
                 }
             }
 

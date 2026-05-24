@@ -46,9 +46,91 @@ pub struct BedMap(pub AHashMap<(i32, i32), Entity>);
 #[derive(Resource, Default)]
 pub struct WallMap(pub AHashMap<(i32, i32), Entity>);
 
-/// Maps tile positions to campfire entities placed there.
+/// Semantic role of a hearth. Drives counting: `Civic` is the one public
+/// fire a settled village wants near its plaza, `Domestic` are the cooking
+/// fires inside individual dwellings (Longhouse interiors), `Camp` is the
+/// crescent of band-camp hearths around which Paleo/Meso bedrolls cluster.
+/// Intentionally has **no** `Default` impl so every spawn site is forced to
+/// pick a role; silent default-to-`Camp` was the source of the original
+/// Neolithic over-seeding bug.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HearthRole {
+    Camp,
+    Civic,
+    Domestic,
+}
+
+/// Value stored in `CampfireMap`. Carries the role so pressure counting can
+/// ask "how many *civic* hearths are within radius?" without scanning a
+/// component query.
+#[derive(Clone, Copy, Debug)]
+pub struct CampfireEntry {
+    pub entity: Entity,
+    pub role: HearthRole,
+}
+
+/// Maps tile positions to campfire entries placed there.
 #[derive(Resource, Default)]
-pub struct CampfireMap(pub AHashMap<(i32, i32), Entity>);
+pub struct CampfireMap(pub AHashMap<(i32, i32), CampfireEntry>);
+
+impl CampfireMap {
+    /// Entity at `tile`, role-agnostic.
+    #[inline]
+    pub fn entity_at(&self, tile: (i32, i32)) -> Option<Entity> {
+        self.0.get(&tile).map(|e| e.entity)
+    }
+
+    /// Role of the hearth at `tile`, if any.
+    #[inline]
+    pub fn role_at(&self, tile: (i32, i32)) -> Option<HearthRole> {
+        self.0.get(&tile).map(|e| e.role)
+    }
+
+    /// Iterate every hearth as `(tile, entity)`. Use when the caller doesn't
+    /// care about role (warmth, nearest-fire lookups, despawn cleanup).
+    #[inline]
+    pub fn iter_any(&self) -> impl Iterator<Item = ((i32, i32), Entity)> + '_ {
+        self.0.iter().map(|(t, e)| (*t, e.entity))
+    }
+
+    /// Iterate only hearths matching `role`.
+    pub fn iter_role(
+        &self,
+        role: HearthRole,
+    ) -> impl Iterator<Item = ((i32, i32), Entity)> + '_ {
+        self.0
+            .iter()
+            .filter(move |(_, e)| e.role == role)
+            .map(|(t, e)| (*t, e.entity))
+    }
+
+    /// Count hearths of `role` within chebyshev `radius` of `anchor`.
+    pub fn count_role_near(
+        &self,
+        anchor: (i32, i32),
+        radius: i32,
+        role: HearthRole,
+    ) -> usize {
+        let (hx, hy) = anchor;
+        self.0
+            .iter()
+            .filter(|(pos, e)| {
+                e.role == role
+                    && (pos.0 - hx).abs() <= radius
+                    && (pos.1 - hy).abs() <= radius
+            })
+            .count()
+    }
+
+    /// Count hearths of any role within chebyshev `radius` of `anchor`.
+    pub fn count_any_near(&self, anchor: (i32, i32), radius: i32) -> usize {
+        let (hx, hy) = anchor;
+        self.0
+            .keys()
+            .filter(|pos| (pos.0 - hx).abs() <= radius && (pos.1 - hy).abs() <= radius)
+            .count()
+    }
+}
 
 /// Maps tile positions to active Blueprint entities (faction build reservations).
 #[derive(Resource, Default)]
@@ -433,10 +515,14 @@ impl HearthTier {
     }
 }
 
-/// Marker placed on completed campfire entities.
-#[derive(Component, Default)]
+/// Marker placed on completed campfire entities. `role` is the semantic
+/// classification (see [`HearthRole`]); pressure counting and any future
+/// role-specific behaviour (e.g. preferring `Civic` for hunt-muster) reads
+/// it here as the durable source of truth.
+#[derive(Component)]
 pub struct Campfire {
     pub tier: HearthTier,
+    pub role: HearthRole,
 }
 
 /// Door tier. Wooden plank → reinforced for the citadel-style cultures.
@@ -761,6 +847,10 @@ pub struct Blueprint {
     /// by tier helpers (`best_bed_for` etc.) so the structure upgrades to
     /// the design tier even if the build paused across succession.
     pub design_techs: FactionTechs,
+    /// Semantic role to stamp on the finished `Campfire`. `None` means
+    /// "manual/legacy site — default to `Civic` at finalize". Only
+    /// meaningful for `BuildSiteKind::Campfire`.
+    pub hearth_role: Option<HearthRole>,
 }
 
 impl Blueprint {
@@ -796,6 +886,7 @@ impl Blueprint {
             work_stand: None,
             posted_by: None,
             design_techs: FactionTechs::default(),
+            hearth_role: None,
         }
     }
 
@@ -840,6 +931,14 @@ impl Blueprint {
     /// for `BuildSiteKind::Door` blueprints; ignored for other kinds.
     pub fn with_door_dir(mut self, dir: crate::simulation::land::TileEdge) -> Self {
         self.door_dir = Some(dir);
+        self
+    }
+
+    /// Builder: stamp the hearth role to apply at finalize. Only meaningful
+    /// for `BuildSiteKind::Campfire`; finalize falls back to
+    /// `HearthRole::Civic` when this is `None` (manual right-click build).
+    pub fn with_hearth_role(mut self, role: HearthRole) -> Self {
+        self.hearth_role = Some(role);
         self
     }
 
@@ -2104,12 +2203,7 @@ fn count_beds_near(bed_map: &BedMap, home: (i32, i32), radius: i32) -> usize {
 }
 
 fn count_campfires_near(campfire_map: &CampfireMap, home: (i32, i32), radius: i32) -> usize {
-    let (hx, hy) = (home.0 as i32, home.1 as i32);
-    campfire_map
-        .0
-        .keys()
-        .filter(|&&pos| (pos.0 as i32 - hx).abs() <= radius && (pos.1 as i32 - hy).abs() <= radius)
-        .count()
+    campfire_map.count_any_near(home, radius)
 }
 
 fn count_walls_near(wall_map: &WallMap, home: (i32, i32), radius: i32) -> usize {
@@ -2354,6 +2448,20 @@ fn entrance_cell_for_edge(
 /// Note: this is pure layout — it does NOT pick the door cardinal or check
 /// for clear ground. Callers run `pick_clear_door_cardinal` first and pass
 /// the resolved entrance offset + edge.
+/// One tile in a walled-house plan. `door_edge` is `Some` only for the door
+/// blueprint; `hearth_role` is `Some(HearthRole::Domestic)` for the
+/// interior hearth a Longhouse stamps at its centre, `None` for every
+/// other kind. Replaces the legacy 3-tuple so the Longhouse interior fire
+/// carries its semantic role through both the immediate stamp path and
+/// the deferred-terraform `PendingFootprint` path.
+#[derive(Clone, Copy, Debug)]
+pub struct PlannedHouseTile {
+    pub kind: BuildSiteKind,
+    pub tile: (i32, i32),
+    pub door_edge: Option<crate::simulation::land::TileEdge>,
+    pub hearth_role: Option<HearthRole>,
+}
+
 pub(crate) fn walled_house_tile_plan(
     cx: i32,
     cy: i32,
@@ -2364,16 +2472,8 @@ pub(crate) fn walled_house_tile_plan(
     wall_material: WallMaterial,
     interior_beds: &[(i32, i32)],
     interior_hearth: Option<(i32, i32)>,
-) -> Vec<(
-    BuildSiteKind,
-    (i32, i32),
-    Option<crate::simulation::land::TileEdge>,
-)> {
-    let mut plan: Vec<(
-        BuildSiteKind,
-        (i32, i32),
-        Option<crate::simulation::land::TileEdge>,
-    )> = Vec::new();
+) -> Vec<PlannedHouseTile> {
+    let mut plan: Vec<PlannedHouseTile> = Vec::new();
     for dy in -half_h..=half_h {
         for dx in -half_w..=half_w {
             if dx.abs() < half_w && dy.abs() < half_h {
@@ -2385,16 +2485,35 @@ pub(crate) fn walled_house_tile_plan(
             } else {
                 (BuildSiteKind::Wall(wall_material), None)
             };
-            plan.push((kind, tile, edge));
+            plan.push(PlannedHouseTile {
+                kind,
+                tile,
+                door_edge: edge,
+                hearth_role: None,
+            });
         }
     }
     for &(bdx, bdy) in interior_beds {
         let tile = (cx + bdx, cy + bdy);
-        plan.push((BuildSiteKind::Bed, tile, None));
+        plan.push(PlannedHouseTile {
+            kind: BuildSiteKind::Bed,
+            tile,
+            door_edge: None,
+            hearth_role: None,
+        });
     }
     if let Some((hdx, hdy)) = interior_hearth {
         let tile = (cx + hdx, cy + hdy);
-        plan.push((BuildSiteKind::Campfire, tile, None));
+        // Interior dwelling hearths are by definition Domestic — they're
+        // inside a household's roof, not the village plaza. Caller doesn't
+        // need to specify because non-Domestic interior hearths would mean
+        // a different building intent entirely.
+        plan.push(PlannedHouseTile {
+            kind: BuildSiteKind::Campfire,
+            tile,
+            door_edge: None,
+            hearth_role: Some(HearthRole::Domestic),
+        });
     }
     plan
 }
@@ -2408,22 +2527,18 @@ fn plan_reachable_from_home(
     chunk_map: &ChunkMap,
     home: (i32, i32),
     doormat: (i32, i32),
-    plan: &[(
-        BuildSiteKind,
-        (i32, i32),
-        Option<crate::simulation::land::TileEdge>,
-    )],
+    plan: &[PlannedHouseTile],
 ) -> bool {
     let mut walls: AHashSet<(i32, i32)> = AHashSet::new();
     let mut beds: Vec<(i32, i32)> = Vec::new();
     let mut door: Option<(i32, i32)> = None;
-    for (kind, tile, _edge) in plan {
-        match kind {
+    for entry in plan {
+        match entry.kind {
             BuildSiteKind::Wall(_) => {
-                walls.insert(*tile);
+                walls.insert(entry.tile);
             }
-            BuildSiteKind::Bed => beds.push(*tile),
-            BuildSiteKind::Door => door = Some(*tile),
+            BuildSiteKind::Bed => beds.push(entry.tile),
+            BuildSiteKind::Door => door = Some(entry.tile),
             _ => {}
         }
     }
@@ -2517,15 +2632,18 @@ fn plan_building(
 
     if terraform_tiles.is_empty() {
         // Flat ground: spawn wall blueprints immediately.
-        for (kind, tile, edge) in &wall_plan {
-            if bp_map.0.contains_key(tile) {
+        for entry in &wall_plan {
+            if bp_map.0.contains_key(&entry.tile) {
                 continue;
             }
-            let wp = tile_to_world(tile.0 as i32, tile.1 as i32);
-            let mut bp =
-                Blueprint::new(faction_id, None, *kind, *tile, target_z).with_author(author);
-            if let Some(e) = edge {
-                bp = bp.with_door_dir(*e);
+            let wp = tile_to_world(entry.tile.0 as i32, entry.tile.1 as i32);
+            let mut bp = Blueprint::new(faction_id, None, entry.kind, entry.tile, target_z)
+                .with_author(author);
+            if let Some(e) = entry.door_edge {
+                bp = bp.with_door_dir(e);
+            }
+            if let Some(role) = entry.hearth_role {
+                bp = bp.with_hearth_role(role);
             }
             let e = commands
                 .spawn((
@@ -2536,7 +2654,7 @@ fn plan_building(
                     InheritedVisibility::default(),
                 ))
                 .id();
-            bp_map.0.insert(*tile, e);
+            bp_map.0.insert(entry.tile, e);
         }
         return;
     }
@@ -2638,6 +2756,9 @@ struct BuildCandidate {
     /// for civic/zone-area placements that don't have a frontage; the door
     /// then falls back to the cardinal-toward-home rule inside `plan_building`.
     door_dir: Option<crate::simulation::land::TileEdge>,
+    /// Hearth role to stamp on the resulting `Campfire`. `None` for
+    /// non-Campfire intents (or legacy fallback paths).
+    hearth_role: Option<HearthRole>,
 }
 
 #[derive(Clone, Copy)]
@@ -2690,6 +2811,7 @@ fn build_candidate_from_organic(
         tile: intent.tile,
         score: intent.priority,
         door_dir: intent.door_dir,
+        hearth_role: intent.hearth_role,
     }
 }
 
@@ -2964,6 +3086,7 @@ pub fn chief_directive_system(
             best.tile,
             best.door_dir,
             author,
+            best.hearth_role,
         );
     }
 }
@@ -2984,14 +3107,22 @@ fn spawn_intent(
     tile: (i32, i32),
     door_dir: Option<crate::simulation::land::TileEdge>,
     author: Option<BlueprintAuthor>,
+    hearth_role: Option<HearthRole>,
 ) {
     match intent {
         BuildIntent::Single(kind) => {
             let target_z = chunk_map.surface_z_at(tile.0 as i32, tile.1 as i32) as i8;
             let wp = tile_to_world(tile.0 as i32, tile.1 as i32);
+            let mut bp =
+                Blueprint::new(faction_id, None, kind, tile, target_z).with_author(author);
+            if matches!(kind, BuildSiteKind::Campfire) {
+                if let Some(role) = hearth_role {
+                    bp = bp.with_hearth_role(role);
+                }
+            }
             let e = commands
                 .spawn((
-                    Blueprint::new(faction_id, None, kind, tile, target_z).with_author(author),
+                    bp,
                     Transform::from_xyz(wp.x, wp.y, 0.3),
                     GlobalTransform::default(),
                     Visibility::Visible,
@@ -3323,6 +3454,11 @@ fn seed_apply_intent(
     door_dir: Option<crate::simulation::land::TileEdge>,
     seed_techs: &FactionTechs,
     brain: Option<&crate::simulation::organic_settlement::SettlementBrain>,
+    // Role to stamp when `intent == BuildIntent::Single(Campfire)`. Comes
+    // from the originating `ConstructionIntent::hearth_role`. Other intent
+    // kinds ignore this. `Civic` is the safe fallback (matches every
+    // settled-Neolithic+ civic-pressure path).
+    hearth_role: HearthRole,
 ) -> Option<(i32, i32)> {
     match intent {
         BuildIntent::Single(kind) => {
@@ -3347,6 +3483,7 @@ fn seed_apply_intent(
                 faction_id,
                 kind,
                 seed_techs,
+                hearth_role,
             );
             Some(place_tile)
         }
@@ -4940,8 +5077,14 @@ pub fn construction_system(
                     e
                 }
                 BuildSiteKind::Campfire => {
+                    // Manual / chief / autonomous Campfire finalize. Role
+                    // comes from the blueprint (organic civic pressure +
+                    // Longhouse interior set it explicitly); fall back to
+                    // Civic for legacy / manual right-click sites.
+                    let role = bp.hearth_role.unwrap_or(HearthRole::Civic);
                     let campfire = Campfire {
                         tier: best_hearth_for(&build_techs),
+                        role,
                     };
                     let label = campfire.tier.label();
                     let campfire_entity = commands
@@ -4954,7 +5097,9 @@ pub fn construction_system(
                             InheritedVisibility::default(),
                         ))
                         .id();
-                    maps.campfire_map.0.insert(tile, campfire_entity);
+                    maps.campfire_map
+                        .0
+                        .insert(tile, CampfireEntry { entity: campfire_entity, role });
                     campfire_entity
                 }
                 BuildSiteKind::Door => {
@@ -5983,8 +6128,8 @@ pub fn deconstruct_system(
         let mut removed: Option<(Entity, BuildSiteKind, bool /*was_bed*/)> = None;
         if let Some(e) = maps.bed_map.0.remove(&tile) {
             removed = Some((e, BuildSiteKind::Bed, true));
-        } else if let Some(e) = maps.campfire_map.0.remove(&tile) {
-            removed = Some((e, BuildSiteKind::Campfire, false));
+        } else if let Some(entry) = maps.campfire_map.0.remove(&tile) {
+            removed = Some((entry.entity, BuildSiteKind::Campfire, false));
         } else if let Some(entry) = maps.door_map.0.remove(&tile) {
             removed = Some((entry.entity, BuildSiteKind::Door, false));
         } else if let Some(e) = maps.workbench_map.0.remove(&tile) {
@@ -6303,6 +6448,10 @@ fn spawn_seeded_structure_at_tile(
     faction_id: u32,
     kind: BuildSiteKind,
     seed_techs: &FactionTechs,
+    // Role to stamp on a Campfire. Ignored for non-Campfire kinds.
+    // Seed-time `BuildIntent::Single(BuildSiteKind::Campfire)` always
+    // arrives here from organic civic pressure → `Civic`.
+    hearth_role: HearthRole,
 ) {
     used.insert(tile);
     let world_pos = tile_to_world(tile.0, tile.1);
@@ -6380,6 +6529,7 @@ fn spawn_seeded_structure_at_tile(
         BuildSiteKind::Campfire => {
             let campfire = Campfire {
                 tier: best_hearth_for(seed_techs),
+                role: hearth_role,
             };
             let label = campfire.tier.label();
             let e = commands
@@ -6392,7 +6542,13 @@ fn spawn_seeded_structure_at_tile(
                     InheritedVisibility::default(),
                 ))
                 .id();
-            maps.campfire_map.0.insert(tile, e);
+            maps.campfire_map.0.insert(
+                tile,
+                CampfireEntry {
+                    entity: e,
+                    role: hearth_role,
+                },
+            );
         }
         BuildSiteKind::Workbench => {
             let wb = Workbench {
@@ -6710,9 +6866,17 @@ pub fn seed_starting_buildings_system(
                 };
                 used.insert(hearth_tile);
                 let world_pos = tile_to_world(hearth_tile.0, hearth_tile.1);
+                // Paleo/Meso band camp — multi-hearth crescent. Every
+                // hearth is `Camp` so the population-scaled
+                // `ceil(members/6)` pressure formula counts them and the
+                // Neolithic+ civic-pressure formula doesn't.
+                let role = HearthRole::Camp;
                 let e = commands
                     .spawn((
-                        Campfire { tier: hearth_tier },
+                        Campfire {
+                            tier: hearth_tier,
+                            role,
+                        },
                         StructureLabel(hearth_tier.label()),
                         Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
                         GlobalTransform::default(),
@@ -6720,7 +6884,9 @@ pub fn seed_starting_buildings_system(
                         InheritedVisibility::default(),
                     ))
                     .id();
-                maps.campfire_map.0.insert(hearth_tile, e);
+                maps.campfire_map
+                    .0
+                    .insert(hearth_tile, CampfireEntry { entity: e, role });
                 tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
                     tx: hearth_tile.0,
                     ty: hearth_tile.1,
@@ -6813,6 +6979,7 @@ pub fn seed_starting_buildings_system(
                 let candidate = build_candidate_from_organic(&intent);
                 let tile = candidate.tile;
                 let door_dir = candidate.door_dir;
+                let hearth_role = intent.hearth_role.unwrap_or(HearthRole::Civic);
                 let applied_tile = seed_apply_intent(
                     &mut commands,
                     &mut maps,
@@ -6828,6 +6995,7 @@ pub fn seed_starting_buildings_system(
                     door_dir,
                     &seed_techs,
                     Some(brain),
+                    hearth_role,
                 );
                 if applied_tile.is_some() {
                     applied_any = true;
@@ -6979,8 +7147,10 @@ fn seed_walled_house_at(
         return false;
     }
 
-    for (kind, tile, edge) in &plan {
-        let tile = *tile;
+    for entry in &plan {
+        let tile = entry.tile;
+        let kind = &entry.kind;
+        let edge = entry.door_edge;
         let world_pos = tile_to_world(tile.0, tile.1);
         match kind {
             BuildSiteKind::Door => {
@@ -7091,11 +7261,16 @@ fn seed_walled_house_at(
                 maps.bed_map.0.insert(tile, e);
             }
             BuildSiteKind::Campfire => {
-                // Interior dwelling hearth (Longhouse centre tile).
+                // Interior dwelling hearth (Longhouse centre tile). Role
+                // comes from the plan entry; for `walled_house_tile_plan`
+                // this is always `Domestic` (interior is by definition
+                // household). Default-to-Domestic for safety if a future
+                // caller forgets to set it.
+                let role = entry.hearth_role.unwrap_or(HearthRole::Domestic);
                 let tier = SeedConstructionProfile::from_era(current_era(seed_techs)).hearth_tier;
                 let e = commands
                     .spawn((
-                        Campfire { tier },
+                        Campfire { tier, role },
                         StructureLabel(tier.label()),
                         Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
                         GlobalTransform::default(),
@@ -7103,7 +7278,9 @@ fn seed_walled_house_at(
                         InheritedVisibility::default(),
                     ))
                     .id();
-                maps.campfire_map.0.insert(tile, e);
+                maps.campfire_map
+                    .0
+                    .insert(tile, CampfireEntry { entity: e, role });
             }
             _ => {
                 debug_assert!(
@@ -7191,9 +7368,16 @@ pub(crate) fn seed_nomadic_camp(
             };
         used.insert(hearth_tile);
         let world_pos = tile_to_world(hearth_tile.0, hearth_tile.1);
+        // Nomadic camp — every hearth is `Camp`. Survives pack-and-pitch
+        // because role lives on the durable `Campfire` component and
+        // `seed_nomadic_camp` is the single re-pitch path.
+        let role = HearthRole::Camp;
         let e = commands
             .spawn((
-                Campfire { tier: hearth_tier },
+                Campfire {
+                    tier: hearth_tier,
+                    role,
+                },
                 StructureLabel(hearth_tier.label()),
                 Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
                 GlobalTransform::default(),
@@ -7201,7 +7385,9 @@ pub(crate) fn seed_nomadic_camp(
                 InheritedVisibility::default(),
             ))
             .id();
-        maps.campfire_map.0.insert(hearth_tile, e);
+        maps.campfire_map
+            .0
+            .insert(hearth_tile, CampfireEntry { entity: e, role });
         tile_changed.send(crate::world::chunk_streaming::TileChangedEvent {
             tx: hearth_tile.0,
             ty: hearth_tile.1,
@@ -7638,25 +7824,25 @@ mod tests {
         // Exactly one Door cell, on the east side carrying its edge.
         let doors: Vec<_> = plan
             .iter()
-            .filter(|(k, _, _)| matches!(k, BuildSiteKind::Door))
+            .filter(|p| matches!(p.kind, BuildSiteKind::Door))
             .collect();
         assert_eq!(doors.len(), 1);
-        assert_eq!(doors[0].1, (11, 10));
-        assert_eq!(doors[0].2, Some(TileEdge::East));
+        assert_eq!(doors[0].tile, (11, 10));
+        assert_eq!(doors[0].door_edge, Some(TileEdge::East));
         // Exactly 7 walls, none carrying an edge.
         let walls: Vec<_> = plan
             .iter()
-            .filter(|(k, _, _)| matches!(k, BuildSiteKind::Wall(_)))
+            .filter(|p| matches!(p.kind, BuildSiteKind::Wall(_)))
             .collect();
         assert_eq!(walls.len(), 7);
-        assert!(walls.iter().all(|(_, _, e)| e.is_none()));
+        assert!(walls.iter().all(|p| p.door_edge.is_none()));
         // Exactly one bed at the interior.
         let beds: Vec<_> = plan
             .iter()
-            .filter(|(k, _, _)| matches!(k, BuildSiteKind::Bed))
+            .filter(|p| matches!(p.kind, BuildSiteKind::Bed))
             .collect();
         assert_eq!(beds.len(), 1);
-        assert_eq!(beds[0].1, (10, 10));
+        assert_eq!(beds[0].tile, (10, 10));
     }
 
     #[test]
@@ -7676,8 +7862,8 @@ mod tests {
         );
         let mats: Vec<_> = plan
             .iter()
-            .filter_map(|(k, _, _)| match k {
-                BuildSiteKind::Wall(m) => Some(*m),
+            .filter_map(|p| match p.kind {
+                BuildSiteKind::Wall(m) => Some(m),
                 _ => None,
             })
             .collect();
@@ -7705,14 +7891,14 @@ mod tests {
         assert_eq!(plan.len(), 14);
         let door = plan
             .iter()
-            .find(|(k, _, _)| matches!(k, BuildSiteKind::Door))
+            .find(|p| matches!(p.kind, BuildSiteKind::Door))
             .unwrap();
-        assert_eq!(door.1, (2, 0));
+        assert_eq!(door.tile, (2, 0));
         // Bed cells exactly where requested.
         let bed_tiles: Vec<_> = plan
             .iter()
-            .filter_map(|(k, t, _)| match k {
-                BuildSiteKind::Bed => Some(*t),
+            .filter_map(|p| match p.kind {
+                BuildSiteKind::Bed => Some(p.tile),
                 _ => None,
             })
             .collect();

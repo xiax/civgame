@@ -670,7 +670,14 @@ pub fn pitch_structure_at_task_system(
                 ));
             }
             BuildSiteKind::Campfire => {
-                let campfire = Campfire::default();
+                // Nomad re-pitch from a packed bundle. Camp hearths are
+                // always `Camp`-role; the pack-and-pitch cycle preserves
+                // that because the role lives on the durable component.
+                let role = crate::simulation::construction::HearthRole::Camp;
+                let campfire = Campfire {
+                    tier: crate::simulation::construction::HearthTier::Open,
+                    role,
+                };
                 let label = campfire.tier.label();
                 let e = commands
                     .spawn((
@@ -682,7 +689,10 @@ pub fn pitch_structure_at_task_system(
                         InheritedVisibility::default(),
                     ))
                     .id();
-                campfire_map.0.insert(anchor, e);
+                campfire_map.0.insert(
+                    anchor,
+                    crate::simulation::construction::CampfireEntry { entity: e, role },
+                );
             }
             _ => {}
         }

@@ -18340,6 +18340,102 @@ mod onenter_era_seeding {
     }
 
     #[test]
+    fn neolithic_seed_has_exactly_one_civic_hearth_near_home() {
+        use crate::simulation::construction::{CampfireMap, HearthRole};
+
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        trigger_onenter(&mut sim);
+
+        let world = sim.app.world();
+        let pid = world
+            .resource::<crate::simulation::faction::PlayerFaction>()
+            .faction_id;
+        let home = world
+            .resource::<FactionRegistry>()
+            .factions
+            .get(&pid)
+            .expect("player faction exists after OnEnter")
+            .home_tile;
+
+        let campfire_map = world.resource::<CampfireMap>();
+        let civic = campfire_map.count_role_near(home, 40, HearthRole::Civic);
+        assert!(
+            civic == 1,
+            "Neolithic seed should produce exactly one Civic hearth near home (got {civic})",
+        );
+    }
+
+    #[test]
+    fn neolithic_longhouse_interior_hearth_is_domestic() {
+        // Every Longhouse the seed pipeline stamps carries an interior
+        // hearth at its centre, and that hearth must be tagged Domestic
+        // so it doesn't double-count against civic pressure.
+        use crate::simulation::construction::{Campfire, HearthRole};
+
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        trigger_onenter(&mut sim);
+
+        let world = sim.app.world_mut();
+        let mut q = world.query::<&Campfire>();
+        let mut civic = 0;
+        let mut domestic = 0;
+        let mut camp = 0;
+        for c in q.iter(world) {
+            match c.role {
+                HearthRole::Civic => civic += 1,
+                HearthRole::Domestic => domestic += 1,
+                HearthRole::Camp => camp += 1,
+            }
+        }
+        assert!(
+            civic >= 1,
+            "Neolithic seed should produce at least one Civic hearth (got {civic})"
+        );
+        // No `Camp` role at Neolithic — that's the band-camp branch.
+        assert_eq!(
+            camp, 0,
+            "Neolithic seed should not produce any Camp-role hearths"
+        );
+        // Domestic count is allowed to be zero (no Longhouse stamped this
+        // run) but must never be negative; the role enum guarantees that.
+        let _ = domestic;
+    }
+
+    #[test]
+    fn paleolithic_seed_keeps_camp_role_crescent() {
+        // Paleo branch is the dedicated band-camp seeder. Every hearth it
+        // stamps must be `Camp` so the population-scaled `ceil(members/6)`
+        // pressure formula counts them.
+        use crate::simulation::construction::{Campfire, HearthRole};
+
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Paleolithic);
+        trigger_onenter(&mut sim);
+
+        let world = sim.app.world_mut();
+        let mut q = world.query::<&Campfire>();
+        let mut camp = 0;
+        let mut non_camp = 0;
+        for c in q.iter(world) {
+            if matches!(c.role, HearthRole::Camp) {
+                camp += 1;
+            } else {
+                non_camp += 1;
+            }
+        }
+        assert!(
+            camp >= 1,
+            "Paleolithic seed should produce at least one Camp hearth (got {camp})"
+        );
+        assert_eq!(
+            non_camp, 0,
+            "Paleolithic seed should produce only Camp-role hearths (got {non_camp} non-Camp)"
+        );
+    }
+
+    #[test]
     fn neolithic_start_seeds_beds_for_player_population() {
         let mut sim = fixture_with_flat_world();
         configure_start(&mut sim, Era::Neolithic);
@@ -18753,7 +18849,7 @@ mod onenter_era_seeding {
 
     #[test]
     fn neolithic_runtime_no_paleo_beds_or_excess_hearths() {
-        use crate::simulation::construction::{Blueprint, BuildSiteKind};
+        use crate::simulation::construction::{Blueprint, BuildSiteKind, HearthRole};
 
         let mut sim = fixture_with_flat_world();
         configure_start(&mut sim, Era::Neolithic);
@@ -18771,8 +18867,6 @@ mod onenter_era_seeding {
                 .expect("player faction exists after OnEnter");
             (f.member_count, f.home_tile)
         };
-        // ceil(members / NEOLITHIC_BEDS_PER_HEARTH(=8))
-        let desired_hearths = ((members + 7) / 8).max(1) as usize;
         // Scope to the player faction's settlement footprint. The flat
         // test world spawns ~10 factions; counting campfires/beds globally
         // would tally every neighbour's. Same radius convention as
@@ -18781,34 +18875,44 @@ mod onenter_era_seeding {
         let near = |x: i32, y: i32| (x - home.0).abs().max((y - home.1).abs()) <= radius;
 
         let mut saw_outdoor_bed_bp = false;
-        let mut max_existing_hearths = 0usize;
+        let mut worst_civic_count = 0usize;
+        let mut worst_civic_total = 0usize; // civic blueprints + civic entities
         // ~1600 ticks: > derive cadence (900) and ~26 chief-directive
         // windows (every 60), well past steady state for a 20-pop band.
         for _ in 0..1600 {
             sim.tick();
             let world = sim.app.world_mut();
             let mut bed_bp = 0usize;
-            let mut campfire_bp = 0usize;
+            let mut civic_campfire_bp = 0usize;
             for bp in world.query::<&Blueprint>().iter(world) {
                 if !near(bp.tile.0, bp.tile.1) {
                     continue;
                 }
                 match bp.kind {
                     BuildSiteKind::Bed => bed_bp += 1,
-                    BuildSiteKind::Campfire => campfire_bp += 1,
+                    BuildSiteKind::Campfire => {
+                        // Only civic-tagged pending blueprints count
+                        // against the "one outdoor public hearth" rule.
+                        // Untagged manual blueprints default to civic at
+                        // finalize and should be counted here too.
+                        if bp.hearth_role
+                            .map(|r| r == HearthRole::Civic)
+                            .unwrap_or(true)
+                        {
+                            civic_campfire_bp += 1;
+                        }
+                    }
                     _ => {}
                 }
             }
             if bed_bp > 0 {
                 saw_outdoor_bed_bp = true;
             }
-            let campfire_entities = world
+            let civic_built = world
                 .resource::<crate::simulation::construction::CampfireMap>()
-                .0
-                .keys()
-                .filter(|&&(x, y)| near(x, y))
-                .count();
-            max_existing_hearths = max_existing_hearths.max(campfire_entities + campfire_bp);
+                .count_role_near(home, radius, HearthRole::Civic);
+            worst_civic_count = worst_civic_count.max(civic_built);
+            worst_civic_total = worst_civic_total.max(civic_built + civic_campfire_bp);
         }
 
         assert!(
@@ -18817,14 +18921,20 @@ mod onenter_era_seeding {
              (paleo crescent branch fired — Fix 2 regression). Beds at \
              Neolithic must come from Hut/Longhouse footprints only."
         );
-        // Bootstrap follow-up: the old "≤ ceil(members/8) hearths"
-        // invariant is gone. Seed mode caps the *civic* hearth at 1, but
-        // every Longhouse now carries an interior hearth as part of its
-        // dwelling template, so total CampfireMap entries scale with the
-        // number of seeded Longhouses. We still surface the value for
-        // diagnostic logs but don't fail on it.
-        let _ = max_existing_hearths;
-        let _ = desired_hearths;
+        // Role-aware invariant: at most one civic outdoor hearth near
+        // home (built or pending). Longhouse interior `Domestic` hearths
+        // are explicitly excluded from this count, so they may scale
+        // freely with the number of seeded Longhouses.
+        assert!(
+            worst_civic_count <= 1,
+            "Neolithic faction accumulated {} Civic hearth entities near home; expected ≤1",
+            worst_civic_count,
+        );
+        assert!(
+            worst_civic_total <= 1,
+            "Neolithic faction accumulated {} Civic hearths (built + pending) near home; expected ≤1",
+            worst_civic_total,
+        );
 
         assert_perm_settlement_adopted(&sim, "Neolithic runtime (t≈1600)");
     }

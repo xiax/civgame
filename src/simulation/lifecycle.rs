@@ -375,9 +375,9 @@ fn despawn_camp_structures_at(world: &mut World, tile: (i32, i32)) {
         .filter(|t| cheb(*t, tile) <= OLD_CAMP_RADIUS)
         .collect();
     for t in fire_tiles {
-        if let Some(e) = campfire_map.0.remove(&t) {
-            commands.entity(e).despawn_recursive();
-            despawned.insert(e);
+        if let Some(entry) = campfire_map.0.remove(&t) {
+            commands.entity(entry.entity).despawn_recursive();
+            despawned.insert(entry.entity);
         }
     }
     for (e, tr) in tent_q.iter() {
