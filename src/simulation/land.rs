@@ -739,6 +739,8 @@ pub fn carve_plots_system(
     globe: Res<Globe>,
     mut plot_index: ResMut<PlotIndex>,
     mut field_tiles: ResMut<crate::simulation::farm::FieldTileIndex>,
+    mut plant_map: ResMut<crate::simulation::plants::PlantMap>,
+    mut plant_sprite_index: ResMut<crate::simulation::plants::PlantSpriteIndex>,
     plot_q: Query<&Plot>,
     mut tile_changed: EventWriter<TileChangedEvent>,
 ) {
@@ -890,7 +892,24 @@ pub fn carve_plots_system(
                     if !is_ag {
                         continue;
                     }
-                    plot_index.ag_tiles.insert((tx, ty));
+                    let newly_ag = plot_index.ag_tiles.insert((tx, ty));
+                    // One-time cleanup: when a tile genuinely transitions into
+                    // Agricultural ownership, despawn any pre-existing wild
+                    // plant on it. Yields are skipped — the field is being
+                    // prepared, not harvested. Wild-spawn paths consult
+                    // `ag_tiles` directly to prevent new wild plants from
+                    // landing here going forward.
+                    if newly_ag {
+                        if let Some(&plant_entity) = plant_map.0.get(&(tx, ty)) {
+                            crate::simulation::plants::despawn_plant_internals(
+                                &mut commands,
+                                plant_entity,
+                                (tx, ty),
+                                &mut plant_map,
+                                &mut plant_sprite_index,
+                            );
+                        }
+                    }
                     // Seasonal-farming jellyfish: the carve pass NO LONGER
                     // stamps Cropland. Founders pay for tilling in Spring 1
                     // via `prepare_field_task_system`. Tile role is preserved

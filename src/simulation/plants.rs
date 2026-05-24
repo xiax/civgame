@@ -142,6 +142,29 @@ impl PlantKind {
         self.seed_resource().is_some()
     }
 
+    /// Seasons during which this kind can be deliberately sown. Drives the
+    /// farm planting dispatcher's seasonality guard — clearing a crop in
+    /// Autumn and sowing it again the same day is wrong for an annual sown
+    /// in Spring. Future "winter wheat"-style kinds just declare a different
+    /// window here. BerryBush / Tree are not yet sown by autonomous farm
+    /// postings, but their sowing windows are populated for the planting
+    /// dispatcher's `Task::PlayPlant`-fed path and future husbandry.
+    pub fn sowing_seasons(self) -> &'static [Season] {
+        match self {
+            PlantKind::Grain => &[Season::Spring],
+            PlantKind::BerryBush => &[Season::Spring, Season::Autumn],
+            PlantKind::Tree => &[Season::Spring, Season::Autumn],
+        }
+    }
+
+    /// `true` when this kind is sowable during `season`. Defensive guard for
+    /// both autonomous (private/household) farming and chief-posted farming —
+    /// the chief shouldn't post out-of-season `Plant` jobs, but the gate
+    /// catches that case if it ever happens.
+    pub fn is_sowable_in(self, season: Season) -> bool {
+        self.sowing_seasons().contains(&season)
+    }
+
     /// Ticks the agent must spend Working before a harvest triggers.
     /// Plants are harvested instantly (0); this mirrors how tile-based gathering uses work_ticks.
     pub fn harvest_work_ticks(self) -> u8 {
@@ -423,6 +446,7 @@ mod tests {
         app.insert_resource(PlantSpriteIndex::default());
         app.insert_resource(ChunkMap::default());
         app.insert_resource(crate::simulation::seed_reservation::SeedReservation::default());
+        app.insert_resource(crate::simulation::land::PlotIndex::default());
         app.add_systems(Update, plant_lifecycle_system);
         app
     }
@@ -810,17 +834,21 @@ pub fn spawn_plant_at(
 }
 
 /// Tile predicate for where a scattered seed may land. Rejects tiles the
-/// bootstrap pipeline reserved (footprints, doormats, planned roads,
-/// ag plots) so a streaming-time plant can't land on a planned-but-uncarved
-/// road or on a doormat that hasn't yet flipped to `Road`.
+/// bootstrap pipeline reserved (footprints, doormats, planned roads) and
+/// tiles inside any Agricultural plot (wild scatter has no business sprouting
+/// in a worked field).
 fn seed_target_tile_ok(
     chunk_map: &ChunkMap,
     reservation: &crate::simulation::seed_reservation::SeedReservation,
+    plot_index: &crate::simulation::land::PlotIndex,
     x: i32,
     y: i32,
 ) -> bool {
     use crate::world::tile::TileKind as TK;
     if reservation.is_reserved((x, y)) {
+        return false;
+    }
+    if plot_index.ag_tiles.contains(&(x, y)) {
         return false;
     }
     match chunk_map.tile_kind_at(x, y) {
@@ -839,6 +867,7 @@ fn try_scatter_seed(
     plant_sprite_index: &mut PlantSpriteIndex,
     chunk_map: &ChunkMap,
     reservation: &crate::simulation::seed_reservation::SeedReservation,
+    plot_index: &crate::simulation::land::PlotIndex,
     parent_tile: (i32, i32),
     parent_kind: PlantKind,
     chance: f32,
@@ -853,7 +882,7 @@ fn try_scatter_seed(
         return;
     }
     let (nx, ny) = (parent_tile.0 + dx, parent_tile.1 + dy);
-    if !seed_target_tile_ok(chunk_map, reservation, nx, ny) {
+    if !seed_target_tile_ok(chunk_map, reservation, plot_index, nx, ny) {
         return;
     }
     spawn_plant_at(
@@ -883,6 +912,7 @@ pub fn plant_lifecycle_system(
     calendar: Res<Calendar>,
     chunk_map: Res<ChunkMap>,
     reservation: Res<crate::simulation::seed_reservation::SeedReservation>,
+    plot_index: Res<crate::simulation::land::PlotIndex>,
     mut last_season: Local<Option<Season>>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
@@ -966,6 +996,7 @@ pub fn plant_lifecycle_system(
             &mut plant_sprite_index,
             &chunk_map,
             &reservation,
+            &plot_index,
             parent_tile,
             kind,
             chance,
@@ -982,6 +1013,7 @@ pub fn plant_lifecycle_system(
                 &mut plant_sprite_index,
                 &chunk_map,
                 &reservation,
+                &plot_index,
                 tile,
                 PlantKind::Grain,
                 0.20,

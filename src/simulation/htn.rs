@@ -6872,6 +6872,7 @@ pub struct FarmScopeParams<'w, 's> {
     pub board: Res<'w, crate::simulation::jobs::JobBoard>,
     pub plot_index: Res<'w, crate::simulation::land::PlotIndex>,
     pub plot_q: Query<'w, 's, &'static crate::simulation::land::Plot>,
+    pub calendar: Res<'w, Calendar>,
 }
 
 /// Bundle the two plant resources every planting dispatcher consults
@@ -7292,6 +7293,17 @@ pub fn htn_plant_from_storage_dispatch_system(
         let Some((seed_id, storage_tile, best_tile_stock, source_fid)) = resolved else {
             continue;
         };
+
+        // Per-seed sowing-window gate: don't sow a crop outside its growing
+        // cycle. Annual grain is Spring-only; future winter-sown kinds just
+        // declare an Autumn window. Applied regardless of claim status — if a
+        // chief somehow posts an out-of-season Plant job, the dispatcher
+        // refuses defensively and yields to the harvest dispatcher.
+        if let Some(plant_kind) = PlantKind::from_seed_resource(seed_id) {
+            if !plant_kind.is_sowable_in(farm_plot_params.calendar.season) {
+                continue;
+            }
+        }
 
         // Seasonal-farming jellyfish: planting is gated on **prepared**
         // Cropland AND `FieldTileIndex[tile].nutrients >=

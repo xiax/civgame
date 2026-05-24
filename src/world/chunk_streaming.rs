@@ -110,13 +110,15 @@ pub struct StreamFocusParams<'w> {
 
 /// Bundle of plant-spawn state for `chunk_streaming_system`. Holds the live
 /// `PlantMap`/`PlantSpriteIndex` mutably plus the read-only `SeedReservation`
-/// so the per-chunk plant seeder can skip tiles reserved by the bootstrap
-/// pipeline.
+/// + `PlotIndex` so the per-chunk plant seeder can skip tiles reserved by the
+/// bootstrap pipeline (structures/roads/doormats) and tiles inside any
+/// Agricultural plot.
 #[derive(SystemParam)]
 pub struct StreamPlantParams<'w> {
     pub plant_map: ResMut<'w, PlantMap>,
     pub plant_sprite_index: ResMut<'w, PlantSpriteIndex>,
     pub seed_reservation: Res<'w, crate::simulation::seed_reservation::SeedReservation>,
+    pub plot_index: Res<'w, crate::simulation::land::PlotIndex>,
 }
 
 #[derive(SystemParam)]
@@ -772,9 +774,10 @@ pub fn resolve_render_tile(
 }
 
 /// Deterministically seed initial plants for a chunk. Skips any tile the
-/// bootstrap pipeline reserved (footprint, doormat, planned road, ag plot)
-/// — without this gate, a chunk streaming in after warmup would scatter
-/// wild grain/berries onto seeded house roofs or planned roads.
+/// bootstrap pipeline reserved (footprint, doormat, planned road) and any
+/// tile inside an Agricultural plot — without these gates, a chunk streaming
+/// in after warmup would scatter wild grain/berries onto seeded house roofs,
+/// planned roads, or active farm fields.
 pub fn spawn_chunk_plants(
     commands: &mut Commands,
     plant_map: &mut PlantMap,
@@ -783,6 +786,7 @@ pub fn spawn_chunk_plants(
     gen: &WorldGen,
     globe: &Globe,
     reservation: &crate::simulation::seed_reservation::SeedReservation,
+    plot_index: &crate::simulation::land::PlotIndex,
     coord: ChunkCoord,
 ) {
     let Some(chunk) = chunk_map.0.get(&coord) else {
@@ -794,6 +798,9 @@ pub fn spawn_chunk_plants(
             let global_tx = coord.0 * CHUNK_SIZE as i32 + tx as i32;
             let global_ty = coord.1 * CHUNK_SIZE as i32 + ty as i32;
             if reservation.is_reserved((global_tx, global_ty)) {
+                continue;
+            }
+            if plot_index.ag_tiles.contains(&(global_tx, global_ty)) {
                 continue;
             }
             let surf_z = chunk.surface_z[ty][tx] as i32;
@@ -1097,6 +1104,7 @@ pub fn chunk_streaming_system(
             &gen,
             &globe,
             &plant_params.seed_reservation,
+            &plant_params.plot_index,
             coord,
         );
 

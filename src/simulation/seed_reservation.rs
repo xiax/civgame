@@ -8,14 +8,21 @@
 //! `react_obstacle_under_structure_system`.
 //!
 //! `SeedReservation` is the persistent, additive truth-set of every tile the
-//! bootstrap pipeline has touched (footprint, doormat, road target, farm,
-//! yard). Three consumers:
+//! bootstrap pipeline has stamped as "must remain clear of obstacles" —
+//! structures, blueprints, doormats, planned/queued road tiles. Three
+//! consumers:
 //!
 //! - `plants::seed_target_tile_ok` — wild-seed scatter rejects reserved tiles.
 //! - `world::chunk_streaming::spawn_chunk_plants` — terrain-driven plant
 //!   spawn skips reserved tiles.
 //! - `clear_obstacle::react_obstacle_under_structure_system` — late-streamed
 //!   obstacles on reserved tiles are despawned/relocated synchronously.
+//!
+//! Wild-plant exclusion on agricultural plot tiles is **not** routed through
+//! `SeedReservation`. Field tiles legitimately host cultivated plants that
+//! workers sow there, so they must not be treated as obstacles. The wild-spawn
+//! paths consult `PlotIndex.ag_tiles` directly instead; the carve-time cleanup
+//! in `land::carve_plots_system` handles pre-existing wild plants.
 //!
 //! Entries are never removed during a game session — settlements decay and
 //! restamp differently, but the bootstrap "this tile is part of a stamped
@@ -26,7 +33,6 @@ use bevy::prelude::*;
 
 use crate::simulation::construction::{RoadCarveQueue, StructureIndex};
 use crate::simulation::doormat::DoormatReservations;
-use crate::simulation::land::PlotIndex;
 use crate::simulation::organic_settlement::SettlementBrains;
 
 #[derive(Resource, Default)]
@@ -105,19 +111,21 @@ pub fn rasterize_line_into(reservation: &mut SeedReservation, from: (i32, i32), 
 /// 4. `SettlementBrains::road_tiles` — the planned-road tile set per
 ///    settlement (kept current by the runtime survey and `kickoff_initial_
 ///    survey_system`).
-/// 5. `PlotIndex::ag_tiles` — every Agricultural plot tile. Plants on these
-///    tiles are tilled crops, not wild scatter; this guard backstops
-///    `tile_is_farm_protected` for any future wild-scatter path that doesn't
-///    consult `PlotIndex`.
+///
+/// Agricultural plot tiles are intentionally NOT folded in here — wild-plant
+/// exclusion on fields lives on `PlotIndex.ag_tiles` directly (see
+/// `plants::seed_target_tile_ok` / `chunk_streaming::spawn_chunk_plants`), and
+/// `land::carve_plots_system` handles pre-existing wild plants at carve time.
+/// Reserving field tiles here would cause `react_obstacle_under_structure_system`
+/// to despawn cultivated seedlings the moment a worker plants them.
 ///
 /// Runs after `clear_obstacles_under_seeded_structures` and
-/// `seed_starting_farms_system` so all five inputs are populated.
+/// `seed_starting_farms_system` so all four inputs are populated.
 pub fn populate_seed_reservation_system(
     structure_index: Res<StructureIndex>,
     doormat: Res<DoormatReservations>,
     road_queue: Res<RoadCarveQueue>,
     brains: Res<SettlementBrains>,
-    plot_index: Res<PlotIndex>,
     mut reservation: ResMut<SeedReservation>,
 ) {
     reservation.reserve_iter(structure_index.0.keys().copied());
@@ -128,7 +136,6 @@ pub fn populate_seed_reservation_system(
     for &(_faction_id, from, to) in road_queue.0.iter() {
         rasterize_line_into(&mut reservation, from, to);
     }
-    reservation.reserve_iter(plot_index.ag_tiles.iter().copied());
 }
 
 #[cfg(test)]

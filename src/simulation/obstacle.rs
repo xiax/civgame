@@ -126,19 +126,29 @@ pub fn relocate_entity_aside(
     }
 }
 
-/// Yields produced when a `WorkerClear` obstacle is cleared. Plants drop
-/// their normal harvest yield (no-tool variant); future obstacle kinds
-/// add arms here. Empty Vec means "no loot".
+/// Yields produced when a `WorkerClear` obstacle is cleared. Stage-aware for
+/// plants: only `Mature` / `Overripe` plants drop their harvest. Seed /
+/// Seedling / Harvested plants are torn out for nothing — clearing an
+/// immature crop must not mint mature grain. Future obstacle kinds add arms
+/// here. Empty Vec means "no loot".
 pub fn resolve_clear_yields(entity: Entity, plants: &Query<&Plant>) -> Vec<(ResourceId, u32)> {
+    use crate::simulation::plants::GrowthStage;
     let mut out = Vec::new();
     if let Ok(plant) = plants.get(entity) {
-        let (id, qty) = plant.kind.harvest_yield(false);
-        if qty > 0 {
-            out.push((id, qty));
-        }
-        for (extra_id, extra_qty) in plant.kind.harvest_extra_yields() {
-            if extra_qty > 0 {
-                out.push((extra_id, extra_qty));
+        match plant.stage {
+            GrowthStage::Seed | GrowthStage::Seedling | GrowthStage::Harvested => {
+                return out;
+            }
+            GrowthStage::Mature | GrowthStage::Overripe => {
+                let (id, qty) = plant.kind.harvest_yield(false);
+                if qty > 0 {
+                    out.push((id, qty));
+                }
+                for (extra_id, extra_qty) in plant.kind.harvest_extra_yields() {
+                    if extra_qty > 0 {
+                        out.push((extra_id, extra_qty));
+                    }
+                }
             }
         }
     }
