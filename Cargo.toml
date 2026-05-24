@@ -30,3 +30,4 @@ ahash = "0.8"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 ron = "0.8"
+lightyear = { version = "0.19", default-features = false }

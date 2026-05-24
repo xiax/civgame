@@ -17,7 +17,7 @@ use bevy_egui::{egui, EguiContexts};
 use crate::economy::resource_catalog::ResourceId;
 use crate::rendering::entity_sprites::{vehicle_sprite_plan, VehicleSpritePlan};
 use crate::simulation::faction::{FactionRegistry, FactionTechs, PlayerFaction};
-use crate::simulation::player_command::{PlayerCommand, PlayerCommandEvent};
+use crate::simulation::player_command::{CommandSender, PlayerCommand};
 use crate::simulation::vehicle::{
     cell_durability, collect_design_tech_gates, derive_stats, design_bill,
     design_is_siege_capable, validate_grid, DesignError, MaterialProfile,
@@ -312,7 +312,7 @@ pub fn vehicle_designer_system(
     registry: Res<VehicleDesignRegistry>,
     player_faction: Res<PlayerFaction>,
     factions: Res<FactionRegistry>,
-    mut cmd_events: EventWriter<PlayerCommandEvent>,
+    mut sender: CommandSender,
     // Threaded into `PlayerCommand::DebugSpawnTestVehicle.spawn_near` so
     // the dispatcher spawns the test vehicle on open ground in front of
     // the player rather than inside the (always-crowded) home tile.
@@ -404,15 +404,16 @@ pub fn vehicle_designer_system(
                     resp
                 };
                 if resp.clicked() {
-                    cmd_events.send(PlayerCommandEvent {
-                        actors: Vec::new(),
-                        command: PlayerCommand::QueueCustomVehicle {
+                    sender.send(
+                        Vec::new(),
+                        PlayerCommand::QueueCustomVehicle {
                             name: state.name.trim().to_string(),
                             grid: state.grid.clone(),
                             purpose: state.purpose,
                             required_animals: state.required_animals,
+                            faction_id: player_faction.faction_id,
                         },
-                    });
+                    );
                 }
                 if ui.button("Clear grid").clicked() {
                     state.grid.cells.clear();
@@ -481,16 +482,17 @@ pub fn vehicle_designer_system(
                                 )
                             })
                             .unwrap_or((0, 0));
-                        cmd_events.send(PlayerCommandEvent {
-                            actors: Vec::new(),
-                            command: PlayerCommand::DebugSpawnTestVehicle {
+                        sender.send(
+                            Vec::new(),
+                            PlayerCommand::DebugSpawnTestVehicle {
                                 name: state.name.trim().to_string(),
                                 grid: state.grid.clone(),
                                 purpose: state.purpose,
                                 required_animals: state.required_animals,
                                 spawn_near,
+                                faction_id: player_faction.faction_id,
                             },
-                        });
+                        );
                     }
                 }
             });

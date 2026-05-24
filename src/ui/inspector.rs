@@ -1600,7 +1600,7 @@ pub fn inspector_action_system(
     mut commands: Commands,
     spatial: Res<SpatialIndex>,
     mut pending: ResMut<PendingInspectorAction>,
-    mut cmd_events: EventWriter<crate::simulation::player_command::PlayerCommandEvent>,
+    mut sender: crate::simulation::player_command::CommandSender,
     mut worker_q: Query<(&Transform, &mut EconomicAgent, &mut Carrier, &mut Equipment)>,
     mut ground_items: Query<&mut GroundItem>,
 ) {
@@ -1761,33 +1761,30 @@ pub fn inspector_action_system(
             }
         }
         InspectorActionKind::HoldLecture { lecturer, tech } => {
-            cmd_events.send(crate::simulation::player_command::PlayerCommandEvent {
-                actors: vec![lecturer],
-                command: crate::simulation::player_command::PlayerCommand::HoldLecture { tech },
-            });
+            sender.send(
+                vec![lecturer],
+                crate::simulation::player_command::PlayerCommand::HoldLecture { tech },
+            );
         }
         InspectorActionKind::ReadItem { reader, tech } => {
-            cmd_events.send(crate::simulation::player_command::PlayerCommandEvent {
-                actors: vec![reader],
-                command: crate::simulation::player_command::PlayerCommand::ReadItem { tech },
-            });
+            sender.send(
+                vec![reader],
+                crate::simulation::player_command::PlayerCommand::ReadItem { tech },
+            );
         }
         InspectorActionKind::EncodeTablet { tech } => {
-            // EncodeTablet is faction-level. The actor's identity doesn't
-            // matter for the dispatch (writes a PlayerCraftRequest); we use
-            // the chief or any player-faction member from the spatial index.
-            // For simplicity emit with no actors when none is known — the
-            // dispatcher needs at least one to fire, so we'll attach the
-            // first available player-faction entity in a small radius.
+            // EncodeTablet is faction-level — `CommandSender` fills in
+            // the sender's faction id from `PlayerFaction`, and the
+            // payload carries it forward to the drain.
             let _ = spatial;
-            // The InspectorActionKind doesn't carry the actor — fall back to
-            // a placeholder. The dispatch path will handle the resource
-            // write whichever way; if no actor matches we fire a one-shot
-            // direct write so the contract still posts.
-            cmd_events.send(crate::simulation::player_command::PlayerCommandEvent {
-                actors: vec![],
-                command: crate::simulation::player_command::PlayerCommand::EncodeTablet { tech },
-            });
+            let fid = sender.player_faction.faction_id;
+            sender.send(
+                vec![],
+                crate::simulation::player_command::PlayerCommand::EncodeTablet {
+                    tech,
+                    faction_id: fid,
+                },
+            );
         }
     }
 }

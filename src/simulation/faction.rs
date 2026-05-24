@@ -2818,6 +2818,42 @@ pub struct PlayerFaction {
     pub faction_id: u32,
 }
 
+/// Set of faction ids this process is authorized to issue commands for.
+///
+/// In `Local` / `ListenServer` mode the server seeds this with the local
+/// player's faction; in `DedicatedServer` mode the server populates it
+/// per-connection. The command drain rejects any `PlayerCommand` whose
+/// `faction_id` falls outside this set (faction-level variants) or whose
+/// actors belong to a non-controlled faction (per-actor variants).
+///
+/// Empty set = no command can be issued (e.g. unattached spectator).
+#[derive(Resource, Default, Debug, Clone)]
+pub struct ControlledFactions {
+    pub ids: Vec<u32>,
+}
+
+impl ControlledFactions {
+    pub fn single(faction_id: u32) -> Self {
+        Self {
+            ids: vec![faction_id],
+        }
+    }
+
+    pub fn contains(&self, faction_id: u32) -> bool {
+        self.ids.iter().any(|&id| id == faction_id)
+    }
+
+    pub fn add(&mut self, faction_id: u32) {
+        if !self.contains(faction_id) {
+            self.ids.push(faction_id);
+        }
+    }
+
+    pub fn remove(&mut self, faction_id: u32) {
+        self.ids.retain(|&id| id != faction_id);
+    }
+}
+
 impl FactionRegistry {
     pub fn create_faction(&mut self, home_tile: (i32, i32)) -> u32 {
         self.next_id += 1;

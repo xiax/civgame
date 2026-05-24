@@ -2,6 +2,8 @@ use bevy::prelude::*;
 
 mod economy;
 mod game_state;
+mod net;
+mod net_id;
 mod pathfinding;
 mod rendering;
 mod sandbox;
@@ -38,6 +40,8 @@ fn main() {
     .insert_resource(GameStartOptions::default())
     .insert_resource(simulation::region::SettledRegions::default())
     .insert_resource(simulation::region::SimulationFocus::default())
+    .add_plugins(net_id::NetIdPlugin)
+    .add_plugins(net::NetPlugin)
     .add_plugins(world::WorldPlugin)
     .add_plugins(simulation::SimulationPlugin)
     .add_plugins(economy::EconomyPlugin)

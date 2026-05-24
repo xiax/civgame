@@ -10,7 +10,7 @@ use crate::simulation::construction::AutonomousBuildingToggle;
 use crate::simulation::faction::HuntOrder;
 use crate::simulation::faction::{FactionMember, FactionRegistry, PlayerFaction};
 use crate::simulation::person::{Drafted, Person, Profession};
-use crate::simulation::player_command::{PlayerCommand, PlayerCommandEvent};
+use crate::simulation::player_command::{CommandSender, PlayerCommand};
 use crate::simulation::schedule::SimClock;
 use crate::simulation::speed::{GameSpeed, SpeedPreset};
 use crate::simulation::technology::HUNTING_SPEAR;
@@ -53,7 +53,7 @@ pub fn hud_system(
     drafted_q: Query<(), With<Drafted>>,
     persons: Query<(), With<Person>>,
     professions: Query<(Entity, &Profession, &FactionMember), With<Person>>,
-    mut cmd_events: EventWriter<PlayerCommandEvent>,
+    mut sender: CommandSender,
 ) {
     let clock = &mut *res.clock;
     let speed = &mut *res.speed;
@@ -212,10 +212,7 @@ pub fn hud_system(
                         let muster_resp =
                             ui.add_enabled(hunting_unlocked && current_hunters > 0, muster_btn);
                         if muster_resp.clicked() {
-                            cmd_events.send(PlayerCommandEvent {
-                                actors: player_hunters.clone(),
-                                command: PlayerCommand::Muster,
-                            });
+                            sender.send(player_hunters.clone(), PlayerCommand::Muster);
                         }
 
                         // Pack Camp / Pitch Camp button — shown only for
@@ -245,10 +242,7 @@ pub fn hud_system(
                                 let resp = ui.add_enabled(enabled, camp_btn);
                                 if resp.clicked() {
                                     if let Some(c) = chief {
-                                        cmd_events.send(PlayerCommandEvent {
-                                            actors: vec![c],
-                                            command: PlayerCommand::PackCamp,
-                                        });
+                                        sender.send(vec![c], PlayerCommand::PackCamp);
                                     }
                                 }
                                 // Player-locked migration: Hold/Forage
@@ -279,12 +273,10 @@ pub fn hud_system(
                                     let auto_resp = ui.add_enabled(chief.is_some(), auto_btn);
                                     if auto_resp.clicked() {
                                         if let Some(c) = chief {
-                                            cmd_events.send(PlayerCommandEvent {
-                                                actors: vec![c],
-                                                command: PlayerCommand::SetPackedAutonomy {
-                                                    mode: next,
-                                                },
-                                            });
+                                            sender.send(
+                                                vec![c],
+                                                PlayerCommand::SetPackedAutonomy { mode: next },
+                                            );
                                         }
                                     }
                                 }
@@ -429,7 +421,7 @@ pub fn apply_draft_toggle_system(
     player_faction: Res<PlayerFaction>,
     drafted_q: Query<(), With<Drafted>>,
     faction_q: Query<&FactionMember>,
-    mut cmd_events: EventWriter<PlayerCommandEvent>,
+    mut sender: CommandSender,
 ) {
     let mut requested = req.0;
     req.0 = false;
@@ -463,8 +455,5 @@ pub fn apply_draft_toggle_system(
     } else {
         PlayerCommand::Disband
     };
-    cmd_events.send(PlayerCommandEvent {
-        actors: player_only,
-        command,
-    });
+    sender.send(player_only, command);
 }

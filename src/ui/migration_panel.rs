@@ -21,7 +21,7 @@ use crate::simulation::faction::{
     CampState, FactionRegistry, MigrationIntent, MigrationPhase, PackedMigrationAutonomy,
     PlayerFaction,
 };
-use crate::simulation::player_command::{PlayerCommand, PlayerCommandEvent};
+use crate::simulation::player_command::{CommandSender, PlayerCommand};
 
 /// Toggled by the HUD's "Plan Migration" button.
 #[derive(Resource, Default)]
@@ -32,7 +32,7 @@ pub fn migration_panel_system(
     mut open: ResMut<MigrationPanelOpen>,
     registry: Res<FactionRegistry>,
     player_faction: Res<PlayerFaction>,
-    mut cmd_events: EventWriter<PlayerCommandEvent>,
+    mut sender: CommandSender,
 ) {
     if !open.0 {
         return;
@@ -113,10 +113,10 @@ pub fn migration_panel_system(
                         }
                         if ui.add(btn).clicked() {
                             if let Some(c) = chief {
-                                cmd_events.send(PlayerCommandEvent {
-                                    actors: vec![c],
-                                    command: PlayerCommand::SetPackedAutonomy { mode },
-                                });
+                                sender.send(
+                                    vec![c],
+                                    PlayerCommand::SetPackedAutonomy { mode },
+                                );
                             }
                         }
                     }
@@ -145,10 +145,10 @@ pub fn migration_panel_system(
                 }
                 if ui.add(btn).clicked() {
                     if let Some(c) = chief {
-                        cmd_events.send(PlayerCommandEvent {
-                            actors: vec![c],
-                            command: PlayerCommand::SetMigrationIntent { intent },
-                        });
+                        sender.send(
+                            vec![c],
+                            PlayerCommand::SetMigrationIntent { intent },
+                        );
                     }
                 }
             }
@@ -170,13 +170,13 @@ pub fn migration_panel_system(
                 ] {
                     if ui.button(label).clicked() {
                         if let Some(c) = chief {
-                            cmd_events.send(PlayerCommandEvent {
-                                actors: vec![c],
-                                command: PlayerCommand::SendScout {
+                            sender.send(
+                                vec![c],
+                                PlayerCommand::SendScout {
                                     direction: dir,
                                     range: 60,
                                 },
-                            });
+                            );
                         }
                     }
                 }
@@ -190,13 +190,13 @@ pub fn migration_panel_system(
                 ] {
                     if ui.button(label).clicked() {
                         if let Some(c) = chief {
-                            cmd_events.send(PlayerCommandEvent {
-                                actors: vec![c],
-                                command: PlayerCommand::SendScout {
+                            sender.send(
+                                vec![c],
+                                PlayerCommand::SendScout {
                                     direction: dir,
                                     range: 60,
                                 },
-                            });
+                            );
                         }
                     }
                 }

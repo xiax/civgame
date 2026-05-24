@@ -12,6 +12,7 @@
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
+use crate::net_id::{NetId, NetIdMap};
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
@@ -77,22 +78,22 @@ pub enum PlayerCommand {
         z: i8,
     },
     PickUpItem {
-        item: Entity,
+        item: NetId,
         tile: (i32, i32),
         z: i8,
     },
     PickUpCorpse {
-        corpse: Entity,
+        corpse: NetId,
         tile: (i32, i32),
         z: i8,
     },
     AttackEntity {
-        foe: Entity,
+        foe: NetId,
         tile: (i32, i32),
         z: i8,
     },
     Teach {
-        student: Entity,
+        student: NetId,
         tile: (i32, i32),
         z: i8,
     },
@@ -104,6 +105,11 @@ pub enum PlayerCommand {
     },
     EncodeTablet {
         tech: TechId,
+        /// Faction whose chief should encode the tablet. Faction-level
+        /// variants carry their own faction_id so the drain can validate
+        /// against `ControlledFactions` without consulting `PlayerFaction`
+        /// (which is local UI focus, not authority).
+        faction_id: u32,
     },
     /// Promote `actors` to military mode (`Drafted`). UI enumerates which
     /// agents to draft (e.g. all player-faction Hunters for the HUD button,
@@ -117,7 +123,7 @@ pub enum PlayerCommand {
         z: i8,
     },
     MilitaryAttack {
-        foe: Entity,
+        foe: NetId,
         tile: (i32, i32),
         z: i8,
     },
@@ -160,21 +166,23 @@ pub enum PlayerCommand {
         mode: crate::simulation::faction::PackedMigrationAutonomy,
     },
     /// Faction-level: queue a vehicle of the given design for assembly at
-    /// the player faction's `VehicleYard`. Applied directly in
+    /// the faction's `VehicleYard`. Applied directly in
     /// `drain_player_command_events_system` (empty `actors`) — the
     /// `vehicle_assembly_system` drains the queue.
     QueueVehicle {
         design_id: u32,
+        faction_id: u32,
     },
     /// Faction-level: register a freeform design built in the vehicle
     /// designer, then queue it for assembly. `drain_player_command_events_system`
     /// inserts the design into `VehicleDesignRegistry` (assigning a fresh id)
-    /// and pushes it onto `VehicleAssemblyQueue` for the player faction.
+    /// and pushes it onto `VehicleAssemblyQueue` for the named faction.
     QueueCustomVehicle {
         name: String,
         grid: crate::simulation::vehicle::VehicleGrid,
         purpose: crate::simulation::vehicle::VehiclePurpose,
         required_animals: u8,
+        faction_id: u32,
     },
     /// Faction-level: a player right-click order targeting one spawned
     /// `Vehicle` entity (move / load / unload / right / crew / hitch /
@@ -182,8 +190,9 @@ pub enum PlayerCommand {
     /// `PendingVehicleOps`; `vehicle_player_command_system` applies it.
     /// Empty `actors` — the vehicle, not a worker, is the subject.
     VehicleOrder {
-        vehicle: Entity,
+        vehicle: NetId,
         kind: crate::simulation::vehicle::VehicleOrderKind,
+        faction_id: u32,
     },
     /// Stand on a tile and hold; extends vision to
     /// `LOOKOUT_VIEW_RADIUS` via `ActiveLookout`. Manual / indefinite —
@@ -214,6 +223,7 @@ pub enum PlayerCommand {
         /// the dispatcher because the system is already at Bevy's
         /// 16-param ceiling.
         spawn_near: (i32, i32),
+        faction_id: u32,
     },
 }
 
@@ -298,33 +308,52 @@ pub fn drain_player_command_events_system(
     mut id_gen: ResMut<PlayerCommandIdGen>,
     mut existing: Query<&mut Commanded>,
     mut player_craft: ResMut<crate::simulation::jobs::PlayerCraftRequest>,
-    player_faction: Res<crate::simulation::faction::PlayerFaction>,
+    controlled: Res<crate::simulation::faction::ControlledFactions>,
     mut vehicle_queue: ResMut<crate::simulation::vehicle::VehicleAssemblyQueue>,
     mut vehicle_registry: ResMut<crate::simulation::vehicle::VehicleDesignRegistry>,
     vehicle_data: Res<crate::simulation::vehicle::VehicleData>,
     mut pending_vehicle_ops: ResMut<crate::simulation::vehicle::PendingVehicleOps>,
+    factions: Res<crate::simulation::faction::FactionRegistry>,
     // Debug Test-Drive dependencies — only consumed by the
     // `DebugSpawnTestVehicle` arm (which is `cfg!(debug_assertions)`-gated).
-    chunk_map: Res<ChunkMap>,
-    vehicle_occupancy: Res<crate::simulation::vehicle::VehicleOccupancyIndex>,
-    yards: Query<&crate::simulation::vehicle::VehicleYard>,
-    factions: Res<crate::simulation::faction::FactionRegistry>,
-    mut manual_drive: ResMut<crate::simulation::vehicle::ManualDriveState>,
+    mut debug_drive: DebugTestDriveResources,
+    net_ids: Res<NetIdMap>,
 ) {
     let now = clock.tick as u32;
     for ev in reader.read() {
         // Faction-level applies (no actors needed).
         if ev.actors.is_empty() {
+            // Ownership check: payload faction_id must be controlled here.
+            let payload_faction = match &ev.command {
+                PlayerCommand::EncodeTablet { faction_id, .. }
+                | PlayerCommand::QueueVehicle { faction_id, .. }
+                | PlayerCommand::QueueCustomVehicle { faction_id, .. }
+                | PlayerCommand::VehicleOrder { faction_id, .. }
+                | PlayerCommand::DebugSpawnTestVehicle { faction_id, .. } => Some(*faction_id),
+                _ => None,
+            };
+            if let Some(fid) = payload_faction {
+                if !controlled.contains(fid) {
+                    warn!(
+                        "drop faction-level command for faction {} (not controlled here: {:?})",
+                        fid, controlled.ids
+                    );
+                    continue;
+                }
+            }
             match ev.command {
-                PlayerCommand::EncodeTablet { tech } => {
+                PlayerCommand::EncodeTablet { tech, faction_id: _ } => {
                     if player_craft.0.is_none() {
                         player_craft.0 =
                             Some((crate::simulation::crafting::RECIPE_CLAY_TABLET, Some(tech)));
                     }
                 }
-                PlayerCommand::QueueVehicle { design_id } => {
+                PlayerCommand::QueueVehicle {
+                    design_id,
+                    faction_id,
+                } => {
                     vehicle_queue.entries.push((
-                        player_faction.faction_id,
+                        faction_id,
                         crate::simulation::vehicle::VehicleDesignId(design_id),
                     ));
                 }
@@ -333,6 +362,7 @@ pub fn drain_player_command_events_system(
                     ref grid,
                     purpose,
                     required_animals,
+                    faction_id,
                 } => {
                     use crate::simulation::vehicle::{
                         collect_design_tech_gates, VehicleDesign, VehicleDesignId,
@@ -352,16 +382,25 @@ pub fn drain_player_command_events_system(
                         allowed_purpose: purpose,
                         required_animals,
                         tech_gates,
-                        author_faction: Some(player_faction.faction_id),
+                        author_faction: Some(faction_id),
                         from_user_file: false,
                         revision: 0,
                     });
-                    vehicle_queue
-                        .entries
-                        .push((player_faction.faction_id, id));
+                    vehicle_queue.entries.push((faction_id, id));
                 }
-                PlayerCommand::VehicleOrder { vehicle, kind } => {
-                    pending_vehicle_ops.ops.push((vehicle, kind));
+                PlayerCommand::VehicleOrder {
+                    vehicle,
+                    kind,
+                    faction_id: _,
+                } => {
+                    if let Some(entity) = net_ids.entity_of(vehicle) {
+                        pending_vehicle_ops.ops.push((entity, kind));
+                    } else {
+                        warn!(
+                            "VehicleOrder: NetId {:?} resolved to no live entity (vehicle gone)",
+                            vehicle
+                        );
+                    }
                 }
                 PlayerCommand::DebugSpawnTestVehicle {
                     ref name,
@@ -369,6 +408,7 @@ pub fn drain_player_command_events_system(
                     purpose,
                     required_animals,
                     spawn_near,
+                    faction_id,
                 } => {
                     if !cfg!(debug_assertions) {
                         // Release builds ignore the event entirely — the
@@ -382,7 +422,7 @@ pub fn drain_player_command_events_system(
                         spawn_vehicle_at, DebugTestDriveVehicle, PlayerPiloted, VehicleDesign,
                         VehicleDesignId,
                     };
-                    let fid = player_faction.faction_id;
+                    let fid = faction_id;
                     let home_tile = factions
                         .factions
                         .get(&fid)
@@ -416,9 +456,9 @@ pub fn drain_player_command_events_system(
                         &design,
                         fid,
                         home_tile,
-                        &chunk_map,
-                        &vehicle_occupancy,
-                        &yards,
+                        &debug_drive.chunk_map,
+                        &debug_drive.vehicle_occupancy,
+                        &debug_drive.yards,
                         camera_focus,
                     ) else {
                         let footprint =
@@ -437,7 +477,11 @@ pub fn drain_player_command_events_system(
                             footprint.height_z,
                             home_tile.0,
                             home_tile.1,
-                            yards.iter().filter(|y| y.faction_id == fid).count(),
+                            debug_drive
+                                .yards
+                                .iter()
+                                .filter(|y| y.faction_id == fid)
+                                .count(),
                         );
                         continue;
                     };
@@ -473,8 +517,8 @@ pub fn drain_player_command_events_system(
                             }
                         });
                     }
-                    manual_drive.active = Some(vehicle_e);
-                    manual_drive.last_status =
+                    debug_drive.manual_drive.active = Some(vehicle_e);
+                    debug_drive.manual_drive.last_status =
                         Some(format!("Test driving '{}'", design.name));
                     info!(
                         "DebugSpawnTestVehicle: spawned '{}' at ({}, {}) z={} heading={}",
@@ -542,6 +586,7 @@ pub fn player_command_lifecycle_system(
     health_query: Query<&crate::simulation::combat::Health>,
     bp_map: Res<crate::simulation::construction::BlueprintMap>,
     registry: Res<crate::simulation::faction::FactionRegistry>,
+    net_ids: Res<NetIdMap>,
     mut q: Query<(
         Entity,
         &mut Commanded,
@@ -611,24 +656,21 @@ pub fn player_command_lifecycle_system(
                 }
             }
             PlayerCommand::PickUpItem { item, .. } => {
-                if item_query.get(item).is_err() {
-                    Some(CommandStatus::Completed)
-                } else {
-                    None
+                match net_ids.entity_of(item) {
+                    Some(e) if item_query.get(e).is_ok() => None,
+                    _ => Some(CommandStatus::Completed),
                 }
             }
             PlayerCommand::PickUpCorpse { corpse, .. } => {
-                if corpse_query.get(corpse).is_err() {
-                    Some(CommandStatus::Completed)
-                } else {
-                    None
+                match net_ids.entity_of(corpse) {
+                    Some(e) if corpse_query.get(e).is_ok() => None,
+                    _ => Some(CommandStatus::Completed),
                 }
             }
             PlayerCommand::AttackEntity { foe, .. } => {
-                if health_query.get(foe).is_err() {
-                    Some(CommandStatus::Completed)
-                } else {
-                    None
+                match net_ids.entity_of(foe) {
+                    Some(e) if health_query.get(e).is_ok() => None,
+                    _ => Some(CommandStatus::Completed),
                 }
             }
             PlayerCommand::Teach { .. }
@@ -660,10 +702,9 @@ pub fn player_command_lifecycle_system(
                 }
             }
             PlayerCommand::MilitaryAttack { foe, .. } => {
-                if health_query.get(foe).is_err() {
-                    Some(CommandStatus::Completed)
-                } else {
-                    None
+                match net_ids.entity_of(foe) {
+                    Some(e) if health_query.get(e).is_ok() => None,
+                    _ => Some(CommandStatus::Completed),
                 }
             }
             PlayerCommand::PackCamp => {
@@ -757,6 +798,57 @@ fn chebyshev(a: (i32, i32), b: (i32, i32)) -> i32 {
     (a.0 - b.0).abs().max((a.1 - b.1).abs())
 }
 
+/// Debug Test-Drive resources consumed exclusively by the
+/// `DebugSpawnTestVehicle` arm of `drain_player_command_events_system`.
+/// Bundled into a SystemParam so the drain stays under Bevy's 16-param
+/// ceiling now that `NetIdMap` is a peer resource.
+#[derive(SystemParam)]
+pub struct DebugTestDriveResources<'w, 's> {
+    pub chunk_map: Res<'w, ChunkMap>,
+    pub vehicle_occupancy: Res<'w, crate::simulation::vehicle::VehicleOccupancyIndex>,
+    pub yards: Query<'w, 's, &'static crate::simulation::vehicle::VehicleYard>,
+    pub manual_drive: ResMut<'w, crate::simulation::vehicle::ManualDriveState>,
+}
+
+/// UI-side bundle for emitting commands. Wraps the network-boundary
+/// `NetPlayerCommandEvent` writer with the `NetIdMap` so call sites can
+/// resolve `Entity → NetId` without taking three parallel system params.
+///
+/// All UI commands flow through this single path. The
+/// `command_loopback_system` in `crate::net` drains
+/// `NetPlayerCommandEvent`, validates the declared faction against
+/// `ControlledFactions`, and emits `PlayerCommandEvent` for the sim's
+/// existing drain. In `Local` mode the hop is in-process; Phase 2 wraps
+/// it in Lightyear's `LocalChannel` so the same path carries remote
+/// commands. Sim-internal call sites (tests, executors firing follow-up
+/// commands) continue to write `PlayerCommandEvent` directly — only the
+/// UI / network boundary needs the validator.
+#[derive(SystemParam)]
+pub struct CommandSender<'w, 's> {
+    pub events: EventWriter<'w, crate::net::NetPlayerCommandEvent>,
+    pub net_ids: ResMut<'w, NetIdMap>,
+    pub commands: Commands<'w, 's>,
+    pub player_faction: Res<'w, crate::simulation::faction::PlayerFaction>,
+}
+
+impl<'w, 's> CommandSender<'w, 's> {
+    pub fn send(&mut self, actors: Vec<Entity>, command: PlayerCommand) {
+        let fid = self.player_faction.faction_id;
+        self.events.send(crate::net::NetPlayerCommandEvent {
+            sender_faction_id: fid,
+            actors,
+            command,
+        });
+    }
+
+    /// Resolve an entity to its stable `NetId`, allocating one on the fly
+    /// if the spawn site didn't tag it with `NeedsNetId`. Use this when
+    /// you're building a `PlayerCommand` that targets a known entity.
+    pub fn net_id_for(&mut self, entity: Entity) -> NetId {
+        self.net_ids.lookup_or_alloc(entity, &mut self.commands)
+    }
+}
+
 /// Routing resources bundled together (Bevy 16-param ceiling).
 #[derive(SystemParam)]
 pub struct CommandRouting<'w, 's> {
@@ -776,6 +868,10 @@ pub struct CommandRouting<'w, 's> {
     /// Incremental excavation state — Mine/DigDown dispatch checks the
     /// per-tile level against the actor's tool depth-cap before routing.
     pub excavation_map: Res<'w, crate::simulation::excavation::ExcavationMap>,
+    /// Network-id ↔ entity map. Player commands targeting an entity
+    /// (`PickUpItem`/`PickUpCorpse`/`AttackEntity`/`Teach`/`MilitaryAttack`)
+    /// carry a stable `NetId` resolved here before dispatch.
+    pub net_ids: Res<'w, NetIdMap>,
     #[system_param(ignore)]
     pub _marker: std::marker::PhantomData<&'s ()>,
 }
@@ -1011,6 +1107,9 @@ fn dispatch_one(
             DispatchOutcome::Active
         }
         PickUpItem { item, tile, .. } => {
+            let Some(item) = routing.net_ids.entity_of(item) else {
+                return DispatchOutcome::Failed(CommandFailure::TargetGone);
+            };
             if commands.get_entity(item).is_none() {
                 return DispatchOutcome::Failed(CommandFailure::TargetGone);
             }
@@ -1036,6 +1135,9 @@ fn dispatch_one(
             DispatchOutcome::Active
         }
         PickUpCorpse { corpse, tile, .. } => {
+            let Some(corpse) = routing.net_ids.entity_of(corpse) else {
+                return DispatchOutcome::Failed(CommandFailure::TargetGone);
+            };
             if commands.get_entity(corpse).is_none() {
                 return DispatchOutcome::Failed(CommandFailure::TargetGone);
             }
@@ -1058,6 +1160,9 @@ fn dispatch_one(
             DispatchOutcome::Active
         }
         AttackEntity { foe, tile, .. } => {
+            let Some(foe) = routing.net_ids.entity_of(foe) else {
+                return DispatchOutcome::Failed(CommandFailure::TargetGone);
+            };
             if commands.get_entity(foe).is_none() {
                 return DispatchOutcome::Failed(CommandFailure::TargetGone);
             }
@@ -1185,6 +1290,9 @@ fn dispatch_one(
             DispatchOutcome::Active
         }
         Teach { student, tile, .. } => {
+            let Some(student) = routing.net_ids.entity_of(student) else {
+                return DispatchOutcome::Failed(CommandFailure::TargetGone);
+            };
             if commands.get_entity(student).is_none() {
                 return DispatchOutcome::Failed(CommandFailure::TargetGone);
             }
@@ -1219,7 +1327,7 @@ fn dispatch_one(
             commands.entity(actor).insert(Drafted);
             DispatchOutcome::Active
         }
-        EncodeTablet { tech } => {
+        EncodeTablet { tech, faction_id: _ } => {
             // Faction-level request: post a craft contract for a tablet
             // encoding this tech. `chief_tablet_posting_system` drains.
             if player_craft.0.is_none() {
@@ -1313,6 +1421,9 @@ fn dispatch_one(
             DispatchOutcome::Active
         }
         MilitaryAttack { foe, tile, z } => {
+            let Some(foe) = routing.net_ids.entity_of(foe) else {
+                return DispatchOutcome::Failed(CommandFailure::TargetGone);
+            };
             if commands.get_entity(foe).is_none() {
                 return DispatchOutcome::Failed(CommandFailure::TargetGone);
             }

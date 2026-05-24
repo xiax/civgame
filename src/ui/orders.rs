@@ -339,7 +339,7 @@ pub fn right_click_context_menu_system(
     vehicle_yard_q: Query<&crate::simulation::vehicle::VehicleYard>,
     vehicle_q: Query<&crate::simulation::vehicle::Vehicle>,
     mut menu_state: ResMut<ContextMenuState>,
-    mut cmd_events: EventWriter<crate::simulation::player_command::PlayerCommandEvent>,
+    mut sender: crate::simulation::player_command::CommandSender,
 ) {
     // Require a selected player-faction member.
     let Some(sel_entity) = selected.0 else {
@@ -789,29 +789,38 @@ pub fn right_click_context_menu_system(
         // QueueVehicle is faction-level — emit with empty `actors` so the
         // drain system applies it directly (no per-worker dispatch).
         if let MenuAction::QueueVehicle(design_id) = action {
-            cmd_events.send(crate::simulation::player_command::PlayerCommandEvent {
-                actors: Vec::new(),
-                command: crate::simulation::player_command::PlayerCommand::QueueVehicle {
+            sender.send(
+                Vec::new(),
+                crate::simulation::player_command::PlayerCommand::QueueVehicle {
                     design_id,
+                    faction_id: player_faction.faction_id,
                 },
-            });
+            );
             menu_state.open = false;
             return;
         }
         // Vehicle orders are faction-level — the vehicle entity is the
         // subject, so emit with empty `actors`.
         if let MenuAction::VehicleAct(vehicle, kind) = action {
-            cmd_events.send(crate::simulation::player_command::PlayerCommandEvent {
-                actors: Vec::new(),
-                command: crate::simulation::player_command::PlayerCommand::VehicleOrder {
-                    vehicle,
+            let vehicle_id = sender.net_id_for(vehicle);
+            sender.send(
+                Vec::new(),
+                crate::simulation::player_command::PlayerCommand::VehicleOrder {
+                    vehicle: vehicle_id,
                     kind,
+                    faction_id: player_faction.faction_id,
                 },
-            });
+            );
             menu_state.open = false;
             return;
         }
-        if let Some(cmd) = menu_action_to_command(action, target_tile, target_z) {
+        if let Some(cmd) = menu_action_to_command(
+            action,
+            target_tile,
+            target_z,
+            player_faction.faction_id,
+            &mut sender,
+        ) {
             // Broadcast to every non-drafted player-faction worker in
             // `SelectedEntities`. Drafted units are owned by
             // `military_right_click_system`; filtering them here avoids
@@ -833,10 +842,7 @@ pub fn right_click_context_menu_system(
             if actors.is_empty() {
                 actors.push(sel_entity);
             }
-            cmd_events.send(crate::simulation::player_command::PlayerCommandEvent {
-                actors,
-                command: cmd,
-            });
+            sender.send(actors, cmd);
         }
         menu_state.open = false;
     }
@@ -850,6 +856,8 @@ fn menu_action_to_command(
     action: MenuAction,
     target_tile: (i32, i32),
     target_z: i8,
+    player_faction_id: u32,
+    sender: &mut crate::simulation::player_command::CommandSender,
 ) -> Option<crate::simulation::player_command::PlayerCommand> {
     use crate::simulation::player_command::PlayerCommand;
     Some(match action {
@@ -879,29 +887,35 @@ fn menu_action_to_command(
             z: target_z,
         },
         MenuAction::PickUpItem(item) => PlayerCommand::PickUpItem {
-            item,
+            item: sender.net_id_for(item),
             tile: target_tile,
             z: target_z,
         },
         MenuAction::PickUpCorpse(corpse) => PlayerCommand::PickUpCorpse {
-            corpse,
+            corpse: sender.net_id_for(corpse),
             tile: target_tile,
             z: target_z,
         },
         MenuAction::AttackEntity(foe) => PlayerCommand::AttackEntity {
-            foe,
+            foe: sender.net_id_for(foe),
             tile: target_tile,
             z: target_z,
         },
         MenuAction::Teach(student) => PlayerCommand::Teach {
-            student,
+            student: sender.net_id_for(student),
             tile: target_tile,
             z: target_z,
         },
         MenuAction::HoldLecture(tech) => PlayerCommand::HoldLecture { tech },
         MenuAction::ReadItem(tech) => PlayerCommand::ReadItem { tech },
-        MenuAction::EncodeTablet(tech) => PlayerCommand::EncodeTablet { tech },
-        MenuAction::QueueVehicle(design_id) => PlayerCommand::QueueVehicle { design_id },
+        MenuAction::EncodeTablet(tech) => PlayerCommand::EncodeTablet {
+            tech,
+            faction_id: player_faction_id,
+        },
+        MenuAction::QueueVehicle(design_id) => PlayerCommand::QueueVehicle {
+            design_id,
+            faction_id: player_faction_id,
+        },
         // Handled by a dedicated faction-level branch before this call.
         MenuAction::VehicleAct(..) => return None,
         MenuAction::PitchCampHere => PlayerCommand::PitchCamp {
@@ -1071,7 +1085,7 @@ pub fn military_right_click_system(
     camera_view_z: Res<CameraViewZ>,
     registry: Res<FactionRegistry>,
     mut menu_state: ResMut<MilitaryMenuState>,
-    mut cmd_events: EventWriter<crate::simulation::player_command::PlayerCommandEvent>,
+    mut sender: crate::simulation::player_command::CommandSender,
 ) {
     // Snapshot drafted player-faction members from the selection.
     let drafted_units: Vec<Entity> = selected_many
@@ -1135,7 +1149,7 @@ pub fn military_right_click_system(
         match target {
             None => {
                 // Empty tile → group move.
-                emit_military_move(&mut cmd_events, &drafted_units, target_tile_i32, target_z);
+                emit_military_move(&mut sender, &drafted_units, target_tile_i32, target_z);
                 menu_state.open = false;
             }
             Some(foe) => {
@@ -1165,7 +1179,7 @@ pub fn military_right_click_system(
                     Hostility::Hostile => {
                         if classify.health_q.get(foe).is_ok() {
                             emit_military_attack(
-                                &mut cmd_events,
+                                &mut sender,
                                 &drafted_units,
                                 foe,
                                 foe_tile,
@@ -1218,7 +1232,7 @@ pub fn military_right_click_system(
         if let Some(foe) = menu_state.target_entity {
             if classify.health_q.get(foe).is_ok() {
                 emit_military_attack(
-                    &mut cmd_events,
+                    &mut sender,
                     &drafted_units,
                     foe,
                     menu_state.target_tile,
@@ -1229,7 +1243,7 @@ pub fn military_right_click_system(
         menu_state.open = false;
     } else if chosen_move {
         emit_military_move(
-            &mut cmd_events,
+            &mut sender,
             &drafted_units,
             menu_state.target_tile,
             menu_state.target_z,
@@ -1239,30 +1253,32 @@ pub fn military_right_click_system(
 }
 
 fn emit_military_move(
-    cmd_events: &mut EventWriter<crate::simulation::player_command::PlayerCommandEvent>,
+    sender: &mut crate::simulation::player_command::CommandSender,
     actors: &[Entity],
     tile: (i32, i32),
     z: i8,
 ) {
-    use crate::simulation::player_command::{PlayerCommand, PlayerCommandEvent};
-    cmd_events.send(PlayerCommandEvent {
-        actors: actors.to_vec(),
-        command: PlayerCommand::MilitaryMove { tile, z },
-    });
+    use crate::simulation::player_command::PlayerCommand;
+    sender.send(actors.to_vec(), PlayerCommand::MilitaryMove { tile, z });
 }
 
 fn emit_military_attack(
-    cmd_events: &mut EventWriter<crate::simulation::player_command::PlayerCommandEvent>,
+    sender: &mut crate::simulation::player_command::CommandSender,
     actors: &[Entity],
     foe: Entity,
     tile: (i32, i32),
     z: i8,
 ) {
-    use crate::simulation::player_command::{PlayerCommand, PlayerCommandEvent};
+    use crate::simulation::player_command::PlayerCommand;
     // Drop the foe from the actor list so they don't try to attack themselves.
     let filtered: Vec<Entity> = actors.iter().copied().filter(|&e| e != foe).collect();
-    cmd_events.send(PlayerCommandEvent {
-        actors: filtered,
-        command: PlayerCommand::MilitaryAttack { foe, tile, z },
-    });
+    let foe_id = sender.net_id_for(foe);
+    sender.send(
+        filtered,
+        PlayerCommand::MilitaryAttack {
+            foe: foe_id,
+            tile,
+            z,
+        },
+    );
 }

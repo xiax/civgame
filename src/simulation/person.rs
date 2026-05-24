@@ -341,6 +341,7 @@ pub fn spawn_population(
     mut clock: ResMut<SimClock>,
     mut registry: ResMut<FactionRegistry>,
     mut player_faction: ResMut<PlayerFaction>,
+    mut controlled: ResMut<crate::simulation::faction::ControlledFactions>,
     mut settled: ResMut<crate::simulation::region::SettledRegions>,
     pending: Res<crate::PendingSpawn>,
     world_seed: Res<crate::WorldSeed>,
@@ -524,6 +525,7 @@ pub fn spawn_population(
 
         if group_idx == 0 {
             player_faction.faction_id = faction_id;
+            controlled.add(faction_id);
 
             // Mark the player's faction center
             commands.spawn((

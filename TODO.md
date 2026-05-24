@@ -177,4 +177,6 @@ Diplomacy
 
 Barter economies
 
+Add volume to items and carrying capacity, remove hard number limit
+
 X - The amount of game map z level variability should depend on the biome and status in the world map. Currently we can't even properly simulate plains. Our game map generation needs to be more realistic.

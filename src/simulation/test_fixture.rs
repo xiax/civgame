@@ -150,6 +150,7 @@ impl TestSim {
 
         // The real plugins. SimulationPlugin's OnEnter(Playing) hooks
         // never fire because we stay in SpawnSelect.
+        app.add_plugins(crate::net_id::NetIdPlugin);
         app.add_plugins(crate::pathfinding::PathfindingPlugin);
         app.add_plugins(crate::economy::EconomyPlugin);
         app.add_plugins(crate::simulation::SimulationPlugin);
@@ -176,6 +177,9 @@ impl TestSim {
             registry.create_faction((0, 0))
         };
         app.world_mut().resource_mut::<PlayerFaction>().faction_id = player_faction_id;
+        app.world_mut()
+            .resource_mut::<crate::simulation::faction::ControlledFactions>()
+            .add(player_faction_id);
 
         Self {
             app,
@@ -7125,6 +7129,7 @@ mod smoke {
                 grid,
                 purpose: VehiclePurpose::Cargo,
                 required_animals: 0,
+                faction_id: fid,
             },
         });
         let drain_id = sim
