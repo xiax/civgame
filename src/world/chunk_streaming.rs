@@ -1274,6 +1274,13 @@ pub fn refresh_changed_tiles_system(
             continue;
         }
 
+        // TODO(plans/incremental-mining.md §12): when
+        // `chunk_map.tile_at(tx, ty, surf_z).is_partially_excavated()`, attach
+        // a child overlay sprite (procedural rubble variant by level) so the
+        // player can see in-progress excavation visually. The right-click menu
+        // already shows "(N/7)" and movement applies the slowdown, so this is
+        // visual polish — gameplay is functional without it.
+
         let wx = tx as f32 * TILE_SIZE + TILE_SIZE * 0.5;
         let wy = ty as f32 * TILE_SIZE + TILE_SIZE * 0.5;
 

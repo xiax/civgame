@@ -219,10 +219,14 @@ pub struct TileData {
     pub kind: TileKind,
     pub elevation: u8,
     pub fertility: u8,
-    /// bit 0: has_building, bit 1: has_road, bit 2: explored, bit 3: currently_visible
+    /// bit 0: has_building, bit 1: has_road, bit 2: explored, bit 3: currently_visible,
+    /// bits 4-6: excavation_level (0..=7, see `simulation::excavation`), bit 7: reserved.
     pub flags: u8,
     pub ore: u8,
 }
+
+const EXCAVATION_LEVEL_MASK: u8 = 0b0111_0000;
+const EXCAVATION_LEVEL_SHIFT: u8 = 4;
 
 impl TileData {
     pub fn is_passable(self) -> bool {
@@ -243,6 +247,23 @@ impl TileData {
 
     pub fn ore_kind(self) -> OreKind {
         OreKind::from_u8(self.ore)
+    }
+
+    /// Per-tile excavation level (0 = pristine, 1..=6 = partial, 7 = carved+finalised).
+    /// Source of truth lives in `simulation::ExcavationMap`; this is a fast-read cache.
+    pub fn excavation_level(self) -> u8 {
+        (self.flags & EXCAVATION_LEVEL_MASK) >> EXCAVATION_LEVEL_SHIFT
+    }
+
+    pub fn set_excavation_level(&mut self, lvl: u8) {
+        debug_assert!(lvl <= 7, "excavation level must fit in 3 bits");
+        self.flags = (self.flags & !EXCAVATION_LEVEL_MASK)
+            | ((lvl & 0b111) << EXCAVATION_LEVEL_SHIFT);
+    }
+
+    pub fn is_partially_excavated(self) -> bool {
+        let l = self.excavation_level();
+        l > 0 && l < 7
     }
 }
 
@@ -360,6 +381,43 @@ mod tests {
         assert!(!k.is_opaque());
         assert!(!k.is_stone_like());
         assert!(!k.is_soil_like());
+    }
+
+    #[test]
+    fn excavation_level_roundtrip_preserves_other_flags() {
+        // Set every existing-bit flag, then round-trip excavation level 0..=7
+        // and confirm bits 0-3 (building/road/explored/visible) and bit 7
+        // (reserved) are untouched.
+        let mut td = TileData {
+            kind: TileKind::Stone,
+            flags: 0b1000_1111, // bits 0,1,2,3 and 7 set; bits 4-6 empty
+            ..Default::default()
+        };
+        for lvl in 0u8..=7 {
+            td.set_excavation_level(lvl);
+            assert_eq!(td.excavation_level(), lvl, "level {lvl} did not round-trip");
+            assert!(td.has_building(), "building bit lost at level {lvl}");
+            assert!(td.is_explored(), "explored bit lost at level {lvl}");
+            assert!(td.is_visible(), "visible bit lost at level {lvl}");
+            assert_eq!(td.flags & 0b1000_0000, 0b1000_0000, "reserved bit 7 lost");
+            assert_eq!(td.flags & 0b0000_0010, 0b0000_0010, "road bit lost");
+        }
+    }
+
+    #[test]
+    fn is_partially_excavated_only_middle_levels() {
+        let mut td = TileData {
+            kind: TileKind::Stone,
+            ..Default::default()
+        };
+        td.set_excavation_level(0);
+        assert!(!td.is_partially_excavated());
+        for lvl in 1u8..=6 {
+            td.set_excavation_level(lvl);
+            assert!(td.is_partially_excavated(), "level {lvl} should read partial");
+        }
+        td.set_excavation_level(7);
+        assert!(!td.is_partially_excavated(), "level 7 = finalised, not partial");
     }
 
     #[test]

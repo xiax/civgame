@@ -1,6 +1,6 @@
 use crate::pathfinding::pool::AStarScratch;
 use crate::pathfinding::step::passable_diagonal_step_for;
-use crate::pathfinding::tile_cost::{step_cost_for, TraversalProfile, IMPASSABLE};
+use crate::pathfinding::tile_cost::{step_cost_for_data, TraversalProfile, IMPASSABLE};
 use crate::world::chunk::ChunkMap;
 use std::cmp::Reverse;
 
@@ -124,8 +124,8 @@ pub fn find_path_profile(
                 if !ok {
                     continue;
                 }
-                let kind = chunk_map.tile_at(nx, ny, nz).kind;
-                let base = step_cost_for(kind, profile);
+                let data = chunk_map.tile_at(nx, ny, nz);
+                let base = step_cost_for_data(data, profile);
                 if base == IMPASSABLE {
                     continue;
                 }

@@ -396,7 +396,27 @@ pub fn combat_system(
                 .and_then(|(_, s)| s)
                 .map(|s| stats::modifier(s.dexterity))
                 .unwrap_or(0);
-            let hit_chance = (0.7 + 0.05 * (atk_dex - tgt_dex) as f32).clamp(0.2, 0.95);
+            let base_hit = 0.7 + 0.05 * (atk_dex - tgt_dex) as f32;
+            // Ranged-only cover: partial-excavation rubble at the target tile
+            // (level 1..=6) reduces hit chance by 5%/level, capped at 30%.
+            // Melee is unaffected — a chebyshev-1 spear thrust doesn't get
+            // meaningfully deflected by chipped rock under the target.
+            let cover_pct = if weapon_range > 1 {
+                let target_z = ai_query
+                    .get(target)
+                    .map(|ai| ai.current_z as i32)
+                    .unwrap_or_else(|_| chunk_map.surface_z_at(found_tile.0, found_tile.1));
+                let data = chunk_map.tile_at(found_tile.0, found_tile.1, target_z);
+                let lvl = data.excavation_level();
+                if lvl > 0 && lvl < 7 {
+                    (lvl as f32 * 0.05).min(0.30)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            let hit_chance = (base_hit - cover_pct).clamp(0.2, 0.95);
             let attack_lands = fastrand::f32() < hit_chance;
 
             let mut damage = ATTACK_DAMAGE;

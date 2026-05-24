@@ -16,7 +16,7 @@ use crate::pathfinding::path_request::{
     cooldown_for_streak, FollowStatus, PathDebugFlags, PathFollow, PathKind, PathRequestQueue,
     DEFAULT_PATH_BUDGET,
 };
-use crate::pathfinding::tile_cost::{furniture_speed_factor, tile_speed_multiplier};
+use crate::pathfinding::tile_cost::{furniture_speed_factor, tile_speed_multiplier_from_data};
 use crate::pathfinding::worker::PathfindingDiagnostics;
 use crate::world::chunk::ChunkMap;
 use crate::world::spatial::{Indexed, SpatialIndex};
@@ -447,9 +447,13 @@ pub fn movement_system(
                 MOVE_SPEED
             };
             // Per-tile terrain multiplier (Road 1.4×, Forest 0.7×, etc.).
+            // Reads TileData (not just TileKind) so partial-excavation
+            // levels on the agent's surface tile apply their slowdown.
             let mut terrain_mult = 1.0_f32;
-            if let Some(kind) = chunk_map.tile_kind_at(cur_tx, cur_ty) {
-                let m = tile_speed_multiplier(kind);
+            if chunk_map.tile_kind_at(cur_tx, cur_ty).is_some() {
+                let surface_z = chunk_map.surface_z_at(cur_tx, cur_ty);
+                let data = chunk_map.tile_at(cur_tx, cur_ty, surface_z);
+                let m = tile_speed_multiplier_from_data(data);
                 if m > 0.0 {
                     effective_speed *= m;
                     terrain_mult = m;

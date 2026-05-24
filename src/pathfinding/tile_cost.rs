@@ -1,5 +1,5 @@
 use crate::simulation::construction::{BedMap, ChairMap, LoomMap, TableMap, WorkbenchMap};
-use crate::world::tile::TileKind;
+use crate::world::tile::{TileData, TileKind};
 
 pub const FURNITURE_SPEED_FACTOR: f32 = 0.5;
 
@@ -53,6 +53,46 @@ pub fn tile_step_cost(kind: TileKind) -> u16 {
         IMPASSABLE
     } else {
         ((BASE_STEP_COST as f32) / m).round() as u16
+    }
+}
+
+/// TileData-aware speed: starts from `tile_speed_multiplier(kind)` then
+/// applies the per-level excavation slowdown for partial-excavation tiles.
+/// Levels 1..=6 multiply by `1.0 − 0.08·level` (0.92, 0.84, 0.76, 0.68,
+/// 0.60, 0.52); levels 0 and 7 leave the base multiplier unchanged.
+pub fn tile_speed_multiplier_from_data(data: TileData) -> f32 {
+    let base = tile_speed_multiplier(data.kind);
+    if base <= 0.0 {
+        return base;
+    }
+    let lvl = data.excavation_level();
+    if lvl == 0 || lvl >= 7 {
+        return base;
+    }
+    base * (1.0 - 0.08 * lvl as f32)
+}
+
+pub fn tile_step_cost_from_data(data: TileData) -> u16 {
+    let m = tile_speed_multiplier_from_data(data);
+    if m <= 0.0 {
+        IMPASSABLE
+    } else {
+        ((BASE_STEP_COST as f32) / m).round() as u16
+    }
+}
+
+/// Profile-aware step cost reading the full `TileData`. Same behaviour as
+/// [`step_cost_for`] for `Land` / `Amphibious` water handling, but applies
+/// the excavation slowdown for land tiles. Used by A* + flow fields.
+pub fn step_cost_for_data(data: TileData, profile: TraversalProfile) -> u16 {
+    match profile {
+        TraversalProfile::Land => tile_step_cost_from_data(data),
+        TraversalProfile::Amphibious => match data.kind {
+            TileKind::Water | TileKind::River => {
+                ((BASE_STEP_COST as f32) / SWIM_SPEED_MULT).round() as u16
+            }
+            _ => tile_step_cost_from_data(data),
+        },
     }
 }
 

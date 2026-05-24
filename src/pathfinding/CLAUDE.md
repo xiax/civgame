@@ -72,6 +72,10 @@ Pre-built per-chunk flow fields for popular destinations (faction centres, stora
 
 **Amphibious worker path is land-first.** `compute_outcome` runs the chunk-graph route (`compute_land`) first; for `Amphibious` requests it falls back to `compute_amphibious` **only** when land routing returns `Unreachable`/`NoRoute` (banks split by water). `compute_amphibious` is a single bounded full-route A* over `passable_for(Amphibious)` packed into one segment (`chunk_route = [start_chunk]`); a swim exceeding the A* budget fails gracefully.
 
+## Tile cost reads (`tile_cost.rs`)
+
+A* (`astar.rs`) and flow fields (`flow_field.rs`) compute step cost from full `TileData`, not just `TileKind`. `tile_speed_multiplier_from_data` / `tile_step_cost_from_data` apply the per-level partial-excavation slowdown (levels 1..=6 multiply base mult by `1.0 − 0.08·level`, giving 0.92..0.52); levels 0 and 7 leave the base unchanged. `step_cost_for_data(data, profile)` is the profile-aware variant (Land / Amphibious water still uses kind-only fast-path for swim cost). `movement::movement_system` reads the same helper at the agent's surface tile so partial excavation actually slows agents traversing it. Flow fields are **not** re-invalidated on excavation `TileChangedEvent` — they're hotspot-anchored and rebuilt lazily; brief partial-excavation cost staleness is acceptable.
+
 ## Conventions
 
 - Coords: world `(i32, i32, i8)`; chunks `ChunkCoord(i32, i32)`.

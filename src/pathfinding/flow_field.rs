@@ -1,5 +1,5 @@
 use crate::pathfinding::step::passable_diagonal_step;
-use crate::pathfinding::tile_cost::{tile_step_cost, IMPASSABLE};
+use crate::pathfinding::tile_cost::{tile_step_cost_from_data, IMPASSABLE};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -107,8 +107,8 @@ where
             // standability, but we still want speed weighting (Road faster,
             // Forest slower) and IMPASSABLE rejection for kinds that
             // shouldn't ever be routed through (Water, Wall, Air).
-            let kind = chunk_map.tile_at(global_tx, global_ty, nz as i32).kind;
-            let base = tile_step_cost(kind);
+            let data = chunk_map.tile_at(global_tx, global_ty, nz as i32);
+            let base = tile_step_cost_from_data(data);
             if base == IMPASSABLE {
                 continue;
             }

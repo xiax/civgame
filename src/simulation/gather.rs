@@ -6,7 +6,10 @@ use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::simulation::carry::Carrier;
-use crate::simulation::carve::carve_tile;
+use crate::simulation::excavation::{
+    advance as excavation_advance, excavation_depth_cap, AdvanceOutcome, ExcavationKey,
+    ExcavationMap, ExcavationMode, LEVEL_WORK_TICKS,
+};
 use crate::simulation::construction::WallMap;
 use crate::simulation::faction::StorageTileMap;
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
@@ -29,7 +32,7 @@ use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
 use crate::simulation::technology::ActivityKind;
 use crate::simulation::typed_task::{ActionQueue, Task};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
-use crate::world::chunk_streaming::TileChangedEvent;
+use crate::world::chunk_streaming::{TileCarvedEvent, TileChangedEvent};
 use crate::world::globe::Globe;
 use crate::world::terrain::{tile_to_world, world_to_tile, WorldGen};
 use crate::world::tile::TileKind;
@@ -201,6 +204,12 @@ pub struct GatherRoutingResources<'w, 's> {
     /// `gather_system` stays under Bevy's 16-param ceiling.
     pub job_board: ResMut<'w, crate::simulation::jobs::JobBoard>,
     pub job_completed: EventWriter<'w, crate::simulation::jobs::JobCompletedEvent>,
+    /// Incremental excavation: durable per-tile partial state shared with
+    /// `dig_system`. Stone/ore branch consults + advances. Bundled here so
+    /// `gather_system` stays under Bevy's 16-param ceiling.
+    pub excavation_map: ResMut<'w, crate::simulation::excavation::ExcavationMap>,
+    /// Emitted only at level-7 finalize; `aquifer_seep_emitter_system` reads it.
+    pub tile_carved: EventWriter<'w, crate::world::chunk_streaming::TileCarvedEvent>,
 }
 
 /// Phase 5c-ii-c-ii chain handoff: called by every `gather_system` exit path
@@ -851,14 +860,16 @@ pub fn gather_system(
                 tile_kind,
                 Some(TileKind::Wall) | Some(TileKind::Stone) | Some(TileKind::Ore)
             ) {
-                // ── Mineable rock: Wall, Stone, or Ore.
-                // Realistic Tool Overhaul: breaking rock from a tile needs a
-                // Pick. With no Pick the worker can only prise loose surface
-                // stone — a small trickle yield — and the tile is NOT carved.
-                // No `ToolKit` at all degrades gracefully (treated as armed).
+                // ── Incremental excavation (7-level model).
+                //
+                // Per cycle: pay this level's yield (flat 1 unit + faction
+                // multiplier), advance ExcavationMap by one. At level 7 the
+                // tile finalises via carve::finalize_carved_tile.
+                //
+                // Bare-hands cap at HAND_DEPTH_LIMIT for stone-like material;
+                // any Pick unlocks 7. Tier scales work-tick threshold.
                 use crate::simulation::tools::{ToolRequirement, ToolUseKind};
                 let pick_req = ToolRequirement::any(ToolUseKind::Mine);
-                let has_pick = toolkit.map(|tk| tk.satisfies(&pick_req)).unwrap_or(true);
                 let pick_speed = toolkit
                     .and_then(|tk| tk.best_for(&pick_req))
                     .map(|it| {
@@ -867,31 +878,29 @@ pub fn gather_system(
                         )
                     })
                     .unwrap_or(1.0);
-                let mine_threshold = ((STONE.work_ticks as f32 / pick_speed).ceil() as i32)
-                    .clamp(0, 255) as u8;
-                if ai.work_progress < mine_threshold {
+                let level_threshold = ((LEVEL_WORK_TICKS as f32 / pick_speed).ceil() as i32)
+                    .clamp(1, 255) as u8;
+                if ai.work_progress < level_threshold {
                     continue;
                 }
                 ai.work_progress = 0;
 
-                let target_floor_z = ai.current_z as i32;
+                let worked_z = ai.current_z as i32;
                 let was_wall = tile_kind == Some(TileKind::Wall);
+                let unwrapped_kind = tile_kind.unwrap_or(TileKind::Stone);
 
-                // No-Pick trickle: skip the carve, hand out a small loose-stone
-                // yield, leave the tile intact. Bootstrap-safe — a faction can
-                // still scrape together stone for the first picks.
-                if !has_pick {
-                    let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
-                    route_yield(
-                        &mut commands,
-                        &mut carrier,
-                        &mut agent,
-                        core_ids::stone(),
-                        1,
-                        agent_tx,
-                        agent_ty,
-                    );
-                    skills.gain_xp(SkillKind::Mining, STONE.xp / 4);
+                // Per-cycle tool gate. A pick lost mid-excavation halts at
+                // level 3 on stone-like material; soil-like is hand-diggable.
+                let depth_cap = excavation_depth_cap(toolkit, unwrapped_kind);
+                let key = ExcavationKey {
+                    tile: (tx, ty),
+                    z: worked_z as i8,
+                    mode: ExcavationMode::Mine,
+                };
+                let current_level = routing.excavation_map.level_at(&key);
+                if current_level >= depth_cap {
+                    // No deeper progress possible — drop the chain. HTN can
+                    // re-route to a tool acquisition or different site.
                     finish_gather(
                         &mut ai,
                         &mut aq,
@@ -903,24 +912,26 @@ pub fn gather_system(
                         &routing,
                         &mut method_history,
                         clock.tick,
-                        FinishGatherOutcome::Completed,
+                        FinishGatherOutcome::TargetInvalid,
                     );
                     continue;
                 }
 
-                let drops = carve_tile(
+                let mut yields = Vec::with_capacity(2);
+                let outcome = excavation_advance(
+                    &mut routing.excavation_map,
                     &mut chunk_map,
                     &gen,
                     &globe,
-                    tx,
-                    ty,
-                    target_floor_z,
+                    key,
                     &mut tile_changed,
+                    &mut routing.tile_carved,
+                    &mut yields,
                 );
 
                 let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
                 let mut total_qty: u32 = 0;
-                for (resource_id, qty) in drops {
+                for (resource_id, qty) in yields {
                     if qty == 0 {
                         continue;
                     }
@@ -945,18 +956,47 @@ pub fn gather_system(
                     }
                     discovery_events.send(DiscoveryActionEvent { actor, activity });
                 }
+                let _ = total_qty; // kept for future debug instrumentation
 
-                if total_qty == 0 {
-                    // Carved a non-yielding tile (e.g. Dirt headspace); credit the
-                    // baseline so XP/effort isn't entirely wasted.
-                    total_qty = STONE.base_yield_qty;
+                // Per-level XP (smaller than old STONE.xp=2 single-shot; sums
+                // to ~7 across a fully-pickaxed carve).
+                skills.gain_xp(SkillKind::Mining, 1);
+
+                match outcome {
+                    AdvanceOutcome::Levelled { new_level } => {
+                        // Keep the task alive across partial levels. Only
+                        // retire if the next step would exceed the tool cap
+                        // or the carrier is at haul cap.
+                        let next_blocked =
+                            new_level >= depth_cap || carrier.is_at_haul_cap();
+                        if next_blocked {
+                            finish_gather(
+                                &mut ai,
+                                &mut aq,
+                                actor,
+                                cur_tile,
+                                cur_chunk,
+                                faction_id,
+                                &chunk_map,
+                                &routing,
+                                &mut method_history,
+                                clock.tick,
+                                FinishGatherOutcome::Completed,
+                            );
+                        }
+                        // else: fall through, ai.state stays Working.
+                        continue;
+                    }
+                    AdvanceOutcome::Carved => {
+                        // Level 7 finalised — proceed to wall despawn + finish.
+                    }
                 }
 
-                skills.gain_xp(SkillKind::Mining, STONE.xp);
-
-                // Despawn the Wall entity only if the column no longer has
-                // any solid tile at or above the carved Z (the visible wall
-                // is fully gone).
+                // For Mine the finalize opens floor at worked_z - 1 (see
+                // ExcavationMode::Mine in excavation::advance). The wall
+                // entity matches `ai.dest_tile`; remove only when column
+                // has no solid tile at or above (the visible wall is gone).
+                let target_floor_z = worked_z - 1;
                 if was_wall && chunk_map.surface_z_at(tx, ty) < target_floor_z + 1 {
                     if let Some(wall_entity) = wall_map.0.remove(&ai.dest_tile) {
                         commands.entity(wall_entity).despawn_recursive();

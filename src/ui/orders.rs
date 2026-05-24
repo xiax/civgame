@@ -657,7 +657,30 @@ pub fn right_click_context_menu_system(
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 // Section 1 — Tile actions (Move, Mine, Gather, Dig, Deconstruct)
                 for action in &actions {
-                    if ui.button(action.label()).clicked() {
+                    // For Mine / DigDown on a partially-excavated tile, suffix
+                    // the menu label with " (N/7)" so the player can see how
+                    // far an in-progress excavation has come along. Reads
+                    // TileData.flags directly (surface tile carries the cache).
+                    let suffix = match action {
+                        MenuAction::Mine | MenuAction::DigDown => {
+                            let surf_z = chunk_map.surface_z_at(target_tile.0, target_tile.1);
+                            let lvl = chunk_map
+                                .tile_at(target_tile.0, target_tile.1, surf_z)
+                                .excavation_level();
+                            if lvl > 0 && lvl < 7 {
+                                Some(format!(" ({}/7)", lvl))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    let display: String = if let Some(s) = suffix {
+                        format!("{}{}", action.label(), s)
+                    } else {
+                        action.label().to_string()
+                    };
+                    if ui.button(display).clicked() {
                         chosen = Some(*action);
                     }
                 }

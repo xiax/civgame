@@ -262,6 +262,9 @@ pub enum CommandFailure {
     /// The actor isn't eligible for this command kind (e.g. `Muster` on a
     /// non-Hunter; `Teach` with no teachable techs).
     Ineligible,
+    /// The actor needs a tool they don't carry (e.g. Mine / Dig Down on stone
+    /// past the bare-hands `HAND_DEPTH_LIMIT` without a Pick in their ToolKit).
+    MissingTool,
 }
 
 /// Monotonic command id source. Wraps at u32::MAX (~4B commands — never).
@@ -770,6 +773,9 @@ pub struct CommandRouting<'w, 's> {
     // autonomous build.
     pub poster_pool: Res<'w, crate::simulation::construction::ConstructionPosterPool>,
     pub settlement_map: Res<'w, crate::simulation::settlement::SettlementMap>,
+    /// Incremental excavation state — Mine/DigDown dispatch checks the
+    /// per-tile level against the actor's tool depth-cap before routing.
+    pub excavation_map: Res<'w, crate::simulation::excavation::ExcavationMap>,
     #[system_param(ignore)]
     pub _marker: std::marker::PhantomData<&'s ()>,
 }
@@ -791,6 +797,7 @@ pub fn dispatch_player_command_system(
         &mut ActionQueue,
         &Transform,
         Option<&FactionMember>,
+        Option<&crate::simulation::tools::ToolKit>,
     )>,
     mut target_item_q: Query<&mut TargetItem>,
     mut combat_target_q: Query<&mut CombatTarget>,
@@ -800,7 +807,7 @@ pub fn dispatch_player_command_system(
     mut camp_ops: ResMut<crate::simulation::nomad::PendingCampOps>,
     pending_slots: Res<PendingFormationSlots>,
 ) {
-    for (actor, mut cmd, mut ai, mut aq, transform, member) in actors.iter_mut() {
+    for (actor, mut cmd, mut ai, mut aq, transform, member, toolkit) in actors.iter_mut() {
         if cmd.status != CommandStatus::Pending {
             continue;
         }
@@ -850,6 +857,7 @@ pub fn dispatch_player_command_system(
             &registry,
             &mut camp_ops,
             &pending_slots,
+            toolkit,
         );
 
         match outcome {
@@ -886,6 +894,7 @@ fn dispatch_one(
     registry: &crate::simulation::faction::FactionRegistry,
     camp_ops: &mut crate::simulation::nomad::PendingCampOps,
     pending_slots: &PendingFormationSlots,
+    toolkit: Option<&crate::simulation::tools::ToolKit>,
 ) -> DispatchOutcome {
     use PlayerCommand::*;
     match *command {
@@ -909,6 +918,26 @@ fn dispatch_one(
             DispatchOutcome::Active
         }
         Gather { tile, .. } | Mine { tile, .. } => {
+            // Tool gate: stone-like target whose excavation level is already
+            // at the actor's hand-depth cap is unworkable without a Pick.
+            // (Mine variant routes here; Gather on plants/items is unaffected
+            // because non-stone-like → cap = 7 → never blocks.)
+            let kind = routing
+                .chunk_map
+                .tile_kind_at(tile.0, tile.1)
+                .unwrap_or(crate::world::tile::TileKind::Air);
+            if kind.is_stone_like() {
+                let z = routing.chunk_map.surface_z_at(tile.0, tile.1) as i8;
+                let key = crate::simulation::excavation::ExcavationKey {
+                    tile,
+                    z,
+                    mode: crate::simulation::excavation::ExcavationMode::Mine,
+                };
+                let cap = crate::simulation::excavation::excavation_depth_cap(toolkit, kind);
+                if routing.excavation_map.level_at(&key) >= cap {
+                    return DispatchOutcome::Failed(CommandFailure::MissingTool);
+                }
+            }
             let routed = assign_task_with_routing(
                 ai,
                 cur_tile,
@@ -928,6 +957,22 @@ fn dispatch_one(
             DispatchOutcome::Active
         }
         DigDown { tile, .. } => {
+            // Tool gate: stone-like floor below the surface needs a Pick
+            // past HAND_DEPTH_LIMIT. Soil floors are hand-diggable.
+            let surf_z = routing.chunk_map.surface_z_at(tile.0, tile.1);
+            let floor_z = surf_z - 1;
+            let floor_kind = routing.chunk_map.tile_at(tile.0, tile.1, floor_z).kind;
+            if floor_kind.is_stone_like() {
+                let key = crate::simulation::excavation::ExcavationKey {
+                    tile,
+                    z: floor_z as i8,
+                    mode: crate::simulation::excavation::ExcavationMode::DigDown,
+                };
+                let cap = crate::simulation::excavation::excavation_depth_cap(toolkit, floor_kind);
+                if routing.excavation_map.level_at(&key) >= cap {
+                    return DispatchOutcome::Failed(CommandFailure::MissingTool);
+                }
+            }
             let routed = assign_task_with_routing(
                 ai,
                 cur_tile,

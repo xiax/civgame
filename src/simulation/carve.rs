@@ -61,15 +61,47 @@ pub fn carve_tile(
     events: &mut EventWriter<TileChangedEvent>,
 ) -> CarveYield {
     let mut yields: CarveYield = Vec::with_capacity(2);
+
+    let head_z = target_floor_z + 1;
+    let head = tile_at_3d(chunk_map, gen, globe, tx, ty, head_z);
+    if head.kind.is_stone_like() {
+        if let Some(y) = yield_for_tile(head) {
+            yields.push(y);
+        }
+    }
+
+    let floor = tile_at_3d(chunk_map, gen, globe, tx, ty, target_floor_z);
+    if floor.kind.is_stone_like() {
+        if let Some(y) = yield_for_tile(floor) {
+            yields.push(y);
+        }
+    }
+
+    finalize_carved_tile(chunk_map, gen, globe, tx, ty, target_floor_z, events);
+
+    yields
+}
+
+/// Non-yielding body of [`carve_tile`]: opens head + floor, emits
+/// `TileChangedEvent`. Incremental excavation pays per-level yields itself and
+/// calls this once at level 7 to apply the final tile mutation. One-shot
+/// callers (wells, terraform, wall destruction) use [`carve_tile`] which
+/// wraps this and pays the head + floor block yield.
+pub fn finalize_carved_tile(
+    chunk_map: &mut ChunkMap,
+    gen: &WorldGen,
+    globe: &Globe,
+    tx: i32,
+    ty: i32,
+    target_floor_z: i32,
+    events: &mut EventWriter<TileChangedEvent>,
+) {
     let mut changed = false;
 
     let head_z = target_floor_z + 1;
     let head = tile_at_3d(chunk_map, gen, globe, tx, ty, head_z);
     match head.kind {
         k if k.is_stone_like() => {
-            if let Some(y) = yield_for_tile(head) {
-                yields.push(y);
-            }
             chunk_map.set_tile(
                 tx,
                 ty,
@@ -84,7 +116,7 @@ pub fn carve_tile(
         TileKind::Air | TileKind::Ramp => {} // already open
         _ => {
             // Some other solid (Dirt, Grass, etc. somehow at headspace).
-            // Carve to Air to make headroom; no yield.
+            // Carve to Air to make headroom.
             chunk_map.set_tile(
                 tx,
                 ty,
@@ -101,9 +133,6 @@ pub fn carve_tile(
     let floor = tile_at_3d(chunk_map, gen, globe, tx, ty, target_floor_z);
     match floor.kind {
         k if k.is_stone_like() => {
-            if let Some(y) = yield_for_tile(floor) {
-                yields.push(y);
-            }
             chunk_map.set_tile(
                 tx,
                 ty,
@@ -117,7 +146,7 @@ pub fn carve_tile(
         }
         _ => {
             // Floor is already passable (procedural Dirt from topsoil, etc.) —
-            // no yield, but write a delta so the chunk's surface_kind cache
+            // write a delta with the existing kind so `surface_kind` cache
             // reflects the real kind instead of the Air placeholder left by
             // the head carve. Without this, surface_tile_kind returns Air
             // and the right-click menu hides Dig Down on subsequent clicks.
@@ -132,8 +161,6 @@ pub fn carve_tile(
             ty: ty as i32,
         });
     }
-
-    yields
 }
 
 /// Inverse of `carve_tile`. Raises the surface at (tx, ty) by writing

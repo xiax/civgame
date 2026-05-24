@@ -19,6 +19,7 @@ pub mod corpse;
 pub mod crafting;
 pub mod dig;
 pub mod doormat;
+pub mod excavation;
 pub mod draftwork;
 pub mod drink;
 pub mod energy;
@@ -253,6 +254,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(construction::BridgeMap::default())
             .insert_resource(construction::DamMap::default())
             .insert_resource(construction::WellMap::default())
+            .insert_resource(excavation::ExcavationMap::default())
             .insert_resource(husbandry::PenMap::default())
             .insert_resource(husbandry::StableMap::default())
             .insert_resource(husbandry::FeedTroughMap::default())

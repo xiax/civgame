@@ -102,6 +102,7 @@ impl Plugin for WorldPlugin {
                     // walls already read `Wall` and are skipped.
                     crate::simulation::well::restamp_wells_on_chunk_load,
                     crate::simulation::construction::restamp_walls_on_chunk_load,
+                    crate::simulation::excavation::restamp_excavation_on_chunk_load,
                     water_runtime::restamp_runtime_water_on_chunk_load,
                     // Phase 3 swimming: rebuild the per-tile current field
                     // last, after the chunk's water state is finalised.

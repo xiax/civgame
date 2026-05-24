@@ -71,6 +71,8 @@ ParallelA → ParallelB → Sequential → Economy
 
 Helpers: `stone_yield_count`, `soil_fertility_mult`. No `Farmland` variant — Grain grows on `Cropland`; world-gen `TileData.fertility` is the immutable per-tile recovery ceiling, while `FieldTileIndex.by_tile[tile].nutrients` is the live nutrient pool. Pathing speeds: Sand 0.75, Snow 0.6, Marsh 0.4, Scrub 0.9, soils 0.85–0.9 (Cropland 0.9), stone 1.0.
 
+**Incremental excavation (`simulation::excavation`):** stone/ore Mine and Dig Down advance through 7 levels (`EXCAVATION_LEVEL_MAX`). Levels 1-6 slow traversal (0.92×..0.52×) and grant ranged cover (5%/level, capped 30%); level 7 fires `carve::finalize_carved_tile` + `TileCarvedEvent`. Bare hands cap at `HAND_DEPTH_LIMIT=3` on stone-like tiles. Durable state in `ExcavationMap` Resource; cached as 3 bits (4-6) in `TileData.flags`. See `src/simulation/CLAUDE.md` → Incremental excavation, and `plans/incremental-mining.md`.
+
 `river_distance_at(tx, ty)` returns chebyshev tiles to nearest river (`u8::MAX` = far/unloaded), populated at chunk-gen and read by riparian biome shift, fertility boost, settlement scoring, herd/nomad freshwater preference.
 
 ## Rendering conventions
