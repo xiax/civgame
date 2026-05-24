@@ -931,9 +931,10 @@ fn draw_preview_column(
             ))
             .on_hover_text(stat_help("footprint"));
             ui.label(format!(
-                "Empty {} kg  ·  max payload {} kg",
+                "Empty {} kg  ·  max payload {} kg  ({} L)",
                 stats.empty_mass_g / 1000,
-                stats.max_payload_g / 1000
+                stats.max_payload_g / 1000,
+                stats.max_cargo_volume_ml / 1000,
             ))
             .on_hover_text(stat_help("mass"));
             ui.label(format!(
@@ -981,7 +982,11 @@ fn draw_preview_column(
                 .filter(|m| data.module_def(m.def).map(|d| d.range > 0).unwrap_or(false))
                 .count();
             let siege = design_is_siege_capable(&preview, data);
-            ui.label(format!("Cargo capacity: {} kg", stats.max_payload_g / 1000));
+            ui.label(format!(
+                "Cargo capacity: {} kg  |  {} L",
+                stats.max_payload_g / 1000,
+                stats.max_cargo_volume_ml / 1000,
+            ));
             ui.label(format!("Crew seats: {crew}"));
             ui.label(if stats.is_engine_driven {
                 "Drive: engine-powered".to_string()

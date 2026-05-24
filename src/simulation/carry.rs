@@ -16,9 +16,15 @@ use bevy::prelude::*;
 /// Per-hand load ceiling, in grams. Two hands → up to ~50 kg combined.
 pub const HUMAN_HAND_CAP_G: u32 = 25_000;
 
-/// Per-hand quantity cap. A worker fills a hand with at most this many units of one
-/// item before they need to head back and deposit. Drives the gather→deposit cycle.
-pub const HAND_QTY_CAP: u32 = 3;
+/// Per-hand small-item volume ceiling, in millilitres. Bounds `Bulk::Small`
+/// stacks (pouches / fistful). With fruit at 300 ml, one hand holds ~6.
+pub const HAND_SMALL_VOLUME_ML: u32 = 2_000;
+
+/// Per-hand oversized volume ceiling, in millilitres. Bounds bulky stacks
+/// (`Bulk::OneHand` / `Bulk::TwoHand`) physically clutched in the hand. With
+/// wood at 35 L, even a TwoHand `2 × 100 L` envelope only fits one log
+/// because per-stack qty is bounded by both weight and oversized volume.
+pub const HAND_OVERSIZED_VOLUME_ML: u32 = 100_000;
 
 /// One stack held in one or both hands.
 #[derive(Clone, Copy, Debug)]
@@ -32,6 +38,10 @@ pub struct HeldStack {
 impl HeldStack {
     pub fn weight_g(&self) -> u32 {
         self.item.stack_weight_g(self.qty)
+    }
+
+    pub fn volume_ml(&self) -> u32 {
+        self.item.stack_volume_ml(self.qty)
     }
 }
 
@@ -101,12 +111,15 @@ impl Carrier {
     }
 
     /// Try to pick up `qty` of `item` into hands. Returns leftover that did not fit.
-    /// Respects bulk class (two-handed needs both hands free) and per-hand weight cap.
+    /// Respects bulk class (two-handed needs both hands free), per-hand weight cap,
+    /// and per-hand volume cap (small bucket for `Bulk::Small`, oversized bucket
+    /// for `Bulk::OneHand`/`Bulk::TwoHand`).
     pub fn try_pick_up(&mut self, item: Item, qty: u32) -> u32 {
         if qty == 0 {
             return 0;
         }
         let unit_w = item.unit_weight_g().max(1);
+        let unit_v = item.unit_volume_ml().max(1);
         let bulk = item.resource_id.bulk();
 
         match bulk {
@@ -114,9 +127,11 @@ impl Carrier {
                 if self.left.is_some() || self.right.is_some() {
                     return qty;
                 }
-                let cap = HUMAN_HAND_CAP_G.saturating_mul(2);
-                let by_weight = cap / unit_w;
-                let take = qty.min(by_weight).min(HAND_QTY_CAP);
+                let weight_cap = HUMAN_HAND_CAP_G.saturating_mul(2);
+                let vol_cap = HAND_OVERSIZED_VOLUME_ML.saturating_mul(2);
+                let by_weight = weight_cap / unit_w;
+                let by_volume = vol_cap / unit_v;
+                let take = qty.min(by_weight).min(by_volume);
                 if take == 0 {
                     return qty;
                 }
@@ -132,10 +147,12 @@ impl Carrier {
                     return qty;
                 }
                 let by_weight = HUMAN_HAND_CAP_G / unit_w;
-                if by_weight == 0 {
+                let by_volume = HAND_OVERSIZED_VOLUME_ML / unit_v;
+                let per_hand = by_weight.min(by_volume);
+                if per_hand == 0 {
                     return qty;
                 }
-                let take = qty.min(by_weight).min(HAND_QTY_CAP);
+                let take = qty.min(per_hand);
                 let stack = HeldStack {
                     item,
                     qty: take,
@@ -160,11 +177,13 @@ impl Carrier {
                 for slot in [&mut self.left, &mut self.right] {
                     if let Some(stack) = slot.as_mut() {
                         if stack.item == item && !stack.two_handed {
-                            let used = stack.weight_g();
-                            let cap_left = HUMAN_HAND_CAP_G.saturating_sub(used);
-                            let by_weight = cap_left / unit_w;
-                            let qty_room = HAND_QTY_CAP.saturating_sub(stack.qty);
-                            let take = remaining.min(by_weight).min(qty_room);
+                            let used_w = stack.weight_g();
+                            let used_v = stack.volume_ml();
+                            let weight_room = HUMAN_HAND_CAP_G.saturating_sub(used_w);
+                            let vol_room = HAND_SMALL_VOLUME_ML.saturating_sub(used_v);
+                            let by_weight = weight_room / unit_w;
+                            let by_volume = vol_room / unit_v;
+                            let take = remaining.min(by_weight).min(by_volume);
                             if take > 0 {
                                 stack.qty = stack.qty.saturating_add(take);
                                 remaining -= take;
@@ -179,7 +198,8 @@ impl Carrier {
                 for slot in [&mut self.left, &mut self.right] {
                     if slot.is_none() {
                         let by_weight = HUMAN_HAND_CAP_G / unit_w;
-                        let take = remaining.min(by_weight).min(HAND_QTY_CAP);
+                        let by_volume = HAND_SMALL_VOLUME_ML / unit_v;
+                        let take = remaining.min(by_weight).min(by_volume);
                         if take > 0 {
                             *slot = Some(HeldStack {
                                 item,
@@ -211,14 +231,15 @@ impl Carrier {
     /// haul resolvers to size a commit before they dispatch.
     pub fn pickup_capacity(&self, item: Item) -> u32 {
         let unit_w = item.unit_weight_g().max(1);
+        let unit_v = item.unit_volume_ml().max(1);
         match item.resource_id.bulk() {
             Bulk::TwoHand => {
                 if self.left.is_some() || self.right.is_some() {
                     return 0;
                 }
-                let cap = HUMAN_HAND_CAP_G.saturating_mul(2);
-                let by_weight = cap / unit_w;
-                by_weight.min(HAND_QTY_CAP)
+                let weight_cap = HUMAN_HAND_CAP_G.saturating_mul(2);
+                let vol_cap = HAND_OVERSIZED_VOLUME_ML.saturating_mul(2);
+                (weight_cap / unit_w).min(vol_cap / unit_v)
             }
             Bulk::OneHand => {
                 // Mirrors try_pick_up: a single OneHand call fills at most one
@@ -230,10 +251,8 @@ impl Carrier {
                     return 0;
                 }
                 let by_weight = HUMAN_HAND_CAP_G / unit_w;
-                if by_weight == 0 {
-                    return 0;
-                }
-                by_weight.min(HAND_QTY_CAP)
+                let by_volume = HAND_OVERSIZED_VOLUME_ML / unit_v;
+                by_weight.min(by_volume)
             }
             Bulk::Small => {
                 if self.has_two_handed_load() {
@@ -243,16 +262,19 @@ impl Carrier {
                 // Top-ups on existing matching stacks.
                 for slot in [self.left, self.right].iter().flatten() {
                     if slot.item == item && !slot.two_handed {
-                        let used = slot.weight_g();
-                        let cap_left = HUMAN_HAND_CAP_G.saturating_sub(used);
-                        let by_weight = cap_left / unit_w;
-                        let qty_room = HAND_QTY_CAP.saturating_sub(slot.qty);
-                        total = total.saturating_add(by_weight.min(qty_room));
+                        let used_w = slot.weight_g();
+                        let used_v = slot.volume_ml();
+                        let weight_room = HUMAN_HAND_CAP_G.saturating_sub(used_w);
+                        let vol_room = HAND_SMALL_VOLUME_ML.saturating_sub(used_v);
+                        let by_weight = weight_room / unit_w;
+                        let by_volume = vol_room / unit_v;
+                        total = total.saturating_add(by_weight.min(by_volume));
                     }
                 }
                 // Empty hands available for a fresh stack.
                 let by_weight = HUMAN_HAND_CAP_G / unit_w;
-                let per_hand = by_weight.min(HAND_QTY_CAP);
+                let by_volume = HAND_SMALL_VOLUME_ML / unit_v;
+                let per_hand = by_weight.min(by_volume);
                 if self.left.is_none() {
                     total = total.saturating_add(per_hand);
                 }
@@ -264,19 +286,30 @@ impl Carrier {
         }
     }
 
-    /// True when the worker has hauled enough that they should head back to
-    /// deposit. Any two-handed stack triggers it (the slot occupies both hands,
-    /// no more can be picked up regardless of qty); otherwise both hands must
-    /// be occupied with at least one at the cap.
-    pub fn is_at_haul_cap(&self) -> bool {
+    /// True when no more of `item` will fit into hands and the worker should
+    /// head back to deposit. Item-keyed because what counts as "full" depends
+    /// on the resource being gathered: a TwoHand stack pins both hands after
+    /// one unit; a Small item only saturates after the per-hand small-volume
+    /// bucket is at zero room across both hands.
+    pub fn should_return_to_deposit(&self, item: Item) -> bool {
+        self.pickup_capacity(item) == 0
+    }
+
+    /// True when the worker is holding enough that the gather catch-all
+    /// should head back to deposit. Used by the gather catch-all where the
+    /// just-harvested resource isn't in scope. Triggers when:
+    ///   - a TwoHand stack is held (always pins both hands), OR
+    ///   - both hands are occupied (mirrors the legacy two-handed haul-cap
+    ///     semantic — once both hands carry something the worker has a
+    ///     non-trivial load and waiting for every bucket to volume-saturate
+    ///     would delay deposit until the source plant despawns).
+    pub fn should_return_to_deposit_held(&self) -> bool {
         if let Some(s) = self.left {
             if s.two_handed {
                 return s.qty > 0;
             }
         }
-        let l_full = self.left.map_or(false, |s| s.qty >= HAND_QTY_CAP);
-        let r_full = self.right.map_or(false, |s| s.qty >= HAND_QTY_CAP);
-        self.left.is_some() && self.right.is_some() && (l_full || r_full)
+        self.left.is_some() && self.right.is_some()
     }
 
     /// Remove up to `qty` of `item` from hands. Returns how many were actually removed.
@@ -325,6 +358,24 @@ impl Carrier {
             }
         }
         removed
+    }
+
+    /// Total carrier+inventory capacity for one batch of `item`, in units.
+    /// Sums hand pickup + the agent inventory bucket matching the item's
+    /// bulk class. Used by HTN dispatchers to size a withdraw qty by
+    /// `min(need, stock, transport_capacity)` before stamping the task.
+    pub fn batch_capacity_for(
+        &self,
+        item: Item,
+        agent: &crate::economy::agent::EconomicAgent,
+    ) -> u32 {
+        let hands = self.pickup_capacity(item);
+        let unit_w = item.unit_weight_g().max(1);
+        let unit_v = item.unit_volume_ml().max(1);
+        let inv_weight_units = agent.free_capacity_g() / unit_w;
+        let inv_vol_units = agent.free_vol_ml_for(item) / unit_v;
+        let inv = inv_weight_units.min(inv_vol_units);
+        hands.saturating_add(inv)
     }
 
     /// Clear both hands and return whatever was held.
@@ -527,16 +578,20 @@ mod tests {
         let leftover = c.try_pick_up(item, 3);
         assert_eq!(leftover, 0);
         assert_eq!(c.quantity_of(item), 3);
+        // Fruit is 300 ml; per-hand small cap 2_000 ml → 6 fruits per hand,
+        // so a 3-stack fits in one hand with the other still free.
         assert_eq!(c.free_hands(), 1);
     }
 
     #[test]
-    fn small_items_capped_at_three_per_hand() {
+    fn small_items_capped_by_small_volume_per_hand() {
+        // Fruit is 300 ml. Per-hand small-volume cap 2_000 ml → 6 per hand,
+        // 12 across both. Asking for 18 leaves 6 behind.
         let mut c = Carrier::default();
         let item = Item::new_commodity(crate::economy::core_ids::fruit());
-        let leftover = c.try_pick_up(item, 10);
-        assert_eq!(leftover, 4, "qty cap fills both hands at 3 each = 6");
-        assert_eq!(c.quantity_of(item), 6);
+        let leftover = c.try_pick_up(item, 18);
+        assert_eq!(leftover, 6, "small volume bucket fills at 6 per hand × 2");
+        assert_eq!(c.quantity_of(item), 12);
         assert_eq!(c.free_hands(), 0);
     }
 
@@ -544,19 +599,22 @@ mod tests {
     fn two_handed_log_takes_both_hands() {
         let mut c = Carrier::default();
         let log = Item::new_commodity(crate::economy::core_ids::wood());
-        let leftover = c.try_pick_up(log, 3);
+        let leftover = c.try_pick_up(log, 1);
         assert_eq!(leftover, 0);
         assert_eq!(c.free_hands(), 0);
         assert!(c.has_two_handed_load());
     }
 
     #[test]
-    fn two_handed_capped_at_three() {
+    fn two_handed_bounded_by_oversized_volume() {
+        // Wood is 35 L (35_000 ml) at 3 kg. TwoHand oversized cap is
+        // 2 × 100_000 = 200_000 ml → 5 logs by volume. Weight cap of
+        // 2 × 25_000 = 50_000 g → 16 logs. Volume is the binding constraint.
         let mut c = Carrier::default();
         let log = Item::new_commodity(crate::economy::core_ids::wood());
-        let leftover = c.try_pick_up(log, 4);
-        assert_eq!(leftover, 1, "two-handed stack caps at HAND_QTY_CAP");
-        assert_eq!(c.quantity_of(log), 3);
+        let leftover = c.try_pick_up(log, 8);
+        assert_eq!(leftover, 3, "two-hand wood capped by oversized volume");
+        assert_eq!(c.quantity_of(log), 5);
     }
 
     #[test]
@@ -572,41 +630,57 @@ mod tests {
     }
 
     #[test]
-    fn over_cap_returns_leftover() {
-        // Stone is TwoHand; qty cap (3) binds before the weight cap.
+    fn stone_bounded_by_weight_not_volume() {
+        // Stone is 8 L at 5 kg. Weight cap 2 × 25 kg → 10 by weight;
+        // volume cap 200 L → 25 by volume. Weight binds, returns 10 stones.
         let mut c = Carrier::default();
         let stone = Item::new_commodity(crate::economy::core_ids::stone());
         let leftover = c.try_pick_up(stone, 100);
-        assert_eq!(leftover, 97);
-        assert_eq!(c.quantity_of(stone), 3);
+        assert_eq!(leftover, 90, "two-hand stone capped by weight at 10");
+        assert_eq!(c.quantity_of(stone), 10);
         assert!(c.total_weight_g() <= HUMAN_HAND_CAP_G * 2);
     }
 
     #[test]
-    fn is_at_haul_cap_triggers_when_two_handed_full() {
+    fn should_return_to_deposit_keyed_on_item() {
         let mut c = Carrier::default();
         let log = Item::new_commodity(crate::economy::core_ids::wood());
-        let _ = c.try_pick_up(log, 3);
-        assert!(c.is_at_haul_cap());
+        let _ = c.try_pick_up(log, 5); // fills the TwoHand oversized cap
+        // No more wood will fit — should head back.
+        assert!(c.should_return_to_deposit(log));
+        // A different (smaller) item is hypothetically pickup_capacity=0
+        // anyway because TwoHand stack blocks all other pickups.
+        let fruit = Item::new_commodity(crate::economy::core_ids::fruit());
+        assert!(c.should_return_to_deposit(fruit));
     }
 
     #[test]
-    fn is_at_haul_cap_triggers_for_partial_two_handed() {
-        // A single log already pins both hands — can't pick up more, so deposit.
+    fn should_return_to_deposit_after_two_handed_pickup() {
+        // A TwoHand stack pins both hands the moment any qty is held; no more
+        // can be picked up regardless of the resource. `pickup_capacity`
+        // returns 0 → `should_return_to_deposit` true.
         let mut c = Carrier::default();
         let log = Item::new_commodity(crate::economy::core_ids::wood());
         let _ = c.try_pick_up(log, 1);
-        assert!(c.is_at_haul_cap());
+        assert!(c.should_return_to_deposit(log));
+        assert!(c.should_return_to_deposit_held());
     }
 
     #[test]
-    fn is_at_haul_cap_requires_both_hands_for_one_hand_goods() {
+    fn should_return_to_deposit_held_requires_both_hands_for_small() {
         let mut c = Carrier::default();
         let coal = Item::new_commodity(crate::economy::core_ids::coal()); // OneHand
         let _ = c.try_pick_up(coal, 3);
-        assert!(!c.is_at_haul_cap(), "one filled hand isn't enough");
+        assert!(
+            !c.should_return_to_deposit_held(),
+            "one OneHand stack leaves the other hand free"
+        );
+        // Second OneHand pickup fills both hands → return.
         let _ = c.try_pick_up(coal, 3);
-        assert!(c.is_at_haul_cap(), "both hands at cap → return");
+        assert!(
+            c.should_return_to_deposit_held(),
+            "both hands occupied → head back"
+        );
     }
 
     #[test]
@@ -615,12 +689,12 @@ mod tests {
         // across bulk classes and partial-hand states. This guards the resolver
         // from committing units the executor would refuse.
         let cases: [crate::economy::resource_catalog::ResourceId; 6] = [
-            crate::economy::core_ids::stone(),      // TwoHand, 5000g
-            crate::economy::core_ids::wood(),       // TwoHand, 3000g
-            crate::economy::core_ids::coal(),       // OneHand, 2000g
-            crate::economy::core_ids::fruit(),      // Small, 250g
-            crate::economy::core_ids::grain_seed(), // Small, 20g
-            crate::economy::core_ids::berry_seed(), // Small, 20g
+            crate::economy::core_ids::stone(),      // TwoHand, 5000g, 8000ml
+            crate::economy::core_ids::wood(),       // TwoHand, 3000g, 35000ml
+            crate::economy::core_ids::coal(),       // OneHand, 2000g, 4000ml
+            crate::economy::core_ids::fruit(),      // Small, 250g, 300ml
+            crate::economy::core_ids::grain_seed(), // Small, 20g, 30ml
+            crate::economy::core_ids::berry_seed(), // Small, 20g, 30ml
         ];
         let fruit_id = crate::economy::core_ids::fruit();
         for rid in cases {
@@ -669,8 +743,8 @@ mod tests {
     #[test]
     fn drop_one_hand_prefers_heaviest() {
         let mut c = Carrier::default();
-        let _ = c.try_pick_up(Item::new_commodity(crate::economy::core_ids::coal()), 3); // ~10 kg per hand
-        let _ = c.try_pick_up(Item::new_commodity(crate::economy::core_ids::skin()), 3); // ~4.5 kg per hand
+        let _ = c.try_pick_up(Item::new_commodity(crate::economy::core_ids::coal()), 3); // ~6 kg per hand
+        let _ = c.try_pick_up(Item::new_commodity(crate::economy::core_ids::skin()), 3); // ~2.7 kg per hand
         let dropped = c.drop_one_hand().expect("should drop something");
         assert_eq!(dropped.item.resource_id, crate::economy::core_ids::coal());
     }

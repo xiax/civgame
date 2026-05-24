@@ -143,9 +143,15 @@ pub fn dig_system(
         // Keep the task alive across levels. Only retire at level 7 (the
         // carve), if the carrier is full, or the next level would exceed the
         // tool cap.
+        // Dig yields stone; "should return to deposit" is keyed on the
+        // stone item so volume + weight both gate the haul cycle.
+        let stone_item =
+            Item::new_commodity(crate::economy::core_ids::stone());
         let next_level_blocked = match outcome {
             AdvanceOutcome::Carved => true,
-            AdvanceOutcome::Levelled { new_level } => new_level >= depth_cap || carrier.is_at_haul_cap(),
+            AdvanceOutcome::Levelled { new_level } => {
+                new_level >= depth_cap || carrier.should_return_to_deposit(stone_item)
+            }
         };
         if next_level_blocked {
             ai.state = AiState::Idle;

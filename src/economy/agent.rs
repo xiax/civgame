@@ -1,3 +1,4 @@
+use super::goods::Bulk;
 use super::item::Item;
 use super::resource_catalog::ResourceId;
 use bevy::prelude::*;
@@ -9,6 +10,14 @@ pub const INVENTORY_SLOTS: usize = 6;
 /// Default base weight capacity for a person, in grams (~5 kg).
 pub const BASE_INVENTORY_CAP_G: u32 = 5_000;
 
+/// Default base small-bulk volume capacity for a person, in millilitres (~8 L).
+/// Bounds `Bulk::Small` stacks (pouches / satchel).
+pub const BASE_INVENTORY_SMALL_VOL_ML: u32 = 8_000;
+
+/// Default base bulky volume capacity for a person, in millilitres (~25 L).
+/// Bounds `Bulk::OneHand` / `Bulk::TwoHand` stacks (lashed pack / sack).
+pub const BASE_INVENTORY_BULKY_VOL_ML: u32 = 25_000;
+
 /// Currency + small fixed inventory.
 #[derive(Component, Clone, Copy)]
 pub struct EconomicAgent {
@@ -18,6 +27,14 @@ pub struct EconomicAgent {
     pub base_cap_g: u32,
     /// Bonus capacity in grams (recomputed from worn equipment).
     pub bonus_cap_g: u32,
+    /// Base small-bulk volume capacity in millilitres.
+    pub base_small_vol_ml: u32,
+    /// Base bulky (OneHand/TwoHand) volume capacity in millilitres.
+    pub base_bulky_vol_ml: u32,
+    /// Bonus small-bulk volume in millilitres (future equipment lift).
+    pub bonus_small_vol_ml: u32,
+    /// Bonus bulky volume in millilitres (future equipment lift).
+    pub bonus_bulky_vol_ml: u32,
 }
 
 impl Default for EconomicAgent {
@@ -31,6 +48,10 @@ impl Default for EconomicAgent {
                 INVENTORY_SLOTS],
             base_cap_g: BASE_INVENTORY_CAP_G,
             bonus_cap_g: 0,
+            base_small_vol_ml: BASE_INVENTORY_SMALL_VOL_ML,
+            base_bulky_vol_ml: BASE_INVENTORY_BULKY_VOL_ML,
+            bonus_small_vol_ml: 0,
+            bonus_bulky_vol_ml: 0,
         }
     }
 }
@@ -48,6 +69,18 @@ impl EconomicAgent {
         self.base_cap_g.saturating_add(self.bonus_cap_g)
     }
 
+    /// Total small-bulk volume capacity, in millilitres.
+    pub fn capacity_small_vol_ml(&self) -> u32 {
+        self.base_small_vol_ml
+            .saturating_add(self.bonus_small_vol_ml)
+    }
+
+    /// Total bulky (OneHand/TwoHand) volume capacity, in millilitres.
+    pub fn capacity_bulky_vol_ml(&self) -> u32 {
+        self.base_bulky_vol_ml
+            .saturating_add(self.bonus_bulky_vol_ml)
+    }
+
     /// Current inventory weight, in grams.
     pub fn current_weight_g(&self) -> u32 {
         self.inventory
@@ -58,33 +91,79 @@ impl EconomicAgent {
             })
     }
 
+    /// Current small-bulk volume, summed over `Bulk::Small` stacks.
+    pub fn current_small_vol_ml(&self) -> u32 {
+        self.inventory
+            .iter()
+            .filter(|(it, q)| *q > 0 && matches!(it.resource_id.bulk(), Bulk::Small))
+            .fold(0u32, |acc, (it, q)| {
+                acc.saturating_add(it.stack_volume_ml(*q))
+            })
+    }
+
+    /// Current bulky volume, summed over `Bulk::OneHand` / `Bulk::TwoHand` stacks.
+    pub fn current_bulky_vol_ml(&self) -> u32 {
+        self.inventory
+            .iter()
+            .filter(|(it, q)| {
+                *q > 0 && !matches!(it.resource_id.bulk(), Bulk::Small)
+            })
+            .fold(0u32, |acc, (it, q)| {
+                acc.saturating_add(it.stack_volume_ml(*q))
+            })
+    }
+
     /// Remaining weight capacity, in grams.
     pub fn free_capacity_g(&self) -> u32 {
         self.capacity_g().saturating_sub(self.current_weight_g())
     }
 
+    /// Remaining volume capacity for the bucket matching `item`'s bulk class.
+    pub fn free_vol_ml_for(&self, item: Item) -> u32 {
+        match item.resource_id.bulk() {
+            Bulk::Small => self
+                .capacity_small_vol_ml()
+                .saturating_sub(self.current_small_vol_ml()),
+            Bulk::OneHand | Bulk::TwoHand => self
+                .capacity_bulky_vol_ml()
+                .saturating_sub(self.current_bulky_vol_ml()),
+        }
+    }
+
     /// Try to add `qty` of `item`. Returns the amount that did not fit (0 if all fit).
-    /// Constraints: weight cap and slot count.
+    /// Constraints: weight cap, per-bucket volume cap, and slot count.
     pub fn add_item(&mut self, item: Item, qty: u32) -> u32 {
         if qty == 0 {
             return 0;
         }
         let unit_w = item.unit_weight_g().max(1);
-        let cap = self.capacity_g();
-        let mut used = self.current_weight_g();
+        let unit_v = item.unit_volume_ml().max(1);
+        let cap_w = self.capacity_g();
+        let bulk = item.resource_id.bulk();
+        let (cap_v, mut used_v) = match bulk {
+            Bulk::Small => (self.capacity_small_vol_ml(), self.current_small_vol_ml()),
+            Bulk::OneHand | Bulk::TwoHand => (
+                self.capacity_bulky_vol_ml(),
+                self.current_bulky_vol_ml(),
+            ),
+        };
+        let mut used_w = self.current_weight_g();
         let mut remaining = qty;
 
         // Top up an existing matching stack.
         for (it, q) in self.inventory.iter_mut() {
             if *q > 0 && *it == item {
-                let cap_left = cap.saturating_sub(used);
-                let by_weight = cap_left / unit_w;
-                if by_weight == 0 {
+                let weight_room = cap_w.saturating_sub(used_w);
+                let vol_room = cap_v.saturating_sub(used_v);
+                let by_weight = weight_room / unit_w;
+                let by_volume = vol_room / unit_v;
+                let take = remaining.min(by_weight).min(by_volume);
+                if take == 0 {
                     return remaining;
                 }
-                let take = remaining.min(by_weight);
                 *q = q.saturating_add(take);
-                used = used.saturating_add(take.saturating_mul(unit_w));
+                used_w = used_w.saturating_add(take.saturating_mul(unit_w));
+                used_v = used_v.saturating_add(take.saturating_mul(unit_v));
                 remaining -= take;
                 if remaining == 0 {
                     return 0;
@@ -95,12 +174,14 @@ impl EconomicAgent {
 
         // Claim an empty slot.
         if remaining > 0 {
-            let cap_left = cap.saturating_sub(used);
-            let by_weight = cap_left / unit_w;
-            if by_weight == 0 {
+            let weight_room = cap_w.saturating_sub(used_w);
+            let vol_room = cap_v.saturating_sub(used_v);
+            let by_weight = weight_room / unit_w;
+            let by_volume = vol_room / unit_v;
+            let take = remaining.min(by_weight).min(by_volume);
+            if take == 0 {
                 return remaining;
             }
-            let take = remaining.min(by_weight);
             for (it, q) in self.inventory.iter_mut() {
                 if *q == 0 {
                     *it = item;
@@ -170,24 +251,38 @@ impl EconomicAgent {
             .map(|(it, q)| (it.resource_id, *q))
     }
 
-    /// Inventory is full when no more weight can fit (using the smallest stocked item as a
-    /// rough lower bound, or any item if empty).
+    /// Inventory is full when no smallest-stack unit (by weight AND its
+    /// matching bulk-bucket volume) fits, accounting for slot availability.
     pub fn is_inventory_full(&self) -> bool {
-        let cap = self.capacity_g();
-        let used = self.current_weight_g();
-        if used >= cap {
+        let cap_w = self.capacity_g();
+        let used_w = self.current_weight_g();
+        let weight_room = cap_w.saturating_sub(used_w);
+        let small_room = self
+            .capacity_small_vol_ml()
+            .saturating_sub(self.current_small_vol_ml());
+        let bulky_room = self
+            .capacity_bulky_vol_ml()
+            .saturating_sub(self.current_bulky_vol_ml());
+        if weight_room == 0 || (small_room == 0 && bulky_room == 0) {
             return true;
         }
-        // Slots all in use AND no existing stack can grow within the weight budget?
         let any_empty = self.inventory.iter().any(|(_, q)| *q == 0);
-        if any_empty {
-            return false;
-        }
-        // All slots occupied: inventory is "full" if no smallest-stack unit fits.
-        let cap_left = cap - used;
-        !self
-            .inventory
-            .iter()
-            .any(|(it, q)| *q > 0 && it.unit_weight_g() <= cap_left)
+        // Fits if any occupied stack can grow OR an empty slot can accept
+        // a fresh stack of any held item type within both budgets.
+        let any_fits = self.inventory.iter().any(|(it, q)| {
+            if *q == 0 {
+                return false;
+            }
+            let unit_w = it.unit_weight_g().max(1);
+            let unit_v = it.unit_volume_ml().max(1);
+            let vol_room = match it.resource_id.bulk() {
+                Bulk::Small => small_room,
+                Bulk::OneHand | Bulk::TwoHand => bulky_room,
+            };
+            unit_w <= weight_room && unit_v <= vol_room
+        });
+        // An empty slot with positive weight+volume room makes us not full
+        // (conservative — caller adding determines exact qty).
+        !(any_fits || any_empty)
     }
 }

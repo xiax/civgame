@@ -363,6 +363,7 @@ pub fn withdraw_good_task_system(
         &mut PersonAI,
         &mut crate::simulation::typed_task::ActionQueue,
         &mut EconomicAgent,
+        &mut Carrier,
         &FactionMember,
         &BucketSlot,
         &LodLevel,
@@ -370,7 +371,7 @@ pub fn withdraw_good_task_system(
 ) {
     use crate::simulation::typed_task::{Task, WithdrawGoodFilter};
 
-    for (mut ai, mut aq, mut agent, member, slot, lod) in query.iter_mut() {
+    for (mut ai, mut aq, mut agent, mut carrier, member, slot, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -417,15 +418,25 @@ pub fn withdraw_good_task_system(
                 }
                 // Preserve the manufactured stats (material + quality +
                 // weapon/armor stats) by transferring the actual `Item`,
-                // not a freshly-constructed commodity. Without this, an
-                // Iron Spear withdrawn from storage would arrive in
-                // inventory as a stat-less commodity and the equip step
-                // would wield it for zero damage_bonus.
-                agent.add_item(gi.item, 1);
-                if gi.qty == 1 {
+                // not a freshly-constructed commodity.
+                //
+                // Bulky items (Bulk::OneHand / TwoHand) may exceed the
+                // personal bulky-vol bucket. Try hands first (oversized
+                // per-hand cap), then fall back to inventory.
+                let leftover_hand = carrier.try_pick_up(gi.item, 1);
+                let leftover = if leftover_hand > 0 {
+                    agent.add_item(gi.item, leftover_hand)
+                } else {
+                    0
+                };
+                let taken = 1 - leftover;
+                if taken == 0 {
+                    break;
+                }
+                if gi.qty == taken {
                     commands.entity(gi_entity).despawn_recursive();
                 } else {
-                    gi.qty -= 1;
+                    gi.qty -= taken;
                 }
                 break;
             }
@@ -699,8 +710,8 @@ pub fn withdraw_material_task_system(
             }
         }
 
-        let mut remaining = target_qty as u32;
-        let promised = target_qty as u32;
+        let mut remaining = target_qty;
+        let promised = target_qty;
         let pickup_item = Item::new_commodity(target_resource);
 
         for &gi_entity in spatial.get(tx as i32, ty as i32) {
@@ -791,7 +802,7 @@ pub fn buy_material_task_system(world: &mut World) {
     struct BuySnap {
         entity: bevy::prelude::Entity,
         resource_id: crate::economy::resource_catalog::ResourceId,
-        qty: u8,
+        qty: u32,
         node: bevy::prelude::Entity,
         max_unit_price: f32,
         job_id: Option<crate::simulation::jobs::JobId>,
@@ -894,7 +905,7 @@ pub fn buy_material_task_system(world: &mut World) {
                             crate::simulation::camp::MarketNodeRef::Camp(s.node)
                         },
                         s.resource_id,
-                        s.qty as u32,
+                        s.qty,
                     );
                     bought = res.is_some();
                     // Return the unspent remainder: residual = current −
@@ -1288,7 +1299,7 @@ pub fn take_from_member_task_system(
             to_finalize.push(actor);
             continue;
         }
-        transfers.push((actor, target, resource_id, qty as u32));
+        transfers.push((actor, target, resource_id, qty));
     }
 
     for (actor, target, rid, want) in transfers {

@@ -108,7 +108,7 @@ pub enum Task {
     /// not-strictly-self faction should set this.
     WithdrawMaterial {
         resource_id: ResourceId,
-        qty: u8,
+        qty: u32,
         source_faction_id: Option<u32>,
     },
     /// Market-procurement counterpart of `WithdrawMaterial` (Step 5). The
@@ -122,7 +122,7 @@ pub enum Task {
     /// `production::buy_material_task_system`.
     BuyMaterialAtMarket {
         resource_id: ResourceId,
-        qty: u8,
+        qty: u32,
         node: bevy::prelude::Entity,
     },
     /// P2b: nomadic / member-pool counterpart to `WithdrawMaterial`. Walks
@@ -138,7 +138,7 @@ pub enum Task {
     WalkAndTakeFromMember {
         target: bevy::prelude::Entity,
         resource_id: ResourceId,
-        qty: u8,
+        qty: u32,
     },
     /// Move a matching `Item` from inventory or hands into `Equipment[slot]`.
     /// Replaces `PersonAI.equip_slot` (sentinel-encoded `u8`) and the Equip
@@ -1002,7 +1002,7 @@ impl Task {
     }
 
     /// Convenience accessor for the BuyMaterialAtMarket variant.
-    pub fn as_buy_material_at_market(&self) -> Option<(ResourceId, u8, bevy::prelude::Entity)> {
+    pub fn as_buy_material_at_market(&self) -> Option<(ResourceId, u32, bevy::prelude::Entity)> {
         match *self {
             Task::BuyMaterialAtMarket {
                 resource_id,
@@ -1014,7 +1014,7 @@ impl Task {
     }
 
     /// Convenience accessor for the WithdrawMaterial variant.
-    pub fn as_withdraw_material(&self) -> Option<(ResourceId, u8)> {
+    pub fn as_withdraw_material(&self) -> Option<(ResourceId, u32)> {
         match *self {
             Task::WithdrawMaterial {
                 resource_id, qty, ..

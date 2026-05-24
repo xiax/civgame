@@ -232,7 +232,7 @@ pub struct PersonAI {
     /// Reserved quantity. The reservation is decremented by exactly this many
     /// units when the task ends (success, abort, or plan teardown), so the
     /// fields must be kept in sync with the actual `StorageReservations` map.
-    pub reserved_qty: u8,
+    pub reserved_qty: u32,
     /// The HTN `MethodId` whose expansion produced the agent's currently-running
     /// task chain. Stamped by each `htn_*_dispatch_system` after a successful
     /// dispatch and cleared by `htn_method_completion_system` (Sequential, after

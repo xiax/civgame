@@ -966,9 +966,13 @@ pub fn gather_system(
                     AdvanceOutcome::Levelled { new_level } => {
                         // Keep the task alive across partial levels. Only
                         // retire if the next step would exceed the tool cap
-                        // or the carrier is at haul cap.
-                        let next_blocked =
-                            new_level >= depth_cap || carrier.is_at_haul_cap();
+                        // or the carrier can't accept more stone.
+                        let stone_item =
+                            crate::economy::item::Item::new_commodity(
+                                crate::economy::core_ids::stone(),
+                            );
+                        let next_blocked = new_level >= depth_cap
+                            || carrier.should_return_to_deposit(stone_item);
                         if next_blocked {
                             finish_gather(
                                 &mut ai,
@@ -1042,7 +1046,7 @@ pub fn gather_system(
 
         // ── Hands at haul cap → end gather step so the plan advances to deposit ──
 
-        if carrier.is_at_haul_cap() {
+        if carrier.should_return_to_deposit_held() {
             finish_gather(
                 &mut ai,
                 &mut aq,

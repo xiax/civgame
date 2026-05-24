@@ -250,9 +250,11 @@ pub fn hover_info_system(
                         // packing and see why a horse is "loaded".
                         if let Some(inv) = pack {
                             ui.label(format!(
-                                "Carrying: {} / {} kg",
+                                "Carrying: {} / {} kg  |  {} / {} L",
                                 inv.current_weight_g() / 1000,
                                 inv.capacity_g / 1000,
+                                inv.current_volume_ml() / 1000,
+                                inv.capacity_ml / 1000,
                             ));
                             for (rid, qty) in inv.iter() {
                                 ui.label(format!(

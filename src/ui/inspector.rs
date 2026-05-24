@@ -245,9 +245,10 @@ pub fn inspector_panel_system(
                             }
                             let stats = derive_stats(&design.grid, &task_display.vehicle.data);
                             ui.label(format!(
-                                "Empty {} kg  ·  max payload {} kg",
+                                "Empty {} kg  ·  max payload {} kg  ({} L)",
                                 stats.empty_mass_g / 1000,
-                                stats.max_payload_g / 1000
+                                stats.max_payload_g / 1000,
+                                stats.max_cargo_volume_ml / 1000,
                             ));
                             ui.label(format!(
                                 "Speed: road {:.2}  off-road {:.2}",
@@ -817,10 +818,18 @@ pub fn inspector_panel_system(
 
                         let cur_g = agent.current_weight_g();
                         let cap_g = agent.capacity_g();
+                        let small_cur = agent.current_small_vol_ml();
+                        let small_cap = agent.capacity_small_vol_ml();
+                        let bulky_cur = agent.current_bulky_vol_ml();
+                        let bulky_cap = agent.capacity_bulky_vol_ml();
                         ui.label(format!(
-                            "Inventory ({:.1} / {:.1} kg):",
+                            "Inventory: {:.1} / {:.1} kg  |  pouch {:.1}/{:.1} L  |  pack {:.1}/{:.1} L",
                             cur_g as f32 / 1000.0,
                             cap_g as f32 / 1000.0,
+                            small_cur as f32 / 1000.0,
+                            small_cap as f32 / 1000.0,
+                            bulky_cur as f32 / 1000.0,
+                            bulky_cap as f32 / 1000.0,
                         ));
                         let frac = if cap_g > 0 {
                             (cur_g as f32 / cap_g as f32).clamp(0.0, 1.0)

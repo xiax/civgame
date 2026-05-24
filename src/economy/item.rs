@@ -215,6 +215,17 @@ impl Item {
     pub fn stack_weight_g(&self, qty: u32) -> u32 {
         self.unit_weight_g().saturating_mul(qty)
     }
+
+    /// Volume of one unit, in millilitres. Volume comes from the resource
+    /// catalog only — material does not multiply volume.
+    pub fn unit_volume_ml(&self) -> u32 {
+        self.resource_id.unit_volume_ml()
+    }
+
+    /// Volume of `qty` units, in millilitres.
+    pub fn stack_volume_ml(&self, qty: u32) -> u32 {
+        self.unit_volume_ml().saturating_mul(qty)
+    }
 }
 
 /// Derive combat stats from `(resource_id, material, quality)`. Weapons get

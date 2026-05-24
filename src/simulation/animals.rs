@@ -200,6 +200,14 @@ pub const PACK_CAP_COW: u32 = 80_000;
 pub const PACK_CAP_PIG: u32 = 30_000;
 pub const PACK_CAP_DOG: u32 = 15_000;
 
+/// Per-species pack-volume ceilings in millilitres. Saddlebag + lash-bundle
+/// envelope; complements the weight ceilings above. At horse 180 L one
+/// `packed_yurt` (180 L) saturates a single horse exactly.
+pub const PACK_VOL_HORSE: u32 = 180_000;
+pub const PACK_VOL_COW: u32 = 240_000;
+pub const PACK_VOL_PIG: u32 = 80_000;
+pub const PACK_VOL_DOG: u32 = 35_000;
+
 /// Number of distinct stack types a pack animal can carry.
 pub const PACK_INVENTORY_SLOTS: usize = 6;
 
@@ -211,6 +219,7 @@ pub const PACK_INVENTORY_SLOTS: usize = 6;
 pub struct PackAnimalInventory {
     pub items: [(crate::economy::resource_catalog::ResourceId, u32); PACK_INVENTORY_SLOTS],
     pub capacity_g: u32,
+    pub capacity_ml: u32,
 }
 
 impl Default for PackAnimalInventory {
@@ -220,14 +229,26 @@ impl Default for PackAnimalInventory {
         Self {
             items: [(crate::economy::core_ids::fruit(), 0); PACK_INVENTORY_SLOTS],
             capacity_g: 0,
+            capacity_ml: 0,
         }
     }
 }
 
 impl PackAnimalInventory {
     pub fn for_capacity(cap_g: u32) -> Self {
+        // Legacy constructor — used by tests and unscoped call sites.
+        // Defaults volume cap to "very large" so weight stays the binding
+        // constraint, matching pre-volume behaviour.
         let mut me = Self::default();
         me.capacity_g = cap_g;
+        me.capacity_ml = u32::MAX;
+        me
+    }
+
+    pub fn for_capacity_and_volume(cap_g: u32, cap_ml: u32) -> Self {
+        let mut me = Self::default();
+        me.capacity_g = cap_g;
+        me.capacity_ml = cap_ml;
         me
     }
 
@@ -243,8 +264,24 @@ impl PackAnimalInventory {
         w
     }
 
+    pub fn current_volume_ml(&self) -> u32 {
+        let mut v = 0u32;
+        for (rid, qty) in self.items.iter() {
+            if *qty == 0 {
+                continue;
+            }
+            let unit = rid.unit_volume_ml().max(1);
+            v = v.saturating_add(unit.saturating_mul(*qty));
+        }
+        v
+    }
+
     pub fn free_capacity_g(&self) -> u32 {
         self.capacity_g.saturating_sub(self.current_weight_g())
+    }
+
+    pub fn free_capacity_ml(&self) -> u32 {
+        self.capacity_ml.saturating_sub(self.current_volume_ml())
     }
 
     /// Add up to `qty` units of `rid`. Returns the number that did NOT fit.
@@ -253,16 +290,24 @@ impl PackAnimalInventory {
             return 0;
         }
         let unit_w = rid.unit_weight_g().max(1);
+        let unit_v = rid.unit_volume_ml().max(1);
         let mut remaining = qty;
-        let mut used = self.current_weight_g();
+        let mut used_w = self.current_weight_g();
+        let mut used_v = self.current_volume_ml();
         // Top up an existing matching stack first.
         for (slot_rid, slot_qty) in self.items.iter_mut() {
             if *slot_qty > 0 && *slot_rid == rid {
-                let cap_left = self.capacity_g.saturating_sub(used);
-                let by_weight = cap_left / unit_w;
-                let take = remaining.min(by_weight);
+                let weight_room = self.capacity_g.saturating_sub(used_w);
+                let vol_room = self.capacity_ml.saturating_sub(used_v);
+                let by_weight = weight_room / unit_w;
+                let by_volume = vol_room / unit_v;
+                let take = remaining.min(by_weight).min(by_volume);
+                if take == 0 {
+                    return remaining;
+                }
                 *slot_qty = slot_qty.saturating_add(take);
-                used = used.saturating_add(take.saturating_mul(unit_w));
+                used_w = used_w.saturating_add(take.saturating_mul(unit_w));
+                used_v = used_v.saturating_add(take.saturating_mul(unit_v));
                 remaining -= take;
                 if remaining == 0 {
                     return 0;
@@ -272,9 +317,14 @@ impl PackAnimalInventory {
         }
         if remaining > 0 {
             // Find an empty slot.
-            let cap_left = self.capacity_g.saturating_sub(used);
-            let by_weight = cap_left / unit_w;
-            let take = remaining.min(by_weight);
+            let weight_room = self.capacity_g.saturating_sub(used_w);
+            let vol_room = self.capacity_ml.saturating_sub(used_v);
+            let by_weight = weight_room / unit_w;
+            let by_volume = vol_room / unit_v;
+            let take = remaining.min(by_weight).min(by_volume);
+            if take == 0 {
+                return remaining;
+            }
             for (slot_rid, slot_qty) in self.items.iter_mut() {
                 if *slot_qty == 0 {
                     *slot_rid = rid;
@@ -334,7 +384,7 @@ pub fn attach_pack_inventory_system(
     wolf_q: Query<Entity, (Added<Tamed>, With<Wolf>, Without<DomesticAnimal>)>,
 ) {
     let now = clock.tick as u32;
-    let mut attach = |e: Entity, species: DomesticSpecies, pack_cap: Option<u32>| {
+    let mut attach = |e: Entity, species: DomesticSpecies, pack_cap: Option<(u32, u32)>| {
         let mut ec = commands.entity(e);
         ec.insert(DomesticAnimal {
             species,
@@ -342,24 +392,24 @@ pub fn attach_pack_inventory_system(
             preferred_home: None,
             last_cared_tick: now,
         });
-        if let Some(cap) = pack_cap {
-            ec.insert(PackAnimalInventory::for_capacity(cap));
+        if let Some((cap_g, cap_ml)) = pack_cap {
+            ec.insert(PackAnimalInventory::for_capacity_and_volume(cap_g, cap_ml));
         }
     };
     for e in horse_q.iter() {
-        attach(e, DomesticSpecies::Horse, Some(PACK_CAP_HORSE));
+        attach(e, DomesticSpecies::Horse, Some((PACK_CAP_HORSE, PACK_VOL_HORSE)));
     }
     for e in cow_q.iter() {
-        attach(e, DomesticSpecies::Cattle, Some(PACK_CAP_COW));
+        attach(e, DomesticSpecies::Cattle, Some((PACK_CAP_COW, PACK_VOL_COW)));
     }
     for e in pig_q.iter() {
-        attach(e, DomesticSpecies::Pig, Some(PACK_CAP_PIG));
+        attach(e, DomesticSpecies::Pig, Some((PACK_CAP_PIG, PACK_VOL_PIG)));
     }
     for e in cat_q.iter() {
         attach(e, DomesticSpecies::Cat, None);
     }
     for e in wolf_q.iter() {
-        attach(e, DomesticSpecies::Dog, Some(PACK_CAP_DOG));
+        attach(e, DomesticSpecies::Dog, Some((PACK_CAP_DOG, PACK_VOL_DOG)));
     }
 }
 

@@ -28,7 +28,7 @@ VehicleDataFile(
         PartDef(kind: wheel,        base_mass_g: 5000, cargo_volume_g: 0,     crew_capacity: 0, tech_gates: []),
         PartDef(kind: hitch,        base_mass_g: 1500, cargo_volume_g: 0,     crew_capacity: 0, tech_gates: []),
         PartDef(kind: yoke,         base_mass_g: 2500, cargo_volume_g: 0,     crew_capacity: 0, tech_gates: []),
-        PartDef(kind: cargo_bay,    base_mass_g: 2000, cargo_volume_g: 80000, crew_capacity: 0, tech_gates: []),
+        PartDef(kind: cargo_bay,    base_mass_g: 2000, cargo_volume_g: 80000, cargo_volume_ml: 300000, crew_capacity: 0, tech_gates: []),
         PartDef(kind: crew_seat,    base_mass_g: 1200, cargo_volume_g: 0,     crew_capacity: 1, tech_gates: []),
         PartDef(kind: weapon_mount, base_mass_g: 2500, cargo_volume_g: 0,     crew_capacity: 0, tech_gates: ["war_chariot"]),
         // ── Tank / siege parts ────────────────────────────────────────────

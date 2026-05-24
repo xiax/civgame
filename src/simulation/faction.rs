@@ -1982,7 +1982,7 @@ pub fn release_reservation(
     ai: &mut crate::simulation::person::PersonAI,
 ) {
     if let Some(resource_id) = ai.reserved_resource {
-        reservations.sub(ai.reserved_tile, resource_id, ai.reserved_qty as u32);
+        reservations.sub(ai.reserved_tile, resource_id, ai.reserved_qty);
     }
     ai.reserved_resource = None;
     ai.reserved_qty = 0;

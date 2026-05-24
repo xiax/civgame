@@ -360,6 +360,9 @@ pub struct VehicleDesignId(pub u32);
 pub struct VehicleStats {
     pub empty_mass_g: u32,
     pub max_payload_g: u32,
+    /// Physical cargo space, in millilitres. Sum of every `CargoBay` cell's
+    /// `cargo_volume_ml × variant.cargo_volume_mult`.
+    pub max_cargo_volume_ml: u32,
     /// Rated fully-loaded mass (`empty + max_payload`); runtime updates the
     /// live value as cargo changes.
     pub loaded_mass_g: u32,
@@ -948,6 +951,7 @@ pub fn derive_stats(grid: &VehicleGrid, data: &VehicleData) -> VehicleStats {
         return VehicleStats {
             empty_mass_g: 0,
             max_payload_g: 0,
+            max_cargo_volume_ml: 0,
             loaded_mass_g: 0,
             draft_power_needed: 0.0,
             wheelbase: 0.0,
@@ -1053,6 +1057,16 @@ pub fn derive_stats(grid: &VehicleGrid, data: &VehicleData) -> VehicleStats {
             (base as f32 * mult.max(0.0)) as u32
         })
         .sum();
+    let max_cargo_volume_ml: u32 = grid
+        .cells
+        .iter()
+        .filter(|(_, c)| c.kind == VehiclePartKind::CargoBay)
+        .map(|(_, c)| {
+            let base = data.part(c.kind).map(|p| p.cargo_volume_ml).unwrap_or(0);
+            let mult = variant_of(c, data).map(|v| v.cargo_volume_mult).unwrap_or(1.0);
+            (base as f32 * mult.max(0.0)) as u32
+        })
+        .sum();
     let max_payload_g = cargo_volume.min(support.saturating_sub(empty_mass_g));
     let loaded_mass_g = empty_mass_g.saturating_add(max_payload_g);
 
@@ -1123,6 +1137,7 @@ pub fn derive_stats(grid: &VehicleGrid, data: &VehicleData) -> VehicleStats {
     VehicleStats {
         empty_mass_g,
         max_payload_g,
+        max_cargo_volume_ml,
         loaded_mass_g,
         draft_power_needed,
         wheelbase,
@@ -1160,6 +1175,11 @@ struct PartDefRon {
     kind: VehiclePartKind,
     base_mass_g: u32,
     cargo_volume_g: u32,
+    /// Physical cargo space the part contributes, in millilitres. Non-zero
+    /// only on `cargo_bay`. `#[serde(default)]` keeps old defs valid; missing
+    /// reads 0 (no volume contribution).
+    #[serde(default)]
+    cargo_volume_ml: u32,
     crew_capacity: u8,
     #[serde(default)]
     tech_gates: Vec<String>,
@@ -1324,6 +1344,9 @@ pub struct PartDef {
     pub kind: VehiclePartKind,
     pub base_mass_g: u32,
     pub cargo_volume_g: u32,
+    /// Physical cargo space contribution per cell, in millilitres
+    /// (`cargo_bay` only).
+    pub cargo_volume_ml: u32,
     pub crew_capacity: u8,
     pub tech_gates: Vec<TechId>,
     /// Abstract powered-draft output (grams of draft-equivalent draw).
@@ -1602,6 +1625,7 @@ pub fn load_vehicle_assets() -> (VehicleData, VehicleDesignRegistry) {
                 kind: p.kind,
                 base_mass_g: p.base_mass_g,
                 cargo_volume_g: p.cargo_volume_g,
+                cargo_volume_ml: p.cargo_volume_ml,
                 crew_capacity: p.crew_capacity,
                 tech_gates,
                 engine_power_g: p.engine_power_g,
@@ -2691,6 +2715,19 @@ pub fn capacity_units(payload_g: u32, rid: ResourceId) -> u32 {
     (payload_g / unit_weight_g(rid)).max(1)
 }
 
+/// Capacity units bounded by BOTH weight and physical volume. Used by the
+/// cargo haul executor so a low-density bulky load (e.g. wood, packed yurts)
+/// is volume-limited even when weight headroom remains.
+pub fn capacity_units_bounded(payload_g: u32, vol_ml: u32, rid: ResourceId) -> u32 {
+    let by_weight = payload_g / unit_weight_g(rid);
+    let by_volume = if vol_ml == 0 {
+        u32::MAX
+    } else {
+        vol_ml / rid.unit_volume_ml().max(1)
+    };
+    by_weight.min(by_volume).max(1)
+}
+
 /// The cargo payload (grams) of a design — `derive_stats().max_payload_g`.
 pub fn design_payload_g(design: &VehicleDesign, data: &VehicleData) -> u32 {
     derive_stats(&design.grid, data).max_payload_g
@@ -3218,7 +3255,8 @@ pub fn vehicle_cargo_haul_task_system(
                 continue;
             }
             let payload_g = design_payload_g(design, &data);
-            let want = need.min(capacity_units(payload_g, rid));
+            let payload_ml = derive_stats(&design.grid, &data).max_cargo_volume_ml;
+            let want = need.min(capacity_units_bounded(payload_g, payload_ml, rid));
             let mut loaded_qty = 0u32;
             for gi_e in spatial.get(src.0, src.1).to_vec() {
                 if loaded_qty >= want {

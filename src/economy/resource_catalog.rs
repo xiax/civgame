@@ -90,6 +90,16 @@ impl ResourceId {
             .unwrap_or(0)
     }
 
+    /// Per-unit volume in millilitres. Mirrors catalog `volume_ml`;
+    /// returns 0 for unknown ids. Volume is per-resource only — material
+    /// variation reflects in `unit_weight_g` (density), not volume.
+    pub fn unit_volume_ml(self) -> u32 {
+        super::core_ids::catalog()
+            .get(self)
+            .map(|d| d.volume_ml)
+            .unwrap_or(0)
+    }
+
     /// True if this resource is a planting seed (catalog `class == Seed`).
     /// Mirrors catalog `class == Seed`.
     pub fn is_seed(self) -> bool {
@@ -182,6 +192,9 @@ pub struct ResourceDef {
     pub class: ResourceClass,
     pub bulk: BulkDef,
     pub weight_g: u32,
+    /// Per-unit volume in millilitres. Drives carrier/inventory/pack/vehicle
+    /// volume-bucket checks alongside weight.
+    pub volume_ml: u32,
     /// Calories/satiation per unit when eaten. `None` for inedible.
     #[serde(default)]
     pub edible_calories: Option<u16>,

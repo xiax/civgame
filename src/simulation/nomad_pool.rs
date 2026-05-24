@@ -239,12 +239,19 @@ mod tests {
     use crate::economy::item::Item;
 
     fn fresh_agent() -> EconomicAgent {
+        // Redistribution tests are about pool-balance logic, not personal
+        // capacity. Give the test agent oversized weight + volume budgets so
+        // bedroll caps don't truncate the setup.
         EconomicAgent {
             currency: 0.0,
             inventory: [(Item::new_commodity(crate::economy::core_ids::fruit()), 0);
                 INVENTORY_SLOTS],
-            base_cap_g: BASE_INVENTORY_CAP_G,
+            base_cap_g: BASE_INVENTORY_CAP_G * 10,
             bonus_cap_g: 0,
+            base_small_vol_ml: u32::MAX / 2,
+            base_bulky_vol_ml: u32::MAX / 2,
+            bonus_small_vol_ml: 0,
+            bonus_bulky_vol_ml: 0,
         }
     }
 
@@ -294,12 +301,14 @@ mod tests {
     fn full_capacity_recipient_keeps_donor_intact() {
         install_test_catalog();
         let bedroll = crate::economy::core_ids::bedroll();
-        let stone_id = crate::economy::core_ids::stone(); // weight 5000g = full cap
         let mut donor = fresh_agent();
         let mut recipient = fresh_agent();
         donor.add_resource(bedroll, 4);
-        // Saturate recipient with stone so no bedroll can fit.
-        recipient.add_resource(stone_id, 1);
+        // Saturate recipient by zeroing both bulky-vol and weight caps so
+        // no bedroll (OneHand, 12 L, 1.5 kg) can fit. Tests cap-rejection
+        // semantics; the saturation mechanism is orthogonal.
+        recipient.base_cap_g = 0;
+        recipient.base_bulky_vol_ml = 0;
         let pre_donor = donor.quantity_of_resource(bedroll);
         let pre_total = pre_donor + recipient.quantity_of_resource(bedroll);
 

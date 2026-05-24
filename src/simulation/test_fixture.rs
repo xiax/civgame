@@ -4108,7 +4108,10 @@ mod smoke {
         // Tick enough for: settlement auto-found → SettlementPlan
         // (faction-staggered ~60 ticks) → carve → ≥1 listing cycle
         // (every TICKS_PER_DAY/4) → ≥1 acquisition cycle (TICKS_PER_DAY).
-        sim.tick_n(TICKS_PER_DAY as u32 * 2 + 200);
+        // Bumped to 4 days: post-volume-overhaul the chief's directive pipeline
+        // (workforce budget + capacity-driven haul qty) takes longer to clear
+        // a plot of obstacles + listing reaches the household.
+        sim.tick_n(TICKS_PER_DAY as u32 * 4 + 200);
 
         // Pre-check: confirm carving happened for the village.
         {
@@ -9745,16 +9748,23 @@ mod baseline_behaviour {
         let ai = person_ai(&sim.app, person);
         let task = person_task(&sim.app, person);
         let inv = person_inventory(&sim.app, person);
-        let wood_in_hand = inv
+        // Wood (TwoHand, 35 L) exceeds the 25 L personal bulky bucket, so the
+        // withdraw lands in the carrier hands instead of inventory.
+        let wood_in_inv = inv
             .get(&crate::economy::core_ids::wood())
             .copied()
             .unwrap_or(0);
-
+        let wood_in_hand = sim
+            .app
+            .world()
+            .get::<crate::simulation::carry::Carrier>(person)
+            .map(|c| c.quantity_of_resource(crate::economy::core_ids::wood()))
+            .unwrap_or(0);
+        let total_wood = wood_in_inv + wood_in_hand;
         assert!(
-            wood_in_hand >= 1,
-            "expected agent to pull at least 1 Wood from storage; got {} (inventory: {:?})",
-            wood_in_hand,
-            inv
+            total_wood >= 1,
+            "expected agent to pull at least 1 Wood from storage; got {} (inv: {:?}, hand: {})",
+            total_wood, inv, wood_in_hand,
         );
         assert_eq!(
             task,
@@ -10750,7 +10760,11 @@ mod baseline_behaviour {
                     crate::economy::core_ids::wood(),
                     "head resource should match ClaimTarget"
                 );
-                assert_eq!(qty, 1, "5c-ii-b uses the qty:1 unit-acquisition contract");
+                // Capacity-driven batching: dispatcher sizes qty by
+                // `min(stock, carrier.batch_capacity_for(item, agent)).max(1)`.
+                // Wood (TwoHand, 35 L) bounded by oversized hand volume to 5,
+                // so a qty ≥ 1 with batched fixture stock is expected.
+                assert!(qty >= 1, "qty must be at least 1, got {qty}");
             }
             other => panic!(
                 "expected Task::WithdrawMaterial as head of AcquireGood haul chain, got {:?}",
@@ -11808,7 +11822,8 @@ mod baseline_behaviour {
                     crate::economy::core_ids::wood(),
                     "head must withdraw the bp's needed resource (Wood)"
                 );
-                assert_eq!(qty, 1, "WithdrawAndHaulToPersonalBlueprint withdraws qty=1");
+                // Dispatcher batches qty by carrier capacity.
+                assert!(qty >= 1, "qty must be at least 1, got {qty}");
             }
             other => panic!(
                 "expected Task::WithdrawMaterial as head of personal-build chain, got {:?}",
@@ -13004,7 +13019,9 @@ mod baseline_behaviour {
                     crate::economy::core_ids::wood(),
                     "head resource should be Wood (most-deficient on the stocked tile)"
                 );
-                assert_eq!(qty, 1, "DeliverMaterialToCraftOrder uses qty:1 contract");
+                // Capacity-driven batching — dispatcher widens qty by carrier
+                // capacity / stock.
+                assert!(qty >= 1, "qty must be at least 1, got {qty}");
             }
             other => panic!(
                 "expected Task::WithdrawMaterial as head of DeliverMaterialToCraftOrder chain, got {:?}",
@@ -15205,10 +15222,25 @@ mod baseline_behaviour {
             .entity_mut(chief)
             .insert(crate::simulation::faction::FactionChief);
 
-        // Hauler with 3 wood already in inventory at (0, 0).
-        let hauler = sim.spawn_person(sim.player_faction_id, (0, 0), |b| {
-            b.add_inventory(crate::economy::core_ids::wood(), 3);
-        });
+        // Hauler with 3 wood already in hand at (0, 0). Wood is `Bulk::TwoHand`
+        // (35 L per log) — it can't fit in the 25 L bulky inventory bucket
+        // post-volume-overhaul, so seed it into the carrier instead.
+        let hauler = sim.spawn_person(sim.player_faction_id, (0, 0), |_b| {});
+        {
+            let mut carrier = sim
+                .app
+                .world_mut()
+                .get_mut::<crate::simulation::carry::Carrier>(hauler)
+                .expect("Carrier missing");
+            let wood = crate::economy::item::Item::new_commodity(
+                crate::economy::core_ids::wood(),
+            );
+            let leftover = carrier.try_pick_up(wood, 3);
+            assert_eq!(
+                leftover, 0,
+                "carrier should fit 3 wood logs (2 × 100 L oversized = 200 L)"
+            );
+        }
 
         // Civic blueprint at (10, 10) needing 3 wood (Bed). Unsatisfied.
         let bp_tile = (10, 10);
@@ -18497,7 +18529,9 @@ mod onenter_era_seeding {
         let mut saw_crescent_bed = false;
         // Past several classifier (60) + chief-directive (60) windows; the
         // organic pressure→intent→spawn chain needs the survey-paced cadence.
-        for _ in 0..1200 {
+        // Bumped to 2400 post-volume-overhaul (capacity-driven haul qty
+        // shifts settlement workforce balance + classifier timing).
+        for _ in 0..2400 {
             sim.tick();
             let w = sim.app.world_mut();
             for bp in w.query::<&Blueprint>().iter(w) {

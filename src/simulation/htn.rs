@@ -5155,9 +5155,17 @@ pub fn htn_acquire_good_dispatch_system(
                         &chunk_connectivity,
                     );
                     if dispatched {
+                        // Capacity-driven batching capped at the market's
+                        // listed stock for this resource (procurement budget
+                        // bound is enforced by the executor — it stops at
+                        // available escrow / market stock).
+                        let probe_item =
+                            crate::economy::item::Item::new_commodity(resource_id);
+                        let cap = carrier.batch_capacity_for(probe_item, agent_econ);
+                        let qty = cap.max(1);
                         aq.dispatch(Task::BuyMaterialAtMarket {
                             resource_id,
-                            qty: 1,
+                            qty,
                             node,
                         });
                         let _ = aq.enqueue(Task::HaulToBlueprint { blueprint });
@@ -5293,7 +5301,7 @@ pub fn htn_acquire_good_dispatch_system(
         match head {
             Task::WithdrawMaterial {
                 resource_id: head_resource,
-                qty,
+                qty: head_qty,
             source_faction_id: _,
             } => {
                 let dispatched = assign_task_with_routing(
@@ -5313,12 +5321,19 @@ pub fn htn_acquire_good_dispatch_system(
                     history.push(chosen_id, MethodOutcome::FailedRouting, now);
                     continue;
                 }
+                // Capacity-driven batching: take as many units as fit in the
+                // worker's hands + inventory, bounded by storage stock and the
+                // method's requested base qty (`head_qty` is the per-call
+                // minimum from `Method::expand`).
+                let probe_item =
+                    crate::economy::item::Item::new_commodity(head_resource);
+                let cap = carrier.batch_capacity_for(probe_item, agent_econ);
+                let stock = ctx.material_stock_for_target.max(head_qty);
+                let qty = stock.min(cap).max(head_qty);
                 // Reserve the qty against the chosen tile so a parallel
                 // dispatch in the same tick sees a smaller effective stock.
-                // Mirrors `plan_execution_system`'s WithdrawMaterial dispatch
-                // site (`plan/mod.rs:2724`).
                 let reserved_tile = (storage_tile.0, storage_tile.1);
-                storage_reservations.add(reserved_tile, head_resource, qty as u32);
+                storage_reservations.add(reserved_tile, head_resource, qty);
                 ai.reserved_tile = reserved_tile;
                 ai.reserved_resource = Some(head_resource);
                 ai.reserved_qty = qty;
@@ -6164,7 +6179,7 @@ pub fn htn_equip_hunting_spear_dispatch_system(
                     continue;
                 }
                 let reserved_tile = storage_tile;
-                storage_reservations.add(reserved_tile, head_resource, qty as u32);
+                storage_reservations.add(reserved_tile, head_resource, qty);
                 ai.reserved_tile = reserved_tile;
                 ai.reserved_resource = Some(head_resource);
                 ai.reserved_qty = qty;
@@ -7497,7 +7512,7 @@ pub fn htn_plant_from_storage_dispatch_system(
                     history.push(chosen_id, MethodOutcome::FailedRouting, now);
                     continue;
                 }
-                storage_reservations.add(storage_tile, head_resource, qty as u32);
+                storage_reservations.add(storage_tile, head_resource, qty);
                 ai.reserved_tile = storage_tile;
                 ai.reserved_resource = Some(head_resource);
                 ai.reserved_qty = qty;
@@ -8075,13 +8090,11 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             }
             Task::WithdrawMaterial {
                 resource_id: head_resource,
-                qty,
+                qty: head_qty,
             source_faction_id: _,
             } => {
                 // Path B haul leg. Route to the resolved storage tile, reserve
                 // the qty against `StorageReservations`, dispatch the head.
-                // Mirrors the AcquireGood haul branch's reservation
-                // bookkeeping (`htn_acquire_good_dispatch_system`).
                 let Some(storage_tile) = material_storage_tile else {
                     ai.active_method = None;
                     history.push(chosen_id, MethodOutcome::FailedTarget, now);
@@ -8104,7 +8117,12 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
                     history.push(chosen_id, MethodOutcome::FailedRouting, now);
                     continue;
                 }
-                storage_reservations.add(storage_tile, head_resource, qty as u32);
+                let probe_item =
+                    crate::economy::item::Item::new_commodity(head_resource);
+                let cap = carrier.batch_capacity_for(probe_item, agent_econ);
+                let stock = ctx.material_stock_for_target.max(head_qty);
+                let qty = stock.min(cap).max(head_qty);
+                storage_reservations.add(storage_tile, head_resource, qty);
                 ai.reserved_tile = storage_tile;
                 ai.reserved_resource = Some(head_resource);
                 ai.reserved_qty = qty;
@@ -9566,12 +9584,14 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
             &FactionMember,
             &Transform,
             &LodLevel,
+            &crate::simulation::carry::Carrier,
+            &crate::economy::agent::EconomicAgent,
         ),
         Without<Drafted>,
     >,
 ) {
     let now = clock.tick;
-    for (mut ai, mut aq, mut history, goal, member, transform, lod) in query.iter_mut() {
+    for (mut ai, mut aq, mut history, goal, member, transform, lod, carrier, agent_econ) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -9804,7 +9824,7 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
         match head {
             Task::WithdrawMaterial {
                 resource_id: head_resource,
-                qty,
+                qty: head_qty,
             source_faction_id: _,
             } => {
                 let dispatched = assign_task_with_routing(
@@ -9824,9 +9844,13 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
                     history.push(chosen_id, MethodOutcome::FailedRouting, now);
                     continue;
                 }
-                // Reserve the qty against the chosen tile so a parallel
-                // dispatch in the same tick sees a smaller effective stock.
-                storage_reservations.add((stx, sty), head_resource, qty as u32);
+                // Capacity-driven batching against the picked storage tile.
+                let probe_item =
+                    crate::economy::item::Item::new_commodity(head_resource);
+                let cap = carrier.batch_capacity_for(probe_item, agent_econ);
+                let stock = ctx.material_stock_for_target.max(head_qty);
+                let qty = stock.min(cap).max(head_qty);
+                storage_reservations.add((stx, sty), head_resource, qty);
                 ai.reserved_tile = (stx, sty);
                 ai.reserved_resource = Some(head_resource);
                 ai.reserved_qty = qty;
@@ -11554,7 +11578,7 @@ pub fn htn_play_dispatch_system(
                     history.push(chosen_id, MethodOutcome::FailedRouting, now);
                     continue;
                 }
-                storage_reservations.add(storage_tile, head_resource, qty as u32);
+                storage_reservations.add(storage_tile, head_resource, qty);
                 ai.reserved_tile = storage_tile;
                 ai.reserved_resource = Some(head_resource);
                 ai.reserved_qty = qty;
