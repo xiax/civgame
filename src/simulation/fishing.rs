@@ -69,6 +69,11 @@ const RECOVERED_FRACTION: f32 = 0.995;
 /// Terrain-scan radius for the HTN method precondition + dispatcher.
 pub const FISHING_SEARCH_RADIUS: i32 = 14;
 
+/// Minimum size of a connected `River`/`Marsh`/`Water` component for a tile to
+/// count as fishable. Wells (1 cell), tiny dug pits, and dam-pinched pools fall
+/// below this; rivers, lakes, marshes, and real impoundments easily clear it.
+pub const MIN_FISHABLE_WATER_TILES: usize = 8;
+
 // ── Habitat ───────────────────────────────────────────────────────────────────
 
 /// Where a stock lives. Derived from `TileKind` + salinity by [`habitat_at`];
@@ -105,8 +110,14 @@ impl FishHabitat {
 /// Derive the fishable habitat of a tile, or `None` if it is not fishable.
 /// `River` / `Marsh` are always fresh; open `Water` is `Coast` when salt or
 /// brackish, `Lake` when fresh. `Bridge` is an access tile (handled by the
-/// routing layer), `Dam` blocks the water — neither is a fishing spot.
+/// routing layer), `Dam` blocks the water — neither is a fishing spot. The
+/// tile must also belong to a connected water component of at least
+/// `MIN_FISHABLE_WATER_TILES` cells (see [`tile_supports_fishery`]) — dug
+/// wells, tiny pits, and pinched dam pools fail by size.
 pub fn habitat_at(chunk_map: &ChunkMap, globe: &Globe, tile: (i32, i32)) -> Option<FishHabitat> {
+    if !tile_supports_fishery(chunk_map, tile) {
+        return None;
+    }
     match chunk_map.tile_kind_at(tile.0, tile.1)? {
         TileKind::River => Some(FishHabitat::River),
         TileKind::Marsh => Some(FishHabitat::Marsh),
@@ -116,6 +127,47 @@ pub fn habitat_at(chunk_map: &ChunkMap, globe: &Globe, tile: (i32, i32)) -> Opti
         },
         _ => None,
     }
+}
+
+/// True when `tile` is a `River`/`Marsh`/`Water` cell whose 4-connected
+/// water component contains at least `MIN_FISHABLE_WATER_TILES` cells.
+/// `Bridge` (decking; water flows beneath) and `Dam` are not walked through —
+/// banks on either side of a bridge clear the threshold on their own. BFS
+/// early-outs once `MIN_FISHABLE_WATER_TILES` distinct cells have been visited.
+fn tile_supports_fishery(chunk_map: &ChunkMap, tile: (i32, i32)) -> bool {
+    let is_water = |t: (i32, i32)| {
+        matches!(
+            chunk_map.tile_kind_at(t.0, t.1),
+            Some(TileKind::River | TileKind::Marsh | TileKind::Water)
+        )
+    };
+    if !is_water(tile) {
+        return false;
+    }
+    let mut visited: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::default();
+    let mut frontier: Vec<(i32, i32)> = Vec::with_capacity(MIN_FISHABLE_WATER_TILES * 2);
+    visited.insert(tile);
+    frontier.push(tile);
+    if visited.len() >= MIN_FISHABLE_WATER_TILES {
+        return true;
+    }
+    while let Some((x, y)) = frontier.pop() {
+        for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let n = (x + dx, y + dy);
+            if visited.contains(&n) {
+                continue;
+            }
+            if !is_water(n) {
+                continue;
+            }
+            visited.insert(n);
+            if visited.len() >= MIN_FISHABLE_WATER_TILES {
+                return true;
+            }
+            frontier.push(n);
+        }
+    }
+    false
 }
 
 // ── Fishing method ────────────────────────────────────────────────────────────
@@ -347,11 +399,7 @@ pub fn nearest_fishable_water(
     for dy in -radius..=radius {
         for dx in -radius..=radius {
             let tile = (from.0 + dx, from.1 + dy);
-            let fishable = matches!(
-                chunk_map.tile_kind_at(tile.0, tile.1),
-                Some(TileKind::River | TileKind::Marsh | TileKind::Water)
-            );
-            if !fishable || !has_stand_tile(chunk_map, tile) {
+            if !tile_supports_fishery(chunk_map, tile) || !has_stand_tile(chunk_map, tile) {
                 continue;
             }
             let dist = dx.abs().max(dy.abs());
@@ -660,6 +708,32 @@ pub fn fish_claim_kind() -> MemoryKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::chunk::{Chunk, ChunkCoord, CHUNK_SIZE};
+    use crate::world::tile::TileData;
+
+    /// Build a single-chunk `ChunkMap` whose every surface tile reads as
+    /// `base_kind` at z=0. Caller patches in water tiles via `set_tile`.
+    fn chunk_map_filled(base_kind: TileKind) -> ChunkMap {
+        let surface_z = Box::new([[0i8; CHUNK_SIZE]; CHUNK_SIZE]);
+        let surface_kind = Box::new([[base_kind; CHUNK_SIZE]; CHUNK_SIZE]);
+        let surface_fertility = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
+        let chunk = Chunk::new(surface_z, surface_kind, surface_fertility);
+        let mut map = ChunkMap::default();
+        map.0.insert(ChunkCoord(0, 0), chunk);
+        map
+    }
+
+    fn paint(map: &mut ChunkMap, tile: (i32, i32), kind: TileKind) {
+        map.set_tile(
+            tile.0,
+            tile.1,
+            0,
+            TileData {
+                kind,
+                ..Default::default()
+            },
+        );
+    }
 
     #[test]
     fn fresh_capacity_is_deterministic_per_seed_and_tile() {
@@ -722,5 +796,78 @@ mod tests {
     fn method_work_ticks_and_catch_order() {
         assert!(FishingMethod::Trap.work_ticks() < FishingMethod::Handline.work_ticks());
         assert!(FishingMethod::Trap.base_catch() < FishingMethod::Handline.base_catch());
+    }
+
+    #[test]
+    fn single_water_tile_is_not_fishable() {
+        // A lone Water cell (e.g. a dug well shaft) in a sea of Grass must
+        // not register as a fishing spot — the component is one tile.
+        let mut map = chunk_map_filled(TileKind::Grass);
+        paint(&mut map, (5, 5), TileKind::Water);
+        assert!(!tile_supports_fishery(&map, (5, 5)));
+        assert!(nearest_fishable_water(&map, (5, 5), 8).is_none());
+        let globe = crate::world::globe::Globe::new(0);
+        assert!(habitat_at(&map, &globe, (5, 5)).is_none());
+    }
+
+    #[test]
+    fn large_lake_is_fishable() {
+        // 4×4 Water block (16 cells, well above MIN_FISHABLE_WATER_TILES=8).
+        let mut map = chunk_map_filled(TileKind::Grass);
+        for dy in 0..4 {
+            for dx in 0..4 {
+                paint(&mut map, (10 + dx, 10 + dy), TileKind::Water);
+            }
+        }
+        assert!(tile_supports_fishery(&map, (11, 11)));
+        // Stand tile available (Grass neighbours), spot returned.
+        assert!(nearest_fishable_water(&map, (10, 10), 8).is_some());
+    }
+
+    #[test]
+    fn river_strip_is_fishable() {
+        // A 10×1 River line — long enough to clear the size threshold.
+        let mut map = chunk_map_filled(TileKind::Grass);
+        for dx in 0..10 {
+            paint(&mut map, (4 + dx, 7), TileKind::River);
+        }
+        assert!(tile_supports_fishery(&map, (8, 7)));
+        let globe = crate::world::globe::Globe::new(0);
+        assert!(matches!(
+            habitat_at(&map, &globe, (8, 7)),
+            Some(FishHabitat::River)
+        ));
+    }
+
+    #[test]
+    fn well_shaft_pattern_is_not_fishable() {
+        // Replicate the 5×5 well projection: a single central Water cell
+        // (the shaft), with the surrounding ring of Wall lining + carved
+        // Dirt floor. No connected water → not fishable.
+        let mut map = chunk_map_filled(TileKind::Grass);
+        // Wall lining ring (5×5 outer rim, excluding the gateway gap).
+        for dy in 0..5 {
+            for dx in 0..5 {
+                let on_rim = dx == 0 || dx == 4 || dy == 0 || dy == 4;
+                if !on_rim {
+                    continue;
+                }
+                // Leave one tile open as the gateway, like a real well.
+                if dx == 2 && dy == 0 {
+                    continue;
+                }
+                paint(&mut map, (20 + dx, 20 + dy), TileKind::Wall);
+            }
+        }
+        // Carved Dirt floors inside the ring.
+        for dy in 1..4 {
+            for dx in 1..4 {
+                paint(&mut map, (20 + dx, 20 + dy), TileKind::Dirt);
+            }
+        }
+        // Single water-shaft cell at the centre.
+        paint(&mut map, (22, 22), TileKind::Water);
+        assert!(!tile_supports_fishery(&map, (22, 22)));
+        assert!(nearest_fishable_water(&map, (22, 22), 8).is_none());
     }
 }
