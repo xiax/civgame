@@ -367,6 +367,7 @@ pub fn trader_route_dispatch_system(
     settlements: Query<&Settlement>,
     mut query: Query<
         (
+            Entity,
             &Profession,
             &TraderPlan,
             &mut PersonAI,
@@ -377,8 +378,12 @@ pub fn trader_route_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
+    clock: Res<crate::simulation::SimClock>,
 ) {
-    for (prof, plan, mut ai, mut aq, transform, lod, goal) in query.iter_mut() {
+    let now = clock.tick;
+    for (actor, prof, plan, mut ai, mut aq, transform, lod, goal) in query.iter_mut() {
         if *prof != Profession::Trader {
             continue;
         }
@@ -428,6 +433,10 @@ pub fn trader_route_dispatch_system(
             &chunk_router,
             &chunk_map,
             &chunk_connectivity,
+            &spatial_index,
+            &stand_reservations,
+            actor,
+            now,
         );
         if routed {
             aq.dispatch(Task::Lead { dest });

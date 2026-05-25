@@ -250,11 +250,14 @@ pub fn htn_provide_care_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
     let now = clock.tick;
     for (agent, mut ai, mut aq, goal, transform, member, profession, lod, mut history) in
         query.iter_mut()
     {
+        let actor = agent;
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -315,6 +318,10 @@ pub fn htn_provide_care_dispatch_system(
             &chunk_router,
             &chunk_map,
             &chunk_connectivity,
+            &spatial_index,
+            &stand_reservations,
+            actor,
+            now,
         );
         if !dispatched {
             continue;
@@ -411,6 +418,7 @@ pub fn htn_seek_care_dispatch_system(
     ownership: Res<crate::simulation::capital::WorkshopOwnership>,
     mut query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut ActionQueue,
             &AgentGoal,
@@ -420,9 +428,13 @@ pub fn htn_seek_care_dispatch_system(
         ),
         (Without<Drafted>, With<Injury>),
     >,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
+    clock: Res<crate::simulation::SimClock>,
 ) {
     use crate::simulation::capital::WorkshopKind;
-    for (mut ai, mut aq, goal, transform, member, lod) in query.iter_mut() {
+    let now = clock.tick;
+    for (actor, mut ai, mut aq, goal, transform, member, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -445,6 +457,7 @@ pub fn htn_seek_care_dispatch_system(
         let mut target: Option<(i32, i32)> = None;
         let mut best_dist = i32::MAX;
         for entry in ownership.workshops_for(member.faction_id) {
+    let now = clock.tick;
             if entry.kind != WorkshopKind::Shrine {
                 continue;
             }
@@ -499,6 +512,10 @@ pub fn htn_seek_care_dispatch_system(
             &chunk_router,
             &chunk_map,
             &chunk_connectivity,
+            &spatial_index,
+            &stand_reservations,
+            actor,
+            now,
         );
         if !dispatched {
             continue;

@@ -176,6 +176,9 @@ pub struct GatherRoutingResources<'w, 's> {
     pub chunk_graph: Res<'w, ChunkGraph>,
     pub chunk_router: Res<'w, ChunkRouter>,
     pub chunk_connectivity: Res<'w, ChunkConnectivity>,
+    pub spatial_index: Res<'w, crate::world::spatial::SpatialIndex>,
+    pub stand_reservations:
+        Res<'w, crate::simulation::stand_reservation::StandTileReservations>,
     /// Phase 5e-xi-c: read by `finish_gather` to look up `CraftOrder.anchor_tile`
     /// when the prefetch ring promotes a `Task::HaulToCraftOrder { order }`
     /// (the trailing leg of the harvest-grain-for-craft chain produced by
@@ -269,6 +272,9 @@ fn finish_gather(
     // (success/fail/handoff) must release it or the cluster stays "claimed"
     // until expiry and downstream agents over-disperse.
     release_gather_claim(&routing.gather_claims, ai, actor);
+    // Stand-tile reservations: drop the worker's slot at every gather exit
+    // (success/fail/handoff) so the next dispatcher pass starts clean.
+    routing.stand_reservations.release_for_worker(actor);
 
     ai.state = AiState::Idle;
     ai.target_entity = None;
@@ -322,6 +328,10 @@ fn finish_gather(
                 &routing.chunk_router,
                 chunk_map,
                 &routing.chunk_connectivity,
+                &routing.spatial_index,
+                &routing.stand_reservations,
+                actor,
+                now,
             );
             if !dispatched {
                 record_routing_failure(method_history, ai, now);
@@ -361,6 +371,10 @@ fn finish_gather(
                 &routing.chunk_router,
                 chunk_map,
                 &routing.chunk_connectivity,
+                &routing.spatial_index,
+                &routing.stand_reservations,
+                actor,
+                now,
             );
             if !dispatched {
                 record_routing_failure(method_history, ai, now);
@@ -390,6 +404,10 @@ fn finish_gather(
                 &routing.chunk_router,
                 chunk_map,
                 &routing.chunk_connectivity,
+                &routing.spatial_index,
+                &routing.stand_reservations,
+                actor,
+                now,
             );
             if !dispatched {
                 record_routing_failure(method_history, ai, now);
@@ -542,6 +560,10 @@ pub fn gather_system(
                                 &routing.chunk_router,
                                 &chunk_map,
                                 &routing.chunk_connectivity,
+                                &routing.spatial_index,
+                                &routing.stand_reservations,
+                                actor,
+                                clock.tick,
                             );
                             if dispatched {
                                 routing.gather_claims.release(claim_tile, claim_kind, actor);
@@ -1126,6 +1148,7 @@ pub fn gather_system(
         // ── Hands at haul cap → end gather step so the plan advances to deposit ──
 
         if carrier.should_return_to_deposit_held() {
+    let now = clock.tick;
             finish_gather(
                 &mut ai,
                 &mut aq,

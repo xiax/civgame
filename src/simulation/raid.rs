@@ -579,9 +579,13 @@ pub fn raid_prep_dispatch_system(
         &FactionMember,
         &LodLevel,
     )>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
+    clock: Res<crate::simulation::SimClock>,
 ) {
+    let spatial_index = &*spatial;
     let weapon_id = crate::economy::core_ids::weapon();
-    for (entity, mut ai, mut aq, goal, agent, carrier, equipment, transform, member, lod) in
+    let now = clock.tick;
+    for (actor, mut ai, mut aq, goal, agent, carrier, equipment, transform, member, lod) in
         query.iter_mut()
     {
         if *lod == LodLevel::Dormant || *goal != AgentGoal::Raid {
@@ -597,7 +601,7 @@ pub fn raid_prep_dispatch_system(
         if !matches!(faction.raid_phase, RaidPhase::Preparing { .. }) {
             continue;
         }
-        if !faction.raid_party.contains(&entity) {
+        if !faction.raid_party.contains(&actor) {
             continue;
         }
         if agent_is_armed(equipment, carrier, Some(agent)) {
@@ -656,6 +660,10 @@ pub fn raid_prep_dispatch_system(
             &chunk_router,
             &chunk_map,
             &chunk_connectivity,
+            &spatial_index,
+            &stand_reservations,
+            actor,
+            now,
         );
         if !dispatched {
             continue;

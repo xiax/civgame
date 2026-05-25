@@ -404,9 +404,22 @@ pub fn dispatch_unpitch_tasks(world: &mut World, packs: &[(u32, (i32, i32), i32)
         Res<ChunkGraph>,
         Res<ChunkRouter>,
         Res<ChunkConnectivity>,
+        Res<crate::world::spatial::SpatialIndex>,
+        Res<crate::simulation::stand_reservation::StandTileReservations>,
+        Res<crate::simulation::SimClock>,
         Query<(&mut PersonAI, &mut ActionQueue, &mut AgentGoal)>,
     )> = SystemState::new(world);
-    let (chunk_map, chunk_graph, chunk_router, chunk_connectivity, mut q) = state.get_mut(world);
+    let (
+        chunk_map,
+        chunk_graph,
+        chunk_router,
+        chunk_connectivity,
+        spatial_index,
+        stand_reservations,
+        clock,
+        mut q,
+    ) = state.get_mut(world);
+    let now = clock.tick;
     for a in assignments.iter() {
         let Ok((mut ai, mut aq, mut goal)) = q.get_mut(a.worker) else {
             continue;
@@ -424,6 +437,10 @@ pub fn dispatch_unpitch_tasks(world: &mut World, packs: &[(u32, (i32, i32), i32)
             &chunk_router,
             &chunk_map,
             &chunk_connectivity,
+            &spatial_index,
+            &stand_reservations,
+            a.worker,
+            now,
         );
         if routed {
             aq.cancel();

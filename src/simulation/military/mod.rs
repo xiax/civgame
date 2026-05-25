@@ -64,11 +64,14 @@ pub fn military_task_system(
     >,
     mut rally: ResMut<ActiveRallyPoints>,
     clock: Res<SimClock>,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
     let move_id = TaskKind::MilitaryMove as u16;
     let attack_id = TaskKind::MilitaryAttack as u16;
 
-    for (_entity, mut ai, mut aq, transform, mut combat, lod) in q.iter_mut() {
+    let now = clock.tick;
+    for (actor, mut ai, mut aq, transform, mut combat, lod) in q.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -147,6 +150,7 @@ pub fn military_task_system(
             } else {
                 // Re-route if the foe has moved off our last destination.
                 if ai.dest_tile != (foe_tx as i32, foe_ty as i32) {
+    let now = clock.tick;
                     let cur_chunk = ChunkCoord(
                         cur_tx.div_euclid(CHUNK_SIZE as i32),
                         cur_ty.div_euclid(CHUNK_SIZE as i32),
@@ -162,6 +166,10 @@ pub fn military_task_system(
                         &chunk_router,
                         &chunk_map,
                         &chunk_connectivity,
+                        &spatial_index,
+                        &stand_reservations,
+                        actor,
+                        now,
                     );
                     if routed {
                         // Keep typed channel in sync with the rerouted attack

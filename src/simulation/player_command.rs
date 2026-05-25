@@ -994,6 +994,10 @@ pub struct CommandRouting<'w, 's> {
     pub chunk_graph: Res<'w, ChunkGraph>,
     pub chunk_router: Res<'w, ChunkRouter>,
     pub chunk_connectivity: Res<'w, ChunkConnectivity>,
+    pub spatial_index: Res<'w, crate::world::spatial::SpatialIndex>,
+    pub stand_reservations:
+        Res<'w, crate::simulation::stand_reservation::StandTileReservations>,
+    pub clock: Res<'w, crate::simulation::schedule::SimClock>,
     pub bp_map: ResMut<'w, BlueprintMap>,
     pub hotspots: ResMut<'w, HotspotFlowFields>,
     // sleepy-dove Phase 6: re-resolve the construction poster at dispatch
@@ -1074,6 +1078,7 @@ pub fn dispatch_player_command_system(
             commands.entity(actor).remove::<MilitaryFormationSlot>();
         }
 
+        let now = routing.clock.tick;
         let outcome = dispatch_one(
             actor,
             &cmd.command,
@@ -1092,6 +1097,7 @@ pub fn dispatch_player_command_system(
             &mut camp_ops,
             &pending_slots,
             toolkit,
+            now,
         );
 
         match outcome {
@@ -1129,6 +1135,7 @@ fn dispatch_one(
     camp_ops: &mut crate::simulation::nomad::PendingCampOps,
     pending_slots: &PendingFormationSlots,
     toolkit: Option<&crate::simulation::tools::ToolKit>,
+    now: u64,
 ) -> DispatchOutcome {
     use PlayerCommand::*;
     match *command {
@@ -1144,6 +1151,10 @@ fn dispatch_one(
                 &routing.chunk_router,
                 &routing.chunk_map,
                 &routing.chunk_connectivity,
+                &routing.spatial_index,
+                &routing.stand_reservations,
+                actor,
+                now,
             );
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
@@ -1183,6 +1194,10 @@ fn dispatch_one(
                 &routing.chunk_router,
                 &routing.chunk_map,
                 &routing.chunk_connectivity,
+                &routing.spatial_index,
+                &routing.stand_reservations,
+                actor,
+                now,
             );
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
@@ -1218,6 +1233,10 @@ fn dispatch_one(
                 &routing.chunk_router,
                 &routing.chunk_map,
                 &routing.chunk_connectivity,
+                &routing.spatial_index,
+                &routing.stand_reservations,
+                actor,
+                now,
             );
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
@@ -1237,6 +1256,10 @@ fn dispatch_one(
                 &routing.chunk_router,
                 &routing.chunk_map,
                 &routing.chunk_connectivity,
+                &routing.spatial_index,
+                &routing.stand_reservations,
+                actor,
+                now,
             );
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
@@ -1262,6 +1285,10 @@ fn dispatch_one(
                 &routing.chunk_router,
                 &routing.chunk_map,
                 &routing.chunk_connectivity,
+                &routing.spatial_index,
+                &routing.stand_reservations,
+                actor,
+                now,
             );
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
@@ -1290,6 +1317,10 @@ fn dispatch_one(
                 &routing.chunk_router,
                 &routing.chunk_map,
                 &routing.chunk_connectivity,
+                &routing.spatial_index,
+                &routing.stand_reservations,
+                actor,
+                now,
             );
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
@@ -1315,6 +1346,10 @@ fn dispatch_one(
                 &routing.chunk_router,
                 &routing.chunk_map,
                 &routing.chunk_connectivity,
+                &routing.spatial_index,
+                &routing.stand_reservations,
+                actor,
+                now,
             );
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
@@ -1414,6 +1449,10 @@ fn dispatch_one(
                 &routing.chunk_router,
                 &routing.chunk_map,
                 &routing.chunk_connectivity,
+                &routing.spatial_index,
+                &routing.stand_reservations,
+                actor,
+                now,
             );
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
@@ -1445,6 +1484,10 @@ fn dispatch_one(
                 &routing.chunk_router,
                 &routing.chunk_map,
                 &routing.chunk_connectivity,
+                &routing.spatial_index,
+                &routing.stand_reservations,
+                actor,
+                now,
             );
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
@@ -1536,6 +1579,10 @@ fn dispatch_one(
                 &routing.chunk_router,
                 &routing.chunk_map,
                 &routing.chunk_connectivity,
+                &routing.spatial_index,
+                &routing.stand_reservations,
+                actor,
+                now,
             );
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
@@ -1579,6 +1626,10 @@ fn dispatch_one(
                 &routing.chunk_router,
                 &routing.chunk_map,
                 &routing.chunk_connectivity,
+                &routing.spatial_index,
+                &routing.stand_reservations,
+                actor,
+                now,
             );
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
@@ -1730,6 +1781,10 @@ fn dispatch_one(
                 &routing.chunk_router,
                 &routing.chunk_map,
                 &routing.chunk_connectivity,
+                &routing.spatial_index,
+                &routing.stand_reservations,
+                actor,
+                now,
             );
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);

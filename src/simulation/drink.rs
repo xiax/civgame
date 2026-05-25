@@ -217,6 +217,7 @@ pub fn drink_task_system(
     sanitation: Res<crate::simulation::sanitation::SanitationMap>,
     well_map: Res<WellMap>,
     mut runtime_water: ResMut<crate::world::water_runtime::RuntimeWater>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
     mut commands: Commands,
     mut query: Query<(
         Entity,
@@ -257,6 +258,7 @@ pub fn drink_task_system(
             // dispatcher pass can re-plan, mirroring withdraw_good_task_system
             // (production.rs:323-327). Without this branch a desynced agent
             // freezes here forever — see the user-reported frozen-worker bug.
+            stand_reservations.release_for_worker(entity);
             aq.cancel_chain(&mut ai);
             continue;
         };
@@ -328,6 +330,7 @@ pub fn drink_task_system(
             }
         }
 
+        stand_reservations.release_for_worker(entity);
         aq.finish_task(&mut ai);
     }
 }
@@ -348,12 +351,16 @@ pub fn htn_drink_dispatch_system(
     chunk_graph: Res<ChunkGraph>,
     chunk_router: Res<ChunkRouter>,
     chunk_connectivity: Res<ChunkConnectivity>,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
+    clock: Res<crate::simulation::SimClock>,
     globe: Res<Globe>,
     well_map: Res<WellMap>,
     runtime_water: Res<crate::world::water_runtime::RuntimeWater>,
     faction_registry: Res<FactionRegistry>,
     mut query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut ActionQueue,
             &AgentGoal,
@@ -368,8 +375,9 @@ pub fn htn_drink_dispatch_system(
     >,
 ) {
     let clean_water = core_ids::clean_water();
+    let now = clock.tick;
     query.par_iter_mut().for_each(
-        |(mut ai, mut aq, goal, needs, agent, carrier, transform, member, lod)| {
+        |(actor, mut ai, mut aq, goal, needs, agent, carrier, transform, member, lod)| {
             if *lod == LodLevel::Dormant {
                 return;
             }
@@ -470,6 +478,10 @@ pub fn htn_drink_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if routed {
                     aq.dispatch(Task::Drink {

@@ -2,16 +2,22 @@ use super::animals::{CarriedBy, Deer, Horse, Tamed, Wolf};
 use super::combat::{Body, Health};
 use super::construction::{Bed, BedMap, ChairMap, LoomMap, TableMap, WorkbenchMap};
 use super::faction::{FactionMember, FactionRegistry};
+use super::goal_contract::{self, BlockedReason};
+use super::goals::AgentGoal;
+use super::htn::MethodHistory;
 use super::items::GroundItem;
 use super::lod::LodLevel;
 use super::memory::RelationshipMemory;
 use super::person::{AiState, Person, PersonAI, UNEMPLOYED_TASK_KIND};
 use super::plants::Plant;
 use super::schedule::{BucketSlot, SimClock};
-use super::tasks::{task_interacts_from_adjacent, TaskKind};
+use super::stand_reservation::StandTileReservations;
+use super::tasks::{pick_adjacent_stand_tile, task_interacts_from_adjacent, TaskKind};
 use super::technology::HORSEBACK_RIDING;
 use super::typed_task::ActionQueue;
 use super::vehicle::BoardedVehicle;
+use crate::pathfinding::chunk_graph::ChunkGraph;
+use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::pathfinding::path_request::{
     cooldown_for_streak, FollowStatus, PathDebugFlags, PathFollow, PathKind, PathRequestQueue,
     DEFAULT_PATH_BUDGET,
@@ -79,11 +85,20 @@ fn release_to_idle(
     transform.translation.y = center.y;
 }
 
+/// Routing bundle for movement_system to stay under Bevy's 16-param ceiling.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct MovementStandRouting<'w> {
+    pub chunk_graph: Res<'w, ChunkGraph>,
+    pub chunk_connectivity: Res<'w, ChunkConnectivity>,
+    pub stand_reservations: Res<'w, StandTileReservations>,
+}
+
 pub fn movement_system(
     time: Res<Time>,
     clock: Res<SimClock>,
     chunk_map: Res<ChunkMap>,
     spatial_index: Res<SpatialIndex>,
+    stand_routing: MovementStandRouting,
     bed_map: Res<BedMap>,
     chair_map: Res<ChairMap>,
     table_map: Res<TableMap>,
@@ -99,6 +114,8 @@ pub fn movement_system(
             &mut Transform,
             &mut PersonAI,
             &mut ActionQueue,
+            &mut MethodHistory,
+            &AgentGoal,
             &LodLevel,
             &mut MovementState,
             &mut PathFollow,
@@ -124,11 +141,17 @@ pub fn movement_system(
 
     // Movement can't be fully parallel because it writes Transform (position sync)
     // and can read ChunkMap for passability. Run sequentially.
+    let now = clock.tick;
+    let chunk_graph = &stand_routing.chunk_graph;
+    let chunk_connectivity = &stand_routing.chunk_connectivity;
+    let stand_reservations = &stand_routing.stand_reservations;
     for (
         entity,
         mut transform,
         mut ai,
         mut aq,
+        mut history,
+        goal,
         lod,
         mut mv,
         mut pf,
@@ -615,52 +638,128 @@ pub fn movement_system(
                 let count_limit = if was_here { 1 } else { 0 };
 
                 if already_taken || spatial_index.agent_count(tx, ty, cz) > count_limit {
-                    // Nudge to an adjacent free tile and stay Seeking.
-                    let dirs: [(i32, i32); 8] = [
-                        (-1, 0),
-                        (1, 0),
-                        (0, -1),
-                        (0, 1),
-                        (-1, -1),
-                        (1, -1),
-                        (-1, 1),
-                        (1, 1),
-                    ];
-                    let mut rng = rand::thread_rng();
-                    let start = rng.gen_range(0..8);
-                    let mut bumped = false;
-                    for i in 0..8usize {
-                        let (dx, dy) = dirs[(start + i) % 8];
-                        let (ntx, nty) = (tx + dx, ty + dy);
-                        // Try same-Z, then Z+1 (ramp up), then Z-1 (ramp down).
-                        for &dz in &[0, 1, -1] {
-                            let ntz = cz + dz;
-                            if chunk_map.passable_step_3d((tx, ty, cz), (ntx, nty, ntz))
-                                && !spatial_index.agent_occupied(ntx, nty, ntz)
-                                && !claimed_this_tick.contains(&(ntx, nty, ntz))
-                            {
-                                ai.target_tile = (ntx as i32, nty as i32);
-                                bumped = true;
+                    // Anchor retarget on the WORK tile (`ai.dest_tile`), NOT
+                    // the now-blocked stand tile. The old behavior spiralled
+                    // around `tx, ty` (the stand tile) so the nudge could
+                    // land 2 tiles from the well/tree/etc., outside the
+                    // chebyshev≤1 gate every adjacent-task executor enforces.
+                    let is_adjacent_task =
+                        task_interacts_from_adjacent(aq.current_task_kind());
+                    let bumped = if is_adjacent_task {
+                        let work_tile = ai.dest_tile;
+                        let resource_z = chunk_map.nearest_standable_z(
+                            work_tile.0 as i32,
+                            work_tile.1 as i32,
+                            cz,
+                        ) as i8;
+                        // Release the old stand reservation before staking a
+                        // new one — keeps the resource consistent even when
+                        // the agent's target_tile has drifted across ticks.
+                        stand_reservations.release_for_worker(entity);
+                        let agent_tile_3d = (
+                            (pos.x / TILE_SIZE).floor() as i32,
+                            (pos.y / TILE_SIZE).floor() as i32,
+                            ai.current_z,
+                        );
+                        match pick_adjacent_stand_tile(
+                            work_tile,
+                            resource_z,
+                            agent_tile_3d,
+                            &chunk_map,
+                            &chunk_graph,
+                            &chunk_connectivity,
+                            &spatial_index,
+                            &stand_reservations,
+                            Some(&claimed_this_tick),
+                            entity,
+                        ) {
+                            Some((new_stand, new_z)) => {
+                                stand_reservations.try_stake(
+                                    new_stand.0,
+                                    new_stand.1,
+                                    new_z,
+                                    entity,
+                                    now,
+                                );
+                                ai.target_tile = new_stand;
+                                ai.target_z = new_z;
+                                // Drop the stale segment path so the next
+                                // tick replans toward the new stand tile.
+                                pf.status = FollowStatus::Idle;
+                                pf.segment_path.clear();
+                                pf.chunk_route.clear();
+                                pf.segment_cursor = 0;
+                                pf.route_cursor = 0;
+                                pf.goal = (new_stand.0, new_stand.1, new_z);
+                                claimed_this_tick.insert((
+                                    new_stand.0,
+                                    new_stand.1,
+                                    new_z as i32,
+                                ));
+                                true
+                            }
+                            None => false,
+                        }
+                    } else {
+                        // Non-adjacent task (player Move order, etc.): keep
+                        // the legacy random-spiral nudge. The work-target
+                        // anchor isn't meaningful here.
+                        let dirs: [(i32, i32); 8] = [
+                            (-1, 0),
+                            (1, 0),
+                            (0, -1),
+                            (0, 1),
+                            (-1, -1),
+                            (1, -1),
+                            (-1, 1),
+                            (1, 1),
+                        ];
+                        let mut rng = rand::thread_rng();
+                        let start = rng.gen_range(0..8);
+                        let mut found = false;
+                        for i in 0..8usize {
+                            let (dx, dy) = dirs[(start + i) % 8];
+                            let (ntx, nty) = (tx + dx, ty + dy);
+                            for &dz in &[0, 1, -1] {
+                                let ntz = cz + dz;
+                                if chunk_map.passable_step_3d((tx, ty, cz), (ntx, nty, ntz))
+                                    && !spatial_index.agent_occupied(ntx, nty, ntz)
+                                    && !claimed_this_tick.contains(&(ntx, nty, ntz))
+                                {
+                                    ai.target_tile = (ntx, nty);
+                                    claimed_this_tick.insert((ntx, nty, ntz));
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if found {
                                 break;
                             }
                         }
-                        if bumped {
-                            break;
-                        }
-                    }
+                        found
+                    };
                     if !bumped {
-                        // No real task to do here — Move-order arrivals carry
-                        // `task_id == UNEMPLOYED` and would otherwise sit in
-                        // Working with no executor, blocking PlayerOrder
-                        // teardown. Drop to Idle so the completion system
-                        // releases the marker and autonomy resumes.
-                        ai.state = if aq.current_task_kind() == UNEMPLOYED_TASK_KIND {
-                            AiState::Idle
-                        } else {
-                            AiState::Working
-                        };
+                        // No free stand tile anywhere: drop to Idle so the
+                        // dispatcher/scorer can re-evaluate. Don't fall
+                        // through to Working — that's the silent-failure
+                        // path that caused workers to "complete" on a
+                        // chebyshev-2 tile outside the executor's gate.
+                        if is_adjacent_task {
+                            goal_contract::blocked(
+                                &mut history,
+                                &mut ai,
+                                now,
+                                *goal,
+                                BlockedReason::NoAdjacentStandTile,
+                            );
+                        }
+                        // Move-order arrivals carry `UNEMPLOYED` — go Idle so
+                        // PlayerOrder teardown can release the marker. Other
+                        // tasks also drop to Idle (no more Working fall-through).
+                        ai.state = AiState::Idle;
+                        stand_reservations.release_for_worker(entity);
                     }
-                    // else: stays Seeking toward the adjacent tile
+                    // else: stays Seeking toward the new adjacent stand tile
                 } else {
                     claimed_this_tick.insert((tx, ty, cz));
                     ai.state = if aq.current_task_kind() == UNEMPLOYED_TASK_KIND {

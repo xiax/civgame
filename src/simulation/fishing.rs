@@ -423,6 +423,9 @@ pub struct FishRouting<'w, 's> {
     pub chunk_graph: Res<'w, ChunkGraph>,
     pub chunk_router: Res<'w, ChunkRouter>,
     pub chunk_connectivity: Res<'w, ChunkConnectivity>,
+    pub spatial_index: Res<'w, crate::world::spatial::SpatialIndex>,
+    pub stand_reservations:
+        Res<'w, crate::simulation::stand_reservation::StandTileReservations>,
     pub gather_claims: Res<'w, GatherClaims>,
     _marker: std::marker::PhantomData<&'s ()>,
 }
@@ -509,6 +512,10 @@ fn finish_fish(
                 &routing.chunk_router,
                 chunk_map,
                 &routing.chunk_connectivity,
+                &routing.spatial_index,
+                &routing.stand_reservations,
+                actor,
+                now,
             );
             if !dispatched {
                 record_routing_failure(method_history, ai, now);

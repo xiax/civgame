@@ -622,10 +622,13 @@ pub fn htn_acquire_tool_dispatch_system(
     storage_reservations: bevy::prelude::Res<crate::simulation::faction::StorageReservations>,
     faction_registry: bevy::prelude::Res<crate::simulation::faction::FactionRegistry>,
     job_board: bevy::prelude::Res<crate::simulation::jobs::JobBoard>,
-    spatial: bevy::prelude::Res<crate::world::spatial::SpatialIndex>,
+    spatial_index: bevy::prelude::Res<crate::world::spatial::SpatialIndex>,
     item_query: bevy::prelude::Query<&crate::simulation::items::GroundItem>,
+    stand_reservations: bevy::prelude::Res<crate::simulation::stand_reservation::StandTileReservations>,
+    clock: bevy::prelude::Res<crate::simulation::SimClock>,
     mut query: bevy::prelude::Query<
         (
+            bevy::prelude::Entity,
             &mut crate::simulation::person::PersonAI,
             &mut crate::simulation::typed_task::ActionQueue,
             &crate::simulation::goals::AgentGoal,
@@ -638,6 +641,7 @@ pub fn htn_acquire_tool_dispatch_system(
         bevy::prelude::Without<crate::simulation::person::Drafted>,
     >,
 ) {
+    let now = clock.tick;
     use crate::simulation::faction::SOLO;
     use crate::simulation::lod::LodLevel;
     use crate::simulation::person::AiState;
@@ -648,6 +652,7 @@ pub fn htn_acquire_tool_dispatch_system(
     use crate::world::terrain::TILE_SIZE;
 
     for (
+        actor,
         mut ai,
         mut aq,
         goal,
@@ -708,7 +713,7 @@ pub fn htn_acquire_tool_dispatch_system(
         let mut best_dist = i32::MAX;
         for &(tx, ty) in tiles {
             let mut tile_has = false;
-            for &gi_entity in spatial.get(tx, ty) {
+            for &gi_entity in spatial_index.get(tx, ty) {
                 if let Ok(gi) = item_query.get(gi_entity) {
                     if gi.qty > 0 && req.satisfied_by(&gi.item) {
                         tile_has = true;
@@ -746,6 +751,10 @@ pub fn htn_acquire_tool_dispatch_system(
             &chunk_router,
             &chunk_map,
             &chunk_connectivity,
+            &spatial_index,
+            &stand_reservations,
+            actor,
+            now,
         );
         if !dispatched {
             continue;

@@ -3030,6 +3030,138 @@ mod smoke {
         );
     }
 
+    // ─── Pregnancy gestation is calendar-pinned ──────────────────────
+
+    #[test]
+    fn pregnancy_constant_is_three_seasons() {
+        use crate::simulation::reproduction::PREGNANCY_TICKS;
+        use crate::world::seasons::TICKS_PER_SEASON;
+        assert_eq!(PREGNANCY_TICKS, TICKS_PER_SEASON * 3);
+        assert_eq!(PREGNANCY_TICKS, 108_000);
+    }
+
+    #[test]
+    fn dormant_mother_still_gestates_and_births() {
+        // Regression: previously `pregnancy_system` skipped the
+        // decrement whenever `*lod == LodLevel::Dormant` or the
+        // mother's BucketSlot was outside SimClock's active window,
+        // which stretched gestation arbitrarily for off-camera
+        // mothers. After the fix, decrement is unconditional and a
+        // Dormant mother's pregnancy lands exactly on schedule.
+        use crate::simulation::lod::LodLevel;
+        use crate::simulation::person::Person;
+        use crate::simulation::reproduction::Pregnancy;
+
+        let mut sim = TestSim::new(0xBEEF);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        let mother = sim.spawn_person(sim.player_faction_id, (5, 5), |_| {});
+
+        // Force the mother into Dormant LOD — the TestSim camera-at-origin
+        // setup would otherwise keep her at Full and bypass the bug entirely.
+        sim.app
+            .world_mut()
+            .entity_mut(mother)
+            .insert(LodLevel::Dormant);
+
+        sim.app.world_mut().entity_mut(mother).insert(Pregnancy {
+            ticks_remaining: 3,
+            father: None,
+            father_stats: None,
+            father_known: crate::simulation::knowledge_bits::KnowledgeBits::EMPTY,
+            faction_id: sim.player_faction_id,
+        });
+
+        // `app.update()` doesn't always fire FixedUpdate on the first call
+        // (Time<Fixed> accumulation), so `tick_n(N)` produces ≤ N FixedUpdate
+        // runs. Tick generously and assert progress, not exact decrement count.
+        sim.tick_n(2);
+        let remaining = sim
+            .app
+            .world()
+            .entity(mother)
+            .get::<Pregnancy>()
+            .map(|p| p.ticks_remaining)
+            .expect("pregnancy should still be live after partial gestation");
+        assert!(
+            remaining < 3,
+            "Dormant mother's pregnancy must decrement (still {}/3)",
+            remaining,
+        );
+
+        // Birth lands on schedule (give generous slack for warmup tick).
+        sim.tick_n(5);
+        assert!(
+            sim.app
+                .world()
+                .entity(mother)
+                .get::<Pregnancy>()
+                .is_none(),
+            "pregnancy should resolve on schedule for a Dormant mother",
+        );
+        let child_count = {
+            let mut q = sim
+                .app
+                .world_mut()
+                .query_filtered::<Entity, With<Person>>();
+            q.iter(sim.app.world())
+                .filter(|e| *e != mother)
+                .count()
+        };
+        assert_eq!(child_count, 1, "Dormant mother should birth one child");
+    }
+
+    #[test]
+    fn birth_emits_child_born_activity_log_event() {
+        use crate::simulation::reproduction::Pregnancy;
+        use crate::ui::activity_log::{ActivityEntryKind, ActivityLogEvent};
+
+        let mut sim = TestSim::new(0xC1B0);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        let mother = sim.spawn_person(sim.player_faction_id, (5, 5), |_| {});
+        sim.app.world_mut().entity_mut(mother).insert(Pregnancy {
+            ticks_remaining: 1,
+            father: None,
+            father_stats: None,
+            father_known: crate::simulation::knowledge_bits::KnowledgeBits::EMPTY,
+            faction_id: sim.player_faction_id,
+        });
+
+        sim.tick_n(2);
+
+        let world = sim.app.world_mut();
+        let events = world.resource::<Events<ActivityLogEvent>>();
+        let mut reader = events.get_reader();
+        let births: Vec<(Entity, String)> = reader
+            .read(events)
+            .filter_map(|ev| match &ev.kind {
+                ActivityEntryKind::ChildBorn { child, child_name } => {
+                    Some((*child, child_name.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            births.len(),
+            1,
+            "expected one ChildBorn event for one resolved pregnancy",
+        );
+        let (child, child_name) = &births[0];
+        // Child should be alive and named.
+        let actual_name = sim
+            .app
+            .world()
+            .entity(*child)
+            .get::<Name>()
+            .map(|n| n.as_str().to_string())
+            .expect("newborn must carry a Name component");
+        assert_eq!(
+            &actual_name, child_name,
+            "ChildBorn.child_name must match the newborn's Name",
+        );
+    }
+
     // ─── Pluralist Economy R8 follow-on — SelfActualization teaching ───
 
     #[test]

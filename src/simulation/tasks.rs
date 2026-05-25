@@ -11,11 +11,13 @@ use super::plants::{GrowthStage, Plant, PlantKind, PlantMap};
 use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
+use crate::simulation::stand_reservation::StandTileReservations;
 use crate::simulation::typed_task::{ActionQueue, AutonomousTaskLifecycle, DispatchOutcome, Task};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::TILE_SIZE;
 use crate::world::tile::TileKind;
+use ahash::AHashSet;
 use bevy::prelude::*;
 
 /// Represents the current active task an agent is performing.
@@ -655,6 +657,99 @@ pub fn find_nearest_unplanted_in_rect(
     best
 }
 
+/// Shared 8-neighbour stand-tile picker used by both `assign_task_with_routing`
+/// at dispatch time and `movement_system` on arrival-collision recovery.
+///
+/// Filter cascade (in order):
+///   1. `chunk_map.passable_at(ntx, nty, nz)` where `nz = surface_z_at`.
+///   2. `|nz - resource_z| ≤ 1` — the agent must actually be able to reach the
+///      work tile from here.
+///   3. `chunk_connectivity.tile_reachable(agent → candidate)` — pathfinding
+///      can route the worker without a multi-chunk hop fall-through.
+///   4. **Occupancy** via `spatial_index.agent_count` — but a tile occupied
+///      only by `worker` itself does not exclude (the agent might already be
+///      standing on a perfectly valid neighbour).
+///   5. **Reservation** via `stand_reservations.is_taken_by_other(.., worker)`
+///      — same self-tolerant exception.
+///   6. **Within-tick claim set** (optional) — when called from
+///      `movement_system`, the same per-tick reservations used to block two
+///      arriving agents from claiming one tile this tick.
+///
+/// Tie-break by Chebyshev distance to `agent_tile_3d.xy()`, then lexicographic
+/// on `(nx, ny)` for determinism.
+///
+/// Returns `Some((stand_tile, stand_z))` on success — caller is responsible
+/// for `stand_reservations.try_stake(stand_tile, stand_z, worker, now)`.
+pub fn pick_adjacent_stand_tile(
+    work_tile: (i32, i32),
+    resource_z: i8,
+    agent_tile_3d: (i32, i32, i8),
+    chunk_map: &ChunkMap,
+    chunk_graph: &ChunkGraph,
+    chunk_connectivity: &ChunkConnectivity,
+    spatial_index: &SpatialIndex,
+    stand_reservations: &StandTileReservations,
+    claimed_this_tick: Option<&AHashSet<(i32, i32, i32)>>,
+    worker: Entity,
+) -> Option<((i32, i32), i8)> {
+    const ADJ: [(i32, i32); 8] = [
+        (-1, 0),
+        (1, 0),
+        (0, -1),
+        (0, 1),
+        (-1, -1),
+        (1, -1),
+        (-1, 1),
+        (1, 1),
+    ];
+    let (ax, ay, _az) = agent_tile_3d;
+    let mut best: Option<((i32, i32), i8, i32)> = None;
+    for &(dx, dy) in ADJ.iter() {
+        let ntx = work_tile.0 + dx;
+        let nty = work_tile.1 + dy;
+        let nz = chunk_map.surface_z_at(ntx, nty);
+        if !chunk_map.passable_at(ntx, nty, nz) {
+            continue;
+        }
+        let dz = nz as i32 - resource_z as i32;
+        if !(-1..=1).contains(&dz) {
+            continue;
+        }
+        if !chunk_connectivity.tile_reachable(chunk_graph, agent_tile_3d, (ntx, nty, nz as i8)) {
+            continue;
+        }
+        // Self-tolerant occupancy: another agent here blocks us; ourselves
+        // standing here does not.
+        let occupants = spatial_index.agent_count(ntx, nty, nz as i32);
+        if occupants > 0 {
+            // We can't read which entity occupies without iterating; treat any
+            // occupancy as blocking unless this candidate is the agent's own
+            // current tile (the only place `worker` could be).
+            let is_own_tile = ntx == ax && nty == ay;
+            if !is_own_tile {
+                continue;
+            }
+        }
+        if stand_reservations.is_taken_by_other(ntx, nty, nz as i8, worker) {
+            continue;
+        }
+        if let Some(claims) = claimed_this_tick {
+            if claims.contains(&(ntx, nty, nz as i32)) {
+                continue;
+            }
+        }
+        let cheb = (ntx - ax).abs().max((nty - ay).abs());
+        let better = match best {
+            None => true,
+            Some((_, _, b)) => cheb < b,
+        };
+        if better {
+            best = Some(((ntx, nty), nz as i8, cheb));
+        }
+    }
+    best.map(|(tile, z, _)| (tile, z))
+}
+
 pub fn assign_task_with_routing(
     ai: &mut PersonAI,
     cur_tile: (i32, i32),
@@ -666,6 +761,10 @@ pub fn assign_task_with_routing(
     chunk_router: &ChunkRouter,
     chunk_map: &ChunkMap,
     chunk_connectivity: &ChunkConnectivity,
+    spatial_index: &SpatialIndex,
+    stand_reservations: &StandTileReservations,
+    worker: Entity,
+    now: u64,
 ) -> bool {
     // Resource's standable Z — used to gate which adjacent tiles can actually
     // reach the work tile. The agent's `target_z` is set below to the route
@@ -674,58 +773,49 @@ pub fn assign_task_with_routing(
     let resource_z =
         chunk_map.nearest_standable_z(target.0 as i32, target.1 as i32, ai.current_z as i32) as i8;
 
+    // Release any prior stand-tile reservation for this worker; we may stake a
+    // fresh one below. Releasing first keeps the bookkeeping clean across
+    // back-to-back dispatches without a leak.
+    stand_reservations.release_for_worker(worker);
+
     // For tasks where the agent works from beside the target (not on it), route to
-    // the nearest passable adjacent tile within ±1 Z of the resource so the agent
-    // can actually interact once they arrive. Also require the candidate tile to
-    // share a connectivity component with the agent — otherwise the path worker
-    // will reject every request to that tile and the agent will loop forever on
-    // the same unreachable resource.
+    // the nearest passable adjacent tile within ±1 Z of the resource that is
+    // unoccupied + unreserved. Reservation eliminates dispatch-wave races where
+    // multiple thirsty agents pick the same stand tile in one tick.
     let route_target = if task_interacts_from_adjacent(task as u16) {
-        let (tx, ty) = (target.0 as i32, target.1 as i32);
-        let (ax, ay) = (cur_tile.0 as i32, cur_tile.1 as i32);
-        const ADJ: [(i32, i32); 8] = [
-            (-1, 0),
-            (1, 0),
-            (0, -1),
-            (0, 1),
-            (-1, -1),
-            (1, -1),
-            (-1, 1),
-            (1, 1),
-        ];
-        let agent_z = ai.current_z;
-        let agent_tile_3d = (cur_tile.0, cur_tile.1, agent_z);
-        let picked = ADJ
-            .iter()
-            .map(|&(dx, dy)| (tx + dx, ty + dy))
-            .filter(|&(ntx, nty)| {
-                let nz = chunk_map.surface_z_at(ntx, nty);
-                if !chunk_map.passable_at(ntx, nty, nz) {
-                    return false;
-                }
-                let dz = nz as i32 - resource_z as i32;
-                if !(-1..=1).contains(&dz) {
-                    return false;
-                }
-                chunk_connectivity.tile_reachable(chunk_graph, agent_tile_3d, (ntx, nty, nz as i8))
-            })
-            .min_by_key(|&(ntx, nty)| (ntx - ax).abs() + (nty - ay).abs())
-            .map(|(ntx, nty)| (ntx as i32, nty as i32));
+        let agent_tile_3d = (cur_tile.0, cur_tile.1, ai.current_z);
+        let picked = pick_adjacent_stand_tile(
+            target,
+            resource_z,
+            agent_tile_3d,
+            chunk_map,
+            chunk_graph,
+            chunk_connectivity,
+            spatial_index,
+            stand_reservations,
+            None,
+            worker,
+        );
         match picked {
-            Some(t) => t,
+            Some((stand_tile, stand_z)) => {
+                // Stake the chosen stand tile so the next dispatcher in this
+                // same tick (or a later tick before arrival) won't pick it.
+                stand_reservations.try_stake(stand_tile.0, stand_tile.1, stand_z, worker, now);
+                stand_tile
+            }
             None => {
                 // No reachable adjacent tile (camp perimeter blocked, target
-                // sealed in by walls / blueprints, etc.). Fall back to the
-                // nearest passable, reachable tile in a small radius around
-                // the target — agent walks toward it and the next dispatch
-                // tick re-tries adjacency from a closer position. Without
-                // this fallback the agent loops Idle forever on a goal whose
-                // adjacency happens to be temporarily blocked.
+                // sealed in by walls / blueprints, occupied by other workers).
+                // Fall back to the nearest passable, reachable tile in a small
+                // radius around the target — agent walks toward it and the next
+                // dispatch tick re-tries adjacency from a closer position. No
+                // reservation staked: this is a "walk closer" hint, not a final
+                // stand commitment.
                 match nearest_reachable_tile_near(
                     chunk_map,
                     chunk_graph,
                     chunk_connectivity,
-                    (tx, ty),
+                    target,
                     agent_tile_3d,
                     8,
                 ) {
@@ -799,6 +889,10 @@ pub fn dispatch_autonomous_task_with_routing(
     chunk_router: &ChunkRouter,
     chunk_map: &ChunkMap,
     chunk_connectivity: &ChunkConnectivity,
+    spatial_index: &SpatialIndex,
+    stand_reservations: &StandTileReservations,
+    worker: Entity,
+    now: u64,
 ) -> bool {
     if ai.state != AiState::Idle || !aq.is_idle() || !aq.queued_is_empty() {
         return false;
@@ -815,6 +909,10 @@ pub fn dispatch_autonomous_task_with_routing(
         chunk_router,
         chunk_map,
         chunk_connectivity,
+        spatial_index,
+        stand_reservations,
+        worker,
+        now,
     ) {
         return false;
     }
@@ -1688,6 +1786,8 @@ mod tests {
         let graph = ChunkGraph::default();
         let router = ChunkRouter::default();
         let conn = ChunkConnectivity::default();
+        let spatial = SpatialIndex::default();
+        let stand = StandTileReservations::default();
         assign_task_with_routing(
             &mut ai,
             (10, 10),
@@ -1699,6 +1799,10 @@ mod tests {
             &router,
             &map,
             &conn,
+            &spatial,
+            &stand,
+            Entity::PLACEHOLDER,
+            0,
         );
 
         // target_z must follow the agent's Z (the tunnel floor at z=0),

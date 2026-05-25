@@ -1016,6 +1016,8 @@ pub fn craft_order_system(
         Option<&crate::simulation::apprenticeship::ApprenticeOf>,
         Option<&crate::simulation::tools::ToolKit>,
     )>,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
     let mut order_haulers: AHashMap<Entity, Vec<(Entity, [u32; MAX_CRAFT_INPUTS])>> =
         AHashMap::new();
@@ -1402,6 +1404,10 @@ pub fn craft_order_system(
                         &chunk_router,
                         &chunk_map,
                         &chunk_connectivity,
+                        &spatial_index,
+                        &stand_reservations,
+                        entity,
+                        clock.tick,
                     );
                     if !dispatched {
                         aq.cancel();

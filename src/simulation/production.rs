@@ -466,6 +466,7 @@ pub fn withdraw_material_task_system(
     mut commands: Commands,
     clock: Res<SimClock>,
     spatial: Res<SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
     storage_tile_map: Res<StorageTileMap>,
     storage_reservations: Res<StorageReservations>,
     mut plant_reservations: ResMut<crate::simulation::plants::PlantingReservations>,
@@ -492,8 +493,9 @@ pub fn withdraw_material_task_system(
     use crate::simulation::typed_task::Task;
     use crate::world::terrain::world_to_tile;
 
+    let spatial_index: &SpatialIndex = &*spatial;
     for (
-        _entity,
+        actor,
         mut ai,
         mut aq,
         mut agent,
@@ -607,8 +609,11 @@ pub fn withdraw_material_task_system(
                 &chunk_graph,
                 &chunk_router,
                 &chunk_connectivity,
+                spatial_index,
+                &stand_reservations,
                 &bp_query,
                 &co_query,
+                actor,
                 cur_tile,
                 cur_chunk,
             &carrier,
@@ -629,8 +634,11 @@ pub fn withdraw_material_task_system(
                 &chunk_graph,
                 &chunk_router,
                 &chunk_connectivity,
+                spatial_index,
+                &stand_reservations,
                 &bp_query,
                 &co_query,
+                actor,
                 cur_tile,
                 cur_chunk,
             &carrier,
@@ -666,8 +674,11 @@ pub fn withdraw_material_task_system(
                 &chunk_graph,
                 &chunk_router,
                 &chunk_connectivity,
+                spatial_index,
+                &stand_reservations,
                 &bp_query,
                 &co_query,
+                actor,
                 cur_tile,
                 cur_chunk,
             &carrier,
@@ -769,8 +780,11 @@ pub fn withdraw_material_task_system(
             &chunk_graph,
             &chunk_router,
             &chunk_connectivity,
+            spatial_index,
+            &stand_reservations,
             &bp_query,
             &co_query,
+            actor,
             cur_tile,
             cur_chunk,
         &carrier,
@@ -964,8 +978,11 @@ fn route_haul_to_blueprint_tail(
     chunk_graph: &crate::pathfinding::chunk_graph::ChunkGraph,
     chunk_router: &crate::pathfinding::chunk_router::ChunkRouter,
     chunk_connectivity: &crate::pathfinding::connectivity::ChunkConnectivity,
+    spatial_index: &crate::world::spatial::SpatialIndex,
+    stand_reservations: &crate::simulation::stand_reservation::StandTileReservations,
     bp_query: &Query<&crate::simulation::construction::Blueprint>,
     blueprint: bevy::prelude::Entity,
+    actor: bevy::prelude::Entity,
     cur_tile: (i32, i32),
     cur_chunk: crate::world::chunk::ChunkCoord,
 ) {
@@ -992,6 +1009,10 @@ fn route_haul_to_blueprint_tail(
         chunk_router,
         chunk_map,
         chunk_connectivity,
+        spatial_index,
+        stand_reservations,
+        actor,
+        now,
     );
     if !dispatched {
         crate::simulation::htn::record_routing_failure(method_history, ai, now);
@@ -1026,8 +1047,11 @@ fn finish_withdraw_material(
     chunk_graph: &crate::pathfinding::chunk_graph::ChunkGraph,
     chunk_router: &crate::pathfinding::chunk_router::ChunkRouter,
     chunk_connectivity: &crate::pathfinding::connectivity::ChunkConnectivity,
+    spatial_index: &crate::world::spatial::SpatialIndex,
+    stand_reservations: &crate::simulation::stand_reservation::StandTileReservations,
     bp_query: &Query<&crate::simulation::construction::Blueprint>,
     co_query: &Query<&crate::simulation::crafting::CraftOrder>,
+    actor: bevy::prelude::Entity,
     cur_tile: (i32, i32),
     cur_chunk: crate::world::chunk::ChunkCoord,
     carrier: &Carrier,
@@ -1051,8 +1075,11 @@ fn finish_withdraw_material(
                 chunk_graph,
                 chunk_router,
                 chunk_connectivity,
+                spatial_index,
+                stand_reservations,
                 bp_query,
                 blueprint,
+                actor,
                 cur_tile,
                 cur_chunk,
             );
@@ -1082,6 +1109,10 @@ fn finish_withdraw_material(
                 chunk_router,
                 chunk_map,
                 chunk_connectivity,
+                spatial_index,
+                stand_reservations,
+                actor,
+                now,
             );
             if !dispatched {
                 crate::simulation::htn::record_routing_failure(method_history, ai, now);
@@ -1138,6 +1169,10 @@ fn finish_withdraw_material(
                 chunk_router,
                 chunk_map,
                 chunk_connectivity,
+                spatial_index,
+                stand_reservations,
+                actor,
+                now,
             );
             if !dispatched {
                 plant_reservations.release(tile);
@@ -1210,6 +1245,10 @@ fn finish_withdraw_material(
                 chunk_router,
                 chunk_map,
                 chunk_connectivity,
+                spatial_index,
+                stand_reservations,
+                actor,
+                now,
             );
             if !dispatched {
                 plant_reservations.release(tile);

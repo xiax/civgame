@@ -119,11 +119,18 @@ pub enum ActivityEntryKind {
         from_faction: u32,
         proposal: crate::simulation::diplomacy::DiplomacyProposal,
     },
+    /// A mother gave birth. `actor` is the mother; `child` is clickable so the
+    /// player can focus the camera on the newborn.
+    ChildBorn {
+        child: Entity,
+        child_name: String,
+    },
 }
 
 #[derive(Clone)]
 pub enum ResultLink {
     Built { entity: Entity, snapshot: Vec2 },
+    Born { entity: Entity, snapshot: Vec2 },
     HeldByActor,
     NoTarget,
 }
@@ -291,6 +298,21 @@ pub fn activity_log_ingest_system(
                 format!("{:?} from faction {}", proposal, from_faction),
                 ResultLink::NoTarget,
             ),
+            ActivityEntryKind::ChildBorn { child, child_name } => {
+                let snapshot = transforms
+                    .get(*child)
+                    .ok()
+                    .map(|t| t.translation.truncate())
+                    .unwrap_or_default();
+                (
+                    "gave birth to",
+                    child_name.clone(),
+                    ResultLink::Born {
+                        entity: *child,
+                        snapshot,
+                    },
+                )
+            }
         };
 
         log.entries.push_back(ActivityLogEntry {
@@ -390,7 +412,8 @@ pub fn activity_log_panel_system(
                                     );
 
                                     match &entry.result {
-                                        ResultLink::Built { entity, snapshot } => {
+                                        ResultLink::Built { entity, snapshot }
+                                        | ResultLink::Born { entity, snapshot } => {
                                             let result_alive = transforms.get(*entity).is_ok();
                                             let thing_btn =
                                                 link_button(ui, &entry.thing_label, result_alive);

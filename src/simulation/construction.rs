@@ -4589,6 +4589,8 @@ pub fn building_upgrade_system(
         &Transform,
         &LodLevel,
     )>,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
     if clock.tick % UPGRADE_INTERVAL_TICKS != 0 {
         return;
@@ -4703,6 +4705,10 @@ pub fn building_upgrade_system(
                 &chunk_router,
                 &chunk_map,
                 &chunk_connectivity,
+                &spatial_index,
+                &stand_reservations,
+                agent_e,
+                clock.tick,
             );
             if routed {
                 aq.dispatch(crate::simulation::typed_task::Task::Deconstruct { tile });
@@ -6481,7 +6487,11 @@ pub fn deconstruct_system(
     chunk_connectivity: Res<ChunkConnectivity>,
     mut chunk_map: ResMut<ChunkMap>,
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
+    clock: Res<crate::simulation::SimClock>,
 ) {
+    let now = clock.tick;
     // Collect agents that just finished deconstruction.
     let mut to_complete: Vec<(Entity, (i32, i32), u32, (i32, i32))> = Vec::new();
 
@@ -6707,6 +6717,10 @@ pub fn deconstruct_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    agent_entity,
+                    now,
                 );
                 if !dispatched {
                     aq.cancel_chain(&mut ai);

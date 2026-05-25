@@ -17,6 +17,8 @@ use super::skills::{SkillPeaks, SkillUseTicks, Skills, SkillsLastSeen};
 use super::stats::Stats;
 use crate::economy::agent::EconomicAgent;
 use crate::pathfinding::path_request::PathFollow;
+use crate::ui::activity_log::{ActivityEntryKind, ActivityLogEvent};
+use crate::world::chunk::Z_MIN;
 use crate::world::seasons::TICKS_PER_SEASON;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
@@ -53,7 +55,9 @@ impl BiologicalSex {
     }
 }
 
-/// Pregnancy lasts three seasons (54,000 ticks at 20Hz / 5-day seasons).
+/// Pregnancy lasts three seasons (108,000 ticks at TICKS_PER_DAY=7200,
+/// DAYS_PER_SEASON=5 → 15 game days). Ticked every FixedUpdate regardless of
+/// the mother's LOD or bucket slot so gestation matches calendar time.
 pub const PREGNANCY_TICKS: u32 = TICKS_PER_SEASON * 3;
 /// Tile radius (Chebyshev) within which a sleeping pair counts as co-sleeping.
 const COSLEEP_RADIUS: i32 = 3;
@@ -432,12 +436,13 @@ pub fn pregnancy_system(
     mut registry: ResMut<FactionRegistry>,
     chunk_map: Res<crate::world::chunk::ChunkMap>,
     name_query: Query<&Name>,
+    mut activity_log: EventWriter<ActivityLogEvent>,
     mut query: Query<(
         Entity,
         &mut Pregnancy,
         &Transform,
-        &BucketSlot,
         &LodLevel,
+        &PersonAI,
         Option<&Stats>,
         Option<&crate::simulation::knowledge::PersonKnowledge>,
         // Pluralist Economy R3 follow-on b: pass the mother's
@@ -449,6 +454,8 @@ pub fn pregnancy_system(
     let mut births: Vec<(
         Entity,
         Transform,
+        LodLevel,
+        i8,
         u32,
         Stats,
         crate::simulation::knowledge_bits::KnowledgeBits,
@@ -459,16 +466,16 @@ pub fn pregnancy_system(
         mother,
         mut preg,
         transform,
-        slot,
         lod,
+        person_ai,
         mother_stats,
         mother_knowledge,
         mother_household,
     ) in query.iter_mut()
     {
-        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
-            continue;
-        }
+        // Pregnancy must tick every FixedUpdate so gestation matches calendar
+        // time: a Dormant mother far from the camera, or one whose BucketSlot
+        // is outside the active window, must still birth on schedule.
         preg.ticks_remaining = preg.ticks_remaining.saturating_sub(1);
         if preg.ticks_remaining > 0 {
             continue;
@@ -485,6 +492,8 @@ pub fn pregnancy_system(
         births.push((
             mother,
             *transform,
+            *lod,
+            person_ai.current_z,
             preg.faction_id,
             child_stats,
             inherited_aware,
@@ -492,8 +501,16 @@ pub fn pregnancy_system(
         ));
     }
 
-    for (mother, parent_transform, faction_id, child_stats, inherited_aware, mother_household) in
-        births
+    for (
+        mother,
+        parent_transform,
+        mother_lod,
+        mother_z,
+        faction_id,
+        child_stats,
+        inherited_aware,
+        mother_household,
+    ) in births
     {
         commands.entity(mother).remove::<Pregnancy>();
 
@@ -504,6 +521,15 @@ pub fn pregnancy_system(
         let tx = (parent_transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (parent_transform.translation.y / TILE_SIZE).floor() as i32;
         let world_pos = tile_to_world(tx, ty);
+        // `surface_z_at` returns `Z_MIN - 1` for unloaded chunks; Dormant
+        // mothers may now birth off-screen, so fall back to the mother's
+        // current Z when the chunk hasn't been streamed in.
+        let surface_z = chunk_map.surface_z_at(tx, ty);
+        let child_z = if surface_z >= Z_MIN {
+            surface_z as i8
+        } else {
+            mother_z
+        };
 
         registry.add_member(faction_id);
         let sex = BiologicalSex::random();
@@ -536,14 +562,14 @@ pub fn pregnancy_system(
                         state: AiState::Idle,
                         target_tile: (tx as i32, ty as i32),
                         dest_tile: (tx as i32, ty as i32),
-                        current_z: chunk_map.surface_z_at(tx, ty) as i8,
-                        target_z: chunk_map.surface_z_at(tx, ty) as i8,
+                        current_z: child_z,
+                        target_z: child_z,
                         ..PersonAI::default()
                     },
                     EconomicAgent::default(),
                 ),
                 (
-                    LodLevel::Full,
+                    mother_lod,
                     BucketSlot(new_slot),
                     MovementState::default(),
                     sex,
@@ -567,7 +593,7 @@ pub fn pregnancy_system(
                     RelationshipMemory::default(),
                     MethodHistory::default(),
                     crate::simulation::memory::CurrentVision::default(),
-                    Name::new(child_name),
+                    Name::new(child_name.clone()),
                     PathFollow::default(),
                     Carrier::default(),
                 ),
@@ -601,6 +627,16 @@ pub fn pregnancy_system(
         if let Some(mother_hh) = mother_household {
             commands.entity(child_entity).insert(mother_hh);
         }
+
+        activity_log.send(ActivityLogEvent {
+            tick: clock.tick,
+            actor: mother,
+            faction_id,
+            kind: ActivityEntryKind::ChildBorn {
+                child: child_entity,
+                child_name,
+            },
+        });
     }
 }
 

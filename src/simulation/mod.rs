@@ -76,6 +76,7 @@ pub mod sedentary_collapse;
 pub mod seed_reservation;
 pub mod settlement;
 pub mod settlement_bootstrap;
+pub mod stand_reservation;
 pub mod shared_knowledge;
 pub mod skills;
 pub mod sleep;
@@ -235,6 +236,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(plants::PlantMap::default())
             .insert_resource(plants::PlantSpriteIndex::default())
             .insert_resource(plants::PlantingReservations::default())
+            .insert_resource(stand_reservation::StandTileReservations::default())
             .insert_resource(method_registry)
             .insert_resource(construction::AutonomousBuildingToggle(true))
             .insert_resource(wild_herd::WildHerdRegistry::default())
@@ -1306,6 +1308,10 @@ impl Plugin for SimulationPlugin {
                     // stale entries (worker died / Dormant-demoted / goal
                     // flipped without releasing).
                     plants::planting_reservation_gc_system,
+                    // Daily GC for stand-tile reservations — same shape:
+                    // worker despawned / Dormant / current task is no
+                    // longer adjacent-interacting / age > TICKS_PER_DAY.
+                    stand_reservation::stand_reservation_gc_system,
                 )
                     .in_set(SimulationSet::Economy),
             )

@@ -3575,6 +3575,7 @@ pub fn htn_sleep_dispatch_system(
     bed_query: Query<&Transform, With<Bed>>,
     mut query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut ActionQueue,
             &mut MethodHistory,
@@ -3586,9 +3587,11 @@ pub fn htn_sleep_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
     let now = clock.tick;
-    for (mut ai, mut aq, mut history, goal, member, transform, lod, home_bed_opt) in
+    for (actor, mut ai, mut aq, mut history, goal, member, transform, lod, home_bed_opt) in
         query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -3700,6 +3703,10 @@ pub fn htn_sleep_dispatch_system(
                         &chunk_router,
                         &chunk_map,
                         &chunk_connectivity,
+                        &spatial_index,
+                        &stand_reservations,
+                        actor,
+                        now,
                     );
                     if routed {
                         aq.dispatch(Task::Sleep {
@@ -3737,6 +3744,10 @@ pub fn htn_sleep_dispatch_system(
                             &chunk_router,
                             &chunk_map,
                             &chunk_connectivity,
+                            &spatial_index,
+                            &stand_reservations,
+                            actor,
+                            now,
                         );
                         if routed {
                             aq.dispatch(Task::Sleep { bed: None });
@@ -3990,8 +4001,7 @@ pub fn htn_acquire_food_dispatch_system(
     storage_tile_map: Res<StorageTileMap>,
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
-    spatial: Res<crate::world::spatial::SpatialIndex>,
-    clock: Res<SimClock>,
+    routing_stand: crate::simulation::stand_reservation::StandRouting,
     calendar: Res<Calendar>,
     plant_map: Res<PlantMap>,
     gather_claims: Res<GatherClaims>,
@@ -4017,6 +4027,10 @@ pub fn htn_acquire_food_dispatch_system(
         Without<Drafted>,
     >,
 ) {
+    let spatial = &routing_stand.spatial_index;
+    let stand_reservations = &routing_stand.stand_reservations;
+    let clock = &routing_stand.clock;
+    let spatial_index = &*spatial;
     let now = clock.tick;
     query.par_iter_mut().for_each(
         |(
@@ -4375,6 +4389,10 @@ pub fn htn_acquire_food_dispatch_system(
                         &chunk_router,
                         &chunk_map,
                         &chunk_connectivity,
+                        &spatial_index,
+                        &stand_reservations,
+                        actor,
+                        now,
                     );
                     if dispatched {
                         ai.active_method = Some(MethodId::TERMINAL_EXPLORE);
@@ -4418,6 +4436,10 @@ pub fn htn_acquire_food_dispatch_system(
                         &chunk_router,
                         &chunk_map,
                         &chunk_connectivity,
+                        &spatial_index,
+                        &stand_reservations,
+                        actor,
+                        now,
                     );
                     if !dispatched {
                         // Routing rejected the storage tile (no reachable
@@ -4467,6 +4489,10 @@ pub fn htn_acquire_food_dispatch_system(
                         &chunk_router,
                         &chunk_map,
                         &chunk_connectivity,
+                        &spatial_index,
+                        &stand_reservations,
+                        actor,
+                        now,
                     );
                     if !dispatched {
                         ai.active_method = None;
@@ -4512,6 +4538,10 @@ pub fn htn_acquire_food_dispatch_system(
                         &chunk_router,
                         &chunk_map,
                         &chunk_connectivity,
+                        &spatial_index,
+                        &stand_reservations,
+                        actor,
+                        now,
                     );
                     if !dispatched {
                         ai.active_method = None;
@@ -4536,6 +4566,10 @@ pub fn htn_acquire_food_dispatch_system(
                         &chunk_router,
                         &chunk_map,
                         &chunk_connectivity,
+                        &spatial_index,
+                        &stand_reservations,
+                        actor,
+                        now,
                     );
                     if !dispatched {
                         ai.active_method = None;
@@ -4569,6 +4603,10 @@ pub fn htn_acquire_food_dispatch_system(
                         &chunk_router,
                         &chunk_map,
                         &chunk_connectivity,
+                        &spatial_index,
+                        &stand_reservations,
+                        actor,
+                        now,
                     );
                     if !dispatched {
                         ai.active_method = None;
@@ -4666,8 +4704,7 @@ pub fn htn_acquire_good_dispatch_system(
     storage_reservations: Res<crate::simulation::faction::StorageReservations>,
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
-    spatial: Res<crate::world::spatial::SpatialIndex>,
-    clock: Res<SimClock>,
+    routing_stand: crate::simulation::stand_reservation::StandRouting,
     calendar: Res<Calendar>,
     gather_claims: Res<GatherClaims>,
     gk: crate::simulation::shared_knowledge::GatherKnowledge,
@@ -4694,6 +4731,10 @@ pub fn htn_acquire_good_dispatch_system(
         Without<Drafted>,
     >,
 ) {
+    let spatial = &routing_stand.spatial_index;
+    let stand_reservations = &routing_stand.stand_reservations;
+    let clock = &routing_stand.clock;
+    let spatial_index = &*spatial;
     use crate::simulation::jobs::JobKind;
 
     let now = clock.tick;
@@ -4999,6 +5040,10 @@ pub fn htn_acquire_good_dispatch_system(
                             &chunk_router,
                             &chunk_map,
                             &chunk_connectivity,
+                            &spatial_index,
+                            &stand_reservations,
+                            actor,
+                            now,
                         );
                         if !dispatched {
                             ai.active_method = None;
@@ -5031,6 +5076,10 @@ pub fn htn_acquire_good_dispatch_system(
                             &chunk_router,
                             &chunk_map,
                             &chunk_connectivity,
+                            &spatial_index,
+                            &stand_reservations,
+                            actor,
+                            now,
                         );
                         if !dispatched {
                             ai.active_method = None;
@@ -5075,6 +5124,10 @@ pub fn htn_acquire_good_dispatch_system(
                             &chunk_router,
                             &chunk_map,
                             &chunk_connectivity,
+                            &spatial_index,
+                            &stand_reservations,
+                            actor,
+                            now,
                         );
                         if !dispatched {
                             ai.active_method = None;
@@ -5155,6 +5208,10 @@ pub fn htn_acquire_good_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if dispatched {
                     aq.dispatch(Task::HaulToBlueprint { blueprint });
@@ -5197,6 +5254,10 @@ pub fn htn_acquire_good_dispatch_system(
                         &chunk_router,
                         &chunk_map,
                         &chunk_connectivity,
+                        &spatial_index,
+                        &stand_reservations,
+                        actor,
+                        now,
                     );
                     if dispatched {
                         // Capacity-driven batching capped at the market's
@@ -5359,6 +5420,10 @@ pub fn htn_acquire_good_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -5483,6 +5548,8 @@ pub fn htn_stockpile_food_dispatch_system(
             Without<crate::simulation::person::TraderPlan>,
         ),
     >,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
     use crate::simulation::jobs::JobKind;
 
@@ -5807,6 +5874,10 @@ pub fn htn_stockpile_food_dispatch_system(
                         &chunk_router,
                         &chunk_map,
                         &chunk_connectivity,
+                        &spatial_index,
+                        &stand_reservations,
+                        actor,
+                        now,
                     );
                     if dispatched {
                         ai.active_method = Some(MethodId::TERMINAL_EXPLORE);
@@ -5860,6 +5931,10 @@ pub fn htn_stockpile_food_dispatch_system(
                         &chunk_router,
                         &chunk_map,
                         &chunk_connectivity,
+                        &spatial_index,
+                        &stand_reservations,
+                        actor,
+                        now,
                     );
                     if !dispatched {
                         ai.active_method = None;
@@ -5894,6 +5969,10 @@ pub fn htn_stockpile_food_dispatch_system(
                         &chunk_router,
                         &chunk_map,
                         &chunk_connectivity,
+                        &spatial_index,
+                        &stand_reservations,
+                        actor,
+                        now,
                     );
                     if !dispatched {
                         ai.active_method = None;
@@ -5919,6 +5998,10 @@ pub fn htn_stockpile_food_dispatch_system(
                         &chunk_router,
                         &chunk_map,
                         &chunk_connectivity,
+                        &spatial_index,
+                        &stand_reservations,
+                        actor,
+                        now,
                     );
                     if !dispatched {
                         ai.active_method = None;
@@ -5951,6 +6034,10 @@ pub fn htn_stockpile_food_dispatch_system(
                         &chunk_router,
                         &chunk_map,
                         &chunk_connectivity,
+                        &spatial_index,
+                        &stand_reservations,
+                        actor,
+                        now,
                     );
                     if !dispatched {
                         ai.active_method = None;
@@ -6010,6 +6097,7 @@ pub fn htn_equip_hunting_spear_dispatch_system(
     item_query: Query<&crate::simulation::items::GroundItem>,
     mut query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut ActionQueue,
             &mut MethodHistory,
@@ -6025,10 +6113,13 @@ pub fn htn_equip_hunting_spear_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
+    let spatial_index = &*spatial;
     let weapon_id = crate::economy::core_ids::weapon();
     let now = clock.tick;
     for (
+        actor,
         mut ai,
         mut aq,
         mut history,
@@ -6216,6 +6307,10 @@ pub fn htn_equip_hunting_spear_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -6276,6 +6371,7 @@ pub fn htn_scout_dispatch_system(
     clock: Res<SimClock>,
     mut query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut ActionQueue,
             &mut MethodHistory,
@@ -6288,11 +6384,13 @@ pub fn htn_scout_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
     use crate::simulation::faction::HuntOrder;
     let now = clock.tick;
     query.par_iter_mut().for_each(
-        |(mut ai, mut aq, mut history, goal, profession, transform, member, lod, knowledge_opt)| {
+        |(actor, mut ai, mut aq, mut history, goal, profession, transform, member, lod, knowledge_opt)| {
             if *lod == LodLevel::Dormant {
                 return;
             }
@@ -6422,6 +6520,10 @@ pub fn htn_scout_dispatch_system(
                         &chunk_router,
                         &chunk_map,
                         &chunk_connectivity,
+                        &spatial_index,
+                        &stand_reservations,
+                        actor,
+                        now,
                     );
                     if !dispatched {
                         ai.active_method = None;
@@ -6470,6 +6572,7 @@ pub fn htn_return_surplus_dispatch_system(
     clock: Res<SimClock>,
     mut query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut ActionQueue,
             &mut MethodHistory,
@@ -6482,10 +6585,12 @@ pub fn htn_return_surplus_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
     let now = clock.tick;
     query.par_iter_mut().for_each(
-        |(mut ai, mut aq, mut history, goal, agent, carrier, transform, member, lod)| {
+        |(actor, mut ai, mut aq, mut history, goal, agent, carrier, transform, member, lod)| {
             if *lod == LodLevel::Dormant {
                 return;
             }
@@ -6623,6 +6728,10 @@ pub fn htn_return_surplus_dispatch_system(
                         &chunk_router,
                         &chunk_map,
                         &chunk_connectivity,
+                        &spatial_index,
+                        &stand_reservations,
+                        actor,
+                        now,
                     );
                     if !dispatched {
                         ai.active_method = None;
@@ -6700,6 +6809,7 @@ pub fn htn_tame_animal_dispatch_system(
     >,
     mut query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut ActionQueue,
             &mut MethodHistory,
@@ -6710,10 +6820,12 @@ pub fn htn_tame_animal_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
+    let spatial_index = &*spatial;
     const VIEW_RADIUS: i32 = crate::simulation::goal_contract::TAME_SEARCH_RADIUS;
     let now = clock.tick;
-    for (mut ai, mut aq, mut history, goal, transform, member, lod) in query.iter_mut() {
+    for (actor, mut ai, mut aq, mut history, goal, transform, member, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -6875,6 +6987,10 @@ pub fn htn_tame_animal_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -7216,8 +7332,7 @@ pub fn htn_plant_from_storage_dispatch_system(
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
     mut planting: PlantingDispatchParams,
-    spatial: Res<crate::world::spatial::SpatialIndex>,
-    clock: Res<SimClock>,
+    routing_stand: crate::simulation::stand_reservation::StandRouting,
     item_query: Query<&crate::simulation::items::GroundItem>,
     farm_plot_params: FarmScopeParams,
     field_tiles: Res<crate::simulation::farm::FieldTileIndex>,
@@ -7239,6 +7354,10 @@ pub fn htn_plant_from_storage_dispatch_system(
         Without<Drafted>,
     >,
 ) {
+    let spatial = &routing_stand.spatial_index;
+    let stand_reservations = &routing_stand.stand_reservations;
+    let clock = &routing_stand.clock;
+    let spatial_index = &*spatial;
     use crate::simulation::plants::PlantKind;
     use crate::simulation::tasks::{
         find_nearest_unplanted_farmland, find_nearest_unplanted_in_rect,
@@ -7549,6 +7668,10 @@ pub fn htn_plant_from_storage_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -7619,6 +7742,8 @@ pub fn htn_prepare_field_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
     use crate::simulation::farm::FarmWorkPhase;
     use crate::simulation::jobs::{JobKind, JobProgress};
@@ -7724,6 +7849,10 @@ pub fn htn_prepare_field_dispatch_system(
             &chunk_router,
             &chunk_map,
             &chunk_connectivity,
+            &spatial_index,
+            &stand_reservations,
+            actor,
+            now,
         );
         if !dispatched {
             continue;
@@ -7799,11 +7928,13 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
+    let spatial_index = &*spatial;
     use crate::simulation::jobs::JobKind;
     let now = clock.tick;
     for (
-        agent_entity,
+        actor,
         mut ai,
         mut aq,
         mut history,
@@ -7818,6 +7949,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
         agent_econ,
     ) in query.iter_mut()
     {
+        let agent_entity = actor;
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -7908,6 +8040,10 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if dispatched {
                     aq.dispatch(Task::HaulToBlueprint {
@@ -8124,6 +8260,10 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -8155,6 +8295,10 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -8192,6 +8336,10 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -8240,6 +8388,7 @@ pub fn htn_deliver_hunt_kill_dispatch_system(
     clock: Res<SimClock>,
     mut query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut ActionQueue,
             &mut MethodHistory,
@@ -8250,9 +8399,11 @@ pub fn htn_deliver_hunt_kill_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
     let now = clock.tick;
-    for (mut ai, mut aq, mut history, transform, member, lod, _carrying) in query.iter_mut() {
+    for (actor, mut ai, mut aq, mut history, transform, member, lod, _carrying) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -8365,6 +8516,10 @@ pub fn htn_deliver_hunt_kill_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -8440,7 +8595,9 @@ pub fn htn_engage_prey_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
+    let spatial_index = &*spatial;
     use crate::simulation::faction::HuntOrder;
     use crate::simulation::technology::HUNTING_SPEAR;
     const VIEW_RADIUS: i32 = 15;
@@ -8464,6 +8621,7 @@ pub fn htn_engage_prey_dispatch_system(
         disposition_opt,
     ) in query.iter_mut()
     {
+        let actor = agent;
         let disposition = disposition_opt.copied().unwrap_or_default();
         if *lod == LodLevel::Dormant {
             continue;
@@ -8688,6 +8846,10 @@ pub fn htn_engage_prey_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -8713,6 +8875,10 @@ pub fn htn_engage_prey_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -8774,6 +8940,8 @@ pub fn htn_join_hunt_party_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
     use crate::simulation::faction::{HuntOrder, HUNT_PARTY_TIMEOUT};
     use crate::simulation::technology::HUNTING_SPEAR;
@@ -8794,6 +8962,7 @@ pub fn htn_join_hunt_party_dispatch_system(
         equipment_opt,
     ) in query.iter_mut()
     {
+        let actor = agent;
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -8930,6 +9099,10 @@ pub fn htn_join_hunt_party_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -8954,6 +9127,10 @@ pub fn htn_join_hunt_party_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -9016,12 +9193,15 @@ pub fn htn_socialize_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
+    let spatial_index = &*spatial;
     const PARTNER_RADIUS: i32 = crate::simulation::goal_contract::SOCIAL_PARTNER_RADIUS;
     let now = clock.tick;
     for (agent, mut ai, mut aq, mut history, goal, transform, member, lod, disposition_opt) in
         query.iter_mut()
     {
+        let actor = agent;
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -9165,6 +9345,10 @@ pub fn htn_socialize_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -9219,11 +9403,14 @@ pub fn htn_combat_faction_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
     let now = clock.tick;
     for (agent, mut ai, mut aq, mut history, mut combat_target, goal, transform, member, lod) in
         query.iter_mut()
     {
+        let actor = agent;
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -9400,6 +9587,10 @@ pub fn htn_combat_faction_dispatch_system(
             &chunk_router,
             &chunk_map,
             &chunk_connectivity,
+            &spatial_index,
+            &stand_reservations,
+            actor,
+            now,
         );
         if !dispatched {
             ai.active_method = None;
@@ -9444,6 +9635,7 @@ pub fn bureaucrat_admin_dispatch_system(
     settlements: Query<&crate::simulation::settlement::Settlement>,
     mut query: Query<
         (
+            Entity,
             &crate::simulation::person::Profession,
             &mut PersonAI,
             &mut ActionQueue,
@@ -9453,8 +9645,12 @@ pub fn bureaucrat_admin_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
+    clock: Res<crate::simulation::SimClock>,
 ) {
-    for (prof, mut ai, mut aq, transform, member, lod) in query.iter_mut() {
+    let now = clock.tick;
+    for (actor, prof, mut ai, mut aq, transform, member, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -9511,6 +9707,10 @@ pub fn bureaucrat_admin_dispatch_system(
             &chunk_router,
             &chunk_map,
             &chunk_connectivity,
+            &spatial_index,
+            &stand_reservations,
+            actor,
+            now,
         );
         if routed {
             aq.dispatch(Task::Lead { dest });
@@ -9634,6 +9834,7 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
     clock: Res<SimClock>,
     mut query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut ActionQueue,
             &mut MethodHistory,
@@ -9646,9 +9847,11 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
+    let spatial_index = &*spatial;
     let now = clock.tick;
-    for (mut ai, mut aq, mut history, goal, member, transform, lod, carrier, agent_econ) in query.iter_mut() {
+    for (actor, mut ai, mut aq, mut history, goal, member, transform, lod, carrier, agent_econ) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -9895,6 +10098,10 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -10016,6 +10223,7 @@ pub fn htn_work_on_craft_order_dispatch_system(
     clock: Res<SimClock>,
     mut query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut ActionQueue,
             &mut MethodHistory,
@@ -10026,9 +10234,11 @@ pub fn htn_work_on_craft_order_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
     let now = clock.tick;
-    for (mut ai, mut aq, mut history, goal, member, transform, lod) in query.iter_mut() {
+    for (actor, mut ai, mut aq, mut history, goal, member, transform, lod) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -10160,6 +10370,10 @@ pub fn htn_work_on_craft_order_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -10271,6 +10485,8 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
     let now = clock.tick;
     let grain_id = crate::economy::core_ids::grain();
@@ -10486,6 +10702,10 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -10620,6 +10840,8 @@ pub fn htn_harvest_plant_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
     let now = clock.tick;
     for (
@@ -10820,6 +11042,10 @@ pub fn htn_harvest_plant_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -11163,7 +11389,7 @@ pub fn htn_play_dispatch_system(
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
     mut planting: PlantingDispatchParams,
-    spatial: Res<crate::world::spatial::SpatialIndex>,
+    routing_stand: crate::simulation::stand_reservation::StandRouting,
     person_query: Query<(), With<crate::simulation::person::Person>>,
     bp_query: Query<(), With<crate::simulation::construction::Blueprint>>,
     item_query: Query<&crate::simulation::items::GroundItem>,
@@ -11175,7 +11401,6 @@ pub fn htn_play_dispatch_system(
             With<crate::simulation::animals::Horse>,
         )>,
     >,
-    clock: Res<SimClock>,
     mut query: Query<
         (
             Entity,
@@ -11192,6 +11417,10 @@ pub fn htn_play_dispatch_system(
         Without<Drafted>,
     >,
 ) {
+    let spatial = &routing_stand.spatial_index;
+    let stand_reservations = &routing_stand.stand_reservations;
+    let clock = &routing_stand.clock;
+    let spatial_index = &*spatial;
     const PLAY_RADIUS: i32 = crate::simulation::goal_contract::PLAY_PARTNER_RADIUS;
     const ITEM_RADIUS: i32 = crate::simulation::goal_contract::PLAY_ITEM_RADIUS;
 
@@ -11209,6 +11438,7 @@ pub fn htn_play_dispatch_system(
         disposition_opt,
     ) in query.iter_mut()
     {
+        let actor = agent;
         let disposition = disposition_opt.copied().unwrap_or_default();
         if *lod == LodLevel::Dormant {
             continue;
@@ -11554,6 +11784,10 @@ pub fn htn_play_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -11626,6 +11860,10 @@ pub fn htn_play_dispatch_system(
                     &chunk_router,
                     &chunk_map,
                     &chunk_connectivity,
+                    &spatial_index,
+                    &stand_reservations,
+                    actor,
+                    now,
                 );
                 if !dispatched {
                     ai.active_method = None;
@@ -11731,8 +11969,12 @@ pub fn htn_clear_obstacle_dispatch_system(
         ),
         Without<Drafted>,
     >,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
+    clock: Res<crate::simulation::SimClock>,
 ) {
     use crate::simulation::jobs::JobKind;
+    let now = clock.tick;
     for (agent_entity, mut ai, mut aq, goal, transform, job_claim_opt, claim_target_opt, lod) in
         query.iter_mut()
     {
@@ -11806,6 +12048,10 @@ pub fn htn_clear_obstacle_dispatch_system(
             &chunk_router,
             &chunk_map,
             &chunk_connectivity,
+            &spatial_index,
+            &stand_reservations,
+            agent_entity,
+            now,
         );
         if dispatched {
             aq.dispatch(Task::ClearObstacle {

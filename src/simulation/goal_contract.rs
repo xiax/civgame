@@ -75,6 +75,12 @@ pub enum BlockedReason {
     NoFarmPhaseWork,
     /// `Drink`: no routable water / storage source.
     NoDrinkSource,
+    /// Adjacent-interaction task arrived to find its stand tile occupied AND
+    /// every other reachable chebyshev-1 neighbour of the work tile is taken
+    /// or reserved. Movement-side collision-recovery emits this so the
+    /// chronic-failure release path can cooldown the goal after a few
+    /// consecutive contention failures rather than re-dispatching forever.
+    NoAdjacentStandTile,
     /// HTN argmax produced no method, or the method expanded to no tasks.
     NoMethod,
 }
@@ -90,6 +96,7 @@ impl BlockedReason {
             BlockedReason::NoBuildMaterialPath => "no build material path",
             BlockedReason::NoFarmPhaseWork => "no farm phase work",
             BlockedReason::NoDrinkSource => "no drink source",
+            BlockedReason::NoAdjacentStandTile => "no adjacent stand tile",
             BlockedReason::NoMethod => "no method / empty expansion",
         }
     }

@@ -2926,11 +2926,15 @@ pub fn htn_vehicle_haul_dispatch_system(
         ),
         (With<Person>, Without<Drafted>, Without<BoardedVehicle>),
     >,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
-    let now = clock.tick as u32;
+    let now = clock.tick;
+    let now_u32 = now as u32;
     let mut claimed_this_pass: ahash::AHashSet<Entity> = ahash::AHashSet::default();
 
     for (worker, mut ai, mut aq, goal, fm, tr, lod, slot, claim) in workers.iter_mut() {
+        let actor = worker;
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -3006,7 +3010,7 @@ pub fn htn_vehicle_haul_dispatch_system(
                 commands.entity(a).insert(AnimalWorkClaim {
                     worker,
                     use_kind: AnimalUse::Cart,
-                    expires_tick: now.saturating_add(VEHICLE_CLAIM_TTL_TICKS),
+                    expires_tick: now_u32.saturating_add(VEHICLE_CLAIM_TTL_TICKS),
                 });
             }
             if let Ok((_, mut v, _, mut draft)) = vehicles_q.get_mut(vehicle_e) {
@@ -3033,6 +3037,10 @@ pub fn htn_vehicle_haul_dispatch_system(
             &chunk_router,
             &chunk_map,
             &chunk_connectivity,
+            &spatial_index,
+            &stand_reservations,
+            actor,
+            now,
         );
         if !routed {
             continue;

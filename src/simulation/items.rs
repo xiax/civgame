@@ -216,6 +216,7 @@ fn personal_pickup(rid: crate::economy::resource_catalog::ResourceId, needs: &Ne
 fn finish_scavenge(
     ai: &mut PersonAI,
     aq: &mut ActionQueue,
+    actor: Entity,
     cur_tile: (i32, i32),
     cur_chunk: ChunkCoord,
     faction_id: Option<u32>,
@@ -225,6 +226,9 @@ fn finish_scavenge(
     now: u64,
     outcome: FinishGatherOutcome,
 ) {
+    // Stand-tile reservation: drop at every scavenge exit so the next
+    // dispatcher pass doesn't see a stale entry.
+    routing.stand_reservations.release_for_worker(actor);
     ai.state = AiState::Idle;
     ai.target_entity = None;
 
@@ -269,6 +273,10 @@ fn finish_scavenge(
                 &routing.chunk_router,
                 chunk_map,
                 &routing.chunk_connectivity,
+                &routing.spatial_index,
+                &routing.stand_reservations,
+                actor,
+                now,
             );
             if !dispatched {
                 record_routing_failure(method_history, ai, now);
@@ -319,7 +327,7 @@ pub fn item_pickup_system(
     >,
 ) {
     for (
-        _entity,
+        actor,
         mut ai,
         mut aq,
         mut agent,
@@ -362,6 +370,7 @@ pub fn item_pickup_system(
             finish_scavenge(
                 &mut ai,
                 &mut aq,
+                actor,
                 cur_tile,
                 cur_chunk,
                 faction_id,
@@ -422,6 +431,7 @@ pub fn item_pickup_system(
             finish_scavenge(
                 &mut ai,
                 &mut aq,
+                actor,
                 cur_tile,
                 cur_chunk,
                 faction_id,
@@ -439,6 +449,7 @@ pub fn item_pickup_system(
             finish_scavenge(
                 &mut ai,
                 &mut aq,
+                actor,
                 cur_tile,
                 cur_chunk,
                 faction_id,

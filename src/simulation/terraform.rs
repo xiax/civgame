@@ -91,10 +91,14 @@ pub fn terraform_dispatch_system(
     chunk_graph: Res<ChunkGraph>,
     chunk_router: Res<ChunkRouter>,
     chunk_connectivity: Res<ChunkConnectivity>,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
+    clock: Res<crate::simulation::SimClock>,
     terraform_map: Res<TerraformMap>,
     site_query: Query<&TerraformSite>,
     mut agent_query: Query<
         (
+            Entity,
             &mut PersonAI,
             &mut crate::simulation::typed_task::ActionQueue,
             &AgentGoal,
@@ -108,7 +112,8 @@ pub fn terraform_dispatch_system(
     if terraform_map.0.is_empty() {
         return;
     }
-    for (mut ai, mut aq, goal, member, transform, lod) in agent_query.iter_mut() {
+    let now = clock.tick;
+    for (actor, mut ai, mut aq, goal, member, transform, lod) in agent_query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -154,6 +159,10 @@ pub fn terraform_dispatch_system(
                 &chunk_router,
                 &chunk_map,
                 &chunk_connectivity,
+                &spatial_index,
+                &stand_reservations,
+                actor,
+                now,
             );
             if routed {
                 aq.dispatch(crate::simulation::typed_task::Task::Terraform { tile });

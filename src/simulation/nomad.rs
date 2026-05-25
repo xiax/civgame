@@ -628,6 +628,7 @@ pub fn nomad_survey_dispatch_system(
     chunk_router: Res<crate::pathfinding::chunk_router::ChunkRouter>,
     chunk_connectivity: Res<crate::pathfinding::connectivity::ChunkConnectivity>,
     mut q: Query<(
+        Entity,
         &mut crate::simulation::person::PersonAI,
         &mut crate::simulation::typed_task::ActionQueue,
         &crate::simulation::goals::AgentGoal,
@@ -635,13 +636,17 @@ pub fn nomad_survey_dispatch_system(
         &ScoutAssignment,
         &crate::simulation::lod::LodLevel,
     )>,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
+    clock: Res<crate::simulation::SimClock>,
 ) {
     use crate::simulation::person::{AiState, PersonAI, UNEMPLOYED_TASK_KIND};
     use crate::simulation::tasks::{assign_task_with_routing, TaskKind};
     use crate::simulation::typed_task::Task;
     use crate::world::chunk::{ChunkCoord, CHUNK_SIZE};
     use crate::world::terrain::TILE_SIZE;
-    for (mut ai, mut aq, goal, transform, scout, lod) in q.iter_mut() {
+    let now = clock.tick;
+    for (actor, mut ai, mut aq, goal, transform, scout, lod) in q.iter_mut() {
         if matches!(*lod, crate::simulation::lod::LodLevel::Dormant) {
             continue;
         }
@@ -669,6 +674,10 @@ pub fn nomad_survey_dispatch_system(
             &chunk_router,
             &chunk_map,
             &chunk_connectivity,
+            &spatial_index,
+            &stand_reservations,
+            actor,
+            now,
         );
         if routed {
             aq.dispatch(Task::Explore {
@@ -1280,6 +1289,9 @@ fn dispatch_member_unload_tasks(world: &mut World, pitching: &[AiPitchingMigrati
         Res<crate::pathfinding::chunk_router::ChunkRouter>,
         Res<crate::pathfinding::connectivity::ChunkConnectivity>,
         Res<FactionRegistry>,
+        Res<crate::world::spatial::SpatialIndex>,
+        Res<crate::simulation::stand_reservation::StandTileReservations>,
+        Res<crate::simulation::SimClock>,
         Query<
             (
                 Entity,
@@ -1293,9 +1305,19 @@ fn dispatch_member_unload_tasks(world: &mut World, pitching: &[AiPitchingMigrati
             With<crate::simulation::person::Person>,
         >,
     )> = SystemState::new(world);
-    let (chunk_map, chunk_graph, chunk_router, connectivity, registry, mut q) =
-        state.get_mut(world);
-    for (_e, member, transform, agent, mut ai, mut aq, mut goal) in q.iter_mut() {
+    let (
+        chunk_map,
+        chunk_graph,
+        chunk_router,
+        connectivity,
+        registry,
+        spatial_index,
+        stand_reservations,
+        clock,
+        mut q,
+    ) = state.get_mut(world);
+    let now = clock.tick;
+    for (e, member, transform, agent, mut ai, mut aq, mut goal) in q.iter_mut() {
         let root = registry.root_faction(member.faction_id);
         let Some(&target) = targets.get(&root) else {
             continue;
@@ -1335,6 +1357,10 @@ fn dispatch_member_unload_tasks(world: &mut World, pitching: &[AiPitchingMigrati
             &chunk_router,
             &chunk_map,
             &connectivity,
+            &spatial_index,
+            &stand_reservations,
+            e,
+            now,
         );
         if routed {
             aq.cancel();
@@ -1566,13 +1592,26 @@ fn dispatch_pitch_tasks(world: &mut World, pitching: &[AiPitchingMigration]) {
         Res<crate::pathfinding::chunk_graph::ChunkGraph>,
         Res<crate::pathfinding::chunk_router::ChunkRouter>,
         Res<crate::pathfinding::connectivity::ChunkConnectivity>,
+        Res<crate::world::spatial::SpatialIndex>,
+        Res<crate::simulation::stand_reservation::StandTileReservations>,
+        Res<crate::simulation::SimClock>,
         Query<(
             &mut crate::simulation::person::PersonAI,
             &mut crate::simulation::typed_task::ActionQueue,
             &mut crate::simulation::goals::AgentGoal,
         )>,
     )> = SystemState::new(world);
-    let (chunk_map, chunk_graph, chunk_router, connectivity, mut q) = state.get_mut(world);
+    let (
+        chunk_map,
+        chunk_graph,
+        chunk_router,
+        connectivity,
+        spatial_index,
+        stand_reservations,
+        clock,
+        mut q,
+    ) = state.get_mut(world);
+    let now = clock.tick;
     for (entity, req, worker_tile, worker_chunk, worker_z) in assignments.into_iter() {
         let Ok((mut ai, mut aq, mut goal)) = q.get_mut(entity) else {
             continue;
@@ -1589,6 +1628,10 @@ fn dispatch_pitch_tasks(world: &mut World, pitching: &[AiPitchingMigration]) {
             &chunk_router,
             &chunk_map,
             &connectivity,
+            &spatial_index,
+            &stand_reservations,
+            entity,
+            now,
         );
         if routed {
             aq.cancel();
@@ -3430,6 +3473,8 @@ pub fn nomad_migration_dispatch_system(
             &crate::simulation::faction::FactionMember,
         )>,
     )>,
+    spatial_index: Res<crate::world::spatial::SpatialIndex>,
+    stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
 ) {
     use crate::simulation::lod::LodLevel;
     use crate::simulation::person::{AiState, PersonAI};
@@ -3438,7 +3483,8 @@ pub fn nomad_migration_dispatch_system(
     use crate::world::chunk::{ChunkCoord, CHUNK_SIZE};
     use crate::world::terrain::TILE_SIZE;
 
-    let now = clock.tick as u32;
+    let now = clock.tick;
+    let now_u32 = now as u32;
     // Pass 1: snapshot per-root-faction migrant tiles for centroid reroute.
     let mut tiles_per_faction: ahash::AHashMap<u32, Vec<(i32, i32)>> = ahash::AHashMap::default();
     {
@@ -3567,6 +3613,10 @@ pub fn nomad_migration_dispatch_system(
             &chunk_router,
             &chunk_map,
             &chunk_connectivity,
+            &spatial_index,
+            &stand_reservations,
+            e,
+            now,
         );
         if !routed {
             continue;
@@ -3579,7 +3629,7 @@ pub fn nomad_migration_dispatch_system(
             z,
             why: WalkReason::Migration,
         });
-        target.last_dispatched_tick = now;
+        target.last_dispatched_tick = now_u32;
     }
 }
 
