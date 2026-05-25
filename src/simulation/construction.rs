@@ -5711,6 +5711,7 @@ pub fn assign_beds_system(
             Option<&HomeBed>,
             Option<&crate::simulation::memory::RelationshipMemory>,
             Option<&crate::simulation::reproduction::BiologicalSex>,
+            Option<&crate::simulation::reproduction::HouseholdMember>,
         ),
         With<Person>,
     >,
@@ -5722,6 +5723,7 @@ pub fn assign_beds_system(
     chunk_map: Res<ChunkMap>,
 ) {
     use crate::simulation::reproduction::BiologicalSex;
+    use crate::simulation::settlement_bootstrap::SPOUSE_AFFINITY;
 
     if clock.tick % 30 != 0 {
         return;
@@ -5734,22 +5736,29 @@ pub fn assign_beds_system(
     let bed_pos_by_entity: AHashMap<Entity, (i32, i32)> =
         bed_map.0.iter().map(|(&pos, &e)| (e, pos)).collect();
 
-    // Snapshot every person's HomeBed entity, sex, and faction so Pass A can
-    // resolve partner data without re-querying.
+    // Snapshot every person's HomeBed entity, sex, faction, household, and
+    // current tile so Pass 0 (seeded-spouse pairing) and Pass A can resolve
+    // partner data without re-querying.
     struct PartnerInfo {
         sex: Option<BiologicalSex>,
         home_bed: Option<Entity>,
         faction_id: u32,
+        household_id: Option<u32>,
+        tile: (i32, i32),
     }
     let partner_info: AHashMap<Entity, PartnerInfo> = person_query
         .iter()
-        .map(|(e, fm, _, hb, _, sex)| {
+        .map(|(e, fm, tr, hb, _, sex, hh)| {
+            let tx = (tr.translation.x / crate::world::terrain::TILE_SIZE).floor() as i32;
+            let ty = (tr.translation.y / crate::world::terrain::TILE_SIZE).floor() as i32;
             (
                 e,
                 PartnerInfo {
                     sex: sex.copied(),
                     home_bed: hb.and_then(|h| h.0),
                     faction_id: fm.faction_id,
+                    household_id: hh.map(|h| h.household_id),
+                    tile: (tx, ty),
                 },
             )
         })
@@ -5795,8 +5804,153 @@ pub fn assign_beds_system(
         best.map(|(pos, _)| pos)
     };
 
+    // ── Pass 0: pair seeded spouses to adjacent unclaimed beds atomically.
+    //
+    // For every unhoused `HouseholdMember`, walk their `RelationshipMemory`
+    // for the highest-affinity same-household opposite-sex peer at
+    // `SPOUSE_AFFINITY (79)`. If both are unhoused, pick the closest
+    // unclaimed bed to either spouse, then the closest still-unclaimed bed
+    // within `PARTNER_PROXIMITY_RADIUS` Manhattan as the partner's bed.
+    // Assign both atomically. This eliminates the "female processed first,
+    // partner has no bed yet" race in the homeless faction pass — by the
+    // time Pass A and the homeless faction pass run, seeded spouses are
+    // already paired into adjacent beds inside their dwelling footprint.
+    let mut paired_this_pass: AHashSet<Entity> = AHashSet::new();
+    for (person, member, _transform, home_bed_opt, rel_opt, _sex_opt, household_opt) in
+        &person_query
+    {
+        if member.faction_id == SOLO {
+            continue;
+        }
+        if home_bed_opt.and_then(|h| h.0).is_some() {
+            continue;
+        }
+        if paired_this_pass.contains(&person) {
+            continue;
+        }
+        let Some(my_hh) = household_opt else { continue };
+        let Some(rel) = rel_opt else { continue };
+        let Some(my_info) = partner_info.get(&person) else {
+            continue;
+        };
+        let my_sex = match my_info.sex {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Find best same-household opposite-sex spouse anchor at
+        // SPOUSE_AFFINITY (or higher) that is also currently unhoused.
+        let mut anchor: Option<Entity> = None;
+        let mut anchor_aff: i8 = i8::MIN;
+        for slot in &rel.entries {
+            let Some(entry) = slot else { continue };
+            if entry.entity == person {
+                continue;
+            }
+            if entry.affinity < SPOUSE_AFFINITY {
+                continue;
+            }
+            if paired_this_pass.contains(&entry.entity) {
+                continue;
+            }
+            let Some(p_info) = partner_info.get(&entry.entity) else {
+                continue;
+            };
+            if p_info.faction_id != member.faction_id {
+                continue;
+            }
+            if p_info.household_id != Some(my_hh.household_id) {
+                continue;
+            }
+            let Some(p_sex) = p_info.sex else { continue };
+            if p_sex == my_sex {
+                continue;
+            }
+            if p_info.home_bed.is_some() {
+                continue;
+            }
+            if entry.affinity > anchor_aff {
+                anchor_aff = entry.affinity;
+                anchor = Some(entry.entity);
+            }
+        }
+        let Some(partner) = anchor else { continue };
+        let partner_info_ref = match partner_info.get(&partner) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Pick the unclaimed bed nearest to either spouse's current tile.
+        let my_pos = my_info.tile;
+        let partner_pos = partner_info_ref.tile;
+        let mut first_bed: Option<(Entity, (i32, i32))> = None;
+        let mut first_score = i32::MAX;
+        for (&pos, &bed_e) in &bed_map.0 {
+            if claimed_this_pass.contains(&bed_e) {
+                continue;
+            }
+            match bed_query.get(bed_e) {
+                Ok(b) if b.owner.is_none() => {}
+                _ => continue,
+            }
+            let d_me = (pos.0 - my_pos.0).abs() + (pos.1 - my_pos.1).abs();
+            let d_p = (pos.0 - partner_pos.0).abs() + (pos.1 - partner_pos.1).abs();
+            let d = d_me.min(d_p);
+            if d < first_score {
+                first_score = d;
+                first_bed = Some((bed_e, pos));
+            }
+        }
+        let Some((first_e, first_pos)) = first_bed else {
+            continue;
+        };
+        // Pick the closest *still-unclaimed* bed within
+        // PARTNER_PROXIMITY_RADIUS Manhattan of the first as partner's bed.
+        let mut second_bed: Option<Entity> = None;
+        let mut second_score = i32::MAX;
+        for (&pos, &bed_e) in &bed_map.0 {
+            if bed_e == first_e {
+                continue;
+            }
+            if claimed_this_pass.contains(&bed_e) {
+                continue;
+            }
+            match bed_query.get(bed_e) {
+                Ok(b) if b.owner.is_none() => {}
+                _ => continue,
+            }
+            let d = (pos.0 - first_pos.0).abs() + (pos.1 - first_pos.1).abs();
+            if d > PARTNER_PROXIMITY_RADIUS {
+                continue;
+            }
+            if d < second_score {
+                second_score = d;
+                second_bed = Some(bed_e);
+            }
+        }
+        let Some(second_e) = second_bed else {
+            continue;
+        };
+
+        // Assign atomically.
+        if let Ok(mut b) = bed_query.get_mut(first_e) {
+            b.owner = Some(person);
+        }
+        if let Ok(mut b) = bed_query.get_mut(second_e) {
+            b.owner = Some(partner);
+        }
+        commands.entity(person).insert(HomeBed(Some(first_e)));
+        commands.entity(partner).insert(HomeBed(Some(second_e)));
+        claimed_this_pass.insert(first_e);
+        claimed_this_pass.insert(second_e);
+        paired_this_pass.insert(person);
+        paired_this_pass.insert(partner);
+    }
+
     // ── Pass A: re-evaluate already-housed women whose partner lives far away.
-    for (person, member, _transform, home_bed_opt, rel_opt, sex_opt) in &person_query {
+    for (person, member, _transform, home_bed_opt, rel_opt, sex_opt, household_opt) in
+        &person_query
+    {
         if member.faction_id == SOLO {
             continue;
         }
@@ -5909,6 +6063,111 @@ pub fn assign_beds_system(
         }
     }
 
+    // ── Pass A.5: narrow household-spouse relocation for seeded couples.
+    //
+    // Pass A's `REASSIGN_AFFINITY_THRESHOLD = 80` deliberately excludes
+    // seeded spouses at 79 because its fallback queues a Bed blueprint
+    // outside any Hut/Longhouse footprint. This narrower branch only
+    // *moves* an already-housed household-member to an unclaimed bed within
+    // `PARTNER_PROXIMITY_RADIUS` of their same-household opposite-sex
+    // spouse's bed — never queues a blueprint. Closes the loop for the rare
+    // case where Pass 0 couldn't pair them in a single pass (mid-game
+    // household formation, mid-game spawn, abstract-faction materialisation).
+    for (person, _member, _transform, home_bed_opt, rel_opt, _sex_opt, household_opt) in
+        &person_query
+    {
+        let Some(my_hh) = household_opt else { continue };
+        let Some(my_bed) = home_bed_opt.and_then(|h| h.0) else {
+            continue;
+        };
+        let my_bed_owner = bed_query.get(my_bed).ok().and_then(|b| b.owner);
+        if my_bed_owner != Some(person) {
+            continue;
+        }
+        let Some(&my_bed_pos) = bed_pos_by_entity.get(&my_bed) else {
+            continue;
+        };
+        let Some(rel) = rel_opt else { continue };
+        let Some(my_info) = partner_info.get(&person) else {
+            continue;
+        };
+        let my_sex = match my_info.sex {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Find the spouse anchor: same household, opposite-sex, affinity
+        // ≥ SPOUSE_AFFINITY, with a HomeBed of their own.
+        let mut partner_bed_pos: Option<(i32, i32)> = None;
+        let mut best_aff: i8 = i8::MIN;
+        for slot in &rel.entries {
+            let Some(entry) = slot else { continue };
+            if entry.entity == person {
+                continue;
+            }
+            if entry.affinity < SPOUSE_AFFINITY {
+                continue;
+            }
+            let Some(p_info) = partner_info.get(&entry.entity) else {
+                continue;
+            };
+            if p_info.household_id != Some(my_hh.household_id) {
+                continue;
+            }
+            let Some(p_sex) = p_info.sex else { continue };
+            if p_sex == my_sex {
+                continue;
+            }
+            let Some(p_bed_e) = p_info.home_bed else {
+                continue;
+            };
+            let Some(&p_bed_pos) = bed_pos_by_entity.get(&p_bed_e) else {
+                continue;
+            };
+            if entry.affinity > best_aff {
+                best_aff = entry.affinity;
+                partner_bed_pos = Some(p_bed_pos);
+            }
+        }
+        let Some(partner_pos) = partner_bed_pos else {
+            continue;
+        };
+        let cur_dist =
+            (my_bed_pos.0 - partner_pos.0).abs() + (my_bed_pos.1 - partner_pos.1).abs();
+        if cur_dist <= PARTNER_PROXIMITY_RADIUS {
+            continue;
+        }
+        // Look for a free unclaimed bed within PARTNER_PROXIMITY_RADIUS of
+        // the partner. No blueprint fallback — if none, do nothing.
+        let mut candidate: Option<Entity> = None;
+        for (&pos, &bed_e) in &bed_map.0 {
+            if bed_e == my_bed || claimed_this_pass.contains(&bed_e) {
+                continue;
+            }
+            let d = (pos.0 - partner_pos.0).abs() + (pos.1 - partner_pos.1).abs();
+            if d > PARTNER_PROXIMITY_RADIUS {
+                continue;
+            }
+            match bed_query.get(bed_e) {
+                Ok(b) if b.owner.is_none() => {
+                    candidate = Some(bed_e);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if let Some(new_bed) = candidate {
+            if let Ok(mut old) = bed_query.get_mut(my_bed) {
+                old.owner = None;
+            }
+            if let Ok(mut new) = bed_query.get_mut(new_bed) {
+                new.owner = Some(person);
+            }
+            commands.entity(person).insert(HomeBed(Some(new_bed)));
+            claimed_this_pass.insert(new_bed);
+        }
+    }
+
     // ── Faction pass ─────────────────────────────────────────────────────────
     struct Homeless {
         person: Entity,
@@ -5916,7 +6175,7 @@ pub fn assign_beds_system(
         partner_bed: Option<(i32, i32)>,
     }
     let mut homeless_by_faction: AHashMap<u32, Vec<Homeless>> = AHashMap::new();
-    for (person, member, transform, home_bed, rel_opt, sex_opt) in &person_query {
+    for (person, member, transform, home_bed, rel_opt, sex_opt, _household_opt) in &person_query {
         if member.faction_id == SOLO {
             continue;
         }
@@ -6010,7 +6269,7 @@ pub fn assign_beds_system(
 
     // ── Solo pass ─────────────────────────────────────────────────────────────
     // Solo agents claim any nearby unclaimed bed, or place a personal blueprint.
-    for (person, member, transform, home_bed, _, _) in &person_query {
+    for (person, member, transform, home_bed, _, _, _) in &person_query {
         if member.faction_id != SOLO {
             continue;
         }

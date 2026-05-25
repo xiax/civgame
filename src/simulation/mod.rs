@@ -223,6 +223,7 @@ impl Plugin for SimulationPlugin {
             })
             .insert_resource(faction::FactionRegistry::default())
             .insert_resource(abstract_faction::AbstractFactions::default())
+            .insert_resource(abstract_faction::PendingMaterializationKinSeed::default())
             .insert_resource(faction::PlayerFaction::default())
             .insert_resource(faction::ControlledFactions::default())
             .insert_resource(faction::StorageTileMap::default())
@@ -583,6 +584,12 @@ impl Plugin for SimulationPlugin {
                 FixedUpdate,
                 abstract_faction::materialize_abstract_faction_system
                     .after(crate::world::chunk_streaming::chunk_streaming_system)
+                    .run_if(in_state(crate::GameState::Playing)),
+            )
+            .add_systems(
+                FixedUpdate,
+                abstract_faction::materialize_seed_relationships_system
+                    .after(abstract_faction::materialize_abstract_faction_system)
                     .run_if(in_state(crate::GameState::Playing)),
             )
             .add_systems(

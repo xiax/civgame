@@ -19364,6 +19364,220 @@ mod onenter_era_seeding {
         );
     }
 
+    // ───────────── Reproduction bootstrap — pair-aware founder sex ─────────────
+
+    fn sex_of(sim: &TestSim, entity: Entity) -> Option<BiologicalSex> {
+        sim.app.world().get::<BiologicalSex>(entity).copied()
+    }
+
+    /// 2-founder Subsistence Neolithic: founders must be one Male + one Female,
+    /// reciprocal spouse-grade affinity, same household.
+    #[test]
+    fn subsistence_two_adults_opposite_sex_pair() {
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        configure_economy(&mut sim, crate::game_state::EconomyPreset::Subsistence);
+        configure_population(&mut sim, 2);
+        trigger_onenter(&mut sim);
+
+        let members = player_member_entities(&sim);
+        assert_eq!(members.len(), 2);
+        let sexes: Vec<Option<BiologicalSex>> = members.iter().map(|&e| sex_of(&sim, e)).collect();
+        let males = sexes.iter().filter(|s| matches!(**s, Some(BiologicalSex::Male))).count();
+        let females = sexes.iter().filter(|s| matches!(**s, Some(BiologicalSex::Female))).count();
+        assert_eq!(males, 1, "expected exactly one male, got {males}: {sexes:?}");
+        assert_eq!(females, 1, "expected exactly one female, got {females}: {sexes:?}");
+
+        let h0 = household_id_of(&sim, members[0]);
+        let h1 = household_id_of(&sim, members[1]);
+        assert!(h0.is_some() && h0 == h1, "founders not in same household: {h0:?} vs {h1:?}");
+
+        let aff_ab = affinity_between(&sim, members[0], members[1]);
+        let aff_ba = affinity_between(&sim, members[1], members[0]);
+        assert!(
+            aff_ab >= 79 && aff_ba >= 79,
+            "spouse affinity below SPOUSE_AFFINITY: {aff_ab} / {aff_ba}"
+        );
+    }
+
+    /// 4-founder Subsistence Neolithic: every reciprocal pair at spouse-grade
+    /// affinity (≥ 75) must be opposite-sex.
+    #[test]
+    fn subsistence_four_adults_spouse_pair_opposite_sex() {
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        configure_economy(&mut sim, crate::game_state::EconomyPreset::Subsistence);
+        configure_population(&mut sim, 4);
+        trigger_onenter(&mut sim);
+
+        let members = player_member_entities(&sim);
+        assert_eq!(members.len(), 4);
+        let mut found_spouse_pair = false;
+        for i in 0..members.len() {
+            for j in (i + 1)..members.len() {
+                let aff = affinity_between(&sim, members[i], members[j]);
+                let recip = affinity_between(&sim, members[j], members[i]);
+                if aff >= 75 && recip >= 75 {
+                    found_spouse_pair = true;
+                    let s_i = sex_of(&sim, members[i]);
+                    let s_j = sex_of(&sim, members[j]);
+                    assert!(
+                        matches!((s_i, s_j), (Some(a), Some(b)) if a != b),
+                        "spouse-grade pair {i}/{j} is same-sex: {s_i:?} / {s_j:?}"
+                    );
+                }
+            }
+        }
+        assert!(found_spouse_pair, "no spouse-grade pair detected in 4-founder seed");
+    }
+
+    /// 6-founder Subsistence Neolithic: kin partitions into one 4-group + one
+    /// 2-group; each group must seed an opposite-sex spouse pair.
+    #[test]
+    fn subsistence_six_adults_two_spouse_pairs() {
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        configure_economy(&mut sim, crate::game_state::EconomyPreset::Subsistence);
+        configure_population(&mut sim, 6);
+        trigger_onenter(&mut sim);
+
+        let members = player_member_entities(&sim);
+        assert_eq!(members.len(), 6);
+        // Group founders by household and verify each multi-adult household
+        // carries an opposite-sex spouse pair.
+        use ahash::AHashMap;
+        let mut by_hh: AHashMap<u32, Vec<Entity>> = AHashMap::new();
+        for &e in &members {
+            if let Some(h) = household_id_of(&sim, e) {
+                by_hh.entry(h).or_default().push(e);
+            }
+        }
+        assert!(by_hh.len() >= 2, "expected ≥ 2 households for 6 founders; got {}", by_hh.len());
+        let mut spouse_pairs = 0;
+        for (_, group) in &by_hh {
+            if group.len() < 2 {
+                continue;
+            }
+            // Look for any opposite-sex reciprocal pair at spouse-grade affinity.
+            for i in 0..group.len() {
+                for j in (i + 1)..group.len() {
+                    let aff_ij = affinity_between(&sim, group[i], group[j]);
+                    let aff_ji = affinity_between(&sim, group[j], group[i]);
+                    let s_i = sex_of(&sim, group[i]);
+                    let s_j = sex_of(&sim, group[j]);
+                    if aff_ij >= 79
+                        && aff_ji >= 79
+                        && matches!((s_i, s_j), (Some(a), Some(b)) if a != b)
+                    {
+                        spouse_pairs += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            spouse_pairs >= 2,
+            "expected ≥ 2 opposite-sex spouse pairs (one per kin group); got {spouse_pairs}"
+        );
+    }
+
+    /// `pair_chief_sex` is deterministic per (faction_id, home_tile); over a
+    /// reasonable spread of inputs both sexes appear. Regression guard
+    /// against a hash that collapses to a constant.
+    #[test]
+    fn chief_sex_varies_across_factions() {
+        use crate::simulation::person::pair_chief_sex;
+        let mut males = 0;
+        let mut females = 0;
+        for fid in 0u32..32 {
+            for ty in (-32..32).step_by(8) {
+                let sex = pair_chief_sex(fid, (ty * 13, ty * 17));
+                match sex {
+                    BiologicalSex::Male => males += 1,
+                    BiologicalSex::Female => females += 1,
+                }
+            }
+        }
+        assert!(
+            males > 16 && females > 16,
+            "chief sex skewed: {males} M / {females} F over 256 samples"
+        );
+    }
+
+    /// After `assign_beds_system` runs once (tick 30), seeded spouses must
+    /// land on `HomeBed`s within `COSLEEP_RADIUS = 3` Chebyshev tiles of each
+    /// other.
+    #[test]
+    fn seeded_spouses_get_adjacent_beds() {
+        use crate::simulation::construction::{Bed, BedMap, HomeBed};
+
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        configure_economy(&mut sim, crate::game_state::EconomyPreset::Subsistence);
+        configure_population(&mut sim, 2);
+        trigger_onenter(&mut sim);
+        // assign_beds_system runs every 30 ticks. Cross the boundary once.
+        sim.tick_n(35);
+
+        let members = player_member_entities(&sim);
+        assert_eq!(members.len(), 2);
+
+        // Find each member's HomeBed tile by walking BedMap reverse lookup.
+        let world = sim.app.world();
+        let bed_map = world.resource::<BedMap>();
+        let bed_pos: ahash::AHashMap<Entity, (i32, i32)> =
+            bed_map.0.iter().map(|(&pos, &e)| (e, pos)).collect();
+
+        let mut tiles: Vec<(i32, i32)> = Vec::new();
+        for &m in &members {
+            let hb = world.get::<HomeBed>(m).and_then(|h| h.0);
+            // Sanity: bed component still owns this person.
+            if let Some(bed_e) = hb {
+                if let Some(bed) = world.get::<Bed>(bed_e) {
+                    assert_eq!(bed.owner, Some(m), "bed owner mismatch for {m:?}");
+                }
+                if let Some(&pos) = bed_pos.get(&bed_e) {
+                    tiles.push(pos);
+                }
+            }
+        }
+        assert_eq!(tiles.len(), 2, "both spouses must have HomeBeds; got tiles={tiles:?}");
+        let dx = (tiles[0].0 - tiles[1].0).abs();
+        let dy = (tiles[0].1 - tiles[1].1).abs();
+        let chebyshev = dx.max(dy);
+        assert!(
+            chebyshev <= 3,
+            "spouse beds at chebyshev {chebyshev} (>{}), tiles={tiles:?}",
+            3
+        );
+    }
+
+    /// Backstop: every reciprocal pair at spouse-grade affinity is opposite-
+    /// sex. Extension of `every_founder_has_a_reciprocal_relationship`.
+    #[test]
+    fn no_founder_pair_is_same_sex_spouse_grade() {
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        configure_economy(&mut sim, crate::game_state::EconomyPreset::Subsistence);
+        configure_population(&mut sim, 6);
+        trigger_onenter(&mut sim);
+
+        let members = player_member_entities(&sim);
+        for i in 0..members.len() {
+            for j in (i + 1)..members.len() {
+                let aff = affinity_between(&sim, members[i], members[j]);
+                let recip = affinity_between(&sim, members[j], members[i]);
+                if aff >= 75 && recip >= 75 {
+                    let s_i = sex_of(&sim, members[i]);
+                    let s_j = sex_of(&sim, members[j]);
+                    assert!(
+                        matches!((s_i, s_j), (Some(a), Some(b)) if a != b),
+                        "same-sex spouse-grade pair: {i}/{j} sexes={s_i:?}/{s_j:?}"
+                    );
+                }
+            }
+        }
+    }
+
     // ───────────── Bootstrap P4 — stranded-member relocation ─────────────
 
     /// After OnEnter, no founder shares a tile with a `Wall` (seed-stamped

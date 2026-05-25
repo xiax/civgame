@@ -44,6 +44,13 @@ impl BiologicalSex {
             BiologicalSex::Female => "Female",
         }
     }
+
+    pub fn opposite(self) -> Self {
+        match self {
+            BiologicalSex::Male => BiologicalSex::Female,
+            BiologicalSex::Female => BiologicalSex::Male,
+        }
+    }
 }
 
 /// Pregnancy lasts three seasons (54,000 ticks at 20Hz / 5-day seasons).

@@ -31,6 +31,17 @@ pub struct AbstractFaction {
     pub home_megachunk: (i32, i32),
 }
 
+/// Queue populated by `materialize_abstract_faction_system` and drained the
+/// following tick by `materialize_seed_relationships_system`. Bevy applies
+/// `commands` between systems, so the freshly-spawned members are queryable
+/// only after this hop. Without it, every materialised faction would skip the
+/// kin-household + reciprocal-affinity seeding the OnEnter path runs (see
+/// `settlement_bootstrap::seed_starting_relationships_system`).
+#[derive(Resource, Default)]
+pub struct PendingMaterializationKinSeed {
+    pub entries: Vec<(u32, (i32, i32), Vec<Entity>)>,
+}
+
 /// Registry of every abstract (un-materialised) faction. Drained entry-by-entry
 /// by the materialisation system as the player approaches each home region.
 #[derive(Resource, Default)]
@@ -266,6 +277,7 @@ pub fn materialize_abstract_faction_system(
     mut globe: ResMut<Globe>,
     options: Res<crate::GameStartOptions>,
     mut abstract_factions: ResMut<AbstractFactions>,
+    mut pending_kin: ResMut<PendingMaterializationKinSeed>,
 ) {
     // Match loaded chunks against abstract faction home tiles.
     let mut to_materialize: Vec<AbstractFaction> = Vec::new();
@@ -321,6 +333,14 @@ pub fn materialize_abstract_faction_system(
             fd.materialized = true;
         }
 
+        // Defer kin-household + spouse-affinity seeding to next tick — the
+        // members were just spawned via `commands` and are not yet queryable
+        // here. `materialize_seed_relationships_system` drains this queue
+        // after Bevy applies the deferred spawn commands.
+        pending_kin
+            .entries
+            .push((af.faction_id, anchor, band.members.clone()));
+
         // Hand the cell back: clear its faction fields so `world_sim_system`
         // stops ticking it — the live entities now own this faction. Phase 4
         // (dematerialisation) re-stamps the cell when the player leaves.
@@ -339,6 +359,54 @@ pub fn materialize_abstract_faction_system(
             anchor,
             band.members.len()
         );
+    }
+}
+
+/// Drain `PendingMaterializationKinSeed` and run the same kin-partition logic
+/// `seed_starting_relationships_system` runs at game start, scoped to one
+/// freshly-materialised faction's members. Without this, the materialised
+/// faction would never form households or seed reciprocal spouse/sibling
+/// affinities — the same conception-starvation bug seeded factions had before
+/// `seed_starting_relationships_system` existed, just on a different timeline.
+pub fn materialize_seed_relationships_system(
+    mut commands: Commands,
+    mut pending: ResMut<PendingMaterializationKinSeed>,
+    mut registry: ResMut<FactionRegistry>,
+    catalog: Res<crate::economy::resource_catalog::ResourceCatalog>,
+    sex_q: Query<&crate::simulation::reproduction::BiologicalSex>,
+    mut relationships: Query<&mut crate::simulation::memory::RelationshipMemory>,
+) {
+    use crate::simulation::settlement_bootstrap::{seed_kin_partition, MAX_KIN_GROUP};
+
+    if pending.entries.is_empty() {
+        return;
+    }
+    let entries: Vec<_> = pending.entries.drain(..).collect();
+    for (faction_id, home_tile, mut members) in entries {
+        // Mirror `seed_starting_relationships_system` gates exactly.
+        let Some(faction) = registry.factions.get(&faction_id) else {
+            continue;
+        };
+        if faction.caps.inheritance.seed_storage_tile {
+            continue;
+        }
+        if faction.caps.home.is_mobile() {
+            continue;
+        }
+        // Deterministic ordering (matches the OnEnter seed pass).
+        members.sort_unstable_by_key(|e| e.to_bits());
+        for group in members.chunks(MAX_KIN_GROUP) {
+            seed_kin_partition(
+                &mut commands,
+                &mut registry,
+                &catalog,
+                &sex_q,
+                &mut relationships,
+                faction_id,
+                home_tile,
+                group,
+            );
+        }
     }
 }
 

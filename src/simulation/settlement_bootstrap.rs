@@ -45,14 +45,14 @@ use crate::economy::resource_catalog::ResourceCatalog;
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
 use crate::simulation::memory::RelationshipMemory;
 use crate::simulation::person::Person;
-use crate::simulation::reproduction::HouseholdMember;
+use crate::simulation::reproduction::{BiologicalSex, HouseholdMember};
 
 /// Reciprocal affinity seeded for a spouse pair. Above
 /// `PARTNER_AFFINITY_THRESHOLD = 60` (the homeless-pass partner-bed
 /// pairing read) but **strictly below** `REASSIGN_AFFINITY_THRESHOLD = 80`
 /// (the already-housed-woman migration trigger). 79 is the highest value
 /// that gets us spouse-grade pairing without churning seeded beds.
-const SPOUSE_AFFINITY: i8 = 79;
+pub(crate) const SPOUSE_AFFINITY: i8 = 79;
 
 /// Reciprocal affinity seeded between a sibling and its kin partner. Meets
 /// `PARTNER_AFFINITY_THRESHOLD = 60` (kin reads as familiar) but stays below
@@ -60,7 +60,7 @@ const SPOUSE_AFFINITY: i8 = 79;
 const SIBLING_AFFINITY: i8 = 60;
 
 /// Max kin-group size. Larger founder pools chunk into multiple groups.
-const MAX_KIN_GROUP: usize = 4;
+pub(crate) const MAX_KIN_GROUP: usize = 4;
 
 /// P2 of the bootstrap plan: form deterministic kin households + seed
 /// reciprocal `RelationshipMemory` affinities for every Subsistence/Mixed
@@ -74,6 +74,7 @@ pub fn seed_starting_relationships_system(
     mut registry: ResMut<FactionRegistry>,
     catalog: Res<ResourceCatalog>,
     members_q: Query<(Entity, &FactionMember, Option<&HouseholdMember>), With<Person>>,
+    sex_q: Query<&BiologicalSex>,
     mut relationships: Query<&mut RelationshipMemory>,
 ) {
     // Bucket members by their root faction id (skip households that may
@@ -116,10 +117,11 @@ pub fn seed_starting_relationships_system(
         // Chunk into kin groups of up to MAX_KIN_GROUP. Smaller remainder
         // groups (1-3 trailing adults) form their own household.
         for group in members.chunks(MAX_KIN_GROUP) {
-            seed_kin_group(
+            seed_kin_partition(
                 &mut commands,
                 &mut registry,
                 &catalog,
+                &sex_q,
                 &mut relationships,
                 faction_id,
                 home_tile,
@@ -130,11 +132,37 @@ pub fn seed_starting_relationships_system(
 }
 
 /// Form one kin household from `group` and seed its internal affinities.
+/// Shared by the OnEnter seed pass and runtime materialisation of abstract
+/// factions (`abstract_faction::materialize_abstract_faction_system`).
+pub(crate) fn seed_kin_partition(
+    commands: &mut Commands,
+    registry: &mut FactionRegistry,
+    catalog: &ResourceCatalog,
+    sex_q: &Query<&BiologicalSex>,
+    relationships: &mut Query<&mut RelationshipMemory>,
+    parent_faction_id: u32,
+    home_tile: (i32, i32),
+    group: &[Entity],
+) {
+    seed_kin_group(
+        commands,
+        registry,
+        catalog,
+        sex_q,
+        relationships,
+        parent_faction_id,
+        home_tile,
+        group,
+    );
+}
+
+/// Form one kin household from `group` and seed its internal affinities.
 /// `group` is non-empty (caller guarantees via `chunks(_)`).
 fn seed_kin_group(
     commands: &mut Commands,
     registry: &mut FactionRegistry,
     catalog: &ResourceCatalog,
+    sex_q: &Query<&BiologicalSex>,
     relationships: &mut Query<&mut RelationshipMemory>,
     parent_faction_id: u32,
     home_tile: (i32, i32),
@@ -159,10 +187,23 @@ fn seed_kin_group(
         return;
     }
 
-    // Spouse pair: head + group[1].
+    // Spouse pair: head + group[1]. Defensive against future drift: only set
+    // SPOUSE_AFFINITY when the pair is opposite-sex; same-sex fallback to
+    // SIBLING_AFFINITY so the bed-pairing pass doesn't try to cohabit a
+    // same-sex pair. With `person::pair_chief_sex` + roster wiring this
+    // should always be opposite-sex for kin slot 0/1, but the gate keeps
+    // the contract honest if a fixture/sandbox skips the roster.
     let spouse_a = group[0];
     let spouse_b = group[1];
-    set_reciprocal_affinity(relationships, spouse_a, spouse_b, SPOUSE_AFFINITY);
+    let opposite_sex = matches!(
+        (sex_q.get(spouse_a).ok().copied(), sex_q.get(spouse_b).ok().copied()),
+        (Some(a), Some(b)) if a != b
+    );
+    if opposite_sex {
+        set_reciprocal_affinity(relationships, spouse_a, spouse_b, SPOUSE_AFFINITY);
+    } else {
+        set_reciprocal_affinity(relationships, spouse_a, spouse_b, SIBLING_AFFINITY);
+    }
 
     // Siblings: each remaining member binds to one of the spouses (round-
     // robin) at SIBLING_AFFINITY. A 4-adult group thus has spouse + sibling-

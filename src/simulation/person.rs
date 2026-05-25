@@ -616,6 +616,27 @@ pub(crate) struct FactionBandSpawn {
     pub chief: Option<Entity>,
 }
 
+/// Deterministic chief sex per faction, seeded from `faction_id + home_tile`.
+/// Mixed with splitmix64 so reruns with the same world seed reproduce the
+/// same demographics. Paired with the kin-slot roster in `spawn_faction_band`
+/// so kin groups of 4 lay out as `[chief, !chief, chief, !chief]`, which
+/// `seed_starting_relationships_system` then bonds as opposite-sex spouse
+/// pairs.
+pub(crate) fn pair_chief_sex(faction_id: u32, home_tile: (i32, i32)) -> BiologicalSex {
+    let (hx, hy) = home_tile;
+    let mut x = (faction_id as u64) ^ (hx as u32 as u64) ^ ((hy as u32 as u64) << 32);
+    // splitmix64
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    if x & 1 == 0 {
+        BiologicalSex::Male
+    } else {
+        BiologicalSex::Female
+    }
+}
+
 /// Fallback member-spawn tile: a passable non-stone tile within `SPAWN_RADIUS`
 /// of `(cx, cy)`. Used only when the reachable flood pool is exhausted.
 fn fallback_member_tile(
@@ -694,6 +715,23 @@ pub(crate) fn spawn_faction_band(
         group_size as usize,
     );
     let mut pool_iter = reachable_pool.into_iter();
+    // Pre-computed sex roster aligned to spawn order. Mirrors
+    // `seed_starting_relationships_system::chunks(MAX_KIN_GROUP)` so each kin
+    // group of 4 lays out as `[chief, !chief, chief, !chief]`, guaranteeing
+    // an opposite-sex spouse pair per group. Chief sex varies per faction
+    // via `pair_chief_sex`. Solo/Market households still draw from the
+    // roster but kin grouping never reads it.
+    let chief_sex = pair_chief_sex(faction_id, home_tile);
+    let sex_roster: Vec<BiologicalSex> = (0..group_size as usize)
+        .map(|i| {
+            let kin_slot = i % crate::simulation::settlement_bootstrap::MAX_KIN_GROUP;
+            if kin_slot % 2 == 0 {
+                chief_sex
+            } else {
+                chief_sex.opposite()
+            }
+        })
+        .collect();
     for _ in 0..group_size {
         let Some((tx, ty)) = pool_iter
             .next()
@@ -721,7 +759,10 @@ pub(crate) fn spawn_faction_band(
         clock.bucket_size = clock.population.min(10_000);
 
         let world_pos = tile_to_world(tx, ty);
-        let sex = BiologicalSex::random();
+        let sex = sex_roster
+            .get(members.len())
+            .copied()
+            .unwrap_or_else(BiologicalSex::random);
 
         let person_entity = commands
             .spawn((
