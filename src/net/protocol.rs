@@ -837,4 +837,92 @@ mod tests {
             other => panic!("expected SetPackedAutonomy, got {:?}", other),
         }
     }
+
+    #[test]
+    fn diplomacy_proposal_round_trips() {
+        use crate::simulation::diplomacy::DiplomacyProposal;
+        let original = PlayerCommand::SendDiplomacyProposal {
+            faction_id: 3,
+            target_faction_id: 5,
+            proposal: DiplomacyProposal::OfferAlliance,
+        };
+        let restored = round_trip(&original);
+        match restored {
+            PlayerCommand::SendDiplomacyProposal {
+                faction_id,
+                target_faction_id,
+                proposal,
+            } => {
+                assert_eq!(faction_id, 3);
+                assert_eq!(target_faction_id, 5);
+                assert_eq!(proposal, DiplomacyProposal::OfferAlliance);
+            }
+            other => panic!("expected SendDiplomacyProposal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn diplomacy_response_round_trips() {
+        use crate::simulation::diplomacy::{ProposalId, ProposalResponse};
+        let original = PlayerCommand::RespondDiplomacyProposal {
+            faction_id: 2,
+            proposal_id: ProposalId(99),
+            response: ProposalResponse::Accept,
+        };
+        let restored = round_trip(&original);
+        match restored {
+            PlayerCommand::RespondDiplomacyProposal {
+                faction_id,
+                proposal_id,
+                response,
+            } => {
+                assert_eq!(faction_id, 2);
+                assert_eq!(proposal_id, ProposalId(99));
+                assert_eq!(response, ProposalResponse::Accept);
+            }
+            other => panic!("expected RespondDiplomacyProposal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn declare_war_round_trips() {
+        let original = PlayerCommand::DeclareWar {
+            faction_id: 1,
+            target_faction_id: 4,
+        };
+        let restored = round_trip(&original);
+        match restored {
+            PlayerCommand::DeclareWar {
+                faction_id,
+                target_faction_id,
+            } => {
+                assert_eq!(faction_id, 1);
+                assert_eq!(target_faction_id, 4);
+            }
+            other => panic!("expected DeclareWar, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn break_treaty_round_trips() {
+        use crate::simulation::diplomacy::TreatyKind;
+        let original = PlayerCommand::BreakTreaty {
+            faction_id: 1,
+            target_faction_id: 4,
+            treaty: TreatyKind::TradePact,
+        };
+        let restored = round_trip(&original);
+        match restored {
+            PlayerCommand::BreakTreaty {
+                faction_id,
+                target_faction_id,
+                treaty,
+            } => {
+                assert_eq!(faction_id, 1);
+                assert_eq!(target_faction_id, 4);
+                assert_eq!(treaty, TreatyKind::TradePact);
+            }
+            other => panic!("expected BreakTreaty, got {:?}", other),
+        }
+    }
 }

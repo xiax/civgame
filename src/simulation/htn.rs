@@ -9202,6 +9202,7 @@ pub fn htn_combat_faction_dispatch_system(
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
     clock: Res<SimClock>,
+    defense_queue: Res<crate::simulation::trespass::TerritoryDefenseQueue>,
     chief_query: Query<(), With<crate::simulation::faction::FactionChief>>,
     rescue_query: Query<&crate::simulation::goals::RescueTarget>,
     mut query: Query<
@@ -9255,7 +9256,19 @@ pub fn htn_combat_faction_dispatch_system(
                 (AbstractTask::Raid, dest, None, TaskKind::Raid)
             }
             AgentGoal::Defend => {
-                let Some(dest) = faction_registry.home_tile(member.faction_id) else {
+                // Diplomacy & Territory: prefer the nearest queued
+                // territorial-defense target over the home tile. Falls
+                // back to home when the queue is empty (under-raid path
+                // and stand-down).
+                let cur_tile = (
+                    (transform.translation.x / TILE_SIZE).floor() as i32,
+                    (transform.translation.y / TILE_SIZE).floor() as i32,
+                );
+                let dest = defense_queue
+                    .peek_nearest(member.faction_id, cur_tile)
+                    .map(|t| t.tile)
+                    .or_else(|| faction_registry.home_tile(member.faction_id));
+                let Some(dest) = dest else {
                     continue;
                 };
                 (AbstractTask::Defend, dest, None, TaskKind::Defend)

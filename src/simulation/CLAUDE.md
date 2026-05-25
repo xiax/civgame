@@ -346,6 +346,53 @@ OnEnter coverage in `test_fixture::onenter_era_seeding`: drives state transition
 - **Live chase (`combat::hunt_chase_system`):** Sequential, after `sync_indexed_after_move_system`, before combat. Reads `aq.current = Task::Hunt { prey }`; on despawn → `record_target_failure + aq.cancel()`; on prey-moved within `HUNT_LEASH_RADIUS (30)` → update tiles and replan; beyond leash → cancel `FailedTarget`.
 - **`Carrying(Entity)`** marker for "carrying corpse E"; inserted at pickup, removed at butcher/decay/rescue/muster/hunter-demote. `respond_to_distress_system` recruits any same-faction Hunter within `HUNTER_RESPOND_RANGE=50` regardless of LOS.
 
+## Diplomacy & Territory (`territory.rs`, `diplomacy.rs`, `trespass.rs`)
+
+### Territory
+
+- **`TerritoryMap`** Resource — sparse `AHashMap<(i32,i32), TerritoryCell { owner, state: Claimed|Contested|Unclaimed, score, runner_up }>` + per-faction `TerritoryStats { claimed_tiles, contested_tiles }` + `version` for UI cache invalidation. Only tiles inside some anchor's disc carry a cell — no full-world walk.
+- **Anchors** = live `Settlement` (radius = `era_base_radius(era) + sqrt(peak_population).min(RADIUS_CAP_BONUS=12)`) + pitched `Camp` (radius `era_base / 2`; packed = 0). Era base 8/10/14/18/22 (Paleo→Bronze).
+- **`recompute_territory_system`** (Economy, every `RECOMPUTE_CADENCE = TICKS_PER_DAY/4`) rebuilds `cells` from current `Settlement` + `Camp` queries; chebyshev falloff `FALLOFF=40` from `ANCHOR_BASE_SCORE=1000`; `cell_winner` picks Claimed (winner ≥ `CLAIM_THRESHOLD=200` AND margin ≥ `CONTEST_MARGIN=80`) or Contested. Pure helpers (`settlement_radius_for`, `camp_radius_for`, `score_at`, `cell_winner`, `compute_cells_from_anchors`) unit-tested without an `App`.
+- **Coarse projection**: `WorldCell.faction_id` on the Globe is already populated by `world_sim_system` — the world map renders that layer for abstract-faction extents; main view reads `TerritoryMap` for the precise materialised layer.
+
+### Diplomacy ledger
+
+- **`DiplomacyLedger`** Resource — `AHashMap<FactionPair, DiplomaticRelation>` (canonical-ordered pair) + proposal store + per-faction inbox + monotonic `next_proposal_id`. Households share their village's root and skip the ledger.
+- **`TreatySet`** (bitset): `TradePact | Alliance | NonAggression | War`. **War is exclusive** — `declare_war(...)` clears the other three and emits `TreatyBroken(...)` incidents. Form via `form_treaty`; break via `break_treaty` (rejects War — only `OfferPeace` Accept clears it). `apply_accepted_proposal` is the single Accept side-effect entry point used by both UI and AI paths.
+- **`Reputation`** four tracks: `trust (-100..+100)`, `fear (0..+100)`, `grievance (0..+100)`, `familiarity (0..u16::MAX cap)`. Daily `reputation_decay_system` applies round-to-nearest half-life decay (Trust 90-day, Fear 10-day, Grievance 365-day; familiarity monotonic). Small values can stick at non-zero — an accepted ledger quirk; fresh incidents reset.
+- **Incidents** (`record_incident`) — `Trespass{warned}` / `IgnoredWarning` / `Attack` / `Raid` / `TradeCompleted` / `Aid` / `SharedEnemy` / `TreatyFormed/Broken`. Each maps to deterministic rep deltas + a bounded `incident_log` (cap 16).
+- **AI proposals**: `ai_diplomacy_proposal_system` (Economy, daily-quarter staggered by `faction_id % 5`) emits at most one `OfferPeace`/`OfferTradePact`/`OfferAlliance` per faction-pair per cycle from rep thresholds. `ai_diplomacy_response_system` (quarter-day) drains uncontrolled-faction inboxes via pure-fn `evaluate_proposal`. `proposal_expiry_system` (daily) drops proposals older than `PROPOSAL_EXPIRY_TICKS = 7 days`.
+
+### Player commands
+
+`PlayerCommand` faction-level variants (mirror `EncodeTablet { faction_id }` shape — drained in `drain_player_command_events_system`, validated against `ControlledFactions`):
+
+- `SendDiplomacyProposal { faction_id, target_faction_id, proposal }`
+- `RespondDiplomacyProposal { faction_id, proposal_id, response }`
+- `DeclareWar { faction_id, target_faction_id }`
+- `BreakTreaty { faction_id, target_faction_id, treaty }` (rejects War)
+
+All Serialize/Deserialize via bincode (4 round-trip tests in `net/protocol.rs`).
+
+### Trespass + defender draft
+
+- **`trespass_detection_system`** (Sequential, after `sync_indexed_after_move_system`). Walks `Persons` with `Changed<Transform>`, looks up `TerritoryMap.owner_at(tile)`. Skips own root, alliance, non-aggression, trade-pact (v1: trade-pact-as-fully-allowed; v2 will narrow to road corridor + market disc). Emits `TrespassEvent` per (intruder, owner) cooldown window (`TRESPASS_COOLDOWN_TICKS=200`).
+- **`trespass_handling_system`** (Economy, after `recompute_territory_system`). First incident = warning (no rep change). Second within day = `IgnoredWarning` + grievance bump. Third → `TerritoryDefenseQueue` push. Hostile (war) entries always queue + record `Attack` incident. Emits `ActivityLogEvent::TrespassWarning` for the owner faction (player-side filter).
+- **`TerritoryDefenseQueue`** Resource — per-faction `VecDeque<DefenseTarget { tile, intruder, intruder_faction, expires_tick }>`, cap `DEFENSE_QUEUE_CAP=8`, TTL `DEFENSE_TARGET_TTL = TICKS_PER_DAY/4`.
+- **`goal_update_system`** flips `AgentGoal::Defend` (with `GoalReason("Defending Territory")`) when the queue is non-empty for the agent's faction, mirroring the `under_raid` flip. The HTN `Defend` arm (`htn_combat_faction_dispatch_system`) prefers the nearest queued tile via `peek_nearest`, falling back to home_tile when the queue is empty (under-raid path / stand-down).
+
+### Raid integration
+
+- `pick_raid_target` (`raid.rs`) filters out factions with Alliance / TradePact / NonAggression unless overridden by War.
+- `raid_execution_system` calls `record_incident(IncidentKind::Raid)` + `declare_war` on every successful steal, so a raid creates grievance and locks the pair into war for the duration of the FSM. The diplomacy ledger is the durable record; `RaidPhase` is the local FSM.
+
+### UI
+
+- HUD "Diplomacy" button toggles `DiplomacyPanelOpen`.
+- `ui/diplomacy_panel.rs` — two-column window. Left: known foreign factions sorted by id with one-word attitude + treaty badges. Right: selected faction's reputation tracks, recent incidents (last 8), pending proposals (Accept / Reject), action row (Offer Trade / Alliance / Non-Aggression, Declare War, Break ... when extant).
+- `ui/activity_log.rs` — four new `ActivityEntryKind` variants: `TreatyFormed`, `TreatyBroken`, `TrespassWarning`, `DiplomacyProposalReceived`.
+- `ui/world_map.rs` — `WorldMapView.show_territory` toggle. Mega-chunk tint by dominant `TerritoryMap` owner; deterministic per-faction palette (`territory_tint_for_faction` hashes id into a lifted RGB band).
+
 ## Raids (`raid.rs`)
 
 Faction-level state machine — `FactionData.raid_phase: RaidPhase` is source of truth; `raid_target` / `under_raid` are derived projections.

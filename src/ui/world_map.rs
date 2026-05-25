@@ -21,6 +21,11 @@ pub struct WorldMapOpen(pub bool);
 pub struct WorldMapView {
     /// Tint every mega-chunk by its expected average fertility (climate-derived).
     pub show_fertility: bool,
+    /// Tint mega-chunks by faction territory ownership (settlement +
+    /// camp anchors → `TerritoryMap`). Materialised factions only;
+    /// abstract-faction Globe cells continue to render via the regular
+    /// settled-region outline.
+    pub show_territory: bool,
 }
 
 /// Cache so we don't re-upload the texture every frame unless globe changed.
@@ -57,6 +62,7 @@ pub fn world_map_system(
     mut camera_q: Query<&mut Transform, With<Camera>>,
     mut camera_state: ResMut<crate::rendering::camera::CameraState>,
     view_projection: crate::rendering::projection::ViewProjection,
+    territory: Res<crate::simulation::territory::TerritoryMap>,
 ) {
     // Suppress camera input while map is open
     if open.0 {
@@ -103,6 +109,14 @@ pub fn world_map_system(
                 ui.checkbox(&mut view.show_fertility, "Show fertility");
                 ui.label(
                     egui::RichText::new("(green = high, brown = low; estimated from climate)")
+                        .small()
+                        .weak(),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut view.show_territory, "Show territory");
+                ui.label(
+                    egui::RichText::new("(coloured by owning faction; sparse overlay over loaded anchors)")
                         .small()
                         .weak(),
                 );
@@ -156,6 +170,48 @@ pub fn world_map_system(
                 };
                 ui.painter()
                     .rect_stroke(r, 0.0, egui::Stroke::new(2.0, color));
+            }
+
+            // Territory overlay: paint mega-chunks coloured by the
+            // dominant `TerritoryMap` faction owner in that mega-chunk.
+            // Sparse — only mega-chunks with at least one claimed tile
+            // contribute, so abstract-faction regions stay uncoloured
+            // here (they're rendered by the settled-region outline pass).
+            if view.show_territory && !territory.cells.is_empty() {
+                use ahash::AHashMap;
+                let mut mc_owner: AHashMap<(i32, i32), AHashMap<u32, u32>> =
+                    AHashMap::default();
+                for (&tile, cell) in &territory.cells {
+                    let Some(owner) = cell.owner else {
+                        continue;
+                    };
+                    let mc = MegaChunkCoord::from_tile(tile.0, tile.1);
+                    *mc_owner
+                        .entry(mc)
+                        .or_default()
+                        .entry(owner)
+                        .or_insert(0) += 1;
+                }
+                for ((mx, my), per_faction) in mc_owner {
+                    if mx < 0 || my < 0 || mx >= mc_grid_w || my >= mc_grid_h {
+                        continue;
+                    }
+                    let Some((winner, _)) =
+                        per_faction.into_iter().max_by_key(|(_, n)| *n)
+                    else {
+                        continue;
+                    };
+                    let screen_my = mc_grid_h - 1 - my;
+                    let r = egui::Rect::from_min_size(
+                        egui::pos2(
+                            rect.min.x + mx as f32 * cell_w,
+                            rect.min.y + screen_my as f32 * cell_h,
+                        ),
+                        egui::vec2(cell_w, cell_h),
+                    );
+                    let color = territory_tint_for_faction(winner);
+                    ui.painter().rect_filled(r, 0.0, color);
+                }
             }
 
             // Draw current camera position as a white rectangle. Convert
@@ -504,6 +560,21 @@ pub fn build_globe_image(
 
 /// Two-stop colour ramp for the fertility overlay: dark brown (0) → tan (~128)
 /// → deep green (255). Returns sRGB bytes.
+/// Deterministic faction-id → tint for the territory overlay. ~50%
+/// alpha so the biome texture stays legible underneath.
+fn territory_tint_for_faction(faction_id: u32) -> egui::Color32 {
+    // Cheap deterministic palette: hash → HSV-ish via three integer
+    // splays. Avoids pulling in a colour crate.
+    let h = faction_id.wrapping_mul(0x9E37_79B9);
+    let r = ((h >> 0) & 0xFF) as u8;
+    let g = ((h >> 8) & 0xFF) as u8;
+    let b = ((h >> 16) & 0xFF) as u8;
+    // Lift each channel into the 80-255 band so dark colours don't
+    // blend invisibly into the biome map.
+    let lift = |c: u8| 80 + ((c as u16 * 175 / 255) as u8);
+    egui::Color32::from_rgba_premultiplied(lift(r), lift(g), lift(b), 120)
+}
+
 fn fertility_ramp_color(fert: u8) -> (u8, u8, u8) {
     let t = fert as f32 / 255.0;
     if t < 0.5 {

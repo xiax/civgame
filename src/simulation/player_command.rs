@@ -226,6 +226,39 @@ pub enum PlayerCommand {
         spawn_near: (i32, i32),
         faction_id: u32,
     },
+    /// Faction-level: send a diplomacy proposal to another faction.
+    /// `drain_player_command_events_system` validates ownership of
+    /// `faction_id` and posts a `PendingProposal` onto the target's
+    /// `DiplomacyLedger` inbox. Empty `actors`.
+    SendDiplomacyProposal {
+        faction_id: u32,
+        target_faction_id: u32,
+        proposal: crate::simulation::diplomacy::DiplomacyProposal,
+    },
+    /// Faction-level: respond to a pending proposal in this faction's
+    /// inbox. Drain validates ownership, consumes the proposal, and on
+    /// `Accept` applies treaty side-effects via
+    /// `diplomacy::apply_accepted_proposal`.
+    RespondDiplomacyProposal {
+        faction_id: u32,
+        proposal_id: crate::simulation::diplomacy::ProposalId,
+        response: crate::simulation::diplomacy::ProposalResponse,
+    },
+    /// Faction-level: unilateral declaration of war. No proposal — just
+    /// flip the treaty bitset, cancel coexistence treaties, emit
+    /// `TreatyBroken` incidents.
+    DeclareWar {
+        faction_id: u32,
+        target_faction_id: u32,
+    },
+    /// Faction-level: tear down one active treaty (commonly Alliance or
+    /// TradePact). War can only be ended via `OfferPeace` (Accept) — this
+    /// variant rejects War as the target kind.
+    BreakTreaty {
+        faction_id: u32,
+        target_faction_id: u32,
+        treaty: crate::simulation::diplomacy::TreatyKind,
+    },
 }
 
 /// Per-actor authority marker. Replaces `PlayerOrder` once Commit 3 lands.
@@ -319,6 +352,7 @@ pub fn drain_player_command_events_system(
     // `DebugSpawnTestVehicle` arm (which is `cfg!(debug_assertions)`-gated).
     mut debug_drive: DebugTestDriveResources,
     net_ids: Res<NetIdMap>,
+    mut ledger: ResMut<crate::simulation::diplomacy::DiplomacyLedger>,
 ) {
     let now = clock.tick as u32;
     for ev in reader.read() {
@@ -330,7 +364,11 @@ pub fn drain_player_command_events_system(
                 | PlayerCommand::QueueVehicle { faction_id, .. }
                 | PlayerCommand::QueueCustomVehicle { faction_id, .. }
                 | PlayerCommand::VehicleOrder { faction_id, .. }
-                | PlayerCommand::DebugSpawnTestVehicle { faction_id, .. } => Some(*faction_id),
+                | PlayerCommand::DebugSpawnTestVehicle { faction_id, .. }
+                | PlayerCommand::SendDiplomacyProposal { faction_id, .. }
+                | PlayerCommand::RespondDiplomacyProposal { faction_id, .. }
+                | PlayerCommand::DeclareWar { faction_id, .. }
+                | PlayerCommand::BreakTreaty { faction_id, .. } => Some(*faction_id),
                 _ => None,
             };
             if let Some(fid) = payload_faction {
@@ -524,6 +562,94 @@ pub fn drain_player_command_events_system(
                     info!(
                         "DebugSpawnTestVehicle: spawned '{}' at ({}, {}) z={} heading={}",
                         design.name, tile.0, tile.1, z, heading
+                    );
+                }
+                PlayerCommand::SendDiplomacyProposal {
+                    faction_id,
+                    target_faction_id,
+                    proposal,
+                } => {
+                    // Sanity: don't propose to self or to an unknown
+                    // root-shared faction (households share the village).
+                    if faction_id == target_faction_id
+                        || factions.factions.get(&target_faction_id).is_none()
+                    {
+                        warn!(
+                            "SendDiplomacyProposal: invalid target {} for from {}",
+                            target_faction_id, faction_id
+                        );
+                        continue;
+                    }
+                    let from_root = factions.root_faction(faction_id);
+                    let to_root = factions.root_faction(target_faction_id);
+                    if from_root == to_root {
+                        continue;
+                    }
+                    ledger.post_proposal(
+                        faction_id,
+                        target_faction_id,
+                        proposal,
+                        clock.tick,
+                    );
+                }
+                PlayerCommand::RespondDiplomacyProposal {
+                    faction_id,
+                    proposal_id,
+                    response,
+                } => {
+                    let Some(p) = ledger.consume_proposal(proposal_id) else {
+                        continue;
+                    };
+                    if p.to_faction != faction_id {
+                        // Not addressed to this faction — silently drop.
+                        continue;
+                    }
+                    if response == crate::simulation::diplomacy::ProposalResponse::Accept {
+                        crate::simulation::diplomacy::apply_accepted_proposal(
+                            &mut ledger,
+                            p.from_faction,
+                            p.to_faction,
+                            p.proposal,
+                            clock.tick,
+                        );
+                    }
+                }
+                PlayerCommand::DeclareWar {
+                    faction_id,
+                    target_faction_id,
+                } => {
+                    if faction_id == target_faction_id
+                        || factions.factions.get(&target_faction_id).is_none()
+                    {
+                        continue;
+                    }
+                    if factions.root_faction(faction_id) == factions.root_faction(target_faction_id) {
+                        continue;
+                    }
+                    crate::simulation::diplomacy::declare_war(
+                        &mut ledger,
+                        faction_id,
+                        target_faction_id,
+                        clock.tick,
+                    );
+                }
+                PlayerCommand::BreakTreaty {
+                    faction_id,
+                    target_faction_id,
+                    treaty,
+                } => {
+                    // War is exclusive — can only be ended via accepted
+                    // OfferPeace. Reject unilateral war-break.
+                    if matches!(treaty, crate::simulation::diplomacy::TreatyKind::War) {
+                        warn!("BreakTreaty: cannot unilaterally break War; use OfferPeace");
+                        continue;
+                    }
+                    crate::simulation::diplomacy::break_treaty(
+                        &mut ledger,
+                        faction_id,
+                        target_faction_id,
+                        treaty,
+                        clock.tick,
                     );
                 }
                 _ => {
@@ -747,7 +873,11 @@ pub fn player_command_lifecycle_system(
             | PlayerCommand::QueueVehicle { .. }
             | PlayerCommand::QueueCustomVehicle { .. }
             | PlayerCommand::VehicleOrder { .. }
-            | PlayerCommand::DebugSpawnTestVehicle { .. } => Some(CommandStatus::Completed),
+            | PlayerCommand::DebugSpawnTestVehicle { .. }
+            | PlayerCommand::SendDiplomacyProposal { .. }
+            | PlayerCommand::RespondDiplomacyProposal { .. }
+            | PlayerCommand::DeclareWar { .. }
+            | PlayerCommand::BreakTreaty { .. } => Some(CommandStatus::Completed),
             // Lookout never auto-completes — the worker holds the anchor
             // until the player supersedes the command or `aq.cancel`
             // drops the chain via another dispatch.
@@ -1575,7 +1705,11 @@ fn dispatch_one(
         QueueVehicle { .. }
         | QueueCustomVehicle { .. }
         | VehicleOrder { .. }
-        | DebugSpawnTestVehicle { .. } => {
+        | DebugSpawnTestVehicle { .. }
+        | SendDiplomacyProposal { .. }
+        | RespondDiplomacyProposal { .. }
+        | DeclareWar { .. }
+        | BreakTreaty { .. } => {
             // Faction-level — applied directly in
             // `drain_player_command_events_system` (empty `actors`). If an
             // event ever arrives carrying actors, the dispatch is a no-op.

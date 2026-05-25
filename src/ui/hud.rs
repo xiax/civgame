@@ -38,6 +38,7 @@ pub struct HudResources<'w> {
     pub draft_req: ResMut<'w, DraftToggleRequest>,
     pub migration_panel: ResMut<'w, crate::ui::migration_panel::MigrationPanelOpen>,
     pub vehicle_designer: ResMut<'w, crate::ui::vehicle_designer::VehicleDesignerState>,
+    pub diplomacy_panel: ResMut<'w, crate::ui::diplomacy_panel::DiplomacyPanelOpen>,
     pub camera_view_z: Res<'w, CameraViewZ>,
     pub map_view_mode: ResMut<'w, MapViewMode>,
     pub calendar: Res<'w, Calendar>,
@@ -64,6 +65,7 @@ pub fn hud_system(
     let draft_req = &mut *res.draft_req;
     let migration_panel = &mut *res.migration_panel;
     let vehicle_designer = &mut *res.vehicle_designer;
+    let diplomacy_panel = &mut *res.diplomacy_panel;
     let camera_view_z = &*res.camera_view_z;
     let map_view_mode = &mut *res.map_view_mode;
     let calendar = &*res.calendar;
@@ -153,6 +155,15 @@ pub fn hud_system(
                         });
                         if ui.add(veh_btn).clicked() {
                             vehicle_designer.open = !vehicle_designer.open;
+                        }
+
+                        let dipl_btn = egui::Button::new("Diplomacy").fill(if diplomacy_panel.0 {
+                            egui::Color32::from_rgb(140, 100, 200)
+                        } else {
+                            egui::Color32::from_gray(60)
+                        });
+                        if ui.add(dipl_btn).clicked() {
+                            diplomacy_panel.0 = !diplomacy_panel.0;
                         }
 
                         ui.separator();

@@ -1,0 +1,367 @@
+//! Territorial trespass detection + handling.
+//!
+//! Pipeline:
+//! 1. `trespass_detection_system` — Sequential, after the spatial-index
+//!    sync. Walks `Changed<Transform>` Persons; per-pair throttled. When
+//!    an indexed mover enters a tile owned by another faction
+//!    (`TerritoryMap`), emits `TrespassEvent`.
+//! 2. `trespass_handling_system` — Economy. Drains events, records
+//!    ledger incidents, escalates per (intruder, owner) state, and
+//!    populates `TerritoryDefenseQueue` for war / repeated violators.
+//!
+//! Throttling: per-pair `TrespassCooldown` map prevents one walking
+//! agent from re-firing every tile-step.
+
+use ahash::AHashMap;
+use bevy::prelude::*;
+use std::collections::VecDeque;
+
+use crate::simulation::diplomacy::{
+    record_incident, DiplomacyLedger, IncidentKind, TreatyKind, TreatySet,
+};
+use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
+use crate::simulation::person::Person;
+use crate::simulation::schedule::SimClock;
+use crate::simulation::territory::TerritoryMap;
+use crate::world::seasons::TICKS_PER_DAY;
+use crate::world::terrain::TILE_SIZE;
+
+/// Per-(intruder-faction, owner-faction) cooldown ticks between
+/// trespass events. 200 ticks ≈ 10 s real-time at 20 Hz / ~3 game-min.
+pub const TRESPASS_COOLDOWN_TICKS: u64 = 200;
+
+/// Ticks an entry stays in `TerritoryDefenseQueue` before expiry.
+/// Quarter-day matches the defender-draft cadence.
+pub const DEFENSE_TARGET_TTL: u64 = (TICKS_PER_DAY / 4) as u64;
+
+/// Max queued defense targets per faction. Drops oldest on push.
+pub const DEFENSE_QUEUE_CAP: usize = 8;
+
+#[derive(Event, Debug, Clone)]
+pub struct TrespassEvent {
+    pub intruder: Entity,
+    pub intruder_faction: u32,
+    pub owner_faction: u32,
+    pub tile: (i32, i32),
+}
+
+/// Per-(intruder-faction, owner-faction) state machine. Drives the
+/// warning → grievance → attack escalation across multiple incidents.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct TrespassPairState {
+    pub last_event_tick: u64,
+    pub last_handled_tick: u64,
+    pub incidents_today: u8,
+}
+
+#[derive(Resource, Default)]
+pub struct TrespassRegistry {
+    /// (intruder_faction, owner_faction) → state. Throttle + escalation.
+    pub by_pair: AHashMap<(u32, u32), TrespassPairState>,
+}
+
+/// One pending defense target per faction. Drained by the defender-
+/// drafting system + HTN `DefendTerritoryMethod`.
+#[derive(Clone, Copy, Debug)]
+pub struct DefenseTarget {
+    pub tile: (i32, i32),
+    pub intruder: Entity,
+    pub intruder_faction: u32,
+    pub expires_tick: u64,
+}
+
+#[derive(Resource, Default)]
+pub struct TerritoryDefenseQueue {
+    pub by_faction: AHashMap<u32, VecDeque<DefenseTarget>>,
+}
+
+impl TerritoryDefenseQueue {
+    pub fn push(&mut self, owner_faction: u32, target: DefenseTarget) {
+        let q = self.by_faction.entry(owner_faction).or_default();
+        if q.len() >= DEFENSE_QUEUE_CAP {
+            q.pop_front();
+        }
+        q.push_back(target);
+    }
+
+    pub fn peek_nearest(
+        &self,
+        owner_faction: u32,
+        from_tile: (i32, i32),
+    ) -> Option<DefenseTarget> {
+        self.by_faction.get(&owner_faction).and_then(|q| {
+            q.iter()
+                .min_by_key(|t| {
+                    let dx = (t.tile.0 - from_tile.0).abs();
+                    let dy = (t.tile.1 - from_tile.1).abs();
+                    dx.max(dy)
+                })
+                .copied()
+        })
+    }
+
+    pub fn evict_expired(&mut self, now: u64) {
+        for q in self.by_faction.values_mut() {
+            q.retain(|t| t.expires_tick > now);
+        }
+        self.by_faction.retain(|_, q| !q.is_empty());
+    }
+
+    pub fn has_target(&self, owner_faction: u32) -> bool {
+        self.by_faction
+            .get(&owner_faction)
+            .map(|q| !q.is_empty())
+            .unwrap_or(false)
+    }
+}
+
+/// Pure helper: classify whether an intruder's presence on owner's
+/// territory is legal under treaties / root.
+///
+/// `Allowed` covers: same root, alliance, non-aggression. `TradePact`
+/// alone permits transit only inside the road corridor / market disc —
+/// that finer-grained check is deferred to the caller (today we treat
+/// TradePact as fully Allowed; v2 will narrow).
+pub fn is_trespass(
+    treaties: TreatySet,
+    same_root: bool,
+) -> TrespassClassification {
+    if same_root {
+        return TrespassClassification::Allowed;
+    }
+    if treaties.has(TreatyKind::Alliance)
+        || treaties.has(TreatyKind::NonAggression)
+        || treaties.has(TreatyKind::TradePact)
+    {
+        return TrespassClassification::Allowed;
+    }
+    if treaties.has(TreatyKind::War) {
+        TrespassClassification::Hostile
+    } else {
+        TrespassClassification::Neutral
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TrespassClassification {
+    Allowed,
+    Neutral,
+    Hostile,
+}
+
+/// Sequential, after `sync_indexed_after_move_system`. Walks `Person`s
+/// whose `Transform` changed and emits one `TrespassEvent` per
+/// (intruder, owner_faction) cooldown window.
+pub fn trespass_detection_system(
+    clock: Res<SimClock>,
+    territory: Res<TerritoryMap>,
+    ledger: Res<DiplomacyLedger>,
+    registry: Res<FactionRegistry>,
+    mut state: ResMut<TrespassRegistry>,
+    mut events: EventWriter<TrespassEvent>,
+    persons: Query<(Entity, &Transform, &FactionMember), (With<Person>, Changed<Transform>)>,
+) {
+    let now = clock.tick;
+    for (entity, transform, member) in persons.iter() {
+        let intruder_fid = member.faction_id;
+        if intruder_fid == SOLO {
+            continue;
+        }
+        let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
+        let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
+        let Some(owner_fid) = territory.owner_at((tx, ty)) else {
+            continue;
+        };
+        if owner_fid == intruder_fid {
+            continue;
+        }
+        let same_root = registry.root_faction(intruder_fid) == registry.root_faction(owner_fid);
+        let treaties = ledger.treaties(intruder_fid, owner_fid);
+        let class = is_trespass(treaties, same_root);
+        if matches!(class, TrespassClassification::Allowed) {
+            continue;
+        }
+        let key = (intruder_fid, owner_fid);
+        let pair = state.by_pair.entry(key).or_default();
+        if now.saturating_sub(pair.last_event_tick) < TRESPASS_COOLDOWN_TICKS {
+            continue;
+        }
+        pair.last_event_tick = now;
+        events.send(TrespassEvent {
+            intruder: entity,
+            intruder_faction: intruder_fid,
+            owner_faction: owner_fid,
+            tile: (tx, ty),
+        });
+    }
+}
+
+/// Economy, after detection. Folds events into ledger incidents and
+/// queues defense targets.
+pub fn trespass_handling_system(
+    clock: Res<SimClock>,
+    mut events: EventReader<TrespassEvent>,
+    mut ledger: ResMut<DiplomacyLedger>,
+    mut state: ResMut<TrespassRegistry>,
+    mut queue: ResMut<TerritoryDefenseQueue>,
+    registry: Res<FactionRegistry>,
+    mut log: EventWriter<crate::ui::activity_log::ActivityLogEvent>,
+) {
+    let now = clock.tick;
+    queue.evict_expired(now);
+    for ev in events.read() {
+        let key = (ev.intruder_faction, ev.owner_faction);
+        let pair = state.by_pair.entry(key).or_default();
+        // Reset incident counter daily (cheap, no extra Local).
+        let day_window = TICKS_PER_DAY as u64;
+        if now.saturating_sub(pair.last_handled_tick) >= day_window {
+            pair.incidents_today = 0;
+        }
+        pair.last_handled_tick = now;
+        pair.incidents_today = pair.incidents_today.saturating_add(1);
+
+        let treaties = ledger.treaties(ev.intruder_faction, ev.owner_faction);
+        let same_root = registry.root_faction(ev.intruder_faction)
+            == registry.root_faction(ev.owner_faction);
+        let class = is_trespass(treaties, same_root);
+
+        let mut queue_defense = false;
+        match class {
+            TrespassClassification::Hostile => {
+                // At war — record an Attack incident and always dispatch.
+                record_incident(
+                    &mut ledger,
+                    ev.intruder_faction,
+                    ev.owner_faction,
+                    now,
+                    IncidentKind::Attack {
+                        aggressor: ev.intruder_faction,
+                        victim_count: 1,
+                    },
+                );
+                queue_defense = true;
+            }
+            TrespassClassification::Neutral => {
+                // First incident this day: warning (no rep change).
+                // Second+ : record as IgnoredWarning + repeat trespass.
+                let warned = pair.incidents_today > 1;
+                record_incident(
+                    &mut ledger,
+                    ev.intruder_faction,
+                    ev.owner_faction,
+                    now,
+                    IncidentKind::Trespass {
+                        tile: ev.tile,
+                        warned,
+                    },
+                );
+                if pair.incidents_today >= 2 {
+                    record_incident(
+                        &mut ledger,
+                        ev.intruder_faction,
+                        ev.owner_faction,
+                        now,
+                        IncidentKind::IgnoredWarning,
+                    );
+                    queue_defense = pair.incidents_today >= 3;
+                }
+            }
+            TrespassClassification::Allowed => {
+                // Shouldn't reach here — detection filters Allowed out.
+            }
+        }
+        if queue_defense {
+            queue.push(
+                ev.owner_faction,
+                DefenseTarget {
+                    tile: ev.tile,
+                    intruder: ev.intruder,
+                    intruder_faction: ev.intruder_faction,
+                    expires_tick: now + DEFENSE_TARGET_TTL,
+                },
+            );
+        }
+        // Surface a player-facing log entry. `activity_log_ingest_system`
+        // filters by `faction_id == player_faction`, so only the player's
+        // factions see it.
+        log.send(crate::ui::activity_log::ActivityLogEvent {
+            tick: now,
+            actor: ev.intruder,
+            faction_id: ev.owner_faction,
+            kind: crate::ui::activity_log::ActivityEntryKind::TrespassWarning {
+                intruder_faction: ev.intruder_faction,
+                tile: ev.tile,
+            },
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simulation::diplomacy::TreatyKind;
+
+    #[test]
+    fn same_root_is_allowed() {
+        let class = is_trespass(TreatySet::default(), true);
+        assert_eq!(class, TrespassClassification::Allowed);
+    }
+
+    #[test]
+    fn alliance_is_allowed() {
+        let mut t = TreatySet::default();
+        t.insert(TreatyKind::Alliance);
+        let class = is_trespass(t, false);
+        assert_eq!(class, TrespassClassification::Allowed);
+    }
+
+    #[test]
+    fn war_is_hostile() {
+        let mut t = TreatySet::default();
+        t.insert(TreatyKind::War);
+        let class = is_trespass(t, false);
+        assert_eq!(class, TrespassClassification::Hostile);
+    }
+
+    #[test]
+    fn unrelated_neutral_is_trespass() {
+        let class = is_trespass(TreatySet::default(), false);
+        assert_eq!(class, TrespassClassification::Neutral);
+    }
+
+    #[test]
+    fn defense_queue_evicts_expired() {
+        let mut q = TerritoryDefenseQueue::default();
+        let world = bevy::ecs::world::World::new();
+        let _ = world; // we don't actually need an Entity instance — use placeholder
+        q.push(
+            7,
+            DefenseTarget {
+                tile: (0, 0),
+                intruder: bevy::ecs::entity::Entity::from_raw(1),
+                intruder_faction: 9,
+                expires_tick: 10,
+            },
+        );
+        assert!(q.has_target(7));
+        q.evict_expired(100);
+        assert!(!q.has_target(7));
+    }
+
+    #[test]
+    fn defense_queue_caps_at_eight() {
+        let mut q = TerritoryDefenseQueue::default();
+        for i in 0..(DEFENSE_QUEUE_CAP as i32 + 4) {
+            q.push(
+                1,
+                DefenseTarget {
+                    tile: (i, 0),
+                    intruder: bevy::ecs::entity::Entity::from_raw(1),
+                    intruder_faction: 2,
+                    expires_tick: 1000,
+                },
+            );
+        }
+        assert_eq!(q.by_faction.get(&1).unwrap().len(), DEFENSE_QUEUE_CAP);
+    }
+}

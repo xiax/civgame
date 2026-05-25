@@ -97,6 +97,29 @@ pub enum ActivityEntryKind {
     /// Phase 5b — apprentice graduated; profession is now `Crafter`.
     /// `actor` is the now-graduate.
     ApprenticeshipGraduated,
+    /// Diplomacy: a treaty was formed between the player's faction and
+    /// `with_faction`. Emitted on `Accept` of an `Offer*` proposal.
+    TreatyFormed {
+        with_faction: u32,
+        treaty: crate::simulation::diplomacy::TreatyKind,
+    },
+    /// Diplomacy: a treaty was broken (or war declared). For war-driven
+    /// breaks, the matching `TreatyFormed { War }` follows.
+    TreatyBroken {
+        with_faction: u32,
+        treaty: crate::simulation::diplomacy::TreatyKind,
+    },
+    /// Territory: an intruder from `intruder_faction` was sighted on a
+    /// player-faction-owned tile.
+    TrespassWarning {
+        intruder_faction: u32,
+        tile: (i32, i32),
+    },
+    /// Diplomacy: a proposal was received from `from_faction`.
+    DiplomacyProposalReceived {
+        from_faction: u32,
+        proposal: crate::simulation::diplomacy::DiplomacyProposal,
+    },
 }
 
 #[derive(Clone)]
@@ -244,6 +267,38 @@ pub fn activity_log_ingest_system(
                 "graduated",
                 "(now a Crafter)".to_string(),
                 ResultLink::HeldByActor,
+            ),
+            &ActivityEntryKind::TreatyFormed {
+                with_faction,
+                treaty,
+            } => (
+                "formed a treaty",
+                format!("{:?} with faction {}", treaty, with_faction),
+                ResultLink::NoTarget,
+            ),
+            &ActivityEntryKind::TreatyBroken {
+                with_faction,
+                treaty,
+            } => (
+                "broke a treaty",
+                format!("{:?} with faction {}", treaty, with_faction),
+                ResultLink::NoTarget,
+            ),
+            &ActivityEntryKind::TrespassWarning {
+                intruder_faction,
+                tile,
+            } => (
+                "spotted trespasser",
+                format!("faction {} at {:?}", intruder_faction, tile),
+                ResultLink::NoTarget,
+            ),
+            &ActivityEntryKind::DiplomacyProposalReceived {
+                from_faction,
+                proposal,
+            } => (
+                "received proposal",
+                format!("{:?} from faction {}", proposal, from_faction),
+                ResultLink::NoTarget,
             ),
         };
 

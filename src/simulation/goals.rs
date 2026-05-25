@@ -641,6 +641,7 @@ pub fn goal_update_system(
     >,
     cooldown_query: Query<&GoalCooldown>,
     mut force_reeval: ResMut<ForceGoalReevaluate>,
+    defense_queue: Res<crate::simulation::trespass::TerritoryDefenseQueue>,
 ) {
     let time_of_day_bonus =
         crate::simulation::utility_curves::time_of_day_bonus(calendar.time_phase());
@@ -1125,6 +1126,24 @@ pub fn goal_update_system(
                     r.0 = "Under Raid";
                 } else {
                     commands.entity(entity).insert(GoalReason("Under Raid"));
+                }
+                continue;
+            }
+            // Diplomacy & Territory: a queued defense target (trespass
+            // escalation / hostile incursion) pulls this agent off
+            // autonomous work onto Defend, mirroring the under_raid
+            // flip. The HTN `Defend` arm then prefers the queued tile
+            // over home (see `htn.rs::AgentGoal::Defend` dispatch).
+            if defense_queue.has_target(member.faction_id) {
+                if *goal != AgentGoal::Defend {
+                    *goal = AgentGoal::Defend;
+                    ai.state = AiState::Idle;
+                    aq.cancel();
+                }
+                if let Some(mut r) = reason_opt {
+                    r.0 = "Defending Territory";
+                } else {
+                    commands.entity(entity).insert(GoalReason("Defending Territory"));
                 }
                 continue;
             }

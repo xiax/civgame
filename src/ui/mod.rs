@@ -3,6 +3,7 @@ use bevy_egui::EguiPlugin;
 
 pub mod activity_log;
 pub mod debug_panel;
+pub mod diplomacy_panel;
 pub mod economy_panel;
 pub mod hover;
 pub mod hud;
@@ -42,6 +43,8 @@ impl Plugin for UiPlugin {
             .insert_resource(spawn_select::SpawnSelectTexture::default())
             .insert_resource(migration_panel::MigrationPanelOpen::default())
             .insert_resource(vehicle_designer::VehicleDesignerState::default())
+            .insert_resource(diplomacy_panel::DiplomacyPanelOpen::default())
+            .insert_resource(diplomacy_panel::DiplomacyPanelSelection::default())
             .add_event::<activity_log::ActivityLogEvent>()
             .add_systems(
                 Update,
@@ -66,6 +69,7 @@ impl Plugin for UiPlugin {
                         tech_panel::tech_panel_system,
                         vehicle_designer::vehicle_designer_system,
                         manual_drive::manual_drive_input_system,
+                        diplomacy_panel::diplomacy_panel_system,
                     ),
                     debug_panel::debug_panel_system,
                     job_board::job_board_panel_system,

@@ -17,6 +17,7 @@ pub mod combat;
 pub mod construction;
 pub mod corpse;
 pub mod crafting;
+pub mod diplomacy;
 pub mod dig;
 pub mod doormat;
 pub mod excavation;
@@ -86,6 +87,8 @@ pub mod teaching;
 pub mod technology;
 pub mod technology_adoption;
 pub mod terraform;
+pub mod territory;
+pub mod trespass;
 #[cfg(test)]
 pub mod test_fixture;
 pub mod tools;
@@ -300,6 +303,11 @@ impl Plugin for SimulationPlugin {
             .insert_resource(jobs::PlayerCraftRequest::default())
             .insert_resource(shared_knowledge::SharedKnowledge::default())
             .insert_resource(gather_claims::GatherClaims::default())
+            .insert_resource(territory::TerritoryMap::default())
+            .insert_resource(diplomacy::DiplomacyLedger::default())
+            .insert_resource(trespass::TrespassRegistry::default())
+            .insert_resource(trespass::TerritoryDefenseQueue::default())
+            .add_event::<trespass::TrespassEvent>()
             .configure_sets(
                 FixedUpdate,
                 (
@@ -1570,6 +1578,13 @@ impl Plugin for SimulationPlugin {
                 (
                     settlement::settlement_peak_population_system
                         .after(settlement::auto_found_default_settlements_system),
+                    // Diplomacy & Territory: rebuild the per-tile influence
+                    // map from live `Settlement` + pitched `Camp` anchors.
+                    // Self-gated on `RECOMPUTE_CADENCE` (TICKS_PER_DAY/4)
+                    // inside the system. Read by trespass detection
+                    // (Sequential) and the world-map territory overlay.
+                    territory::recompute_territory_system
+                        .after(settlement::settlement_peak_population_system),
                     // P1b: spawn one Camp per Camp-mode (nomadic) faction.
                     // Sibling to `auto_found_default_settlements_system`;
                     // ordered before the planner so any subsequent camp-aware
@@ -1690,6 +1705,33 @@ impl Plugin for SimulationPlugin {
                 vision::autonomous_scout_lookout_pause_system
                     .before(tasks::goal_dispatch_system)
                     .in_set(SimulationSet::ParallelB),
+            )
+            // Diplomacy & Territory: trespass detection rides movement.
+            // Runs after `sync_indexed_after_move_system` so the
+            // territory lookup sees the post-move tile. Throttled
+            // per (intruder_faction, owner_faction) inside the system.
+            .add_systems(
+                FixedUpdate,
+                trespass::trespass_detection_system
+                    .after(movement::sync_indexed_after_move_system)
+                    .in_set(SimulationSet::Sequential),
+            )
+            // Diplomacy & Territory: ledger maintenance + trespass
+            // handling. Own add_systems block to dodge the 20-arity
+            // ceiling on the primary Economy tuple. All systems
+            // self-gate on cadence; ordering between them is
+            // observationally irrelevant.
+            .add_systems(
+                FixedUpdate,
+                (
+                    trespass::trespass_handling_system
+                        .after(territory::recompute_territory_system),
+                    diplomacy::reputation_decay_system,
+                    diplomacy::proposal_expiry_system,
+                    diplomacy::ai_diplomacy_response_system,
+                    diplomacy::ai_diplomacy_proposal_system,
+                )
+                    .in_set(SimulationSet::Economy),
             )
             // Vision sources (per `plans/lookout-base.md`):
             //   - `lookout_task_system` is the executor: arrival pins the

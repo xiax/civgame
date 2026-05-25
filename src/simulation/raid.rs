@@ -126,6 +126,7 @@ struct FactionSnap {
 /// too distant). Returns `None` when nothing qualifies.
 fn pick_raid_target(
     registry: &FactionRegistry,
+    ledger: &crate::simulation::diplomacy::DiplomacyLedger,
     attacker: u32,
     snaps: &[FactionSnap],
 ) -> Option<u32> {
@@ -155,6 +156,17 @@ fn pick_raid_target(
             || attacker_data.subordinate_to == Some(snap.id)
             || cand.dominance_over.contains(&attacker)
             || cand.subordinate_to == Some(attacker)
+        {
+            continue;
+        }
+        // Diplomacy: ally / trade-partner / non-aggression-pact factions
+        // are not raid targets unless explicitly at war. War overrides
+        // the other treaty bits via `declare_war`'s exclusivity.
+        let treaties = ledger.treaties(attacker, snap.id);
+        if !treaties.has(crate::simulation::diplomacy::TreatyKind::War)
+            && (treaties.has(crate::simulation::diplomacy::TreatyKind::Alliance)
+                || treaties.has(crate::simulation::diplomacy::TreatyKind::TradePact)
+                || treaties.has(crate::simulation::diplomacy::TreatyKind::NonAggression))
         {
             continue;
         }
@@ -223,6 +235,7 @@ fn select_raid_party(members: &[MemberInfo], faction_members: u32) -> Vec<Entity
 pub fn faction_decision_system(
     mut registry: ResMut<FactionRegistry>,
     clock: Res<SimClock>,
+    ledger: Res<crate::simulation::diplomacy::DiplomacyLedger>,
     member_query: Query<(
         Entity,
         &FactionMember,
@@ -323,7 +336,7 @@ pub fn faction_decision_system(
                 let hunger_dur = now.saturating_sub(f.hunger_crisis_streak_tick);
                 let threshold = RAID_TRIGGER_DAYS * TICKS_PER_DAY;
                 if deficit_dur >= threshold && hunger_dur >= threshold {
-                    if let Some(target) = pick_raid_target(&registry, id, &snaps) {
+                    if let Some(target) = pick_raid_target(&registry, &ledger, id, &snaps) {
                         let empty = Vec::new();
                         let party = select_raid_party(
                             members_by_faction.get(&id).unwrap_or(&empty),
@@ -674,6 +687,7 @@ pub fn raid_execution_system(
     storage_tile_map: Res<StorageTileMap>,
     clock: Res<SimClock>,
     mut registry: ResMut<FactionRegistry>,
+    mut ledger: ResMut<crate::simulation::diplomacy::DiplomacyLedger>,
     mut agents: Query<(
         Entity,
         &mut PersonAI,
@@ -794,6 +808,26 @@ pub fn raid_execution_system(
         if let Some(f) = registry.factions.get_mut(&attacker_faction) {
             f.raid_stolen_food = f.raid_stolen_food.saturating_add(1);
         }
+        // Diplomacy: every successful steal counts as a Raid incident
+        // against the attacker. Folded into the per-pair ledger with
+        // a +30 grievance bump and -20 trust per call. The cooldown on
+        // `last_raid_steal_tick` (`RAID_STEAL_COOLDOWN_TICKS`) already
+        // throttles per-raider, so this is bounded.
+        crate::simulation::diplomacy::record_incident(
+            &mut ledger,
+            attacker_faction,
+            target_faction,
+            clock.tick,
+            crate::simulation::diplomacy::IncidentKind::Raid { stolen_food: 1 },
+        );
+        // First raid that ever lands declares war if both sides aren't
+        // already in some treaty state; subsequent calls are idempotent.
+        crate::simulation::diplomacy::declare_war(
+            &mut ledger,
+            attacker_faction,
+            target_faction,
+            clock.tick,
+        );
     }
 }
 
