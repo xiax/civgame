@@ -34,7 +34,7 @@ impl Plugin for UiPlugin {
             .insert_resource(world_map::WorldMapTexture::default())
             .insert_resource(orders::ContextMenuState::default())
             .insert_resource(orders::MilitaryMenuState::default())
-            .insert_resource(tech_panel::TechPanelOpen::default())
+            .insert_resource(tech_panel::KnowledgePanelOpen::default())
             .insert_resource(debug_panel::DebugPanelState::default())
             .insert_resource(job_board::JobBoardPanelState::default())
             .insert_resource(activity_log::ActivityLog::default())

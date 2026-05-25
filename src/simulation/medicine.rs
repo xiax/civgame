@@ -456,7 +456,23 @@ pub fn htn_seek_care_dispatch_system(
                 target = Some(entry.tile);
             }
         }
-        if target.is_none() {
+        // **Phase H.3** — Spirit-Illness HTN bias. When the patient's
+        // chief accepts Spirit Illness, sickness is a ritual problem; a
+        // Shrine is the only legitimate site of treatment. We deliberately
+        // skip the home_tile fallback so the patient idles in place when
+        // no Shrine exists — they will not seek conventional
+        // wound-binding-style care at home. (Healer-side
+        // `htn_provide_care_dispatch_system` can still find them via its
+        // radius scan; that scan is the "ritual practitioner finds the
+        // afflicted" path.) Miasma- or no-belief factions keep the
+        // home-tile fallback so injured agents always have a recovery
+        // anchor.
+        let spirit_illness_held = faction_registry
+            .factions
+            .get(&member.faction_id)
+            .and_then(|f| f.chief_disease_belief)
+            == Some(crate::simulation::technology::SPIRIT_ILLNESS);
+        if target.is_none() && !spirit_illness_held {
             target = faction_registry.home_tile(member.faction_id);
             if let Some(t) = target {
                 best_dist = (t.0 - cur_tx).abs().max((t.1 - cur_ty).abs());

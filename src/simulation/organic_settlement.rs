@@ -3483,6 +3483,19 @@ pub(crate) fn pressure_to_intent(
     {
         priority *= 1.30;
     }
+    // **Phase H.3** — Spirit-Illness Shrine lift. A chief who accepts
+    // Spirit Illness reads sickness as a ritual problem; the Shrine is
+    // where the cure is sought. Lift `Ritual` intent priority by 30%
+    // so a Spirit-Illness-accepting faction builds Shrines earlier than
+    // a Miasma-accepting peer at the same population pressure. Mirrors
+    // the Miasma → WaterAccess hook above; same magnitude keeps the two
+    // belief paths symmetric in their first observable effect.
+    if matches!(pressure.kind, SettlementPressureKind::Ritual)
+        && faction.chief_disease_belief
+            == Some(crate::simulation::technology::SPIRIT_ILLNESS)
+    {
+        priority *= 1.30;
+    }
     Some(ConstructionIntent {
         template_id: archetype_id_for(pressure.kind, era, archetypes).to_string(),
         build_kind,

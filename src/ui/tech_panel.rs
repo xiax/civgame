@@ -7,7 +7,7 @@ use crate::simulation::technology::{complexity, ActivityKind, Era, TechId, TECH_
 use crate::simulation::technology_adoption::AdoptionStage;
 
 #[derive(Resource, Default)]
-pub struct TechPanelOpen(pub bool);
+pub struct KnowledgePanelOpen(pub bool);
 
 fn activity_name(kind: ActivityKind) -> &'static str {
     match kind {
@@ -30,7 +30,7 @@ fn activity_name(kind: ActivityKind) -> &'static str {
 
 pub fn tech_panel_system(
     mut contexts: EguiContexts,
-    open: Res<TechPanelOpen>,
+    open: Res<KnowledgePanelOpen>,
     player_faction: Res<PlayerFaction>,
     registry: Res<FactionRegistry>,
     member_query: Query<(&FactionMember, &PersonKnowledge)>,

@@ -437,8 +437,8 @@ pub fn required_station(tech: TechId) -> Option<WorkshopKind> {
 
 /// The Economy-schedule system that recomputes `FactionData.tech_adoption`
 /// from member knowledges + workshop ownership + recent use. Runs every
-/// `ADOPTION_DERIVE_CADENCE` ticks. Emits `TechAdopted` /
-/// `TechInstitutionalized` activity-log entries on upgrade transitions
+/// `ADOPTION_DERIVE_CADENCE` ticks. Emits `KnowledgeAdopted` /
+/// `KnowledgeInstitutionalized` activity-log entries on upgrade transitions
 /// (downgrades stay silent — Phase 4's decay is intentionally quiet).
 pub fn derive_tech_adoption_system(
     clock: Res<SimClock>,
@@ -566,16 +566,15 @@ pub fn derive_tech_adoption_system(
                 // brief Adopted → Practiced flicker during a bad season
                 // doesn't spam the log.
                 if *fid == player.faction_id && (final_stage as u8) > (prev as u8) {
-                    let def = &TECH_TREE[idx];
+                    let tech_id = idx as crate::simulation::technology::TechId;
                     match final_stage {
                         AdoptionStage::Adopted => {
                             activity_log.send(crate::ui::activity_log::ActivityLogEvent {
                                 tick: clock.tick,
                                 actor: faction.chief_entity.unwrap_or(Entity::PLACEHOLDER),
                                 faction_id: *fid,
-                                kind: crate::ui::activity_log::ActivityEntryKind::TechAdopted {
-                                    tech_name: def.name,
-                                    era_name: def.era.name(),
+                                kind: crate::ui::activity_log::ActivityEntryKind::KnowledgeAdopted {
+                                    id: tech_id,
                                 },
                             });
                         }
@@ -585,9 +584,8 @@ pub fn derive_tech_adoption_system(
                                 actor: faction.chief_entity.unwrap_or(Entity::PLACEHOLDER),
                                 faction_id: *fid,
                                 kind:
-                                    crate::ui::activity_log::ActivityEntryKind::TechInstitutionalized {
-                                        tech_name: def.name,
-                                        era_name: def.era.name(),
+                                    crate::ui::activity_log::ActivityEntryKind::KnowledgeInstitutionalized {
+                                        id: tech_id,
                                     },
                             });
                         }

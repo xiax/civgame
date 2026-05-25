@@ -39,18 +39,17 @@ pub enum ActivityEntryKind {
         tech_name: &'static str,
         era_name: &'static str,
     },
-    /// Faction-level event: a tech crossed into community `Adopted` stage
-    /// (Phase 5 of the tech-adoption refactor). `actor` may be a chief or
-    /// other representative member.
-    TechAdopted {
-        tech_name: &'static str,
-        era_name: &'static str,
+    /// Faction-level event: a knowledge entry crossed into community
+    /// `Adopted` stage. Phrasing depends on `KnowledgeKind` — a skill is
+    /// "adopted", a technique "rolled out", a lore entry "recorded", a
+    /// belief "now widely held".
+    KnowledgeAdopted {
+        id: crate::simulation::technology::TechId,
     },
-    /// Faction-level event: a tech crossed into `Institutionalized` stage —
-    /// survives chief death because preservation conditions are met.
-    TechInstitutionalized {
-        tech_name: &'static str,
-        era_name: &'static str,
+    /// Faction-level event: knowledge crossed into `Institutionalized` —
+    /// survives chief death. Kind-aware phrasing as above.
+    KnowledgeInstitutionalized {
+        id: crate::simulation::technology::TechId,
     },
     RegionSettled {
         megachunk: (i32, i32),
@@ -211,22 +210,14 @@ pub fn activity_log_ingest_system(
                 format!("{} ({})", tech_name, era_name),
                 ResultLink::NoTarget,
             ),
-            &ActivityEntryKind::TechAdopted {
-                tech_name,
-                era_name,
-            } => (
-                "adopted",
-                format!("{} ({})", tech_name, era_name),
-                ResultLink::NoTarget,
-            ),
-            &ActivityEntryKind::TechInstitutionalized {
-                tech_name,
-                era_name,
-            } => (
-                "institutionalized",
-                format!("{} ({})", tech_name, era_name),
-                ResultLink::NoTarget,
-            ),
+            &ActivityEntryKind::KnowledgeAdopted { id } => {
+                let (verb, label) = knowledge_adoption_phrasing(id, /*institutional=*/ false);
+                (verb, label, ResultLink::NoTarget)
+            }
+            &ActivityEntryKind::KnowledgeInstitutionalized { id } => {
+                let (verb, label) = knowledge_adoption_phrasing(id, /*institutional=*/ true);
+                (verb, label, ResultLink::NoTarget)
+            }
             ActivityEntryKind::Taught {
                 student_name,
                 tech_name,
@@ -489,6 +480,28 @@ fn link_button(ui: &mut egui::Ui, text: &str, alive: bool) -> egui::Response {
     };
     let rich = egui::RichText::new(text).color(color).underline();
     ui.add(egui::Button::new(rich).frame(false))
+}
+
+/// Phase I.3 — kind-aware verb + label for `KnowledgeAdopted` /
+/// `KnowledgeInstitutionalized`. Skills/techniques "adopt"/"institutionalize";
+/// lore entries "record"/"preserve"; beliefs "believe"/"hold sacred".
+fn knowledge_adoption_phrasing(
+    id: crate::simulation::technology::TechId,
+    institutional: bool,
+) -> (&'static str, String) {
+    use crate::simulation::knowledge_catalog::{knowledge_def, KnowledgeKind};
+    let def = knowledge_def(id);
+    let verb = match (def.kind(), institutional) {
+        (KnowledgeKind::PracticalSkill, false) => "adopted",
+        (KnowledgeKind::PracticalSkill, true) => "institutionalized",
+        (KnowledgeKind::PracticalTechnique, false) => "rolled out",
+        (KnowledgeKind::PracticalTechnique, true) => "standardized",
+        (KnowledgeKind::Lore, false) => "recorded",
+        (KnowledgeKind::Lore, true) => "preserved",
+        (KnowledgeKind::Belief, false) => "now believes",
+        (KnowledgeKind::Belief, true) => "now holds sacred",
+    };
+    (verb, format!("{} ({})", def.name(), def.era().name()))
 }
 
 fn tick_to_game_date(tick: u64) -> String {

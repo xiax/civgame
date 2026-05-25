@@ -16,7 +16,7 @@ use crate::simulation::speed::{GameSpeed, SpeedPreset};
 use crate::simulation::technology::HUNTING_SPEAR;
 use crate::ui::debug_panel::DebugPanelState;
 use crate::ui::selection::SelectedEntities;
-use crate::ui::tech_panel::TechPanelOpen;
+use crate::ui::tech_panel::KnowledgePanelOpen;
 use crate::world::seasons::Calendar;
 
 /// Set by the Draft button (or `R` keypress); consumed by
@@ -33,7 +33,7 @@ pub struct HudResources<'w> {
     pub speed: ResMut<'w, GameSpeed>,
     pub mode: ResMut<'w, EconomicMode>,
     pub auto_build: ResMut<'w, AutonomousBuildingToggle>,
-    pub tech_panel_open: ResMut<'w, TechPanelOpen>,
+    pub knowledge_panel_open: ResMut<'w, KnowledgePanelOpen>,
     pub debug_state: ResMut<'w, DebugPanelState>,
     pub draft_req: ResMut<'w, DraftToggleRequest>,
     pub migration_panel: ResMut<'w, crate::ui::migration_panel::MigrationPanelOpen>,
@@ -60,7 +60,7 @@ pub fn hud_system(
     let speed = &mut *res.speed;
     let mode = &mut *res.mode;
     let auto_build = &mut *res.auto_build;
-    let tech_panel_open = &mut *res.tech_panel_open;
+    let knowledge_panel_open = &mut *res.knowledge_panel_open;
     let debug_state = &mut *res.debug_state;
     let draft_req = &mut *res.draft_req;
     let migration_panel = &mut *res.migration_panel;
@@ -139,13 +139,13 @@ pub fn hud_system(
                         }
 
                         ui.separator();
-                        let tech_btn = egui::Button::new("Tech").fill(if tech_panel_open.0 {
+                        let knowledge_btn = egui::Button::new("Knowledge").fill(if knowledge_panel_open.0 {
                             egui::Color32::from_rgb(140, 100, 200)
                         } else {
                             egui::Color32::from_gray(60)
                         });
-                        if ui.add(tech_btn).clicked() {
-                            tech_panel_open.0 = !tech_panel_open.0;
+                        if ui.add(knowledge_btn).clicked() {
+                            knowledge_panel_open.0 = !knowledge_panel_open.0;
                         }
 
                         let veh_btn = egui::Button::new("Vehicles").fill(if vehicle_designer.open {

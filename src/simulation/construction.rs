@@ -1057,10 +1057,28 @@ fn build_recipes_table() -> Vec<BuildRecipe> {
     let _ = core_ids::catalog();
     let wood = core_ids::wood();
     let stone = core_ids::stone();
-    let grain = core_ids::grain();
     let skin = core_ids::skin();
     let bedroll = core_ids::bedroll();
     let packed_yurt = core_ids::packed_yurt();
+    // Phase F.2 — per-technique recipe split. Each masonry tier now
+    // consumes the canonical Phase F construction material that defines
+    // it physically: Wattle-and-Daub binds wood lattice with reeds;
+    // Mudbrick blocks are mud + straw (thatch); Cut Stone walls need
+    // lime mortar. Reachability: `reeds` from Marsh tiles (Phase F.2
+    // GatherReeds), `thatch` as a Grain-harvest byproduct, `lime` via
+    // the FIRED_POTTERY-gated `Burn Lime` craft recipe (Limestone tiles
+    // yield `limestone`). All three ingredients are reachable inside
+    // the tech tier each wall recipe gates on, so the build pipeline
+    // never starves on a Phase F resource the faction can't procure.
+    let reeds = *core_ids::Reeds
+        .get()
+        .expect("core_ids: reeds not initialised");
+    let thatch = *core_ids::Thatch
+        .get()
+        .expect("core_ids: thatch not initialised");
+    let lime = *core_ids::Lime
+        .get()
+        .expect("core_ids: lime not initialised");
 
     vec![
         BuildRecipe {
@@ -1072,7 +1090,7 @@ fn build_recipes_table() -> Vec<BuildRecipe> {
         },
         BuildRecipe {
             name: "Wattle & Daub Wall",
-            inputs: vec![(wood, 2), (grain, 1)],
+            inputs: vec![(wood, 2), (reeds, 1)],
             work_ticks: 70,
             tech_gate: Some(PERM_SETTLEMENT),
             deconstruct_refund: vec![(wood, 1)],
@@ -1086,14 +1104,14 @@ fn build_recipes_table() -> Vec<BuildRecipe> {
         },
         BuildRecipe {
             name: "Mudbrick Wall",
-            inputs: vec![(stone, 2), (wood, 1)],
+            inputs: vec![(stone, 2), (wood, 1), (thatch, 1)],
             work_ticks: 80,
             tech_gate: Some(FIRED_POTTERY),
             deconstruct_refund: vec![(stone, 1)],
         },
         BuildRecipe {
             name: "Cut Stone Wall",
-            inputs: vec![(stone, 4)],
+            inputs: vec![(stone, 4), (lime, 1)],
             work_ticks: 120,
             tech_gate: Some(MONUMENTAL_BUILDING),
             deconstruct_refund: vec![(stone, 3)],
@@ -8425,6 +8443,9 @@ mod tests {
     use crate::economy::core_ids;
 
     fn neo_techs() -> FactionTechs {
+        // Touch the catalog so `core_ids::Thatch.get()` / `Reeds.get()` /
+        // `Lime.get()` resolve in test paths that bypass `WorldPlugin`.
+        let _ = core_ids::catalog();
         techs_through_era(Era::Neolithic)
     }
 
@@ -8508,12 +8529,17 @@ mod tests {
 
     #[test]
     fn select_keeps_top_when_available() {
-        // Neolithic top rung = Mudbrick (stone 2 + wood 1).
+        // Neolithic top rung = Mudbrick (stone 2 + wood 1 + thatch 1 after
+        // Phase F.2 recipe split — thatch is the straw binder).
         let t = neo_techs();
         assert_eq!(best_wall_material(&t), WallMaterial::Mudbrick);
+        let thatch = *core_ids::Thatch
+            .get()
+            .expect("core_ids: thatch not initialised");
         let v = view_with(&[
             (core_ids::stone(), Scarcity::Available),
             (core_ids::wood(), Scarcity::Available),
+            (thatch, Scarcity::Available),
         ]);
         assert_eq!(
             select_wall_material(&t, Some(&v)),
@@ -8527,9 +8553,13 @@ mod tests {
     #[test]
     fn select_keeps_top_with_market_source_when_scarce() {
         let t = neo_techs();
+        let thatch = *core_ids::Thatch
+            .get()
+            .expect("core_ids: thatch not initialised");
         let v = view_with(&[
             (core_ids::stone(), Scarcity::Scarce),
             (core_ids::wood(), Scarcity::Available),
+            (thatch, Scarcity::Available),
         ]);
         match select_wall_material(&t, Some(&v)) {
             WallSelection::Material {
@@ -8544,13 +8574,17 @@ mod tests {
 
     #[test]
     fn select_steps_down_ladder_when_unavailable() {
-        // Mudbrick needs stone; mark stone Unavailable but WattleDaub's inputs
-        // (wood + grain) available → step down to WattleDaub (not emergency).
+        // Mudbrick needs stone; mark stone Unavailable but WattleDaub's
+        // inputs (wood + reeds after Phase F.2 recipe split) available →
+        // step down to WattleDaub (not emergency).
         let t = neo_techs();
+        let reeds = *core_ids::Reeds
+            .get()
+            .expect("core_ids: reeds not initialised");
         let v = view_with(&[
             (core_ids::stone(), Scarcity::Unavailable),
             (core_ids::wood(), Scarcity::Available),
-            (core_ids::grain(), Scarcity::Available),
+            (reeds, Scarcity::Available),
         ]);
         assert_eq!(
             select_wall_material(&t, Some(&v)).mat(),

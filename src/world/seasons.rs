@@ -142,6 +142,27 @@ impl Calendar {
         self.year.saturating_sub(1)
     }
 
+    /// Phase H.3 — eclipse calendar tick. A deterministic rare event used
+    /// by the Eclipse Omens mood penalty. Returns true on the last day of
+    /// summer **every other game year** (~once per 40 game-days at default
+    /// `DAYS_PER_SEASON = 5`), with the actual mood-affecting window
+    /// keying off `eclipse_active()` so the penalty doesn't bleed across
+    /// every tick of the eclipse day.
+    pub fn is_eclipse_today(&self) -> bool {
+        self.season == Season::Summer && self.day == self.days_per_season && self.year % 2 == 0
+    }
+
+    /// Eclipse is "happening" — sun-occluded daylight. Penalty consumers
+    /// gate on this so the mood hit lasts the visible window, not the
+    /// whole day. Roughly mid-day to early dusk on `is_eclipse_today`.
+    pub fn eclipse_active(&self) -> bool {
+        if !self.is_eclipse_today() {
+            return false;
+        }
+        let f = self.day_fraction();
+        f >= 0.35 && f < 0.55
+    }
+
     /// Fraction of the day elapsed, in `[0.0, 1.0)`.
     pub fn day_fraction(&self) -> f32 {
         (self.ticks_this_day as f32 / self.ticks_per_day.max(1) as f32).clamp(0.0, 1.0)

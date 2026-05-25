@@ -19,10 +19,10 @@ Resource catalog, goods, items, carrying, markets, recipes, currency primitives.
 Five new catalog entries that feed the Phase E `BuildingTechnique` recipes (`plans/knowledge-system-overhaul.md`):
 
 - `clay` — heavy two-hand material; raw clay dug from clay-bearing soil bands. Wattle-and-Daub / Cob / Adobe / Mudbrick input.
-- `reeds` — one-hand bundle; harvested from wetland Marsh / riparian Silt. Reed Matting + Wattle-and-Daub trim + Thatch Roofing input. *Gather-from-tile task deferred to Phase F.2.*
+- `reeds` — one-hand bundle; harvested from wetland Marsh via the `Task::Gather` Marsh branch (Phase F.2: `MemoryKind::reeds()` vision report on Marsh tiles + `gather_system` Marsh branch yields `REEDS_PER_GATHER = 2` per `REEDS_WORK_TICKS = 30` cycle, tool-free, renewable — reed bed regrows so tile kind never changes). Reed Matting + Wattle-and-Daub binder + Thatch Roofing rope input. **Wattle & Daub recipe**: `(wood, 2), (reeds, 1)` (Phase F.2 swapped grain→reeds).
 - `thatch` — one-hand bundle; **grain-harvest byproduct** (`PlantKind::Grain::harvest_extra_yields` returns 1 thatch alongside 2 grain_seed). Roofing input.
 - `limestone` — two-hand quarried block. `carve::yield_for_tile` now routes a `TileKind::Limestone` mined block to `limestone` (other lithologies still map to generic `stone`).
-- `lime` — one-hand burnt-lime product. `CraftRecipe 46 (Burn Lime)`: 2 limestone + 1 wood → 1 lime, `FIRED_POTTERY`-gated, Workbench-bound. Mortar binder for Cut-Stone / Hydraulic / lime-plaster techniques.
+- `lime` — one-hand burnt-lime product. `CraftRecipe 46 (Burn Lime)`: 2 limestone + 1 wood → 1 lime, `FIRED_POTTERY`-gated, Workbench-bound. Mortar binder for Cut-Stone / Hydraulic / lime-plaster techniques. **Cut Stone Wall recipe**: `(stone, 4), (lime, 1)` (Phase F.2 added lime mortar). **Mudbrick Wall recipe**: `(stone, 2), (wood, 1), (thatch, 1)` (Phase F.2 added thatch straw binder).
 
 `core_ids::clay()` / `reeds()` / `thatch()` / `limestone()` / `lime()` are the lookup accessors. Adding a Phase E technique recipe → reads these as ingredients.
 

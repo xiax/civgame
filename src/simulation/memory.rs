@@ -69,6 +69,18 @@ impl MemoryKind {
                 .expect("MemoryKind::berry_seed: core_ids not initialised"),
         )
     }
+    /// `MemoryKind::Resource(REEDS)` — wetland reed-bed sightings. Phase
+    /// F.2 vision reports any `TileKind::Marsh` as a reeds source so
+    /// the AcquireGood/Stockpile chain can route a worker to harvest
+    /// `reeds` for construction recipes (Wattle-and-Daub trim, Reed
+    /// Matting, Thatch Roofing's reed-rope binding, etc.).
+    pub fn reeds() -> Self {
+        Self::Resource(
+            *core_ids::Reeds
+                .get()
+                .expect("MemoryKind::reeds: core_ids not initialised"),
+        )
+    }
 
     /// True for every kind whose semantic meaning is "this tile holds food."
     pub fn is_any_edible(self) -> bool {
@@ -566,6 +578,28 @@ pub fn vision_system(
                         });
                     } else {
                         shared.report_depleted(write_tier, (ntx, nty), MemoryKind::stone());
+                    }
+                    // Phase F.2 — Marsh tiles carry harvestable reed beds.
+                    // Report as `MemoryKind::reeds()` so the standard
+                    // AcquireGood / Stockpile gather chain (
+                    // `GatherFromKnownMethod` → `htn_acquire_good_dispatch_system`
+                    // → `Task::Gather { tile }` → `gather_system` Marsh
+                    // branch) can route a worker without bespoke
+                    // dispatch infrastructure.
+                    if tile_kind == crate::world::tile::TileKind::Marsh {
+                        shared.report_sighting(
+                            write_tier,
+                            (ntx, nty),
+                            MemoryKind::reeds(),
+                            ResourceOwner::Public,
+                            now,
+                        );
+                        current_vision.entries.push(VisionEntry {
+                            kind: MemoryKind::reeds(),
+                            tile: (ntx, nty),
+                            entity: None,
+                            owner: ResourceOwner::Public,
+                        });
                     }
                 }
             }

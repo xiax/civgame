@@ -1037,6 +1037,68 @@ pub fn gather_system(
                     clock.tick,
                     FinishGatherOutcome::Completed,
                 );
+            } else if matches!(tile_kind, Some(TileKind::Marsh)) {
+                // ── Phase F.2 — GatherReeds task variant. A `Task::Gather`
+                // targeting a wetland Marsh tile harvests reeds: a fast,
+                // tool-free, renewable bundle. The reed bed regrows under
+                // marsh hydrology so the tile kind never changes.
+                //
+                // Per cycle: pay `REEDS_PER_GATHER` reeds after
+                // `REEDS_WORK_TICKS` accumulated. Mirrors the stone
+                // incremental-yield rhythm so a worker gathering reeds
+                // for a chief `Stockpile{reeds}` posting fills hands at
+                // similar pace.
+                const REEDS_WORK_TICKS: u8 = 30;
+                const REEDS_PER_GATHER: u32 = 2;
+                if ai.work_progress < REEDS_WORK_TICKS {
+                    continue;
+                }
+                ai.work_progress = 0;
+                let reeds_id = *crate::economy::core_ids::Reeds
+                    .get()
+                    .expect("core_ids: reeds() called before init_core_ids()");
+                let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());
+                let (_, _, mul) = faction_muls(
+                    &mut faction_registry,
+                    faction_id,
+                    ActivityKind::Foraging,
+                );
+                let qty = (REEDS_PER_GATHER as f32 * mul).round().max(1.0) as u32;
+                route_yield(
+                    &mut commands,
+                    &mut carrier,
+                    &mut agent,
+                    reeds_id,
+                    qty,
+                    agent_tx,
+                    agent_ty,
+                    None, // reeds gather spills are public
+                );
+                skills.gain_xp(SkillKind::Farming, 1);
+                discovery_events.send(DiscoveryActionEvent {
+                    actor,
+                    activity: ActivityKind::Foraging,
+                });
+                // Keep the chain alive across cycles unless carrier full.
+                let next_blocked = {
+                    let reeds_item = crate::economy::item::Item::new_commodity(reeds_id);
+                    carrier.should_return_to_deposit(reeds_item)
+                };
+                if next_blocked {
+                    finish_gather(
+                        &mut ai,
+                        &mut aq,
+                        actor,
+                        cur_tile,
+                        cur_chunk,
+                        faction_id,
+                        &chunk_map,
+                        &routing,
+                        &mut method_history,
+                        clock.tick,
+                        FinishGatherOutcome::Completed,
+                    );
+                }
             } else {
                 // Not a stone/wall tile and not a plant -> target is invalid or already harvested
                 shared.report_depleted(agent_tier, (tx, ty), MemoryKind::stone());
