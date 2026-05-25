@@ -2306,8 +2306,8 @@ mod smoke {
         );
 
         // Fast-forward the clock to one tick before the cadence so a
-        // single tick fires the system. Cheaper than ticking 3600
-        // frames; the system reads only `clock.tick % cadence`.
+        // single tick fires the system. Cheaper than ticking a full
+        // game-day; the system reads only `clock.tick % cadence`.
         {
             let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
             clock.tick = WORKER_SELF_POST_CADENCE - 1;
@@ -4029,8 +4029,8 @@ mod smoke {
         let baseline = CurrencySnapshot::capture(&mut sim.app);
 
         // Tick 3 game-days. tribute_payment_system fires on
-        // `tick % TICKS_PER_DAY == 0`, which is at ticks 0, 3600,
-        // 7200, 10800 — but tick 0 is the bootstrap tick before
+        // `tick % TICKS_PER_DAY == 0`, i.e. once per game-day —
+        // but tick 0 is the bootstrap tick before
         // anything is set up, and the relationship was just stamped.
         // To be safe, ensure the system fires multiple times.
         sim.tick_n((TICKS_PER_DAY * 3) as u32 + 5);

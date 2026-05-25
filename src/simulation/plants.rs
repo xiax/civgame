@@ -1143,7 +1143,7 @@ pub fn planting_reservation_gc_system(
     mut reservations: ResMut<PlantingReservations>,
     aq_q: Query<&crate::simulation::typed_task::ActionQueue>,
 ) {
-    const RESERVATION_MAX_AGE_TICKS: u64 = 3600; // one game-day
+    const RESERVATION_MAX_AGE_TICKS: u64 = crate::world::seasons::TICKS_PER_DAY as u64;
     let now = clock.tick;
     if now % RESERVATION_MAX_AGE_TICKS != 0 {
         return;

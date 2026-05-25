@@ -331,7 +331,7 @@ impl RelationshipMemory {
 /// decay was retired with the 32-slot ring in Phase 7 — `SharedKnowledge`
 /// owns cluster freshness via `cluster_decay_system` now.
 pub fn relationship_decay_system(clock: Res<SimClock>, mut query: Query<&mut RelationshipMemory>) {
-    if clock.tick % 3600 != 0 {
+    if clock.tick % crate::world::seasons::TICKS_PER_DAY as u64 != 0 {
         return;
     }
     for mut rel in query.iter_mut() {

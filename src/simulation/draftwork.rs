@@ -531,6 +531,6 @@ mod tests {
         let area: u32 = 16 * 16;
         let total = area.saturating_mul(PLOW_WORK_TICKS_PER_TILE as u32);
         assert!(total >= 200);
-        assert!(total <= 3600);
+        assert!(total <= crate::world::seasons::TICKS_PER_DAY);
     }
 }

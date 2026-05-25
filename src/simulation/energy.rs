@@ -36,21 +36,32 @@ pub const ENERGY_RECOVERED: f32 = 140.0;
 /// 45% effectiveness (mirrors `medicine::sickness_work_factor`'s shape).
 pub const ENERGY_FACTOR_FLOOR: f32 = 0.45;
 
-// ── Rates (per real second; tick systems scale by `dt` like `Needs`). ──
+// ── Rates ──
+// Continuous (per-game-day) rates derive from per-day targets so doubling
+// `TICKS_PER_DAY` keeps daily accumulation invariant. The per-tile drain
+// stays per-tile (footstep cost is not a function of time).
 
-/// Energy drained per second of active labor (`AiState::Working`).
-pub const ENERGY_LABOR_DRAIN: f32 = 1.5;
-/// Energy drained per attack swing in `combat_system`.
-pub const ENERGY_ATTACK_DRAIN: f32 = 6.0;
+use crate::world::seasons::per_game_day_rate;
+
+/// Energy drained per game day of active labor (`AiState::Working`).
+const ENERGY_LABOR_DRAIN_PER_DAY: f32 = 270.0;
+pub const ENERGY_LABOR_DRAIN: f32 = per_game_day_rate(ENERGY_LABOR_DRAIN_PER_DAY);
+/// Energy drained per attack swing in `combat_system`. Per-game-day rate
+/// applied via `dt` over the swing's animation window — same shape as the
+/// other continuous drains.
+const ENERGY_ATTACK_DRAIN_PER_DAY: f32 = 1080.0;
+pub const ENERGY_ATTACK_DRAIN: f32 = per_game_day_rate(ENERGY_ATTACK_DRAIN_PER_DAY);
 /// Base energy drained per tile of on-foot travel.
 pub const ENERGY_MOVE_DRAIN_PER_TILE: f32 = 0.35;
 /// Mounted travel multiplier — riding is far less tiring than walking.
 pub const ENERGY_MOVE_MOUNTED_SCALE: f32 = 0.15;
-/// Energy recovered per second while awake and idle.
-pub const ENERGY_IDLE_RECOVER: f32 = 0.8;
-/// Energy recovered per second while `AiState::Sleeping` (doubled on a bed,
-/// mirroring the bed bonus on `SLEEP_RECOVER_RATE`).
-pub const ENERGY_SLEEP_RECOVER: f32 = 8.0;
+/// Energy recovered per game day while awake and idle.
+const ENERGY_IDLE_RECOVER_PER_DAY: f32 = 144.0;
+pub const ENERGY_IDLE_RECOVER: f32 = per_game_day_rate(ENERGY_IDLE_RECOVER_PER_DAY);
+/// Energy recovered per game day while `AiState::Sleeping` (doubled on a
+/// bed, mirroring the bed bonus on `SLEEP_RECOVER_RATE`).
+const ENERGY_SLEEP_RECOVER_PER_DAY: f32 = 1440.0;
+pub const ENERGY_SLEEP_RECOVER: f32 = per_game_day_rate(ENERGY_SLEEP_RECOVER_PER_DAY);
 
 /// Per-agent exertion / fatigue pool. `max` exists for a future
 /// Constitution-scaled capacity; v1 leaves it flat at `ENERGY_MAX`.

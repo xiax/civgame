@@ -3988,7 +3988,7 @@ pub struct PlayerCraftRequest(pub Option<(u8, Option<crate::simulation::technolo
 /// Cadence: chief reconsiders tablet posting once per game-day. See plan
 /// memory `feedback_game_time_pacing.md` — faction-level decisions anchor on
 /// game time, not 60-tick reactive cadence.
-const CHIEF_TABLET_POSTING_INTERVAL: u64 = 3600;
+const CHIEF_TABLET_POSTING_INTERVAL: u64 = crate::world::seasons::TICKS_PER_DAY as u64;
 
 /// Auto-post Clay Tablet craft jobs when the chief has Learned a tech the
 /// rest of the faction is largely unaware of. Runs once per game-day per

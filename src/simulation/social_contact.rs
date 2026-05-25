@@ -81,7 +81,7 @@ impl SecondarySocial {
 
 /// Game-time-scaled pairing persistence window: ~20 s @ 20 Hz.
 /// `> 2× TIER_PROMOTION_CADENCE (200)` so an ambient pair survives long
-/// enough for at least one tier-promotion sample, `<< TICKS_PER_DAY (3600)`
+/// enough for at least one tier-promotion sample, `<< TICKS_PER_DAY`
 /// so a stale pair self-expires the same game-day.
 pub const PAIRING_WINDOW: u32 = 400;
 

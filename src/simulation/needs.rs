@@ -114,36 +114,52 @@ impl Needs {
     }
 }
 
-/// Rates in need-units per real second.
-/// Calibration: a game day is TICKS_PER_DAY=3600 ticks × 0.05s = 180 real sec.
-/// HUNGER_RATE 2.0 → 180 hunger accumulates in ~90 s → EAT_TRIGGER_HUNGER (180)
-/// hits twice per day. SLEEP_RATE 1.2 → ~216 sleep by end of day, peaks in
-/// Dusk/Night so SleepScorer × time_of_day_bonus fires once per day.
-const HUNGER_RATE: f32 = 2.0;
-/// Thirst decay per real second. Roughly 2× hunger so a fresh agent crosses
-/// `THIRST_TRIGGER` in ~45 s and severe (~230) in ~60 s; `con_scale` reduces
-/// decay for high-Constitution agents (same floor `0.25×` as hunger).
-const THIRST_RATE: f32 = 4.0;
-const SLEEP_RATE: f32 = 1.2;
-/// `needs.sleep` recovery per real second while `AiState::Sleeping` (doubled
-/// on a bed). Consumed by `sleep::sleep_task_system`, which owns recovery.
-pub const SLEEP_RECOVER_RATE: f32 = 6.0;
+// Rates declared as per-game-day totals; runtime per-real-second values
+// derive via `per_game_day_rate`, keeping daily accumulation invariant when
+// `TICKS_PER_DAY` (and therefore `SECONDS_PER_GAME_DAY`) changes.
+// A game day is `TICKS_PER_DAY=7200` ticks × 0.05 s = 360 real sec.
+// HUNGER 360/day → ~360 hunger by day end (EAT_TRIGGER_HUNGER=180 reached
+// twice per day). SLEEP 216/day → peaks in Dusk/Night so SleepScorer ×
+// time_of_day_bonus fires once per day.
+use crate::world::seasons::per_game_day_rate;
+
+const HUNGER_PER_DAY: f32 = 360.0;
+const HUNGER_RATE: f32 = per_game_day_rate(HUNGER_PER_DAY);
+/// Thirst — roughly 2× hunger so a fresh agent crosses `THIRST_TRIGGER` in
+/// ~45 s and severe (~230) in ~60 s; `con_scale` reduces decay for
+/// high-Constitution agents (same floor `0.25×` as hunger).
+const THIRST_PER_DAY: f32 = 720.0;
+const THIRST_RATE: f32 = per_game_day_rate(THIRST_PER_DAY);
+const SLEEP_PER_DAY: f32 = 216.0;
+const SLEEP_RATE: f32 = per_game_day_rate(SLEEP_PER_DAY);
+/// `needs.sleep` recovery while `AiState::Sleeping` (doubled on a bed).
+/// Consumed by `sleep::sleep_task_system`, which owns recovery.
+const SLEEP_RECOVER_PER_DAY: f32 = 1080.0;
+pub const SLEEP_RECOVER_RATE: f32 = per_game_day_rate(SLEEP_RECOVER_PER_DAY);
 /// `needs.sleep` below this retires the typed `Task::Sleep` (canonical wake).
 /// Consumed by `sleep::sleep_task_system`.
 pub const SLEEP_WAKE_THRESHOLD: f32 = 10.0;
-const SHELTER_RATE: f32 = 0.1;
-const SHELTER_FILL_PER_SCORE: f32 = 0.15; // filled per enclosure-score point per second
-const SAFETY_RATE: f32 = 0.1;
-const SOCIAL_RATE: f32 = 0.2;
-const REPRODUCTION_RATE: f32 = 0.1;
-/// Willpower drain while in a labor task (per real second).
-const WILLPOWER_WORK_DRAIN: f32 = 1.8;
-/// Baseline willpower drift while idle / not working (per real second).
-const WILLPOWER_IDLE_DRAIN: f32 = 0.15;
-/// Willpower regen while AiState::Sleeping (per real second). Doubled when
-/// the sleeper is on a bed, mirroring the bed bonus on SLEEP_RECOVER_RATE.
-/// Consumed by `sleep::sleep_task_system`, which owns recovery.
-pub const WILLPOWER_SLEEP_RECOVER: f32 = 3.0;
+const SHELTER_PER_DAY: f32 = 18.0;
+const SHELTER_RATE: f32 = per_game_day_rate(SHELTER_PER_DAY);
+const SHELTER_FILL_PER_SCORE_PER_DAY: f32 = 27.0; // filled per enclosure-score point per game day
+const SHELTER_FILL_PER_SCORE: f32 = per_game_day_rate(SHELTER_FILL_PER_SCORE_PER_DAY);
+const SAFETY_PER_DAY: f32 = 18.0;
+const SAFETY_RATE: f32 = per_game_day_rate(SAFETY_PER_DAY);
+const SOCIAL_PER_DAY: f32 = 36.0;
+const SOCIAL_RATE: f32 = per_game_day_rate(SOCIAL_PER_DAY);
+const REPRODUCTION_PER_DAY: f32 = 18.0;
+const REPRODUCTION_RATE: f32 = per_game_day_rate(REPRODUCTION_PER_DAY);
+/// Willpower drain while in a labor task.
+const WILLPOWER_WORK_DRAIN_PER_DAY: f32 = 324.0;
+const WILLPOWER_WORK_DRAIN: f32 = per_game_day_rate(WILLPOWER_WORK_DRAIN_PER_DAY);
+/// Baseline willpower drift while idle / not working.
+const WILLPOWER_IDLE_DRAIN_PER_DAY: f32 = 27.0;
+const WILLPOWER_IDLE_DRAIN: f32 = per_game_day_rate(WILLPOWER_IDLE_DRAIN_PER_DAY);
+/// Willpower regen while `AiState::Sleeping`. Doubled when the sleeper is
+/// on a bed, mirroring the bed bonus on SLEEP_RECOVER_RATE. Consumed by
+/// `sleep::sleep_task_system`, which owns recovery.
+const WILLPOWER_SLEEP_RECOVER_PER_DAY: f32 = 540.0;
+pub const WILLPOWER_SLEEP_RECOVER: f32 = per_game_day_rate(WILLPOWER_SLEEP_RECOVER_PER_DAY);
 
 pub fn tick_needs_system(
     time: Res<Time>,
@@ -201,7 +217,8 @@ pub fn tick_needs_system(
 
             // Campfire warmth: agents within 3 Manhattan tiles of a campfire
             // gain shelter and safety relief — fire keeps the cold and predators away.
-            const CAMPFIRE_WARMTH: f32 = 0.25;
+            const CAMPFIRE_WARMTH_PER_DAY: f32 = 45.0;
+            const CAMPFIRE_WARMTH: f32 = per_game_day_rate(CAMPFIRE_WARMTH_PER_DAY);
             let near_fire = campfire_map
                 .0
                 .keys()

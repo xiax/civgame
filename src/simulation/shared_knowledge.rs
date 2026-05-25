@@ -27,8 +27,8 @@ use bevy::prelude::*;
 pub const CLUSTER_MERGE_RADIUS: i32 = 8;
 pub const MAX_CLUSTER_RADIUS: u8 = 12;
 pub const REPRESENTATIVE_TILES: usize = 4;
-pub const CLUSTER_DECAY_TTL_TICKS: u64 = 3600 * 7; // 7 game-days
-pub const CLUSTER_DECAY_CADENCE: u64 = 3600; // 1 game-day
+pub const CLUSTER_DECAY_TTL_TICKS: u64 = crate::world::seasons::ticks_per_days_u64(7);
+pub const CLUSTER_DECAY_CADENCE: u64 = crate::world::seasons::TICKS_PER_DAY as u64;
 
 /// Stable identifier for a `ResourceCluster`. Allocated by `SharedKnowledge`
 /// and never reused — depleted clusters are removed from every index but

@@ -43,24 +43,34 @@ const CAT_REPRO_FEMALE_THRESHOLD: f32 = 170.0;
 const ANIMAL_SPEED: f32 = 32.0; // pixels/sec, slower than persons
 const WANDER_INTERVAL: f32 = 3.0;
 
-// Need rates
-const ANIMAL_HUNGER_RATE: f32 = 0.03;
-/// Animal thirst rate per real second. Roughly 2× hunger so animals seek
-/// water multiple times per game-day.
-const ANIMAL_THIRST_RATE: f32 = 0.06;
+// Need rates — declared as per-game-day totals; per-real-second values
+// derive via `per_game_day_rate` so doubling `TICKS_PER_DAY` doesn't
+// change how much an animal accrues per game day.
+const ANIMAL_HUNGER_PER_DAY: f32 = 5.4;
+const ANIMAL_HUNGER_RATE: f32 = crate::world::seasons::per_game_day_rate(ANIMAL_HUNGER_PER_DAY);
+/// Animal thirst — roughly 2× hunger so animals seek water multiple times
+/// per game-day.
+const ANIMAL_THIRST_PER_DAY: f32 = 10.8;
+const ANIMAL_THIRST_RATE: f32 = crate::world::seasons::per_game_day_rate(ANIMAL_THIRST_PER_DAY);
 /// Animal thirst threshold to interrupt Wander / Grazing and route to
 /// water. Predator chase / flight still preempt.
 pub const ANIMAL_THIRST_TRIGGER: f32 = 160.0;
 /// Thirst reduction per adjacency-drink for an animal.
 pub const ANIMAL_DRINK_THIRST_REDUCTION: f32 = 90.0;
-/// Animal sickness decay per real second. Tuned so a fresh `255` sickness
-/// burn-off settles inside ~1 game-day of dt.
-const ANIMAL_SICKNESS_DECAY_RATE: f32 = 1.5;
-const ANIMAL_SLEEP_RATE: f32 = 0.25;
-const ANIMAL_SLEEP_RECOVER_RATE: f32 = 2.5;
+/// Animal sickness decay. Tuned so a fresh `255` sickness burn-off settles
+/// inside ~1 game day.
+const ANIMAL_SICKNESS_DECAY_PER_DAY: f32 = 270.0;
+const ANIMAL_SICKNESS_DECAY_RATE: f32 =
+    crate::world::seasons::per_game_day_rate(ANIMAL_SICKNESS_DECAY_PER_DAY);
+const ANIMAL_SLEEP_PER_DAY: f32 = 45.0;
+const ANIMAL_SLEEP_RATE: f32 = crate::world::seasons::per_game_day_rate(ANIMAL_SLEEP_PER_DAY);
+const ANIMAL_SLEEP_RECOVER_PER_DAY: f32 = 450.0;
+const ANIMAL_SLEEP_RECOVER_RATE: f32 =
+    crate::world::seasons::per_game_day_rate(ANIMAL_SLEEP_RECOVER_PER_DAY);
 const ANIMAL_SLEEP_THRESHOLD: f32 = 180.0;
 const ANIMAL_SLEEP_WAKE_THRESHOLD: f32 = 20.0;
-const ANIMAL_REPRO_RATE: f32 = 0.04;
+const ANIMAL_REPRO_PER_DAY: f32 = 7.2;
+const ANIMAL_REPRO_RATE: f32 = crate::world::seasons::per_game_day_rate(ANIMAL_REPRO_PER_DAY);
 const ANIMAL_HUNGER_RECOVER_WOLF: f32 = 150.0;
 pub const ANIMAL_HUNGER_RECOVER_DEER: f32 = 80.0;
 const ANIMAL_HUNGER_RECOVER_FOX: f32 = 90.0;

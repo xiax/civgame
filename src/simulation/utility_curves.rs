@@ -121,7 +121,7 @@ pub fn material_deficit_utility(faction_deficit: u32, prof_affinity: f32) -> f32
 /// (~5 years). Tuned to stay above zero so adults still play, just less.
 #[inline]
 fn age_falloff(age_ticks: u64) -> f32 {
-    const TICKS_PER_YEAR: u64 = 3600 * 365;
+    const TICKS_PER_YEAR: u64 = crate::world::seasons::ticks_per_days_u64(365);
     let years = age_ticks as f32 / TICKS_PER_YEAR as f32;
     let t = smoothstep(years, 1.0, 5.0);
     1.0 - 0.6 * t
@@ -132,7 +132,7 @@ fn age_falloff(age_ticks: u64) -> f32 {
 /// in-game years lands fully past the `age_falloff` knee at one year,
 /// so every Person registered with this constant sees the adult
 /// (`0.4×`) youth multiplier.
-pub const ADULT_AGE_TICKS_PLACEHOLDER: u64 = 3600 * 365 * 5;
+pub const ADULT_AGE_TICKS_PLACEHOLDER: u64 = crate::world::seasons::ticks_per_days_u64(365 * 5);
 
 /// Map the world calendar's `TimePhase` to the `[0.0, 1.0]` bonus
 /// `sleep_utility` expects in its second argument — `Day` 0.0,
@@ -280,7 +280,7 @@ mod tests {
     fn play_curve_falls_with_age() {
         // Young (0 days) vs old (10 years), same willpower, same disposition
         let young = play_utility(50.0, 0, 128);
-        let old = play_utility(50.0, 3600 * 365 * 10, 128);
+        let old = play_utility(50.0, crate::world::seasons::ticks_per_days_u64(365 * 10), 128);
         assert!(young > old, "young {young} should > old {old}");
     }
 

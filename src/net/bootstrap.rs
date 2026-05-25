@@ -379,7 +379,7 @@ mod tests {
                 season: 2, // Autumn
                 day: 17,
                 ticks_this_day: 1200,
-                ticks_per_day: 3600,
+                ticks_per_day: crate::world::seasons::TICKS_PER_DAY,
                 days_per_season: 30,
                 year: 5,
             },

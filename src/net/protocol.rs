@@ -670,7 +670,7 @@ mod tests {
                 season: 1,
                 day: 12,
                 ticks_this_day: 800,
-                ticks_per_day: 3600,
+                ticks_per_day: crate::world::seasons::TICKS_PER_DAY,
                 days_per_season: 30,
                 year: 3,
             },

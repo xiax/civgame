@@ -22,10 +22,10 @@ use super::technology::{
 
 pub const KNOWLEDGE_SLOTS: usize = 64;
 
-/// One game-day (3600 ticks at 20 Hz × 180s) of study per complexity point.
-/// Cuneiform (complexity 6) takes 6 days of solo reading; a paleolithic tech
-/// takes one day. Lectures and 1-on-1 teaching contribute at higher rates.
-pub const STUDY_TICKS_PER_COMPLEXITY: u32 = 3600;
+/// One game-day of study per complexity point. Cuneiform (complexity 6) takes
+/// 6 days of solo reading; a paleolithic tech takes one day. Lectures and
+/// 1-on-1 teaching contribute at higher rates.
+pub const STUDY_TICKS_PER_COMPLEXITY: u32 = crate::world::seasons::TICKS_PER_DAY;
 
 /// Per-person knowledge state.
 ///
@@ -356,7 +356,7 @@ pub fn try_discover_from_action(
 
 /// Study-progress jump-start granted by a single discovery insight, per unit
 /// of tech complexity. `complexity × this` is capped strictly below
-/// `study_threshold(tech) = complexity × STUDY_TICKS_PER_COMPLEXITY (3600)`,
+/// `study_threshold(tech) = complexity × STUDY_TICKS_PER_COMPLEXITY`,
 /// so insight never auto-completes — the agent still needs Read/Lecture/Teach
 /// to push over the threshold.
 pub const INSIGHT_PROGRESS_PER_COMPLEXITY: u32 = 1200;

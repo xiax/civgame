@@ -51,11 +51,12 @@ pub const FALLOW_NUTRIENTS_PER_SEASON: u8 = 15;
 // seasonal `farm_pressure` signal read the same numbers. `organic_settlement`
 // re-exports these at the old paths so `parcel_targets` doesn't churn.
 
-/// Grain a person eats per game-year. Derivation: `HUNGER_RATE = 2.0`
-/// hunger/real-s; a game-day is `TICKS_PER_DAY = 3600` ticks × 0.05 s/tick
-/// (20 Hz) = 180 real-s ⇒ 360 hunger/day; grain is 150 cal/unit ⇒ 2.4
-/// grain/person/day; a year is 4 × `DAYS_PER_SEASON = 5` = 20 game-days ⇒
-/// 2.4 × 20 = 48. If those timescale knobs change, re-derive this.
+/// Grain a person eats per game-year. Derivation: continuous physiology
+/// targets `HUNGER_PER_DAY = 360` (see `needs.rs`); grain is 150 cal/unit
+/// ⇒ 2.4 grain/person/day; a year is 4 × `DAYS_PER_SEASON = 5` = 20
+/// game-days ⇒ 2.4 × 20 = 48. Per-game-day balance is invariant under
+/// `TICKS_PER_DAY` edits, so this constant survives timescale changes;
+/// re-derive only if `HUNGER_PER_DAY` or `DAYS_PER_SEASON` changes.
 pub const GRAIN_PER_PERSON_PER_YEAR: u32 = 48;
 /// Typical per-tile annual grain yield used for plot sizing — the middle
 /// nutrient tier (`grain_yield_for_nutrients`: ≥120 → 4).

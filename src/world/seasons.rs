@@ -1,8 +1,31 @@
 use bevy::prelude::*;
 
-pub const TICKS_PER_DAY: u32 = 3600;
+pub const SIM_TICKS_PER_SECOND: u32 = 20;
+pub const FIXED_TIMESTEP_SECS: f32 = 1.0 / SIM_TICKS_PER_SECOND as f32;
+pub const TICKS_PER_DAY: u32 = 7_200;
 pub const DAYS_PER_SEASON: u32 = 5; // ← change this to adjust timescale
+pub const DAYS_PER_YEAR: u32 = DAYS_PER_SEASON * 4;
 pub const TICKS_PER_SEASON: u32 = TICKS_PER_DAY * DAYS_PER_SEASON;
+pub const TICKS_PER_YEAR: u32 = TICKS_PER_DAY * DAYS_PER_YEAR;
+pub const SECONDS_PER_GAME_DAY: f32 = TICKS_PER_DAY as f32 * FIXED_TIMESTEP_SECS;
+
+#[inline]
+pub const fn ticks_per_days(days: u32) -> u32 {
+    TICKS_PER_DAY * days
+}
+
+#[inline]
+pub const fn ticks_per_days_u64(days: u64) -> u64 {
+    TICKS_PER_DAY as u64 * days
+}
+
+/// Converts a per-game-day amount into a per-real-second rate, for use with
+/// systems that accumulate via `value += rate * time.delta_secs()`. Keeps
+/// daily totals invariant when `TICKS_PER_DAY` changes.
+#[inline]
+pub const fn per_game_day_rate(amount_per_day: f32) -> f32 {
+    amount_per_day / SECONDS_PER_GAME_DAY
+}
 
 // Day-cycle phase cuts as a fraction of the day (`ticks_this_day / ticks_per_day`).
 // 0.0 is sunrise (start-of-day). The day rolls Dawn → Day → Dusk → Night and
@@ -226,6 +249,17 @@ mod tests {
         // + day 2.
         let expected = 2 * 4 * DAYS_PER_SEASON + DAYS_PER_SEASON + 2;
         assert_eq!(cal.total_days(), expected);
+    }
+
+    #[test]
+    fn timescale_constants_match_canonical_day() {
+        assert_eq!(TICKS_PER_DAY, 7_200);
+        assert_eq!(TICKS_PER_SEASON, 36_000);
+        assert_eq!(TICKS_PER_YEAR, 144_000);
+        assert!((SECONDS_PER_GAME_DAY - 360.0).abs() < 1e-6);
+        assert!((per_game_day_rate(360.0) - 1.0).abs() < 1e-6);
+        assert_eq!(ticks_per_days(3), TICKS_PER_DAY * 3);
+        assert_eq!(ticks_per_days_u64(7), TICKS_PER_DAY as u64 * 7);
     }
 
     #[test]

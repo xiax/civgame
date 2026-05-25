@@ -6,8 +6,8 @@ use crate::simulation::construction::BuildSiteKind;
 use crate::simulation::faction::PlayerFaction;
 
 const MAX_ENTRIES: usize = 16;
-const TICKS_PER_DAY: u64 = 3600;
-const DAYS_PER_SEASON: u64 = 5;
+const TICKS_PER_DAY: u64 = crate::world::seasons::TICKS_PER_DAY as u64;
+const DAYS_PER_SEASON: u64 = crate::world::seasons::DAYS_PER_SEASON as u64;
 
 #[derive(Event, Clone)]
 pub struct ActivityLogEvent {

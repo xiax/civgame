@@ -1477,9 +1477,16 @@ use super::person::Person;
 use super::schedule::SimClock;
 
 const PLAY_DURATION_TICKS: u32 = 100;
-const WILLPOWER_PLAY_GAIN_PER_ENT: f32 = 0.5;
+// Recovery rates declared as per-game-day coefficients; runtime per-real-
+// second values derive via `per_game_day_rate` so daily totals stay
+// invariant when `TICKS_PER_DAY` changes.
+const WILLPOWER_PLAY_GAIN_PER_ENT_PER_DAY: f32 = 90.0;
+const WILLPOWER_PLAY_GAIN_PER_ENT: f32 =
+    crate::world::seasons::per_game_day_rate(WILLPOWER_PLAY_GAIN_PER_ENT_PER_DAY);
 const SOCIAL_PLAY_PARTNER_VALUE: f32 = 30.0;
-const SOCIAL_PLAY_FILL_RATE: f32 = 0.4; // social need drop per sec for both parties
+const SOCIAL_PLAY_FILL_PER_DAY: f32 = 7200.0; // social need fill across one full game day of play
+const SOCIAL_PLAY_FILL_RATE: f32 =
+    crate::world::seasons::per_game_day_rate(SOCIAL_PLAY_FILL_PER_DAY);
 const PLAY_FULL_WILLPOWER: f32 = 230.0;
 
 fn highest_held_entertainment(carrier: &Carrier) -> u8 {

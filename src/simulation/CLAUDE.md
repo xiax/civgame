@@ -53,7 +53,7 @@ Agent AI, factions, knowledge, hunting, typed-task pipeline, pluralist economy. 
 
 ### Needs
 
-7 needs (hunger, thirst, sleep, shelter, safety, social, reproduction), `[0,255]`, decay over time. Maslow tiers (`Physiological → Safety → Belonging → Esteem → SelfActualization`) via `MaslowTier::next_unmet(needs)`. Decay rates anchored on 180-sec game-day: `HUNGER_RATE = 2.0/s`, `SLEEP_RATE = 1.2/s` paired with `SLEEP_RECOVER_RATE = 6.0/s` (12.0 on bed). `WILLPOWER_WORK_DRAIN = 1.8/s`, `WILLPOWER_IDLE_DRAIN = 0.15/s`. `con_scale` attenuates hunger+sleep decay (floor 0.25×). `tick_needs_system` only accrues sleep need (when not `Sleeping`); `sleep::sleep_task_system` (Sequential) owns sleep recovery + retirement keyed on typed `Task::Sleep` (not `ai.state`).
+7 needs (hunger, thirst, sleep, shelter, safety, social, reproduction), `[0,255]`, decay over time. Maslow tiers (`Physiological → Safety → Belonging → Esteem → SelfActualization`) via `MaslowTier::next_unmet(needs)`. **Rates are per-game-day targets** (e.g. `HUNGER_PER_DAY = 360`, `THIRST_PER_DAY = 720`, `SLEEP_PER_DAY = 216` / `SLEEP_RECOVER_PER_DAY = 1080`, `WILLPOWER_WORK_DRAIN_PER_DAY = 324`, `WILLPOWER_IDLE_DRAIN_PER_DAY = 27`) converted to per-real-second runtime rates via `world::seasons::per_game_day_rate`. Daily totals stay invariant when `TICKS_PER_DAY` changes (current default 7200 ticks ≈ 360 real-sec/game-day at 20 Hz). Bed bonus doubles sleep/willpower recovery. `con_scale` attenuates hunger+sleep decay (floor 0.25×). `tick_needs_system` only accrues sleep need (when not `Sleeping`); `sleep::sleep_task_system` (Sequential) owns sleep recovery + retirement keyed on typed `Task::Sleep` (not `ai.state`).
 
 ### Energy (`energy.rs`)
 
@@ -331,7 +331,7 @@ OnEnter coverage in `test_fixture::onenter_era_seeding`: drives state transition
 - **Decay:** `derive_tech_adoption_system` symmetric — falling conditions walk stage down. Downgrades throttled one stage/day; upgrades immediate.
 - **Founder seeding (`PersonKnowledge::seeded_realistic_through_era`):** chief learns Personal+Household+Subsistence+Specialist+Institutional through era ≤ E; ~1/8 members Specialist (+MilitaryTransport); rest Personal+Household+Subsistence Learned. Everyone Aware of full era.
 - **Tablets and books:** `Good::ClayTablet` and `Good::Book` carry `Item.tech_payload: Option<TechId>`. Recipes gated `CUNEIFORM_WRITING`, Workbench. Reading doesn't consume.
-- **Tablet posting (`chief_tablet_posting_system`):** every 3600 ticks. Picks highest-complexity chief-Learned bit that <50% adults are Aware of, posts `JobKind::Craft` with `tech_payload`. Player override via `PlayerCraftRequest` (`JobSource::Player`, priority 180).
+- **Tablet posting (`chief_tablet_posting_system`):** every `TICKS_PER_DAY` (once per game-day). Picks highest-complexity chief-Learned bit that <50% adults are Aware of, posts `JobKind::Craft` with `tech_payload`. Player override via `PlayerCraftRequest` (`JobSource::Player`, priority 180).
 - **Tech tree (`technology.rs`):** 50 techs, 5 eras, prereq DAG, per-tech `triggers: &[TechTrigger]`. `TechBonus` adds yield/storage/combat bonuses; aggregate via `faction.techs` (chief-aware). Bronze-Age war-vehicle line: `SIEGE_ENGINEERING (47)`, `ARMOR_PLATING (48)`, `POWERED_TRACTION (49)`.
 
 ## Ranged combat (`combat.rs`)

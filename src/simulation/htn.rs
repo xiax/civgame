@@ -13562,19 +13562,20 @@ mod tests {
 
     #[test]
     fn calendar_time_phase_buckets_match_constants() {
-        // Spot-check the day-cycle phase cuts. Calendar at default
-        // ticks_per_day=3600 — phases per PHASE_*_START constants
+        // Spot-check the day-cycle phase cuts, expressed as fractions of
+        // `TICKS_PER_DAY` so this test is timescale-agnostic.
         // (Dawn 0.0–0.05, Day 0.05–0.65, Dusk 0.65–0.85, Night 0.85–1.0).
+        use crate::world::seasons::TICKS_PER_DAY;
         let mut cal = crate::world::seasons::Calendar::default();
-        cal.ticks_this_day = 100; // ~0.028 → Dawn
+        cal.ticks_this_day = TICKS_PER_DAY / 36; // ~0.028 → Dawn
         assert_eq!(cal.time_phase(), TimePhase::Dawn);
-        cal.ticks_this_day = 800; // ~0.222 → Day
+        cal.ticks_this_day = TICKS_PER_DAY * 22 / 100; // ~0.22  → Day
         assert_eq!(cal.time_phase(), TimePhase::Day);
-        cal.ticks_this_day = 1800; // 0.5 → Day
+        cal.ticks_this_day = TICKS_PER_DAY / 2; // 0.5   → Day
         assert_eq!(cal.time_phase(), TimePhase::Day);
-        cal.ticks_this_day = 2500; // ~0.694 → Dusk
+        cal.ticks_this_day = TICKS_PER_DAY * 7 / 10; // 0.70  → Dusk
         assert_eq!(cal.time_phase(), TimePhase::Dusk);
-        cal.ticks_this_day = 3300; // ~0.917 → Night
+        cal.ticks_this_day = TICKS_PER_DAY * 92 / 100; // 0.92  → Night
         assert_eq!(cal.time_phase(), TimePhase::Night);
     }
 

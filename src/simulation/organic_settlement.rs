@@ -4078,6 +4078,13 @@ fn single_tile_clear(
         || maps.bed_map.0.contains_key(&tile)
         || doormat.is_reserved(tile)
         || brain.road_tiles.contains(&tile)
+        // The widened corridor includes the perpendicular tile next to each
+        // spine cell — what `road_carve_system` actually paints. Parcel
+        // allocation already rejects against this; if a footprint enumerator
+        // (residential evaluator or seed radial fallback) anchors inside or
+        // straddles a corridor tile, the carver will later paint Road on
+        // top of the wall and break pathfinding through the dwelling.
+        || brain.road_corridor_tiles.contains(&tile)
     {
         return false;
     }

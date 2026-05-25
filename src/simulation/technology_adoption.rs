@@ -38,9 +38,9 @@ use crate::simulation::technology::{
     WELL_DIGGING, ARMOR_PLATING, POWERED_TRACTION, SIEGE_ENGINEERING,
 };
 
-pub const TICKS_PER_DAY: u32 = 3600;
+pub use crate::world::seasons::TICKS_PER_DAY;
 pub const TICKS_PER_GAME_YEAR: u32 = TICKS_PER_DAY * 20;
-pub const ADOPTION_DERIVE_CADENCE: u32 = TICKS_PER_DAY / 4; // every 900 ticks
+pub const ADOPTION_DERIVE_CADENCE: u32 = TICKS_PER_DAY / 4;
 
 /// How "Adopted" a tech is across a faction. Stored as a packed `u8` per
 /// tech on `FactionData.tech_adoption`. Order matters — `as u8` comparisons
