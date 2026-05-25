@@ -76,7 +76,7 @@ pub struct Pregnancy {
     /// Snapshot of the father's `PersonKnowledge.aware | learned` at conception,
     /// so the child still inherits paternal awareness if the father dies or
     /// wanders out of range before birth.
-    pub father_known: u64,
+    pub father_known: crate::simulation::knowledge_bits::KnowledgeBits,
     pub faction_id: u32,
 }
 
@@ -84,7 +84,7 @@ impl Pregnancy {
     pub fn new(
         father: Entity,
         father_stats: Option<Stats>,
-        father_known: u64,
+        father_known: crate::simulation::knowledge_bits::KnowledgeBits,
         faction_id: u32,
     ) -> Self {
         Self {
@@ -276,7 +276,7 @@ pub fn wake_up_conception_system(
         faction_id: u32,
         mother_transform: Transform,
         father_stats: Option<Stats>,
-        father_known: u64,
+        father_known: crate::simulation::knowledge_bits::KnowledgeBits,
         female_pregnant: bool,
         success: bool,
     }
@@ -286,7 +286,7 @@ pub fn wake_up_conception_system(
     //            aliasing this read-only borrow.
     struct MaleSnapshot {
         father_stats: Option<Stats>,
-        father_known: u64,
+        father_known: crate::simulation::knowledge_bits::KnowledgeBits,
         cooldown: u32,
         sex: BiologicalSex,
         faction_id: u32,
@@ -299,7 +299,9 @@ pub fn wake_up_conception_system(
                     e,
                     MaleSnapshot {
                         father_stats: stats.copied(),
-                        father_known: knowledge.map_or(0u64, |k| k.aware | k.learned),
+                        father_known: knowledge
+                            .map(|k| k.awareness_snapshot())
+                            .unwrap_or_default(),
                         cooldown: cd.0,
                         sex: *sex,
                         faction_id: fm.faction_id,
@@ -444,7 +446,14 @@ pub fn pregnancy_system(
         Option<&HouseholdMember>,
     )>,
 ) {
-    let mut births: Vec<(Entity, Transform, u32, Stats, u64, Option<HouseholdMember>)> = Vec::new();
+    let mut births: Vec<(
+        Entity,
+        Transform,
+        u32,
+        Stats,
+        crate::simulation::knowledge_bits::KnowledgeBits,
+        Option<HouseholdMember>,
+    )> = Vec::new();
 
     for (
         mother,
@@ -469,8 +478,10 @@ pub fn pregnancy_system(
             (Some(p), None) | (None, Some(p)) => Stats::inherit(p, p),
             (None, None) => Stats::roll_3d6(),
         };
-        let mother_known = mother_knowledge.map_or(0u64, |k| k.aware | k.learned);
-        let inherited_aware = mother_known | preg.father_known;
+        let mother_known = mother_knowledge
+            .map(|k| k.awareness_snapshot())
+            .unwrap_or_default();
+        let inherited_aware = mother_known.union(&preg.father_known);
         births.push((
             mother,
             *transform,
@@ -566,9 +577,11 @@ pub fn pregnancy_system(
                     crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Person),
                     crate::simulation::knowledge::PersonKnowledge {
                         aware: inherited_aware,
-                        learned: 0,
-                        learned_at: [0u32; crate::simulation::knowledge::KNOWLEDGE_SLOTS],
+                        learned: crate::simulation::knowledge_bits::KnowledgeBits::EMPTY,
+                        learned_at: ahash::AHashMap::new(),
                         study_progress: ahash::AHashMap::new(),
+                        mastery: ahash::AHashMap::new(),
+                        belief: ahash::AHashMap::new(),
                     },
                     crate::simulation::typed_task::ActionQueue::idle(),
                     crate::simulation::goal_scorers::AgentDecisionState::default(),

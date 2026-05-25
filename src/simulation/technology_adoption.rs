@@ -36,6 +36,15 @@ use crate::simulation::technology::{
     PERM_SETTLEMENT, PORTABLE_DWELLINGS, POTTERS_WHEEL, PROFESSIONAL_ARMY, SACRED_RITUAL,
     SADDLE_QUERN, SCALE_ARMOR, TALLY_MARKS, TECH_COUNT, TECH_TREE, TIN_PROSPECTING, WAR_CHARIOT,
     WELL_DIGGING, ARMOR_PLATING, POWERED_TRACTION, SIEGE_ENGINEERING,
+    ADOBE_BRICK, ASHLAR_DRESSING, COB_WALLING, CUT_STONE_MASONRY, DRY_STONE_WALLING,
+    HYDRAULIC_MASONRY, MUDBRICK_MOULDING, PIT_HOUSE, REED_MATTING, STAKE_AND_HIDE_TENT,
+    THATCH_ROOFING, TIMBER_LONGHOUSE_FRAMING, WATTLE_AND_DAUB, WATTLE_SCREENS,
+    // Phase G foundations:
+    ANIMAL_TRACKING, CLAY_TOKENS, CORDAGE, EDGE_GEOMETRY, EMBER_CARRYING, FIRE_USE, HAFTING,
+    HIDE_WORKING, MEASURES_AND_UNITS, ORAL_TRADITION, PRACTICAL_GEOMETRY, RATION_ARITHMETIC,
+    ROUTE_MEMORY, SEASONAL_MEMORY, TOOLSTONE_RECOGNITION, WATER_SOURCE_MEMORY,
+    // Phase H beliefs:
+    ECLIPSE_OMENS, GEOCENTRIC_COSMOS, MIASMA_THEORY, SKY_DOME, SPIRIT_ILLNESS, WEATHER_OMENS,
 };
 
 pub use crate::world::seasons::TICKS_PER_DAY;
@@ -119,6 +128,42 @@ pub fn tech_scale(tech: TechId) -> AdoptionScale {
         // Household default catches FOOD_SMOKING, DRIED_MEAT, and any future
         // additions until they're explicitly classified.
         FOOD_SMOKING | DRIED_MEAT => AdoptionScale::Household,
+        // Building techniques (Phase E). Simple subsistence-scale practices
+        // — every adult in the band can help build under the supervision of
+        // experienced kin. Stake-and-Hide / Pit House / Reed / Wattle Screens
+        // are Mesolithic-or-earlier band practice. Wattle and Daub / Cob /
+        // Adobe / Mudbrick / Dry-Stone / Timber Framing / Thatch are
+        // Neolithic kin-and-neighbour work parties. Cut-Stone / Ashlar /
+        // Hydraulic are Specialist — they need trained masons.
+        STAKE_AND_HIDE_TENT
+        | REED_MATTING
+        | WATTLE_SCREENS
+        | PIT_HOUSE
+        | WATTLE_AND_DAUB
+        | TIMBER_LONGHOUSE_FRAMING
+        | THATCH_ROOFING
+        | COB_WALLING
+        | ADOBE_BRICK
+        | MUDBRICK_MOULDING
+        | DRY_STONE_WALLING => AdoptionScale::Subsistence,
+        CUT_STONE_MASONRY | ASHLAR_DRESSING | HYDRAULIC_MASONRY => AdoptionScale::Specialist,
+        // Phase G foundations — `Personal` so every founder Learns the
+        // era-≤-target subset via `seeded_realistic_through_era`. The plan
+        // promises "every era-N starting founder has all era ≤ N
+        // foundations Learned" — that's exactly what Personal-scale buys
+        // (the existing seed loop Learns Personal/Household/Subsistence
+        // unconditionally for every role).
+        FIRE_USE | EMBER_CARRYING | TOOLSTONE_RECOGNITION | EDGE_GEOMETRY | CORDAGE | HAFTING
+        | HIDE_WORKING | ANIMAL_TRACKING | SEASONAL_MEMORY | ORAL_TRADITION | ROUTE_MEMORY
+        | WATER_SOURCE_MEMORY | CLAY_TOKENS | MEASURES_AND_UNITS | RATION_ARITHMETIC
+        | PRACTICAL_GEOMETRY => AdoptionScale::Personal,
+        // Phase H beliefs — Personal scale so `seeded_realistic_through_era`
+        // marks them Aware on every founder. **Belief acceptance is
+        // populated separately** by `seed_initial_beliefs` (a Belief is
+        // held, not Learned — the `learned` bitset stays off; the per-group
+        // `belief` map carries `accepted` + `confidence`).
+        SKY_DOME | GEOCENTRIC_COSMOS | SPIRIT_ILLNESS | MIASMA_THEORY | ECLIPSE_OMENS
+        | WEATHER_OMENS => AdoptionScale::Personal,
         _ => AdoptionScale::Household,
     }
 }
@@ -438,7 +483,7 @@ pub fn derive_tech_adoption_system(
                 [PerTechCounts::default(); TECH_COUNT],
             ),
         };
-        let chief_techs = faction.techs.0;
+        let chief_techs = faction.techs;
         let workshops_owned = workshops.workshops_for(*fid);
         let has_workshop = |k: WorkshopKind| workshops_owned.iter().any(|w| w.kind == k);
 
@@ -457,7 +502,7 @@ pub fn derive_tech_adoption_system(
             let idx = id as usize;
             let scale = tech_scale(id);
             let c = counts[idx];
-            let chief_aware = chief_techs & (1u64 << id) != 0;
+            let chief_aware = chief_techs.has(id);
             let chief_learned = chief_aware
                 && faction
                     .chief_entity

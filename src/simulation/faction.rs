@@ -2204,25 +2204,48 @@ impl FactionLineage {
     }
 }
 
-/// u64 bitset storing which technologies are unlocked (bits 0-42).
+/// Bitset over `KnowledgeId` (formerly `TechId`). Widened from a single `u64`
+/// to `KnowledgeBits([u64; 2])` so the knowledge catalog can grow past 64
+/// entries. Field is still `pub` so legacy `.0` access stays available, but
+/// callers should prefer the typed `has` / `unlock` / `union` methods.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct FactionTechs(pub u64);
+pub struct FactionTechs(pub crate::simulation::knowledge_bits::KnowledgeBits);
 
 impl FactionTechs {
     #[inline]
     pub fn has(&self, id: TechId) -> bool {
-        self.0 & (1u64 << id) != 0
+        self.0.has(id)
     }
     #[inline]
     pub fn unlock(&mut self, id: TechId) {
-        self.0 |= 1u64 << id;
+        self.0.set(id);
     }
     /// Bitwise OR of two tech sets. Used by the construction poster pool
     /// to fold resident chief + architect Learned snapshots into the
     /// settlement's buildable surface.
     #[inline]
     pub fn union(&self, other: &FactionTechs) -> FactionTechs {
-        FactionTechs(self.0 | other.0)
+        FactionTechs(self.0.union(&other.0))
+    }
+    /// Population count — number of techs in the set.
+    #[inline]
+    pub fn count(&self) -> u32 {
+        self.0.count()
+    }
+    /// True when no techs are set.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    /// Clear the entire bitset.
+    #[inline]
+    pub fn clear_all(&mut self) {
+        self.0 = crate::simulation::knowledge_bits::KnowledgeBits::EMPTY;
+    }
+    /// Remove a single tech from the set.
+    #[inline]
+    pub fn forget(&mut self, id: TechId) {
+        self.0.clear(id);
     }
 }
 
@@ -2561,6 +2584,16 @@ pub struct FactionData {
     pub craft_demand: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
     /// The current tribal chief of this faction, if one has been designated.
     pub chief_entity: Option<Entity>,
+    /// **Phase H** — chief's accepted disease-causation belief, cached for
+    /// hot-path consumers (`organic_settlement::pressure_to_intent` reads
+    /// this to lift latrine + well intent priority when Miasma Theory is
+    /// the chief's working model). Updated alongside `techs` in
+    /// `sync_faction_techs_from_chief_system`. `None` when the chief
+    /// hasn't been resolved or holds no belief in the group.
+    pub chief_disease_belief: Option<crate::simulation::technology::TechId>,
+    /// **Phase H** — chief's accepted cosmology, used by future ritual /
+    /// monument-orientation logic (Phase H.3+). Updated alongside `techs`.
+    pub chief_cosmology_belief: Option<crate::simulation::technology::TechId>,
     /// Architectural / behavioural personality. Drives planner, selector,
     /// raids, rituals.
     pub culture: FactionCulture,
@@ -2894,6 +2927,8 @@ impl FactionRegistry {
                 resource_demand: ahash::AHashMap::default(),
                 craft_demand: ahash::AHashMap::default(),
                 chief_entity: None,
+                chief_disease_belief: None,
+                chief_cosmology_belief: None,
                 culture,
                 lineage,
                 active_upgrade: None,
@@ -4331,6 +4366,9 @@ pub fn sync_faction_techs_from_chief_system(
     mut registry: ResMut<FactionRegistry>,
     chief_q: Query<&crate::simulation::knowledge::PersonKnowledge>,
 ) {
+    use crate::simulation::knowledge_catalog::{
+        BELIEF_GROUP_COSMOLOGY, BELIEF_GROUP_DISEASE_CAUSATION,
+    };
     for (_id, faction) in registry.factions.iter_mut() {
         let Some(chief) = faction.chief_entity else {
             continue;
@@ -4339,12 +4377,18 @@ pub fn sync_faction_techs_from_chief_system(
             continue;
         };
         // Mask to valid tech bits (lower TECH_COUNT) to keep the bitset clean.
-        let mask = if TECH_COUNT >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << TECH_COUNT) - 1
-        };
-        faction.techs.0 = knowledge.aware & mask;
+        let mask = crate::simulation::knowledge_bits::KnowledgeBits::lower_mask(TECH_COUNT);
+        faction.techs.0 = knowledge.aware.intersect(&mask);
+        // **Phase H** — cache chief's accepted disease + cosmology belief
+        // ids so hot-path consumers (latrine intent priority, future
+        // ritual/monument logic) read them without a PersonKnowledge
+        // query.
+        faction.chief_disease_belief = knowledge
+            .belief_in(BELIEF_GROUP_DISEASE_CAUSATION)
+            .map(|s| s.accepted);
+        faction.chief_cosmology_belief = knowledge
+            .belief_in(BELIEF_GROUP_COSMOLOGY)
+            .map(|s| s.accepted);
     }
 }
 

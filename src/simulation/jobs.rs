@@ -4093,7 +4093,7 @@ pub fn chief_tablet_posting_system(
         let Ok(chief_knowledge) = knowledge_query.get(chief_e) else {
             continue;
         };
-        if chief_knowledge.learned == 0 {
+        if chief_knowledge.learned.is_empty() {
             continue;
         }
 

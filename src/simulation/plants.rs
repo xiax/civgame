@@ -219,7 +219,16 @@ impl PlantKind {
             // reap 1) so a seed-short founding village can never ramp toward
             // its demand target; +2 lets the stock grow year-over-year while
             // staying bounded.
-            PlantKind::Grain => vec![(core_ids::grain_seed(), 2)],
+            //
+            // Phase F (knowledge-system overhaul): a single bundle of thatch
+            // co-yields with every grain harvest. Stalks come off the field
+            // alongside grain — at this rate a 50-tile field generates 50
+            // thatch over the autumn, easily covering the roofing demand of
+            // a Neolithic village.
+            PlantKind::Grain => vec![
+                (core_ids::grain_seed(), 2),
+                (core_ids::thatch(), 1),
+            ],
             PlantKind::BerryBush => {
                 vec![(core_ids::berry_seed(), 1)]
             }

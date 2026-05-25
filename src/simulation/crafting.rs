@@ -193,6 +193,8 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
     let sickle = core_ids::sickle();
     let awl = core_ids::awl();
     let fishing_kit = core_ids::fishing_kit();
+    let limestone = core_ids::limestone();
+    let lime = core_ids::lime();
     // Realistic Tool Overhaul tool-requirement shorthands.
     let cut = ToolRequirement::any(ToolUseKind::Cut);
     let chop = ToolRequirement::any(ToolUseKind::Chop);
@@ -635,6 +637,26 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
         tool_recipe("Bronze Fishing Kit", vec![(copper, 1), (tin, 1), (skin, 1)], fishing_kit,
             ItemMaterial::Bronze, 50, 10, BRONZE_TOOLS, vec![hammer_copper], None,
             Some(WorkbenchTier::Bronze)),
+        // 46 — Phase F: Burn quarried limestone into lime in a wood-fired
+        // kiln. `FIRED_POTTERY`-gated (the same kiln Pottery uses); Workbench-
+        // bound at the cadence of pottery cycles. 2 limestone + 1 wood (the
+        // wood is fuel, not structural) → 1 lime. Recipe is the gateway to
+        // every mortar-class technique (Cut Stone Masonry, Hydraulic Masonry,
+        // Lime Plaster).
+        CraftRecipe {
+            name: "Burn Lime",
+            inputs: vec![(limestone, 2), (wood, 1)],
+            output_resource: lime,
+            output_qty: 1,
+            output_material: None,
+            work_ticks: 60,
+            crafting_xp: 4,
+            tech_gate: Some(FIRED_POTTERY),
+            requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![],
+            quality_floor: None,
+            min_station_tier: None,
+        },
     ]
 }
 
@@ -1428,8 +1450,8 @@ mod tests {
         let recipes = craft_recipes();
         assert_eq!(
             recipes.len(),
-            46,
-            "expected 46 recipes (21 legacy + 25 Realistic Tool Overhaul); \
+            47,
+            "expected 47 recipes (21 legacy + 25 Realistic Tool Overhaul + 1 Phase F Burn Lime); \
              counts feed CraftOrder.recipe_id wire format"
         );
 
@@ -1512,14 +1534,59 @@ mod tests {
         assert_eq!(bronze_axe.tool_requirements.len(), 1);
         assert_eq!(bronze_axe.tool_requirements[0].min_tier, ToolTier::Copper);
 
-        // Every appended recipe (21..) outputs a known tool form.
-        for r in &recipes[21..] {
+        // Every appended tool recipe (21..46) outputs a known tool form.
+        // Recipes after 45 are Phase F construction-material entries (Burn
+        // Lime, etc.) — not tools, skip.
+        for r in &recipes[21..46] {
             assert!(
                 ToolForm::from_resource_id(r.output_resource).is_some(),
                 "recipe {} should output a tool form",
                 r.name
             );
         }
+    }
+
+    /// Phase F (knowledge-system overhaul): Burn Lime resolves to recipe 46
+    /// with the expected inputs/output/gate. Locking this contract because
+    /// future construction-technique recipes will compose against it.
+    #[test]
+    fn burn_lime_recipe_phase_f() {
+        let recipes = craft_recipes();
+        let burn = &recipes[46];
+        assert_eq!(burn.name, "Burn Lime");
+        assert_eq!(
+            burn.inputs,
+            vec![(core_ids::limestone(), 2), (core_ids::wood(), 1)]
+        );
+        assert_eq!(burn.output_resource, core_ids::lime());
+        assert_eq!(burn.output_qty, 1);
+        assert_eq!(
+            burn.tech_gate,
+            Some(crate::simulation::technology::FIRED_POTTERY)
+        );
+        assert!(matches!(
+            burn.requires_station,
+            Some(crate::simulation::crafting::StationKind::Workbench)
+        ));
+    }
+
+    /// Phase F: grain harvest co-yields a thatch bundle alongside grain seeds.
+    /// Locking the contract so Phase E's Thatch Roofing technique recipe has
+    /// a reliable upstream supply.
+    #[test]
+    fn grain_harvest_yields_thatch_byproduct_phase_f() {
+        use crate::simulation::plants::PlantKind;
+        let extras = PlantKind::Grain.harvest_extra_yields();
+        let thatch = core_ids::thatch();
+        let grain_seed = core_ids::grain_seed();
+        assert!(
+            extras.iter().any(|(rid, _)| *rid == thatch),
+            "Grain.harvest_extra_yields should include thatch"
+        );
+        assert!(
+            extras.iter().any(|(rid, _)| *rid == grain_seed),
+            "Grain.harvest_extra_yields should still include grain_seed"
+        );
     }
 
     /// `effective_quality` lifts a low skill result up to the recipe floor

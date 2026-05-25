@@ -214,7 +214,7 @@ pub fn debug_panel_system(
                                 }
                             }
                             if ui.button("Lock All").clicked() {
-                                faction.techs.0 = 0;
+                                faction.techs.clear_all();
                             }
                         });
                         ui.add_space(4.0);
@@ -252,7 +252,7 @@ pub fn debug_panel_system(
                                             |ui| {
                                                 if unlocked {
                                                     if ui.small_button("Lock").clicked() {
-                                                        faction.techs.0 &= !(1u64 << tech.id);
+                                                        faction.techs.forget(tech.id);
                                                     }
                                                 } else if ui.small_button("Unlock").clicked() {
                                                     faction.techs.unlock(tech.id);

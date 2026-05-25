@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 pub type TechId = u16;
-pub const TECH_COUNT: usize = 50;
+pub const TECH_COUNT: usize = 86;
 pub const ACTIVITY_COUNT: usize = 14;
 
 // ── Tech ID constants ─────────────────────────────────────────────────────────
@@ -76,6 +76,65 @@ pub const DAM_BUILDING: TechId = 46;
 pub const SIEGE_ENGINEERING: TechId = 47;
 pub const ARMOR_PLATING: TechId = 48;
 pub const POWERED_TRACTION: TechId = 49;
+
+// ── Building techniques (Phase E of the knowledge-system overhaul) ─────────
+// Construction-domain `KnowledgeKind::PracticalTechnique` entries. Each
+// technique gates one `BuildingTechnique` variant in `building_technique.rs`
+// and maps to a `WallMaterial` for the render/combat surface. Prereqs only
+// reference existing techs or earlier-listed new techniques so the
+// "prereqs are strictly lower id" catalog invariant holds.
+pub const STAKE_AND_HIDE_TENT: TechId = 50;
+pub const REED_MATTING: TechId = 51;
+pub const WATTLE_SCREENS: TechId = 52;
+pub const PIT_HOUSE: TechId = 53;
+pub const WATTLE_AND_DAUB: TechId = 54;
+pub const TIMBER_LONGHOUSE_FRAMING: TechId = 55;
+pub const THATCH_ROOFING: TechId = 56;
+pub const COB_WALLING: TechId = 57;
+pub const ADOBE_BRICK: TechId = 58;
+pub const MUDBRICK_MOULDING: TechId = 59;
+pub const DRY_STONE_WALLING: TechId = 60;
+pub const CUT_STONE_MASONRY: TechId = 61;
+pub const ASHLAR_DRESSING: TechId = 62;
+pub const HYDRAULIC_MASONRY: TechId = 63;
+
+// ── Foundational knowledge (Phase G of the knowledge-system overhaul) ──────
+// Universal `AdoptionScale::Personal` knowledge — every founder is born
+// knowing the era-≤-target foundations regardless of role. `tech_scale` arms
+// classify these as Personal so `seeded_realistic_through_era` auto-Learns
+// them on every founder. Catalog `KnowledgeKind` is `Lore` for memory /
+// recall entries and `PracticalSkill` for the doing entries. No retroactive
+// prereq additions to existing techs (per the Phase G design rule).
+pub const FIRE_USE: TechId = 64;
+pub const EMBER_CARRYING: TechId = 65;
+pub const TOOLSTONE_RECOGNITION: TechId = 66;
+pub const EDGE_GEOMETRY: TechId = 67;
+pub const CORDAGE: TechId = 68;
+pub const HAFTING: TechId = 69;
+pub const HIDE_WORKING: TechId = 70;
+pub const ANIMAL_TRACKING: TechId = 71;
+pub const SEASONAL_MEMORY: TechId = 72;
+pub const ORAL_TRADITION: TechId = 73;
+pub const ROUTE_MEMORY: TechId = 74;
+pub const WATER_SOURCE_MEMORY: TechId = 75;
+pub const CLAY_TOKENS: TechId = 76;
+pub const MEASURES_AND_UNITS: TechId = 77;
+pub const RATION_ARITHMETIC: TechId = 78;
+pub const PRACTICAL_GEOMETRY: TechId = 79;
+
+// ── Beliefs (Phase H of the knowledge-system overhaul) ─────────────────────
+// `KnowledgeKind::Belief` entries — held with confidence in a belief group,
+// no mastery. Cosmology / disease_causation / omens groups defined in
+// `knowledge_catalog.rs`. Truth status varies (FalseUseful drives positive
+// behaviour despite being wrong; FalseHarmful biases the agent away from
+// what works). Heliocentric / Contagion / Empirical Forecasting reserved
+// for the post-Bronze content pass.
+pub const SKY_DOME: TechId = 80;
+pub const GEOCENTRIC_COSMOS: TechId = 81;
+pub const SPIRIT_ILLNESS: TechId = 82;
+pub const MIASMA_THEORY: TechId = 83;
+pub const ECLIPSE_OMENS: TechId = 84;
+pub const WEATHER_OMENS: TechId = 85;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -1220,6 +1279,395 @@ pub static TECH_TREE: [TechDef; TECH_COUNT] = [
         triggers: &[],
         bonus: TechBonus::ZERO,
     },
+    // ── Building techniques (Phase E) ────────────────────────────────────
+    TechDef {
+        id: STAKE_AND_HIDE_TENT,
+        era: Era::Paleolithic,
+        name: "Stake-and-Hide Tent",
+        description: "Hide stretched over a wooden pole frame — the original portable shelter.",
+        prerequisites: &[HUNTING_SPEAR, FOOD_SMOKING],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::WoodGathering,
+            per_unit_chance: 0.001,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: REED_MATTING,
+        era: Era::Mesolithic,
+        name: "Reed Matting",
+        description: "Bundled reeds woven into wall screens, roofing panels, and floor mats.",
+        prerequisites: &[BONE_TOOLS],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::Foraging,
+            per_unit_chance: 0.001,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: WATTLE_SCREENS,
+        era: Era::Mesolithic,
+        name: "Wattle Screens",
+        description: "Pliable hazel rods woven through upright stakes — wind-break panels and \
+             light enclosures.",
+        prerequisites: &[BONE_TOOLS],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::WoodGathering,
+            per_unit_chance: 0.002,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: PIT_HOUSE,
+        era: Era::Mesolithic,
+        name: "Pit House",
+        description: "Semi-subterranean dwelling: shallow pit, sloped earth berm, light timber roof.",
+        prerequisites: &[BONE_TOOLS],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::WoodGathering,
+            per_unit_chance: 0.001,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: WATTLE_AND_DAUB,
+        era: Era::Neolithic,
+        name: "Wattle and Daub",
+        description: "Woven wattle screens packed with clay and straw — load-bearing walls in \
+             permanent dwellings.",
+        prerequisites: &[WATTLE_SCREENS, PERM_SETTLEMENT],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::WoodGathering,
+            per_unit_chance: 0.002,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: TIMBER_LONGHOUSE_FRAMING,
+        era: Era::Neolithic,
+        name: "Timber Longhouse Framing",
+        description: "Heavy oak posts, paired tie-beams, and gable rafters carry a long shared \
+             roof — the Neolithic European longhouse.",
+        prerequisites: &[PERM_SETTLEMENT],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::WoodGathering,
+            per_unit_chance: 0.003,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: THATCH_ROOFING,
+        era: Era::Neolithic,
+        name: "Thatch Roofing",
+        description: "Bundled straw or reed tied to roof rafters — sheds rain, insulates against \
+             cold, lasts decades when maintained.",
+        prerequisites: &[CROP_CULTIVATION],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::Farming,
+            per_unit_chance: 0.001,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: COB_WALLING,
+        era: Era::Neolithic,
+        name: "Cob Walling",
+        description: "Monolithic earth walls — clay, sand, straw, and water mixed and laid wet in \
+             courses, dried in place.",
+        prerequisites: &[PERM_SETTLEMENT],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::Farming,
+            per_unit_chance: 0.001,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: ADOBE_BRICK,
+        era: Era::Neolithic,
+        name: "Adobe Brick",
+        description: "Sun-dried clay-and-straw bricks moulded in wooden frames — modular, stackable \
+             building blocks for arid-climate dwellings.",
+        prerequisites: &[FIRED_POTTERY],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::Farming,
+            per_unit_chance: 0.001,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: MUDBRICK_MOULDING,
+        era: Era::Neolithic,
+        name: "Mudbrick Moulding",
+        description: "Standardised mudbrick production in wooden moulds — uniform courses, faster \
+             walls, the basis for ancient urban dwellings.",
+        prerequisites: &[ADOBE_BRICK],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::Farming,
+            per_unit_chance: 0.001,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: DRY_STONE_WALLING,
+        era: Era::Neolithic,
+        name: "Dry-Stone Walling",
+        description: "Coursed field-stone laid without mortar — the rural enclosure wall, durable \
+             for generations.",
+        prerequisites: &[PERM_SETTLEMENT],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::StoneMining,
+            per_unit_chance: 0.002,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: CUT_STONE_MASONRY,
+        era: Era::Chalcolithic,
+        name: "Cut Stone Masonry",
+        description: "Quarried blocks dressed with copper tools, laid in lime-mortar courses — \
+             the defensive curtain wall.",
+        prerequisites: &[COPPER_TOOLS, DRY_STONE_WALLING],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::StoneMining,
+            per_unit_chance: 0.003,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: ASHLAR_DRESSING,
+        era: Era::BronzeAge,
+        name: "Ashlar Dressing",
+        description: "Precisely-squared and finely-dressed stone blocks — palace and monumental \
+             construction without visible joints.",
+        prerequisites: &[BRONZE_TOOLS, CUT_STONE_MASONRY],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::StoneMining,
+            per_unit_chance: 0.002,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: HYDRAULIC_MASONRY,
+        era: Era::BronzeAge,
+        name: "Hydraulic Masonry",
+        description: "Mortar-and-rubble construction with lime-set joints that cure underwater — \
+             watercourses, cisterns, port works.",
+        prerequisites: &[MONUMENTAL_BUILDING, MUDBRICK_MOULDING],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::StoneMining,
+            per_unit_chance: 0.001,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    // ── Phase G foundations ─────────────────────────────────────────────
+    // Every founder is born knowing the era-≤-target foundations. Triggers
+    // are intentionally sparse: discovery rolls cost work, and these are
+    // assumed common knowledge in any era they sit in.
+    TechDef {
+        id: FIRE_USE,
+        era: Era::Paleolithic,
+        name: "Fire Use",
+        description: "Working understanding of what fire is, what it does, and how to feed it.",
+        prerequisites: &[],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: EMBER_CARRYING,
+        era: Era::Paleolithic,
+        name: "Ember Carrying",
+        description: "Banked coals carried over distance — fire travels with the band before fire-making.",
+        prerequisites: &[FIRE_USE],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: TOOLSTONE_RECOGNITION,
+        era: Era::Paleolithic,
+        name: "Toolstone Recognition",
+        description: "Eye for flint, chert, obsidian, and quartzite — which cobbles knap and which crumble.",
+        prerequisites: &[],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: EDGE_GEOMETRY,
+        era: Era::Paleolithic,
+        name: "Edge Geometry",
+        description: "Intuitive grasp of bevel, edge angle, and percussion — the geometry of a working blade.",
+        prerequisites: &[TOOLSTONE_RECOGNITION],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: CORDAGE,
+        era: Era::Paleolithic,
+        name: "Cordage",
+        description: "Twisting plant fibre and sinew into cord, twine, and rope.",
+        prerequisites: &[],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: HAFTING,
+        era: Era::Paleolithic,
+        name: "Hafting",
+        description: "Binding a stone head to a wooden shaft with cord and pitch.",
+        prerequisites: &[EDGE_GEOMETRY, CORDAGE],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: HIDE_WORKING,
+        era: Era::Paleolithic,
+        name: "Hide Working",
+        description: "Scraping, defleshing, soaking, and stretching hides into supple working leather.",
+        prerequisites: &[],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: ANIMAL_TRACKING,
+        era: Era::Paleolithic,
+        name: "Animal Tracking",
+        description: "Reading prints, droppings, browse, and trail-spoor — the band's hunting eye.",
+        prerequisites: &[],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: SEASONAL_MEMORY,
+        era: Era::Paleolithic,
+        name: "Seasonal Memory",
+        description: "Lived knowledge of when each plant fruits, fish run, and herd moves through the year.",
+        prerequisites: &[],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: ORAL_TRADITION,
+        era: Era::Paleolithic,
+        name: "Oral Tradition",
+        description: "Stories, songs, and genealogies kept alive by recitation — the band's history before writing.",
+        prerequisites: &[],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: ROUTE_MEMORY,
+        era: Era::Paleolithic,
+        name: "Route Memory",
+        description: "Travel routes, landmarks, and trail-knowledge held in head — no map needed.",
+        prerequisites: &[],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: WATER_SOURCE_MEMORY,
+        era: Era::Paleolithic,
+        name: "Water Source Memory",
+        description: "Where every reliable spring, seep, and seasonal pool lies within the band's range.",
+        prerequisites: &[],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: CLAY_TOKENS,
+        era: Era::Neolithic,
+        name: "Clay Tokens",
+        description: "Shaped clay counters representing grain, livestock, or labour debts — the administrative precursor to tablets.",
+        prerequisites: &[],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: MEASURES_AND_UNITS,
+        era: Era::Neolithic,
+        name: "Measures and Units",
+        description: "Standard volumes (basket, jar, sack) and lengths (forearm, pace) by which work and yield are counted.",
+        prerequisites: &[],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: RATION_ARITHMETIC,
+        era: Era::Neolithic,
+        name: "Ration Arithmetic",
+        description: "Counting grain by adult-day, dividing stores by mouths, sizing the next year's seed reserve.",
+        prerequisites: &[MEASURES_AND_UNITS],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: PRACTICAL_GEOMETRY,
+        era: Era::Neolithic,
+        name: "Practical Geometry",
+        description: "Squaring a foundation, walking a circle, dropping a rope-and-stake right angle — geometry of the working site.",
+        prerequisites: &[],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    // ── Phase H beliefs ─────────────────────────────────────────────────
+    // Held with confidence in a belief group, not Learned-and-used. The
+    // catalog `TruthStatus` axis decides whether the belief is genuinely
+    // true (Heliocentric, Contagion — reserved), useful-but-false (Miasma,
+    // Geocentric — drive sensible behaviour for the wrong reason), or
+    // harmful (Spirit Illness — biases the patient toward ritual instead of
+    // treatment).
+    TechDef {
+        id: SKY_DOME,
+        era: Era::Paleolithic,
+        name: "Sky Dome",
+        description: "The sky is a solid vault above the earth — stars are points fixed to its inner face.",
+        prerequisites: &[],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: GEOCENTRIC_COSMOS,
+        era: Era::Neolithic,
+        name: "Geocentric Cosmos",
+        description: "Earth at the centre; sun, moon, and stars revolve in nested celestial spheres.",
+        prerequisites: &[],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: SPIRIT_ILLNESS,
+        era: Era::Paleolithic,
+        name: "Spirit Illness",
+        description: "Sickness is offence given to spirits or ancestors — the cure is propitiation and ritual.",
+        prerequisites: &[],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: MIASMA_THEORY,
+        era: Era::Neolithic,
+        name: "Miasma Theory",
+        description: "Sickness rises from bad air — foul vapours from waste, marsh, and rotting matter.",
+        prerequisites: &[],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: ECLIPSE_OMENS,
+        era: Era::Paleolithic,
+        name: "Eclipse Omens",
+        description: "An eclipse foretells calamity — the moon swallows the sun, the world holds its breath.",
+        prerequisites: &[],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: WEATHER_OMENS,
+        era: Era::Paleolithic,
+        name: "Weather Omens",
+        description: "Clouds, wind, and bird-flight foretell coming weather — the band reads the sky.",
+        prerequisites: &[],
+        triggers: &[],
+        bonus: TechBonus::ZERO,
+    },
 ];
 
 // Discovery is now per-person and per-action; see
@@ -1264,7 +1712,10 @@ mod tests {
         for id in [SIEGE_ENGINEERING, ARMOR_PLATING, POWERED_TRACTION] {
             assert_eq!(tech_def(id).era, Era::BronzeAge);
         }
-        assert_eq!(TECH_COUNT, 50);
+        // Phase E added 14 building-technique entries (50..=63);
+        // Phase G added 16 foundational knowledge entries (64..=79);
+        // Phase H added 6 belief entries (80..=85).
+        assert_eq!(TECH_COUNT, 86);
         // POWERED_TRACTION caps the line — its prereqs precede it.
         assert!(tech_def(POWERED_TRACTION)
             .prerequisites

@@ -32,10 +32,20 @@ fn yield_for_tile(data: TileData) -> Option<(ResourceId, u32)> {
         return Some((ore_yield_resource_id(data.ore_kind()), STONE_PER_BLOCK));
     }
     if data.kind.is_stone_like() {
-        let id = *core_ids::Stone
-            .get()
-            .expect("core_ids: yield_for_tile called before init_core_ids()");
-        // Limestone yields more per swing; Granite/Sandstone/Basalt match Stone.
+        // Phase F (knowledge-system overhaul): a Limestone tile yields the
+        // dedicated `limestone` resource so it can feed the `Burn Lime` craft
+        // recipe (FIRED_POTTERY-gated). All other stone lithologies still
+        // resolve to generic `stone`. Yield qty preserves the per-lithology
+        // count (`stone_yield_count`).
+        let id = if data.kind == TileKind::Limestone {
+            *core_ids::Limestone
+                .get()
+                .expect("core_ids: yield_for_tile called before init_core_ids()")
+        } else {
+            *core_ids::Stone
+                .get()
+                .expect("core_ids: yield_for_tile called before init_core_ids()")
+        };
         let qty = data.kind.stone_yield_count().max(STONE_PER_BLOCK);
         return Some((id, qty));
     }

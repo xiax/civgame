@@ -14,6 +14,18 @@ Resource catalog, goods, items, carrying, markets, recipes, currency primitives.
 - **`FactionStorage`** keys `totals`, `resource_supply`, `resource_demand`, `material_targets`, `material_deficit_ema` on `ResourceId`. Helpers: `stock_of`, `supply_of`, `demand_of`.
 - **`Market` (`market.rs`):** `prices`, `bids_cleared`, `bids_stockout`, `bids_unaffordable`, `price_floor`, `market_stock` are sparse `AHashMap<ResourceId, f32>`. **Bid-driven price discovery** — each tick `signal = (stockout − unaffordable) / (cleared + stockout + unaffordable)` nudges price ±5%; quiet markets unchanged. No upper ceiling — runaway floods `unaffordable` and flips signal. Sales never push price. `Market::default` seeds 22 legacy goods at `(base_price, floor=0.1)`; `SettlementMarket::default` empty (implicit 1.0). Fields private — use helpers (`price_of`, `stock_of`, `set_stock`, `set_price`, `add_bid_*`, `sell_item`, `try_buy_item`). `listings: Vec<(Item, u32)>` pruned in two places: `try_buy_inner` `swap_remove`s zero-qty rows; `price_update_system` / `settlement_price_update_system` / `camp_price_update_system` run `retain(|(_, q)| *q > 0)` every `PRICE_UPDATE_INTERVAL = 5` ticks. `sell_item` early-returns on `qty == 0`.
 
+## Phase F construction materials (knowledge-system overhaul)
+
+Five new catalog entries that feed the Phase E `BuildingTechnique` recipes (`plans/knowledge-system-overhaul.md`):
+
+- `clay` — heavy two-hand material; raw clay dug from clay-bearing soil bands. Wattle-and-Daub / Cob / Adobe / Mudbrick input.
+- `reeds` — one-hand bundle; harvested from wetland Marsh / riparian Silt. Reed Matting + Wattle-and-Daub trim + Thatch Roofing input. *Gather-from-tile task deferred to Phase F.2.*
+- `thatch` — one-hand bundle; **grain-harvest byproduct** (`PlantKind::Grain::harvest_extra_yields` returns 1 thatch alongside 2 grain_seed). Roofing input.
+- `limestone` — two-hand quarried block. `carve::yield_for_tile` now routes a `TileKind::Limestone` mined block to `limestone` (other lithologies still map to generic `stone`).
+- `lime` — one-hand burnt-lime product. `CraftRecipe 46 (Burn Lime)`: 2 limestone + 1 wood → 1 lime, `FIRED_POTTERY`-gated, Workbench-bound. Mortar binder for Cut-Stone / Hydraulic / lime-plaster techniques.
+
+`core_ids::clay()` / `reeds()` / `thatch()` / `limestone()` / `lime()` are the lookup accessors. Adding a Phase E technique recipe → reads these as ingredients.
+
 ## Carrying & item routing
 
 - **Volume + weight, per-bucket caps.** Every `ResourceDef` carries `volume_ml: u32` alongside `weight_g`. `ResourceId::unit_volume_ml` / `Item::stack_volume_ml(qty)` mirror the weight helpers; volume is per-resource only (no material multiplier). Carrying capacity is gated by **both** weight AND a per-`Bulk`-bucket volume. `Bulk` is now purely slot-occupancy classification — quantities are physics-driven.

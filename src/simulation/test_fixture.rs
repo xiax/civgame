@@ -1059,8 +1059,8 @@ mod smoke {
                 .world_mut()
                 .get_mut::<PersonKnowledge>(chief)
                 .unwrap();
-            ck.aware |= 1u64 << FIRED_POTTERY;
-            ck.learned &= !(1u64 << FIRED_POTTERY);
+            ck.aware.set(FIRED_POTTERY);
+            ck.learned.clear(FIRED_POTTERY);
         }
         // Member: has personally Learned FIRED_POTTERY.
         {
@@ -1069,8 +1069,8 @@ mod smoke {
                 .world_mut()
                 .get_mut::<PersonKnowledge>(member)
                 .unwrap();
-            mk.aware |= 1u64 << FIRED_POTTERY;
-            mk.learned |= 1u64 << FIRED_POTTERY;
+            mk.aware.set(FIRED_POTTERY);
+            mk.learned.set(FIRED_POTTERY);
         }
 
         // Run past one architect-assignment cadence (settlement
@@ -1961,8 +1961,8 @@ mod smoke {
             {
                 let world = sim.app.world_mut();
                 let mut k = world.get_mut::<PersonKnowledge>(chief).unwrap();
-                k.aware |= 1u64 << LOOM_WEAVING;
-                k.learned |= 1u64 << LOOM_WEAVING;
+                k.aware.set(LOOM_WEAVING);
+                k.learned.set(LOOM_WEAVING);
             }
             {
                 let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
@@ -2014,8 +2014,8 @@ mod smoke {
                     Item::new_commodity(core_ids::cloth()),
                 );
             let mut k = world.get_mut::<PersonKnowledge>(bare).unwrap();
-            k.aware |= 1u64 << LOOM_WEAVING;
-            k.learned |= 1u64 << LOOM_WEAVING;
+            k.aware.set(LOOM_WEAVING);
+            k.learned.set(LOOM_WEAVING);
         }
         {
             let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
@@ -3001,7 +3001,7 @@ mod smoke {
             ticks_remaining: 5,
             father: None,
             father_stats: None,
-            father_known: 0,
+            father_known: crate::simulation::knowledge_bits::KnowledgeBits::EMPTY,
             faction_id: village,
         });
 
@@ -3069,7 +3069,7 @@ mod smoke {
         // Confirm they have at least one Learned tech.
         let knowledge = sim.app.world().get::<PersonKnowledge>(elder).unwrap();
         assert!(
-            knowledge.learned != 0,
+            !knowledge.learned.is_empty(),
             "elder should have Paleolithic Learned techs"
         );
 
@@ -3558,8 +3558,8 @@ mod smoke {
                 .world_mut()
                 .get_mut::<PersonKnowledge>(chief)
                 .unwrap();
-            ck.aware |= 1u64 << LOOM_WEAVING;
-            ck.learned |= 1u64 << LOOM_WEAVING;
+            ck.aware.set(LOOM_WEAVING);
+            ck.learned.set(LOOM_WEAVING);
         }
 
         // Household head pinned at Belonging tier: physiological + safety
@@ -5448,8 +5448,8 @@ mod smoke {
         {
             let world = sim.app.world_mut();
             let mut knowledge = world.get_mut::<PersonKnowledge>(chief).unwrap();
-            knowledge.aware |= 1u64 << CROP_CULTIVATION;
-            knowledge.learned |= 1u64 << CROP_CULTIVATION;
+            knowledge.aware.set(CROP_CULTIVATION);
+            knowledge.learned.set(CROP_CULTIVATION);
             world.entity_mut(chief).insert(FactionChief);
         }
         {
@@ -5674,8 +5674,8 @@ mod smoke {
         {
             let world = sim.app.world_mut();
             let mut k = world.get_mut::<PersonKnowledge>(chief).unwrap();
-            k.aware |= 1u64 << CROP_CULTIVATION;
-            k.learned |= 1u64 << CROP_CULTIVATION;
+            k.aware.set(CROP_CULTIVATION);
+            k.learned.set(CROP_CULTIVATION);
             world.entity_mut(chief).insert(FactionChief);
         }
         {
@@ -5759,8 +5759,8 @@ mod smoke {
         {
             let world = sim.app.world_mut();
             let mut k = world.get_mut::<PersonKnowledge>(chief).unwrap();
-            k.aware |= 1u64 << CROP_CULTIVATION;
-            k.learned |= 1u64 << CROP_CULTIVATION;
+            k.aware.set(CROP_CULTIVATION);
+            k.learned.set(CROP_CULTIVATION);
             world.entity_mut(chief).insert(FactionChief);
         }
         {
@@ -6139,10 +6139,10 @@ mod smoke {
         {
             let world = sim.app.world_mut();
             let mut k = world.get_mut::<PersonKnowledge>(chief).unwrap();
-            k.aware |= 1u64 << CROP_CULTIVATION;
-            k.learned |= 1u64 << CROP_CULTIVATION;
-            k.aware |= 1u64 << ARD_PLOW;
-            k.learned |= 1u64 << ARD_PLOW;
+            k.aware.set(CROP_CULTIVATION);
+            k.learned.set(CROP_CULTIVATION);
+            k.aware.set(ARD_PLOW);
+            k.learned.set(ARD_PLOW);
             world.entity_mut(chief).insert(FactionChief);
         }
         {
@@ -6244,10 +6244,10 @@ mod smoke {
         {
             let world = sim.app.world_mut();
             let mut k = world.get_mut::<PersonKnowledge>(chief).unwrap();
-            k.aware |= 1u64 << CROP_CULTIVATION;
-            k.learned |= 1u64 << CROP_CULTIVATION;
-            k.aware |= 1u64 << ARD_PLOW;
-            k.learned |= 1u64 << ARD_PLOW;
+            k.aware.set(CROP_CULTIVATION);
+            k.learned.set(CROP_CULTIVATION);
+            k.aware.set(ARD_PLOW);
+            k.learned.set(ARD_PLOW);
             world.entity_mut(chief).insert(FactionChief);
         }
         {
@@ -7847,10 +7847,10 @@ mod smoke {
         {
             let world = sim.app.world_mut();
             let mut k = world.get_mut::<PersonKnowledge>(chief).unwrap();
-            k.aware |= 1u64 << CROP_CULTIVATION;
-            k.learned |= 1u64 << CROP_CULTIVATION;
-            k.aware |= 1u64 << ARD_PLOW;
-            k.learned |= 1u64 << ARD_PLOW;
+            k.aware.set(CROP_CULTIVATION);
+            k.learned.set(CROP_CULTIVATION);
+            k.aware.set(ARD_PLOW);
+            k.learned.set(ARD_PLOW);
             world.entity_mut(chief).insert(FactionChief);
         }
         {
@@ -9883,7 +9883,7 @@ mod baseline_behaviour {
 
         let knowledge = sim.app.world().get::<PersonKnowledge>(person).unwrap();
         let progress_after = knowledge.study_progress.get(&tech).copied().unwrap_or(0);
-        let learned = (knowledge.learned >> tech) & 1 != 0;
+        let learned = knowledge.learned.has(tech);
         assert!(
             progress_after > progress_before || learned,
             "expected study_progress to accumulate (or tech to be learned outright); \
@@ -12150,8 +12150,8 @@ mod baseline_behaviour {
                 .world_mut()
                 .get_mut::<PersonKnowledge>(person)
                 .unwrap();
-            knowledge.aware |= 1u64 << HUNTING_SPEAR;
-            knowledge.learned |= 1u64 << HUNTING_SPEAR;
+            knowledge.aware.set(HUNTING_SPEAR);
+            knowledge.learned.set(HUNTING_SPEAR);
         }
         sim.tick_n(5);
 
@@ -12227,8 +12227,8 @@ mod baseline_behaviour {
                 .world_mut()
                 .get_mut::<PersonKnowledge>(person)
                 .unwrap();
-            knowledge.aware |= 1u64 << HUNTING_SPEAR;
-            knowledge.learned |= 1u64 << HUNTING_SPEAR;
+            knowledge.aware.set(HUNTING_SPEAR);
+            knowledge.learned.set(HUNTING_SPEAR);
         }
 
         // Spawn corpse + insert into CorpseMap (the dispatcher reads the map
@@ -12428,8 +12428,8 @@ mod baseline_behaviour {
                 .world_mut()
                 .get_mut::<PersonKnowledge>(person)
                 .unwrap();
-            k.aware |= 1u64 << HUNTING_SPEAR;
-            k.learned |= 1u64 << HUNTING_SPEAR;
+            k.aware.set(HUNTING_SPEAR);
+            k.learned.set(HUNTING_SPEAR);
         }
 
         // Live deer at (7,5) — within VIEW_RADIUS=15. Triggers `HuntPreyMethod`'s
@@ -12547,8 +12547,8 @@ mod baseline_behaviour {
                 .world_mut()
                 .get_mut::<PersonKnowledge>(person)
                 .unwrap();
-            k.aware |= 1u64 << HUNTING_SPEAR;
-            k.learned |= 1u64 << HUNTING_SPEAR;
+            k.aware.set(HUNTING_SPEAR);
+            k.learned.set(HUNTING_SPEAR);
         }
 
         let initial_prey_tile = (10, 5);
@@ -12657,8 +12657,8 @@ mod baseline_behaviour {
                 .world_mut()
                 .get_mut::<PersonKnowledge>(person)
                 .unwrap();
-            k.aware |= 1u64 << HUNTING_SPEAR;
-            k.learned |= 1u64 << HUNTING_SPEAR;
+            k.aware.set(HUNTING_SPEAR);
+            k.learned.set(HUNTING_SPEAR);
         }
 
         let deer_world = tile_to_world(10, 5);
@@ -12755,8 +12755,8 @@ mod baseline_behaviour {
                 .world_mut()
                 .get_mut::<PersonKnowledge>(person)
                 .unwrap();
-            k.aware |= 1u64 << HUNTING_SPEAR;
-            k.learned |= 1u64 << HUNTING_SPEAR;
+            k.aware.set(HUNTING_SPEAR);
+            k.learned.set(HUNTING_SPEAR);
         }
 
         let deer_world = tile_to_world(10, 5);
@@ -13478,8 +13478,8 @@ mod baseline_behaviour {
                 .world_mut()
                 .get_mut::<PersonKnowledge>(person)
                 .unwrap();
-            knowledge.aware |= 1u64 << CROP_CULTIVATION;
-            knowledge.learned |= 1u64 << CROP_CULTIVATION;
+            knowledge.aware.set(CROP_CULTIVATION);
+            knowledge.learned.set(CROP_CULTIVATION);
         }
 
         // Inject a faction-tier sighting of the grain tile.
@@ -17491,13 +17491,12 @@ mod wage_aware_phase0_phase1 {
         // this, `faction_hunter_assignment_system` would compute
         // `target = 0` (has_tech=false) and demote our hunter to None
         // before the cross-switcher fires.
-        let aware_bit = 1u64 << HUNTING_SPEAR;
         let mut knowledge_query = sim
             .app
             .world_mut()
             .query::<&mut crate::simulation::knowledge::PersonKnowledge>();
         for mut k in knowledge_query.iter_mut(sim.app.world_mut()) {
-            k.aware |= aware_bit;
+            k.aware.set(HUNTING_SPEAR);
         }
         {
             let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
@@ -19998,7 +19997,7 @@ mod onenter_era_seeding {
         });
         {
             let mut k = sim.app.world_mut().get_mut::<PersonKnowledge>(a).unwrap();
-            k.aware |= 1u64 << IRRIGATION;
+            k.aware.set(IRRIGATION);
         }
         tick_pinned(
             &mut sim,
@@ -20049,8 +20048,8 @@ mod onenter_era_seeding {
                 .world_mut()
                 .get_mut::<PersonKnowledge>(teacher)
                 .unwrap();
-            k.aware |= 1u64 << IRRIGATION;
-            k.learned |= 1u64 << IRRIGATION;
+            k.aware.set(IRRIGATION);
+            k.learned.set(IRRIGATION);
         }
         {
             let mut k = sim
@@ -20058,7 +20057,7 @@ mod onenter_era_seeding {
                 .world_mut()
                 .get_mut::<PersonKnowledge>(student)
                 .unwrap();
-            k.aware |= 1u64 << IRRIGATION;
+            k.aware.set(IRRIGATION);
         }
         // Long run: ambient pairing active the whole time, but neither agent
         // is on AgentGoal::Socialize, so tech_teaching_system never fires.
@@ -20484,6 +20483,7 @@ mod loose_resource_cleanup {
             treasury: 0.0,
             market: crate::economy::market::SettlementMarket::default(),
             peak_population: 20,
+            locality: None,
         };
         let entity = sim.app.world_mut().spawn(settlement).id();
         let mut map = sim

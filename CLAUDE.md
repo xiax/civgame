@@ -27,10 +27,31 @@ CivGame is a Dwarf Fortress-style civilization simulation on **Bevy 0.15** (ECS)
 
 Per-directory `CLAUDE.md` files cover subsystem detail and are auto-loaded when reading/editing in those trees.
 
+## Knowledge system (`simulation/{technology,knowledge,knowledge_bits,knowledge_catalog,building_technique}.rs`)
+
+Catalog of 86 `TechId`/`KnowledgeId` entries spanning four axes:
+
+- **Kind** (`KnowledgeKind`) — `PracticalSkill` / `PracticalTechnique` / `Belief` / `Lore`. Skills + techniques carry optional mastery 0..=3 in `PersonKnowledge.mastery`; beliefs carry confidence in `PersonKnowledge.belief` per `BeliefGroupId`; lore is learned but never mastered.
+- **Domain** (`KnowledgeDomain`) — Subsistence / Craft / Construction / Transport / Institutional / Medicine / Cosmology / Lore / Martial.
+- **Truth** (`TruthStatus`) — True / FalseUseful / FalseHarmful / Contested. Almost all skills are True; beliefs span the range.
+- **Adoption scale** (`technology_adoption::AdoptionScale`) — Personal / Household / Subsistence / Specialist / MilitaryTransport / Institutional. Drives founder-Learned seeding.
+
+Layout: 50 core techs (`FIRE_MAKING 0` → `POWERED_TRACTION 49`) + 14 Phase-E construction techniques (50–63) + 16 Phase-G foundations (64–79) + 6 Phase-H beliefs (80–85). `KnowledgeBits` is a 128-bit fixed-width bitset for `aware`/`learned`. `KNOWLEDGE_META[TECH_COUNT]` array layers domain/kind/truth/belief_group onto each id; `knowledge_def(id)` bundles `TechDef` + `KnowledgeMeta` into one view.
+
+**Phase E building techniques** (`building_technique.rs`): `BuildingTechnique` enum (Wattle Screens → Hydraulic Masonry) gated by `KnowledgeId`. `select_building_technique(techs, locality, purpose) -> Option<BuildingTechnique>` picks the cultural method from Learned-pool × `LocalSiteContext` (forest density, clay/stone/wetland/river-silt proximity, biome) × `StructurePurpose`. Each technique's `output_material()` resolves to one of the 5 existing `WallMaterial` tiers, so the recipe + sprite path stays unchanged.
+
+**Phase F construction materials** (`economy/resource_catalog`): `clay`, `reeds`, `thatch`, `limestone`, `lime` catalog entries. `CraftRecipe 46 (Burn Lime)` — `FIRED_POTTERY`-gated, 2 limestone + 1 wood → 1 lime. Grain harvest co-yields 1 thatch (`PlantKind::Grain::harvest_extra_yields`). Mined Limestone tiles yield the new `limestone` resource via `carve::yield_for_tile` (other lithologies stay generic `stone`).
+
+**Phase G foundations**: universal `AdoptionScale::Personal` knowledge auto-Learned by every founder at-era (Fire Use, Ember Carrying, Toolstone Recognition, Edge Geometry, Cordage, Hafting, Hide Working, Animal Tracking, Seasonal Memory, Oral Tradition, Route Memory, Water Source Memory at Paleolithic; Clay Tokens, Measures & Units, Ration Arithmetic, Practical Geometry at Neolithic).
+
+**Phase H beliefs**: `PersonKnowledge.belief: AHashMap<BeliefGroupId, BeliefState>`. Seeded by `seed_initial_beliefs(target_era)`: pre-Neolithic → Sky Dome + Spirit Illness + Eclipse Omens; Neolithic+ → Geocentric + Miasma + Weather Omens. Beliefs never land in `learned` — `seeded_realistic_through_era` skips them in the Learned-bitset loop. `FactionData.chief_disease_belief` / `chief_cosmology_belief` cache the chief's accepted ids; refreshed every Economy tick by `sync_faction_techs_from_chief_system`. **First consumer hook**: chief accepting `MIASMA_THEORY` lifts `SettlementPressureKind::WaterAccess` intent priority by 30% in `organic_settlement::pressure_to_intent` — Miasma-driven sanitation reflex prioritises wells earlier than Spirit-Illness-accepting peers at the same population pressure.
+
+UI: inspector Beliefs subsection per agent (per-group accepted belief + confidence bar + rejected-history); tech panel top-level Beliefs section per faction (chief's belief in each group with truth-status colour). Per-era tech list filters Belief-kind entries out — they only surface in the Beliefs section.
+
 ## Game-start options (`GameStartOptions`, `game_state.rs`)
 
 Read once by `spawn_population` + `seed_starting_buildings_system`:
-- `era: Era` — every member starts Aware of techs through this era. Learned set is role-scoped via `PersonKnowledge::seeded_realistic_through_era` (chief gets Personal+Household+Subsistence+Specialist+Institutional, ~1/8 are Specialist, rest Common).
+- `era: Era` — every member starts Aware of techs through this era. Learned set is role-scoped via `PersonKnowledge::seeded_realistic_through_era` (chief gets Personal+Household+Subsistence+Specialist+Institutional, ~1/8 are Specialist, rest Common). Phase-G foundations auto-Learn for every founder regardless of role; Phase-H beliefs seed via `seed_initial_beliefs(target)`.
 - `player_population: u32` — group size for player faction (others use `GROUP_SIZE=20`).
 - `economy: EconomyPreset` — `Subsistence` / `Mixed` / `Market`. Applied via `policy::apply_preset`.
 - `lifestyle: Lifestyle` — `Settled` (default) or `Nomadic`. Player-faction only; AI stays Settled.

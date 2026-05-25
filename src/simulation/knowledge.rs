@@ -14,12 +14,17 @@
 //! chief's `aware` bitset (see `faction::sync_faction_techs_from_chief_system`).
 use bevy::prelude::*;
 
+use super::knowledge_bits::KnowledgeBits;
 use super::skills::{SkillKind, Skills};
 use super::stats::{modifier, Stats};
 use super::technology::{
     complexity, tech_def, ActivityKind, TechId, TechTrigger, TECH_COUNT, TECH_TREE,
 };
 
+/// Legacy capacity constant for the per-tech `learned_at` array. Retained as a
+/// public alias because external test fixtures and reproduction sites named it
+/// at construction time; the field itself is now an `AHashMap`, so this value
+/// only feeds initial-capacity hints today.
 pub const KNOWLEDGE_SLOTS: usize = 64;
 
 /// One game-day of study per complexity point. Cuneiform (complexity 6) takes
@@ -54,28 +59,91 @@ pub enum FounderRole {
     Scribe,
 }
 
-/// `learned_at`: last tick this tech was learned or refreshed (used or taught).
-#[derive(Component, Clone, Debug)]
+/// Maximum mastery level. `mastery_speed_mult` rises monotonically through this
+/// range; mastery > `MASTERY_MAX` saturates at the cap.
+pub const MASTERY_MAX: u8 = 3;
+
+/// Maximum count of previously-rejected ids tracked per belief group.
+/// Three is plenty for cosmology / disease_causation through the ancient
+/// core (Sky Dome → Geocentric → Heliocentric is the longest chain).
+pub const BELIEF_REJECTED_CAP: usize = 3;
+
+/// Belief held by one agent in one belief group. Confidence is `0..=255`;
+/// `rejected` carries up to three formerly-accepted ids so future content can
+/// distinguish "never heard of" from "considered and dismissed". `rejected_len`
+/// tracks the live prefix of `rejected`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BeliefState {
+    /// Currently-accepted knowledge id in this group.
+    pub accepted: TechId,
+    /// 0..=255. Threshold for swap-on-study lands content-side in Phase H.
+    pub confidence: u8,
+    /// Stack of previously-accepted ids the agent now rejects.
+    pub rejected: [TechId; BELIEF_REJECTED_CAP],
+    /// Live prefix length of `rejected` (`0..=BELIEF_REJECTED_CAP`).
+    pub rejected_len: u8,
+}
+
+impl BeliefState {
+    /// Push `id` onto the rejected stack, dropping the oldest entry when
+    /// the cap is full (FIFO eviction so the most-recent rejection always
+    /// stays). Safe to call with a duplicate id — it bubbles to the end.
+    pub fn push_rejected(&mut self, id: TechId) {
+        // De-dupe: if `id` already present, drop it first.
+        let mut write = 0usize;
+        for read in 0..self.rejected_len as usize {
+            if self.rejected[read] != id {
+                self.rejected[write] = self.rejected[read];
+                write += 1;
+            }
+        }
+        // Drop the oldest if at cap.
+        if write >= BELIEF_REJECTED_CAP {
+            for i in 0..BELIEF_REJECTED_CAP - 1 {
+                self.rejected[i] = self.rejected[i + 1];
+            }
+            write = BELIEF_REJECTED_CAP - 1;
+        }
+        self.rejected[write] = id;
+        self.rejected_len = (write as u8 + 1).min(BELIEF_REJECTED_CAP as u8);
+    }
+
+    /// Iterate the live rejected ids in insertion order.
+    pub fn rejected_iter(&self) -> impl Iterator<Item = TechId> + '_ {
+        self.rejected[..self.rejected_len as usize].iter().copied()
+    }
+}
+
+/// `learned_at`: last tick each tech was learned or refreshed (used or taught).
+/// Sparse map keyed by id so non-Learned ids carry no storage; replaces the
+/// legacy fixed `[u32; 64]` array now that the catalog can grow past 64
+/// entries.
+///
+/// `mastery` and `belief` are Phase-C additions, both sparse + empty by
+/// default — every existing gate site reads them as 0 / absent, so behaviour
+/// is unchanged until later content phases write values in.
+#[derive(Component, Clone, Debug, Default)]
 pub struct PersonKnowledge {
-    pub aware: u64,
-    pub learned: u64,
-    pub learned_at: [u32; KNOWLEDGE_SLOTS],
+    pub aware: KnowledgeBits,
+    pub learned: KnowledgeBits,
+    pub learned_at: ahash::AHashMap<TechId, u32>,
     /// Sparse map TechId → progress ticks accumulated toward Learned. Cleared
     /// on successful learn or eviction. Used by Phase-2 reading/lecture/teach
     /// systems; the original passive `tech_teaching_system` and
     /// `try_discover_from_action` paths bypass it (they roll directly).
     pub study_progress: ahash::AHashMap<TechId, u32>,
-}
-
-impl Default for PersonKnowledge {
-    fn default() -> Self {
-        Self {
-            aware: 0,
-            learned: 0,
-            learned_at: [0u32; KNOWLEDGE_SLOTS],
-            study_progress: ahash::AHashMap::new(),
-        }
-    }
+    /// Per-skill mastery level (0..=`MASTERY_MAX`). Sparse — absent ids read
+    /// as 0. Only meaningful for `KnowledgeKind::PracticalSkill` /
+    /// `PracticalTechnique` entries; reading mastery for a `Belief` is
+    /// undefined (always 0).
+    pub mastery: ahash::AHashMap<TechId, u8>,
+    /// Per-group belief state. Sparse — absent groups read as "no belief held
+    /// in this group". `KnowledgeKind::Belief` entries are the only ones that
+    /// populate this.
+    pub belief: ahash::AHashMap<
+        crate::simulation::knowledge_catalog::BeliefGroupId,
+        BeliefState,
+    >,
 }
 
 impl PersonKnowledge {
@@ -95,9 +163,9 @@ impl PersonKnowledge {
         let target_rank = target as u8;
         for def in TECH_TREE.iter() {
             if (def.era as u8) <= target_rank {
-                k.aware |= 1u64 << def.id;
-                k.learned |= 1u64 << def.id;
-                k.learned_at[def.id as usize] = now;
+                k.aware.set(def.id);
+                k.learned.set(def.id);
+                k.learned_at.insert(def.id, now);
             }
         }
         k
@@ -121,6 +189,7 @@ impl PersonKnowledge {
         role: FounderRole,
         now: u32,
     ) -> Self {
+        use super::knowledge_catalog::{knowledge_def, KnowledgeKind};
         use super::technology_adoption::{tech_scale, AdoptionScale};
         let mut k = Self::default();
         let target_rank = target as u8;
@@ -128,7 +197,15 @@ impl PersonKnowledge {
             if (def.era as u8) > target_rank {
                 continue;
             }
-            k.aware |= 1u64 << def.id;
+            k.aware.set(def.id);
+            // Phase H — `KnowledgeKind::Belief` entries are held, not
+            // Learned. `seed_initial_beliefs` populates the per-group
+            // belief map; the `learned` bitset stays off so nothing
+            // downstream (technique selection, recipe gating, mastery
+            // accrual) treats a belief as a working skill.
+            if matches!(knowledge_def(def.id).kind(), KnowledgeKind::Belief) {
+                continue;
+            }
             let should_learn = match (tech_scale(def.id), role) {
                 (
                     AdoptionScale::Personal | AdoptionScale::Household | AdoptionScale::Subsistence,
@@ -142,21 +219,33 @@ impl PersonKnowledge {
                 _ => false,
             };
             if should_learn {
-                k.learned |= 1u64 << def.id;
-                k.learned_at[def.id as usize] = now;
+                k.learned.set(def.id);
+                k.learned_at.insert(def.id, now);
             }
         }
+        // Phase H — seed initial belief acceptance per era. Cosmology,
+        // disease_causation, and omens each pin to an era-appropriate
+        // accepted id at high confidence; gameplay can shift these via
+        // study (Phase H.2+ belief-swap logic) over time.
+        seed_initial_beliefs(&mut k, target);
         k
     }
 
     #[inline]
     pub fn is_aware(&self, id: TechId) -> bool {
-        (self.aware >> id) & 1 != 0
+        self.aware.has(id)
     }
 
     #[inline]
     pub fn has_learned(&self, id: TechId) -> bool {
-        (self.learned >> id) & 1 != 0
+        self.learned.has(id)
+    }
+
+    /// Snapshot of this person's awareness ∪ Learned as a `KnowledgeBits`
+    /// bag. Used by reproduction inheritance and awareness-gossip merges.
+    #[inline]
+    pub fn awareness_snapshot(&self) -> KnowledgeBits {
+        self.aware.union(&self.learned)
     }
 
     /// Snapshot of this person's Learned set as a `FactionTechs` bitset.
@@ -169,8 +258,8 @@ impl PersonKnowledge {
     }
 
     /// OR another agent's awareness into ours (gossip transfer).
-    pub fn merge_awareness(&mut self, other_aware: u64) {
-        self.aware |= other_aware;
+    pub fn merge_awareness(&mut self, other_aware: &KnowledgeBits) {
+        self.aware.union_assign(other_aware);
     }
 
     /// Sum of complexity points across currently-Learned techs.
@@ -189,12 +278,12 @@ impl PersonKnowledge {
     /// stack size — see `learning_slowdown`.
     pub fn try_learn(&mut self, id: TechId, now: u32) -> LearnOutcome {
         if self.has_learned(id) {
-            self.learned_at[id as usize] = now;
+            self.learned_at.insert(id, now);
             return LearnOutcome::AlreadyKnown;
         }
-        self.aware |= 1u64 << id;
-        self.learned |= 1u64 << id;
-        self.learned_at[id as usize] = now;
+        self.aware.set(id);
+        self.learned.set(id);
+        self.learned_at.insert(id, now);
         LearnOutcome::Learned
     }
 }
@@ -241,11 +330,11 @@ impl PersonKnowledge {
         now: u32,
     ) -> StudyOutcome {
         if self.has_learned(tech) {
-            self.learned_at[tech as usize] = now;
+            self.learned_at.insert(tech, now);
             return StudyOutcome::AlreadyLearned;
         }
         // Awareness is free.
-        self.aware |= 1u64 << tech;
+        self.aware.set(tech);
         let slowdown = learning_slowdown(stats, self);
         let scaled = ((amount as f32) / slowdown).round() as u32;
         // Floor at 1 so a single study tick still nudges progress at extreme
@@ -269,6 +358,59 @@ impl PersonKnowledge {
     }
 }
 
+/// Phase H — seed the belief map for a freshly-spawned founder at era
+/// `target`. Cosmology / disease_causation / omens groups each pin to an
+/// era-appropriate accepted `KnowledgeId` at high confidence.
+///
+/// - **Pre-Neolithic** (`Paleolithic` / `Mesolithic`) — Sky Dome cosmology,
+///   Spirit Illness disease model. Both held with high confidence.
+/// - **Neolithic+** — Geocentric cosmology, Miasma disease model. The
+///   agricultural revolution introduced systematic sky-watching + sanitation
+///   priorities; the FalseUseful members of each group drive better behaviour
+///   than their pre-Neolithic counterparts even though both are wrong.
+/// - **Every era** — Weather Omens accepted in the `omens` group (Eclipse
+///   Omens reserved for the omens group's pre-Neolithic belief; later
+///   content can swap one for the other on study).
+fn seed_initial_beliefs(k: &mut PersonKnowledge, target: super::technology::Era) {
+    use super::knowledge_catalog::{
+        BELIEF_GROUP_COSMOLOGY, BELIEF_GROUP_DISEASE_CAUSATION, BELIEF_GROUP_OMENS,
+    };
+    use super::technology::{
+        Era, ECLIPSE_OMENS, GEOCENTRIC_COSMOS, MIASMA_THEORY, SKY_DOME, SPIRIT_ILLNESS,
+        WEATHER_OMENS,
+    };
+    const HIGH_CONFIDENCE: u8 = 200;
+    const MEDIUM_CONFIDENCE: u8 = 140;
+    let neolithic_or_later = (target as u8) >= Era::Neolithic as u8;
+    // Cosmology
+    let cosmo_accept = if neolithic_or_later {
+        GEOCENTRIC_COSMOS
+    } else {
+        SKY_DOME
+    };
+    k.accept_belief(BELIEF_GROUP_COSMOLOGY, cosmo_accept, HIGH_CONFIDENCE);
+    // Disease causation
+    let disease_accept = if neolithic_or_later {
+        MIASMA_THEORY
+    } else {
+        SPIRIT_ILLNESS
+    };
+    k.accept_belief(
+        BELIEF_GROUP_DISEASE_CAUSATION,
+        disease_accept,
+        HIGH_CONFIDENCE,
+    );
+    // Omens — Pre-Neolithic agents lean Eclipse-fearful; Neolithic+ agents
+    // hold Weather Omens at the foreground (eclipse fear lingers as a
+    // rejected memory once the band reaches systematic calendar-keeping).
+    let omens_accept = if neolithic_or_later {
+        WEATHER_OMENS
+    } else {
+        ECLIPSE_OMENS
+    };
+    k.accept_belief(BELIEF_GROUP_OMENS, omens_accept, MEDIUM_CONFIDENCE);
+}
+
 /// Multiplier applied to learning *time*. 1.0 = full speed (empty stack);
 /// 2.0 at the old `intelligence × 2` baseline; 3.0 at twice that. Smooth in
 /// both `complexity_used` and `intelligence` — no threshold cliffs.
@@ -276,6 +418,85 @@ impl PersonKnowledge {
 pub fn learning_slowdown(stats: &Stats, k: &PersonKnowledge) -> f32 {
     let baseline = (stats.intelligence as f32) * 2.0;
     1.0 + (k.complexity_used() as f32) / baseline.max(1.0)
+}
+
+// ── Mastery + belief helpers ─────────────────────────────────────────────────
+
+impl PersonKnowledge {
+    /// Per-skill mastery level (0..=`MASTERY_MAX`). Absent ids read as 0.
+    #[inline]
+    pub fn mastery_of(&self, id: TechId) -> u8 {
+        self.mastery.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Raise mastery in `id` by `delta`, saturating at `MASTERY_MAX`. Returns
+    /// the new level. No-op for `delta == 0`.
+    pub fn gain_mastery(&mut self, id: TechId, delta: u8) -> u8 {
+        if delta == 0 {
+            return self.mastery_of(id);
+        }
+        let entry = self.mastery.entry(id).or_insert(0);
+        *entry = entry.saturating_add(delta).min(MASTERY_MAX);
+        *entry
+    }
+
+    /// Currently-accepted belief in `group`, if any.
+    #[inline]
+    pub fn belief_in(
+        &self,
+        group: crate::simulation::knowledge_catalog::BeliefGroupId,
+    ) -> Option<&BeliefState> {
+        self.belief.get(&group)
+    }
+
+    /// Accept `id` in `group` with `confidence`. If a different id was held,
+    /// it's pushed onto the rejected stack. Idempotent for same-id calls (only
+    /// confidence updates).
+    pub fn accept_belief(
+        &mut self,
+        group: crate::simulation::knowledge_catalog::BeliefGroupId,
+        id: TechId,
+        confidence: u8,
+    ) {
+        let state = self.belief.entry(group).or_insert(BeliefState::default());
+        if state.accepted != id && (state.confidence > 0 || state.rejected_len > 0) {
+            // Demote the prior accepted id onto the rejected stack.
+            state.push_rejected(state.accepted);
+        }
+        state.accepted = id;
+        state.confidence = confidence;
+    }
+
+    /// Reject `id` outright in `group` without electing a replacement. Pushes
+    /// onto the rejected stack and zeroes confidence. If `id == accepted` the
+    /// accepted slot is cleared (defaulting to id 0); callers typically pair
+    /// this with a subsequent `accept_belief`.
+    pub fn reject_belief(
+        &mut self,
+        group: crate::simulation::knowledge_catalog::BeliefGroupId,
+        id: TechId,
+    ) {
+        let state = self.belief.entry(group).or_insert(BeliefState::default());
+        state.push_rejected(id);
+        if state.accepted == id {
+            state.accepted = 0;
+            state.confidence = 0;
+        }
+    }
+}
+
+/// Multiplier on per-tick work progress for an agent with the given mastery
+/// level in the relevant skill. Level 0 (no mastery) → 1.0× (unchanged).
+/// Above zero: 1.10 / 1.20 / 1.35 for levels 1 / 2 / 3. Default behaviour at
+/// game start is unchanged because every agent's `mastery` map is empty.
+#[inline]
+pub fn mastery_speed_mult(level: u8) -> f32 {
+    match level.min(MASTERY_MAX) {
+        0 => 1.0,
+        1 => 1.10,
+        2 => 1.20,
+        _ => 1.35,
+    }
 }
 
 // ── Discovery ────────────────────────────────────────────────────────────────
@@ -340,7 +561,7 @@ pub fn try_discover_from_action(
         }
         let chance = (trigger_chance * int_scale * skill_scale).min(0.5);
         if fastrand::f32() < chance {
-            knowledge.aware |= 1u64 << def.id;
+            knowledge.aware.set(def.id);
             let threshold = study_threshold(def.id);
             let bump = complexity(def.id) as u32 * INSIGHT_PROGRESS_PER_COMPLEXITY;
             let capped = bump.min(threshold.saturating_sub(1));
@@ -407,12 +628,15 @@ pub fn awareness_gossip_system(
     // teaching (Learned) is the bottleneck via tech_teaching_system.
     let snapshots: ahash::AHashMap<
         Entity,
-        (u64, Vec<crate::simulation::settlement::SettlementId>),
+        (
+            KnowledgeBits,
+            Vec<crate::simulation::settlement::SettlementId>,
+        ),
     > = q
         .iter()
         .filter(|(_, _, goal, lod, _, _, sec)| is_social_contact(**goal, **lod, *sec, now))
         .map(|(e, _, _, _, k, mem_opt, _)| {
-            let aware = k.aware | k.learned;
+            let aware = k.awareness_snapshot();
             let settlements: Vec<_> = mem_opt
                 .as_deref()
                 .map(|m| m.known_settlements().map(|(id, _)| id).collect())
@@ -431,7 +655,7 @@ pub fn awareness_gossip_system(
         }
         let tx = (transform.translation.x / TILE_SIZE_LOCAL).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE_LOCAL).floor() as i32;
-        let mut aware_received: u64 = 0;
+        let mut aware_received = KnowledgeBits::EMPTY;
         let mut settlements_received: ahash::AHashSet<crate::simulation::settlement::SettlementId> =
             ahash::AHashSet::default();
         for dy in -3i32..=3 {
@@ -441,7 +665,7 @@ pub fn awareness_gossip_system(
                         continue;
                     }
                     if let Some((snap_aware, snap_settlements)) = snapshots.get(&other) {
-                        aware_received |= snap_aware;
+                        aware_received.union_assign(snap_aware);
                         for sid in snap_settlements {
                             settlements_received.insert(*sid);
                         }
@@ -449,8 +673,8 @@ pub fn awareness_gossip_system(
                 }
             }
         }
-        if aware_received != 0 {
-            knowledge.merge_awareness(aware_received);
+        if !aware_received.is_empty() {
+            knowledge.merge_awareness(&aware_received);
         }
         if !settlements_received.is_empty() {
             if let Some(mut memory) = mem_opt {
@@ -689,7 +913,7 @@ pub fn tech_teaching_system(
     // `social_contact::SecondarySocial` / `is_social_contact` here — casual
     // work chatter must not become accidental instruction (awareness/wage
     // gossip is free and does go ambient; *teaching* does not).
-    let snapshots: ahash::AHashMap<Entity, u64> = q
+    let snapshots: ahash::AHashMap<Entity, KnowledgeBits> = q
         .iter()
         .filter(|(_, _, goal, _, lod, _, _)| {
             matches!(goal, AgentGoal::Socialize) && **lod != LodLevel::Dormant
@@ -714,28 +938,30 @@ pub fn tech_teaching_system(
         let ty = (transform.translation.y / TILE_SIZE_LOCAL).floor() as i32;
 
         // Look for the nearby teacher with the largest set of teachable techs.
-        let mut best_teach_set: u64 = 0;
+        let mut best_teach_set = KnowledgeBits::EMPTY;
         for dy in -3i32..=3 {
             for dx in -3i32..=3 {
                 for &other in spatial.get(tx + dx, ty + dy) {
                     if other == entity {
                         continue;
                     }
-                    let Some(&other_learned) = snapshots.get(&other) else {
+                    let Some(other_learned) = snapshots.get(&other) else {
                         continue;
                     };
                     // Teachable: teacher has Learned, student is Aware but not
                     // Learned. (`aware` is the shared awareness; the student
                     // needs to have heard of the tech first.)
-                    let teachable = other_learned & knowledge.aware & !knowledge.learned;
-                    if teachable.count_ones() > best_teach_set.count_ones() {
+                    let teachable = other_learned
+                        .intersect(&knowledge.aware)
+                        .difference(&knowledge.learned);
+                    if teachable.count() > best_teach_set.count() {
                         best_teach_set = teachable;
                     }
                 }
             }
         }
 
-        if best_teach_set == 0 {
+        if best_teach_set.is_empty() {
             continue;
         }
 
@@ -752,10 +978,7 @@ pub fn tech_teaching_system(
         // Pick the highest-complexity teachable tech (most valuable lesson).
         let mut chosen: Option<TechId> = None;
         let mut chosen_cx: u8 = 0;
-        for id in 0..TECH_COUNT as TechId {
-            if (best_teach_set >> id) & 1 == 0 {
-                continue;
-            }
+        for id in best_teach_set.iter() {
             let cx = complexity(id);
             if cx > chosen_cx {
                 chosen = Some(id);
@@ -830,5 +1053,99 @@ pub fn discovery_system(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod mastery_belief_tests {
+    use super::*;
+    use crate::simulation::knowledge_catalog::BELIEF_GROUP_COSMOLOGY;
+
+    #[test]
+    fn mastery_accrual_saturates_at_max() {
+        let mut k = PersonKnowledge::default();
+        assert_eq!(k.mastery_of(7), 0);
+        assert_eq!(k.gain_mastery(7, 1), 1);
+        assert_eq!(k.gain_mastery(7, 1), 2);
+        assert_eq!(k.gain_mastery(7, 5), MASTERY_MAX);
+        assert_eq!(k.gain_mastery(7, 1), MASTERY_MAX);
+        assert_eq!(k.mastery_of(7), MASTERY_MAX);
+    }
+
+    #[test]
+    fn mastery_zero_delta_is_noop() {
+        let mut k = PersonKnowledge::default();
+        assert_eq!(k.gain_mastery(3, 0), 0);
+        assert!(k.mastery.is_empty());
+    }
+
+    #[test]
+    fn mastery_speed_mult_default_unchanged() {
+        // The headline Phase-C invariant: an agent with no mastery reads as
+        // exactly 1.0× work progress so existing tests / behaviour don't
+        // shift until a future content phase writes mastery values.
+        assert!((mastery_speed_mult(0) - 1.0).abs() < f32::EPSILON);
+        assert!(mastery_speed_mult(1) > 1.0);
+        assert!(mastery_speed_mult(MASTERY_MAX) > mastery_speed_mult(1));
+        // Saturation at MASTERY_MAX.
+        assert_eq!(
+            mastery_speed_mult(MASTERY_MAX),
+            mastery_speed_mult(MASTERY_MAX + 5)
+        );
+    }
+
+    #[test]
+    fn belief_accept_pushes_prior_onto_rejected() {
+        let mut k = PersonKnowledge::default();
+        // Start: nothing held in cosmology.
+        assert!(k.belief_in(BELIEF_GROUP_COSMOLOGY).is_none());
+        // Accept first model — no demotion yet.
+        k.accept_belief(BELIEF_GROUP_COSMOLOGY, 10, 200);
+        let s = k.belief_in(BELIEF_GROUP_COSMOLOGY).unwrap();
+        assert_eq!(s.accepted, 10);
+        assert_eq!(s.confidence, 200);
+        assert_eq!(s.rejected_len, 0);
+        // Swap to a different model — prior moves to rejected.
+        k.accept_belief(BELIEF_GROUP_COSMOLOGY, 11, 180);
+        let s = k.belief_in(BELIEF_GROUP_COSMOLOGY).unwrap();
+        assert_eq!(s.accepted, 11);
+        assert_eq!(s.rejected_len, 1);
+        assert_eq!(s.rejected_iter().collect::<Vec<_>>(), vec![10]);
+        // Swap again — second rejection stacks.
+        k.accept_belief(BELIEF_GROUP_COSMOLOGY, 12, 220);
+        let s = k.belief_in(BELIEF_GROUP_COSMOLOGY).unwrap();
+        assert_eq!(s.rejected_iter().collect::<Vec<_>>(), vec![10, 11]);
+    }
+
+    #[test]
+    fn belief_rejected_stack_bounded_to_cap() {
+        let mut k = PersonKnowledge::default();
+        // Swap through 5 ids; rejected slot only carries the last
+        // `BELIEF_REJECTED_CAP` (FIFO eviction keeps recent rejections).
+        for id in 10..15 {
+            k.accept_belief(BELIEF_GROUP_COSMOLOGY, id, 100);
+        }
+        let s = k.belief_in(BELIEF_GROUP_COSMOLOGY).unwrap();
+        assert_eq!(s.accepted, 14);
+        assert_eq!(s.rejected_len as usize, BELIEF_REJECTED_CAP);
+        // Oldest two (10, 11) dropped; last three (11, 12, 13) retained.
+        // After 5 swaps the FIFO content is 11, 12, 13 (10 was dropped
+        // first when 13 was rejected).
+        assert_eq!(s.rejected_iter().collect::<Vec<_>>(), vec![11, 12, 13]);
+    }
+
+    #[test]
+    fn belief_group_independence() {
+        let mut k = PersonKnowledge::default();
+        k.accept_belief(crate::simulation::knowledge_catalog::BELIEF_GROUP_COSMOLOGY, 10, 100);
+        k.accept_belief(crate::simulation::knowledge_catalog::BELIEF_GROUP_DISEASE_CAUSATION, 20, 150);
+        let cosmo = k
+            .belief_in(crate::simulation::knowledge_catalog::BELIEF_GROUP_COSMOLOGY)
+            .unwrap();
+        let disease = k
+            .belief_in(crate::simulation::knowledge_catalog::BELIEF_GROUP_DISEASE_CAUSATION)
+            .unwrap();
+        assert_eq!(cosmo.accepted, 10);
+        assert_eq!(disease.accepted, 20);
     }
 }

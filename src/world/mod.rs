@@ -10,6 +10,7 @@ pub mod erosion;
 pub mod geomorph;
 pub mod globe;
 pub mod hydrology;
+pub mod locality;
 pub mod plates;
 pub mod seasons;
 pub mod spatial;

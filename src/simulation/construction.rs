@@ -1930,9 +1930,8 @@ impl ConstructionPosterPool {
             .filter(|c| poster_can_post_intent(intent, &c.learned))
             .max_by(|a, b| {
                 a.learned
-                    .0
-                    .count_ones()
-                    .cmp(&b.learned.0.count_ones())
+                    .count()
+                    .cmp(&b.learned.count())
                     .then(a.building_skill.cmp(&b.building_skill))
                     .then(a.social_skill.cmp(&b.social_skill))
                     .then(b.entity.cmp(&a.entity))
@@ -8363,6 +8362,7 @@ mod tests {
         assert_eq!(bronze.hearth_tier, HearthTier::Lined);
         // seed_techs() must match the legacy era derivation exactly.
         assert_eq!(bronze.seed_techs().0, techs_through_era(Era::BronzeAge).0);
+        // KnowledgeBits equality is structural — same word array means same set.
     }
 
     #[test]

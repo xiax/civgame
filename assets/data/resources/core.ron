@@ -129,6 +129,86 @@ ResourceFile(
             tags: ["material", "construction"],
             sprite_key: Some("resource_loose_rock"),
         ),
+        // ── Phase F construction materials (knowledge-system overhaul) ──
+        // Raw clay dug from clay-bearing soil bands. Input to Wattle-and-Daub,
+        // Cob, Adobe, and Mudbrick technique recipes. Heavy + bulky like
+        // stone — moved in loads, not pouches.
+        ResourceDef(
+            key: "clay",
+            display_name: "Clay",
+            class: material,
+            bulk: two_hand,
+            weight_g: 4000,
+            volume_ml: 6000,
+            entertainment_value: 2,
+            storage_class: pile,
+            trade_base_value: 3,
+            tags: ["material", "construction"],
+            sprite_key: Some("resource_loose_rock"),
+        ),
+        // Bundled reeds from wetland Marsh / riparian-Silt tiles. Input to
+        // Reed Matting, Wattle-and-Daub trim, Thatch Roofing primary. Light
+        // and stackable.
+        ResourceDef(
+            key: "reeds",
+            display_name: "Reeds",
+            class: material,
+            bulk: one_hand,
+            weight_g: 600,
+            volume_ml: 4000,
+            entertainment_value: 3,
+            storage_class: pile,
+            trade_base_value: 2,
+            tags: ["material", "construction"],
+            sprite_key: Some("resource_wood_log"),
+        ),
+        // Bundled straw / dried grain stalks — a small byproduct of grain
+        // harvest (see `harvest_extra_yields` Phase F arm). Primary roof
+        // technique input.
+        ResourceDef(
+            key: "thatch",
+            display_name: "Thatch",
+            class: material,
+            bulk: one_hand,
+            weight_g: 400,
+            volume_ml: 5000,
+            entertainment_value: 2,
+            storage_class: pile,
+            trade_base_value: 2,
+            tags: ["material", "construction"],
+            sprite_key: Some("resource_wood_log"),
+        ),
+        // Quarried limestone block — primary input to lime burning. Mined
+        // from Limestone-band tiles (`stone_yield_count = 3`).
+        ResourceDef(
+            key: "limestone",
+            display_name: "Limestone",
+            class: material,
+            bulk: two_hand,
+            weight_g: 5000,
+            volume_ml: 8000,
+            entertainment_value: 4,
+            storage_class: pile,
+            trade_base_value: 9,
+            tags: ["material", "construction"],
+            sprite_key: Some("resource_loose_rock"),
+        ),
+        // Burnt lime — limestone calcined in a wood-fired kiln. The mortar
+        // binder for Cut Stone Masonry, Hydraulic Masonry, and lime plaster
+        // finishes. `FIRED_POTTERY`-gated crafting recipe consumes it.
+        ResourceDef(
+            key: "lime",
+            display_name: "Lime",
+            class: material,
+            bulk: one_hand,
+            weight_g: 2500,
+            volume_ml: 3000,
+            entertainment_value: 2,
+            storage_class: pile,
+            trade_base_value: 12,
+            tags: ["material", "construction"],
+            sprite_key: Some("resource_loose_rock"),
+        ),
 
         // ── Metals & ores ─────────────────────────────────────────────
         ResourceDef(

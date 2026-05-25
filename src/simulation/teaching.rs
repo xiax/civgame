@@ -572,17 +572,12 @@ pub fn apply_teach_order_system(
         let Ok(s_kn) = knowledges.get(student_e) else {
             continue;
         };
-        let teachable = t_kn.learned & !s_kn.learned;
-        if teachable == 0 {
+        let teachable = t_kn.learned.difference(&s_kn.learned);
+        if teachable.is_empty() {
             continue;
         }
         let mut chosen: Option<(TechId, u8)> = None;
-        for id in
-            0..crate::simulation::technology::TECH_COUNT as crate::simulation::technology::TechId
-        {
-            if (teachable >> id) & 1 == 0 {
-                continue;
-            }
+        for id in teachable.iter() {
             let cx = crate::simulation::technology::complexity(id);
             match chosen {
                 None => chosen = Some((id, cx)),
@@ -677,11 +672,7 @@ pub fn self_actualization_teaching_system(
         // one (most "valuable" knowledge transferred first), mirroring
         // `tech_teaching_system`'s teach-rate weighting.
         let mut best: Option<(TechId, u8)> = None;
-        for tech_id in 0..64u32 {
-            if (knowledge.learned >> tech_id) & 1 == 0 {
-                continue;
-            }
-            let tech = tech_id as TechId;
+        for tech in knowledge.learned.iter() {
             let c = crate::simulation::technology::complexity(tech);
             if best.map_or(true, |(_, b)| c > b) {
                 best = Some((tech, c));

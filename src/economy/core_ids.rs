@@ -174,4 +174,10 @@ core_ids! {
     Awl => "awl" => awl,
     FishingKit => "fishing_kit" => fishing_kit,
     Bone => "bone" => bone,
+    // Phase F construction materials (knowledge-system overhaul):
+    Clay => "clay" => clay,
+    Reeds => "reeds" => reeds,
+    Thatch => "thatch" => thatch,
+    Limestone => "limestone" => limestone,
+    Lime => "lime" => lime,
 }

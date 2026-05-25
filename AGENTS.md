@@ -15,7 +15,7 @@ cargo test --bin civgame   # Run tests (binary crate — `cargo test` alone erro
 ## Game-start options
 
 `GameStartOptions` (resource in `game_state.rs`) drives the spawn-select screen and is read once by `spawn_population` + `seed_starting_buildings_system`:
-- `era: Era` — every spawned member starts with all techs through this era Aware+Learned (`PersonKnowledge::seeded_through_era`); structures and walls scale up accordingly.
+- `era: Era` — every spawned member starts with the era-≤-target subset Aware. Learned-set scope is role-keyed (`PersonKnowledge::seeded_realistic_through_era`): chiefs Learn Personal+Household+Subsistence+Specialist+Institutional, ~1/8 are Specialist, the rest Common. **Phase G foundations** (Fire Use, Cordage, Hafting, Toolstone Recognition, etc.) are Personal-scale so every founder Learns them at-era. **Phase H beliefs** (Cosmology / Disease / Omens groups) populate `PersonKnowledge.belief` via `seed_initial_beliefs(target)` — pre-Neolithic: Sky Dome + Spirit Illness + Eclipse Omens; Neolithic+: Geocentric + Miasma + Weather Omens.
 - `player_population: u32` — group size for `group_idx == 0` (player faction). Other factions stay at hardcoded `GROUP_SIZE=20`.
 - `economy: EconomyPreset` — `Subsistence` (empty policy map = all-communist), `Mixed` (`mixed()` on non-staples; chief still allocates food/wood/stone), `Market` (`capitalist()` on every catalog resource). Applied per-faction in `spawn_population` via `policy::apply_preset`.
 - `lifestyle: Lifestyle` — `Settled` (default) or `Nomadic`. Only the player faction reads it; AI factions stay Settled.

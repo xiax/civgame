@@ -50,6 +50,13 @@ pub struct Settlement {
     /// gates read this so a settlement that drops 30 → 15 doesn't lose its
     /// market. Maintained by `settlement_peak_population_system`.
     pub peak_population: u32,
+    /// Cached read-only site features (stone lithology, forest density,
+    /// clay / wetland / river-silt proximity, biome). Populated at
+    /// `auto_found_default_settlements_system` spawn time from
+    /// `world::locality::compute_local_site_context`. Phase D of the
+    /// knowledge overhaul — Phase E's building-technique selector reads
+    /// this; the inspector surfaces it for verification.
+    pub locality: Option<crate::world::locality::LocalSiteContext>,
 }
 
 /// Resource indexing every live `Settlement` entity by id, megachunk,
@@ -113,6 +120,7 @@ pub fn auto_found_default_settlements_system(
     mut map: ResMut<SettlementMap>,
     registry: Res<FactionRegistry>,
     clock: Res<SimClock>,
+    globe: Option<Res<crate::world::globe::Globe>>,
 ) {
     for (faction_id, data) in registry.factions.iter() {
         if *faction_id == SOLO {
@@ -137,6 +145,9 @@ pub fn auto_found_default_settlements_system(
         let home = data.home_tile;
         let mc = crate::simulation::region::MegaChunkCoord::from_tile(home.0, home.1);
         let id = map.alloc_id();
+        let locality = globe.as_deref().map(|g| {
+            crate::world::locality::compute_local_site_context(g, home.0, home.1)
+        });
         let entity = commands
             .spawn(Settlement {
                 id,
@@ -147,6 +158,7 @@ pub fn auto_found_default_settlements_system(
                 treasury: 0.0,
                 market: SettlementMarket::default(),
                 peak_population: data.member_count,
+                locality,
             })
             .id();
         map.register(id, entity, mc, *faction_id);
@@ -374,7 +386,9 @@ const REPLAN_INTERVAL: u64 = 600;
 /// Compute the input hash that, when changed, forces a re-plan.
 fn culture_hash(faction: &FactionData) -> u64 {
     let pop_bucket = (faction.member_count / 5) as u64;
-    faction.techs.0
+    let words = faction.techs.0 .0;
+    words[0]
+        ^ words[1].rotate_left(17)
         ^ (pop_bucket << 56)
         ^ ((faction.culture.style as u64) << 48)
         ^ ((faction.culture.density as u64) << 40)

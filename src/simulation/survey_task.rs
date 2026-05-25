@@ -366,6 +366,7 @@ mod tests {
             treasury: 0.0,
             market: SettlementMarket::default(),
             peak_population: 12,
+            locality: None,
         };
         let diff = SettlementSurveyDiff {
             settlement_id: settlement.id,
@@ -394,6 +395,7 @@ mod tests {
             treasury: 0.0,
             market: SettlementMarket::default(),
             peak_population: 12,
+            locality: None,
         };
         let diff = SettlementSurveyDiff {
             settlement_id: settlement.id,

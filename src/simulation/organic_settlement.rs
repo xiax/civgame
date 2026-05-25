@@ -3466,13 +3466,30 @@ pub(crate) fn pressure_to_intent(
         }),
         _ => None,
     };
+    // **Phase H** — Miasma Theory belief lift. A chief who accepts Miasma
+    // Theory (`FactionData.chief_disease_belief == Some(MIASMA_THEORY)`)
+    // reads foul air as the cause of sickness; sanitation infrastructure
+    // (latrines, public wells) is the cure. Lift `WaterAccess` intent
+    // priority by 30% so a Neolithic+ Miasma-accepting faction prioritises
+    // wells / latrines earlier than a Spirit-Illness-accepting peer with
+    // the same population pressure. Latrine emission isn't routed through
+    // its own `SettlementPressureKind` variant yet — Phase H.3 will add a
+    // dedicated `Sanitation` pressure kind. For now, the well lift is the
+    // first observable behaviour difference between disease beliefs.
+    let mut priority = pressure.urgency + site_bonus(brain, district, tile);
+    if matches!(pressure.kind, SettlementPressureKind::WaterAccess)
+        && faction.chief_disease_belief
+            == Some(crate::simulation::technology::MIASMA_THEORY)
+    {
+        priority *= 1.30;
+    }
     Some(ConstructionIntent {
         template_id: archetype_id_for(pressure.kind, era, archetypes).to_string(),
         build_kind,
         tile,
         door_dir,
         sponsor: pressure.sponsor,
-        priority: pressure.urgency + site_bonus(brain, district, tile),
+        priority,
         reason: pressure.reason,
         hearth_role,
     })
@@ -3485,6 +3502,15 @@ fn shelter_kind(
     wall_mat: WallMaterial,
     seed_mode: bool,
 ) -> OrganicBuildKind {
+    // Phase E.2: knowledge-aware Longhouse lift. A faction that knows
+    // `TIMBER_LONGHOUSE_FRAMING` has the cultural method for putting up a
+    // shared-roof longhouse — drop the bed-deficit gate to `≥ 1` at
+    // Neolithic+ regardless of seed-mode. Stays under the existing
+    // CITY_STATE_ORG-or-Chalcolithic+ unconditional path, just opens a
+    // Neolithic Longhouse lane for cultures that historically built them.
+    let knows_longhouse = community_techs
+        .has(crate::simulation::technology::TIMBER_LONGHOUSE_FRAMING);
+
     // Bootstrap P3 seed-only lift (was in the legacy `generate_candidates`):
     // at seed time, allow Longhouses at Neolithic+ once bed deficit ≥ 2.
     // The kin-group partition (settlement_bootstrap P2) puts founders into
@@ -3495,6 +3521,9 @@ fn shelter_kind(
     if community_techs.has(CITY_STATE_ORG)
         || (matches!(era, Era::Chalcolithic | Era::BronzeAge) && bed_deficit >= 2)
         || (seed_mode && bed_deficit >= 2)
+        || (knows_longhouse
+            && matches!(era, Era::Neolithic | Era::Chalcolithic | Era::BronzeAge)
+            && bed_deficit >= 2)
     {
         OrganicBuildKind::Longhouse {
             wall_material: wall_mat,
@@ -5420,6 +5449,7 @@ mod tests {
             treasury: 0.0,
             market: SettlementMarket::default(),
             peak_population: 30,
+            locality: None,
         };
 
         let parcels = build_parcels(
@@ -5487,6 +5517,7 @@ mod tests {
             treasury: 0.0,
             market: SettlementMarket::default(),
             peak_population: 30,
+            locality: None,
         }
     }
 
@@ -5807,6 +5838,7 @@ mod tests {
             treasury: 0.0,
             market: SettlementMarket::default(),
             peak_population: members,
+            locality: None,
         };
         (faction, brain, settlement, map, offsets)
     }
@@ -5836,6 +5868,7 @@ mod tests {
             treasury: 0.0,
             market: SettlementMarket::default(),
             peak_population: 12,
+            locality: None,
         };
         let parcels = build_parcels_road_driven(&faction, &settlement, &brain, &map);
         let commons = brain.commons_rect.unwrap();

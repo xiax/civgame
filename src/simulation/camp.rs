@@ -205,6 +205,7 @@ mod tests {
                 treasury: 0.0,
                 market: crate::economy::market::SettlementMarket::default(),
                 peak_population: 0,
+                locality: None,
             })
             .id();
         let s2 = w
@@ -217,6 +218,7 @@ mod tests {
                 treasury: 0.0,
                 market: crate::economy::market::SettlementMarket::default(),
                 peak_population: 0,
+                locality: None,
             })
             .id();
         {

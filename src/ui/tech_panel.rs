@@ -85,6 +85,66 @@ pub fn tech_panel_system(
             let techs = &faction.techs;
             let adoption = &faction.tech_adoption;
 
+            // Phase I — Beliefs section. Reads the chief's belief map directly
+            // (cached on `FactionData.chief_disease_belief` / `chief_cosmology_belief`
+            // by `sync_faction_techs_from_chief_system`). Foundations + omens
+            // beliefs aren't cached yet — pull from `chief_knowledge` for the
+            // omens row.
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Beliefs")
+                    .strong()
+                    .color(egui::Color32::from_rgb(220, 180, 220))
+                    .size(14.0),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                use crate::simulation::knowledge_catalog::{
+                    knowledge_def, TruthStatus, BELIEF_GROUP_COSMOLOGY,
+                    BELIEF_GROUP_DISEASE_CAUSATION, BELIEF_GROUP_OMENS,
+                };
+                let render_row = |ui: &mut egui::Ui, group_label: &str, accepted_id: Option<TechId>| {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("  {}:", group_label));
+                        match accepted_id {
+                            Some(id) => {
+                                let def = knowledge_def(id);
+                                let truth_colour = match def.truth() {
+                                    TruthStatus::True => egui::Color32::from_rgb(120, 200, 120),
+                                    TruthStatus::FalseUseful => egui::Color32::from_rgb(220, 200, 100),
+                                    TruthStatus::FalseHarmful => egui::Color32::from_rgb(220, 120, 100),
+                                    TruthStatus::Contested => egui::Color32::from_rgb(180, 180, 220),
+                                };
+                                ui.label(
+                                    egui::RichText::new(def.name()).color(truth_colour),
+                                );
+                            }
+                            None => {
+                                ui.label(
+                                    egui::RichText::new("(none)").color(egui::Color32::GRAY),
+                                );
+                            }
+                        }
+                    });
+                };
+                render_row(ui, "Cosmology", faction.chief_cosmology_belief);
+                render_row(ui, "Disease", faction.chief_disease_belief);
+                // Omens isn't cached on FactionData yet; pull from chief
+                // directly when available.
+                let omens = chief_knowledge
+                    .and_then(|k| k.belief_in(BELIEF_GROUP_OMENS).map(|s| s.accepted));
+                let _ = BELIEF_GROUP_COSMOLOGY;
+                let _ = BELIEF_GROUP_DISEASE_CAUSATION;
+                render_row(ui, "Omens", omens);
+                ui.label(
+                    egui::RichText::new(
+                        "Yellow = useful but wrong · red = harmful · green = true · purple = contested",
+                    )
+                    .color(egui::Color32::GRAY)
+                    .size(10.0),
+                );
+            });
+            ui.separator();
+
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for era in [
                     Era::Paleolithic,
@@ -101,7 +161,16 @@ pub fn tech_panel_system(
                     )
                     .default_open(true)
                     .show(ui, |ui| {
-                        for tech in TECH_TREE.iter().filter(|t| t.era == era) {
+                        // Phase I — Belief-kind entries surface in the Beliefs
+                        // section above; the per-era list is just techniques /
+                        // foundations / skills.
+                        for tech in TECH_TREE.iter().filter(|t| {
+                            t.era == era
+                                && !matches!(
+                                    crate::simulation::knowledge_catalog::knowledge_def(t.id).kind(),
+                                    crate::simulation::knowledge_catalog::KnowledgeKind::Belief
+                                )
+                        }) {
                             let unlocked = techs.has(tech.id);
                             let prereqs_met = tech.prerequisites.iter().all(|&p| techs.has(p));
                             let chief_learned = chief_knowledge

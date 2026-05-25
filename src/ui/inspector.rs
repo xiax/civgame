@@ -807,6 +807,66 @@ pub fn inspector_panel_system(
                                         ui.label("  (none)");
                                     }
                                 });
+                            // Phase I — Beliefs subsection. Lists every
+                            // accepted belief per group with its confidence
+                            // bar + truth-status colour cue. Pulls from
+                            // `PersonKnowledge.belief` (populated by Phase
+                            // H's `seed_initial_beliefs` and any in-game
+                            // belief swaps).
+                            ui.separator();
+                            ui.label(egui::RichText::new("Beliefs").strong());
+                            if k.belief.is_empty() {
+                                ui.label("  (no beliefs held)");
+                            } else {
+                                use crate::simulation::knowledge_catalog::{
+                                    knowledge_def, TruthStatus,
+                                };
+                                let mut groups: Vec<(u8, &crate::simulation::knowledge::BeliefState)> =
+                                    k.belief.iter().map(|(g, s)| (*g, s)).collect();
+                                groups.sort_by_key(|(g, _)| *g);
+                                for (group, state) in groups {
+                                    let def = knowledge_def(state.accepted);
+                                    let group_label = match group {
+                                        crate::simulation::knowledge_catalog::BELIEF_GROUP_COSMOLOGY => "Cosmology",
+                                        crate::simulation::knowledge_catalog::BELIEF_GROUP_DISEASE_CAUSATION => "Disease",
+                                        crate::simulation::knowledge_catalog::BELIEF_GROUP_OMENS => "Omens",
+                                        _ => "Other",
+                                    };
+                                    let truth_colour = match def.truth() {
+                                        TruthStatus::True => egui::Color32::from_rgb(120, 200, 120),
+                                        TruthStatus::FalseUseful => egui::Color32::from_rgb(220, 200, 100),
+                                        TruthStatus::FalseHarmful => egui::Color32::from_rgb(220, 120, 100),
+                                        TruthStatus::Contested => egui::Color32::from_rgb(180, 180, 220),
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("  {}:", group_label));
+                                        ui.label(
+                                            egui::RichText::new(def.name()).color(truth_colour),
+                                        );
+                                        ui.add(
+                                            egui::ProgressBar::new(
+                                                state.confidence as f32 / 255.0,
+                                            )
+                                            .desired_width(70.0)
+                                            .text(format!("{}%", state.confidence as u32 * 100 / 255)),
+                                        );
+                                    });
+                                    if state.rejected_len > 0 {
+                                        let names: Vec<&'static str> = state
+                                            .rejected_iter()
+                                            .map(|id| knowledge_def(id).name())
+                                            .collect();
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "    rejected: {}",
+                                                names.join(", ")
+                                            ))
+                                            .color(egui::Color32::GRAY)
+                                            .size(11.0),
+                                        );
+                                    }
+                                }
+                            }
                         } else {
                             ui.label("  (no knowledge component)");
                         }

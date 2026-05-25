@@ -142,6 +142,23 @@ pub fn hover_info_system(
                 if tile.has_building() {
                     ui.label("Has Building");
                 }
+
+                // Phase D — locality readout. Computed fresh from Globe; cached on
+                // `Settlement.locality` at survey time for consumers (Phase E
+                // building-technique selector). Show for verification.
+                let loc =
+                    crate::world::locality::compute_local_site_context(&globe, tx as i32, ty as i32);
+                ui.separator();
+                ui.label(egui::RichText::new("Locality").strong());
+                ui.label(format!("Biome: {:?}", loc.biome));
+                match loc.stone_kind {
+                    Some(k) => ui.label(format!("Stone: {:?}", k)),
+                    None => ui.label("Stone: —"),
+                };
+                ui.label(format!(
+                    "Forest: {}  Clay: {}  Wet: {}  River: {}",
+                    loc.forest_density, loc.clay, loc.wetland, loc.river_silt
+                ));
             } else {
                 ui.label("Unloaded Chunk");
             }
