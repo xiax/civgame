@@ -183,3 +183,5 @@ I want to add diplomacy AI that allows AI to initiate and make deals with other 
 Barter economies
 
 Add volume to items and carrying capacity, remove hard number limit
+
+Debug toggle for how quickly workers learn new knowledge

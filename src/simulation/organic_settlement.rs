@@ -311,7 +311,7 @@ pub(crate) fn build_kind_allowed_in_commons(build_kind: OrganicBuildKind) -> boo
                 | BuildSiteKind::Table
         ),
         OrganicBuildKind::Hut(_)
-        | OrganicBuildKind::Longhouse(_)
+        | OrganicBuildKind::Longhouse { .. }
         | OrganicBuildKind::PalisadeSegment(_)
         | OrganicBuildKind::CompositeHouse { .. } => false,
     }
@@ -386,11 +386,36 @@ pub struct SettlementPressure {
 #[derive(Resource, Default)]
 pub struct SettlementPressureMap(pub AHashMap<u32, Vec<SettlementPressure>>);
 
+/// Long-axis orientation for a Longhouse footprint. `EastWest` = 5×3
+/// (`half_w=2, half_h=1`); `NorthSouth` = 3×5 (`half_w=1, half_h=2`).
+/// Picked by the residential evaluator based on which orientation produces
+/// the cleanest entrance route — `EastWest` is the legacy default kept for
+/// non-evaluator emitters (seed retries, fixtures).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HouseAxis {
+    EastWest,
+    NorthSouth,
+}
+
+impl HouseAxis {
+    /// Footprint half-dimensions `(half_w, half_h)` for this axis.
+    #[inline]
+    pub fn longhouse_halves(self) -> (i32, i32) {
+        match self {
+            HouseAxis::EastWest => (2, 1),
+            HouseAxis::NorthSouth => (1, 2),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrganicBuildKind {
     Single(BuildSiteKind),
     Hut(WallMaterial),
-    Longhouse(WallMaterial),
+    Longhouse {
+        wall_material: WallMaterial,
+        axis: HouseAxis,
+    },
     PalisadeSegment(WallMaterial),
     CompositeHouse {
         shape: FootprintShape,
@@ -1056,6 +1081,14 @@ pub fn settlement_morphology_system(
         };
         let mut chosen_tiles = AHashSet::default();
         let mut faction_intents = Vec::new();
+        // One per-faction `RoadField` per planning tick; every residential
+        // candidate evaluation downstream is then a hash lookup + bounded
+        // local A*. Cost scales with road tile count (not city radius).
+        let road_field = crate::simulation::placement_reachability::road_field_from_home(
+            &chunk_map,
+            &brain.road_tiles,
+            faction.home_tile,
+        );
         for pressure in faction_pressures {
             if let Some(intent) = pressure_to_intent(
                 faction,
@@ -1068,6 +1101,7 @@ pub fn settlement_morphology_system(
                 &archetypes,
                 &mut chosen_tiles,
                 CivicGate::Runtime,
+                &road_field,
             ) {
                 faction_intents.push(intent);
             }
@@ -3299,6 +3333,7 @@ pub(crate) fn pressure_to_intent(
     archetypes: &BuildingArchetypeCatalog,
     occupied: &mut AHashSet<(i32, i32)>,
     civic_gate: CivicGate,
+    road_field: &crate::simulation::placement_reachability::RoadField,
 ) -> Option<ConstructionIntent> {
     let seed_mode = matches!(civic_gate, CivicGate::Seed(_));
     let community_techs =
@@ -3367,33 +3402,56 @@ pub(crate) fn pressure_to_intent(
         SettlementPressureKind::Field => return None,
     };
     let district = district_for_pressure(pressure.kind);
-    let tile = if shelter_emergency {
-        // Era-keyed emergency annulus (deterministic via the settlement
-        // layout hash + current bed count) — distinct geometry from the
-        // normal residential district so it reads as outskirts/bunk/overflow
-        // rows rather than proper housing.
-        let bed_count = count_near(&maps.bed_map.0, faction.home_tile, 32) as i32;
-        find_emergency_bed_tile(
-            chunk_map,
-            &maps.bed_map,
-            bp_map,
-            doormat,
-            faction.home_tile,
-            era,
-            brain.layout_hash,
-            bed_count,
-        )
-    } else if matches!(pressure.kind, SettlementPressureKind::Defense) {
-        organic_palisade_site(chunk_map, maps, bp_map, doormat, brain, faction.home_tile)
-    } else {
-        choose_site_for_intent(
+    // For Hut / Longhouse the route-aware residential evaluator returns
+    // (tile, picked axis-aware build_kind, door_dir). Everything else
+    // routes through the legacy single-tile / shelter-emergency / palisade
+    // path. Door direction defaults to the parcel's frontage for those.
+    let (tile, build_kind, door_dir) = if matches!(
+        build_kind,
+        OrganicBuildKind::Hut(_) | OrganicBuildKind::Longhouse { .. }
+    ) && !shelter_emergency
+    {
+        if let Some(choice) = choose_residential_site(
             faction, brain, district, build_kind, chunk_map, maps, bp_map, doormat, occupied,
-            seed_mode,
-        )
-    }?;
+            road_field,
+        ) {
+            (choice.tile, choice.build_kind, Some(choice.door_dir))
+        } else if seed_mode {
+            // Seed-mode legacy radial fallback (still returns a tile only).
+            let tile = choose_site_for_intent(
+                faction, brain, district, build_kind, chunk_map, maps, bp_map, doormat, occupied,
+                seed_mode, road_field,
+            )?;
+            let dir = parcel_for_tile(brain, tile).and_then(|p| p.frontage_edge);
+            (tile, build_kind, dir)
+        } else {
+            return None;
+        }
+    } else {
+        let tile = if shelter_emergency {
+            let bed_count = count_near(&maps.bed_map.0, faction.home_tile, 32) as i32;
+            find_emergency_bed_tile(
+                chunk_map,
+                &maps.bed_map,
+                bp_map,
+                doormat,
+                faction.home_tile,
+                era,
+                brain.layout_hash,
+                bed_count,
+            )
+        } else if matches!(pressure.kind, SettlementPressureKind::Defense) {
+            organic_palisade_site(chunk_map, maps, bp_map, doormat, brain, faction.home_tile)
+        } else {
+            choose_site_for_intent(
+                faction, brain, district, build_kind, chunk_map, maps, bp_map, doormat, occupied,
+                seed_mode, road_field,
+            )
+        }?;
+        let dir = parcel_for_tile(brain, tile).and_then(|p| p.frontage_edge);
+        (tile, build_kind, dir)
+    };
     occupied.insert(tile);
-
-    let door_dir = parcel_for_tile(brain, tile).and_then(|p| p.frontage_edge);
     // Tag civic-pressure Hearth intents with the appropriate role so the
     // downstream blueprint/seed paths stamp the right `Campfire.role`.
     // Pre-Neolithic = `Camp` (band crescent); Neolithic+ = `Civic` (one
@@ -3438,10 +3496,252 @@ fn shelter_kind(
         || (matches!(era, Era::Chalcolithic | Era::BronzeAge) && bed_deficit >= 2)
         || (seed_mode && bed_deficit >= 2)
     {
-        OrganicBuildKind::Longhouse(wall_mat)
+        OrganicBuildKind::Longhouse {
+            wall_material: wall_mat,
+            axis: HouseAxis::EastWest,
+        }
     } else {
         OrganicBuildKind::Hut(wall_mat)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Route-aware residential scoring constants. See
+// `plans/organic-residential-planner.md` for design rationale + tuning notes.
+// ---------------------------------------------------------------------------
+
+const ROUTE_BASE_BONUS: f32 = 45.0;
+const ROUTE_DETOUR_PENALTY_PER_TILE: f32 = 2.0;
+const ROUTE_DETOUR_RATIO_KNEE: f32 = 1.35;
+const ROUTE_DETOUR_RATIO_PENALTY: f32 = 35.0;
+const ROUTE_DETOUR_RATIO_LAST_RESORT: f32 = 2.75;
+const ROUTE_SATURATED_PENALTY: f32 = 80.0;
+/// Two `SiteChoice`s within this absolute score difference are considered
+/// tied and broken lexicographically by tile coordinate for deterministic
+/// placement across runs / multiplayer clients.
+const ROUTE_TIE_BREAK_EPSILON: f32 = 0.5;
+/// Cap on parcels evaluated per residential pressure per tick. Top-N by
+/// pre-route score (`suitability × band`); keeps planner cost bounded
+/// regardless of how many parcels brain has carved.
+const RESIDENTIAL_PARCEL_TOP_N: usize = 32;
+
+/// Pure-fn folding of a `PathStats` into the additive residential score
+/// term. Range: roughly `[-∞, +45]`. Negative values for very long
+/// detours; saturated/disconnected stats apply a flat penalty.
+pub(crate) fn residential_route_score(
+    stats: crate::simulation::placement_reachability::PathStats,
+) -> f32 {
+    let mut s = ROUTE_BASE_BONUS;
+    s -= (stats.detour.max(0) as f32) * ROUTE_DETOUR_PENALTY_PER_TILE;
+    let knee = stats.detour_ratio - ROUTE_DETOUR_RATIO_KNEE;
+    if knee > 0.0 {
+        s -= knee * ROUTE_DETOUR_RATIO_PENALTY;
+    }
+    if stats.saturated {
+        s -= ROUTE_SATURATED_PENALTY;
+    }
+    s
+}
+
+/// One picked residential placement option. Carries the axis-aware
+/// `build_kind` (Longhouse picks its orientation here) plus the cardinal
+/// the door should face. Tile is the parcel centre; door direction maps
+/// to a doormat tile via `entrance_cell_for_edge` downstream.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SiteChoice {
+    pub tile: (i32, i32),
+    pub build_kind: OrganicBuildKind,
+    pub door_dir: TileEdge,
+    pub score: f32,
+    pub is_last_resort: bool,
+}
+
+/// Enumerate `(axis, cardinal)` entrance options for a residential build.
+/// Returns `(build_kind_with_axis, half_w, half_h, door_dir, doormat_tile)`.
+fn residential_entrance_options(
+    build_kind: OrganicBuildKind,
+    centre: (i32, i32),
+    home: (i32, i32),
+) -> Vec<(OrganicBuildKind, i32, i32, TileEdge, (i32, i32))> {
+    use crate::simulation::construction::entrance_cell_for_edge;
+    let cardinals = [
+        TileEdge::North,
+        TileEdge::East,
+        TileEdge::South,
+        TileEdge::West,
+    ];
+    let mut out = Vec::with_capacity(8);
+    let axis_variants: Vec<(OrganicBuildKind, i32, i32)> = match build_kind {
+        OrganicBuildKind::Hut(_) => vec![(build_kind, 1, 1)],
+        OrganicBuildKind::Longhouse { wall_material, .. } => {
+            vec![
+                (
+                    OrganicBuildKind::Longhouse {
+                        wall_material,
+                        axis: HouseAxis::EastWest,
+                    },
+                    2,
+                    1,
+                ),
+                (
+                    OrganicBuildKind::Longhouse {
+                        wall_material,
+                        axis: HouseAxis::NorthSouth,
+                    },
+                    1,
+                    2,
+                ),
+            ]
+        }
+        // Other build kinds shouldn't reach this enumerator.
+        _ => return Vec::new(),
+    };
+    for (bk, half_w, half_h) in axis_variants {
+        for &edge in &cardinals {
+            let entrance_off = entrance_cell_for_edge(half_w, half_h, edge, home, centre);
+            let door_tile = (centre.0 + entrance_off.0, centre.1 + entrance_off.1);
+            let (dx, dy) = edge.delta();
+            let doormat = (door_tile.0 + dx, door_tile.1 + dy);
+            out.push((bk, half_w, half_h, edge, doormat));
+        }
+    }
+    out
+}
+
+/// Route-aware residential placement evaluator. For each parcel (top-N by
+/// pre-route score), enumerates `(axis, cardinal)` options, gates on
+/// existing footprint / commons / reachability checks, scores each with
+/// `path_stats` from the doormat back to `home`. Returns the highest-
+/// scoring `SiteChoice`; falls back to a last-resort option when every
+/// candidate has `detour_ratio > ROUTE_DETOUR_RATIO_LAST_RESORT`.
+#[allow(clippy::too_many_arguments)]
+fn choose_residential_site(
+    faction: &FactionData,
+    brain: &SettlementBrain,
+    district: DistrictKind,
+    build_kind: OrganicBuildKind,
+    chunk_map: &ChunkMap,
+    maps: &OrganicStructureMaps,
+    bp_map: &BlueprintMap,
+    doormat_res: &crate::simulation::doormat::DoormatReservations,
+    occupied: &AHashSet<(i32, i32)>,
+    road_field: &crate::simulation::placement_reachability::RoadField,
+) -> Option<SiteChoice> {
+    use crate::simulation::placement_reachability as reach;
+    let road_frontage_required = faction.community_has(PERM_SETTLEMENT);
+    let commons_blocks = !build_kind_allowed_in_commons(build_kind);
+    // Stage 1: cheap pre-filter — gather viable parcels with their base score
+    // (suitability × band + frontage_bonus + spread), then keep top-N to
+    // bound the route-eval cost.
+    let mut pre: Vec<(f32, &Parcel)> = Vec::new();
+    for parcel in &brain.parcels {
+        let tile = parcel.centre();
+        if occupied.contains(&tile) {
+            continue;
+        }
+        if commons_blocks && tile_inside_commons(brain.commons_rect, tile) {
+            continue;
+        }
+        if road_frontage_required
+            && (parcel.frontage_edge.is_none() || parcel.access_tile.is_none())
+        {
+            continue;
+        }
+        let suitability = parcel.suitability.for_district(district);
+        if suitability <= 0.05 {
+            continue;
+        }
+        let dist = cheb(tile, faction.home_tile);
+        let band = band_mul(district, brain.phase, dist);
+        if band <= 0.0 {
+            continue;
+        }
+        let frontage_bonus = parcel.frontage_edge.map(|_| 8.0).unwrap_or(0.0);
+        let spread = well_spread_adjustment(build_kind, tile, chunk_map, maps);
+        let base = suitability * 100.0 * band + frontage_bonus + spread;
+        pre.push((base, parcel));
+    }
+    if pre.is_empty() {
+        return None;
+    }
+    pre.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.centre().cmp(&b.1.centre()))
+    });
+    pre.truncate(RESIDENTIAL_PARCEL_TOP_N);
+
+    let mut best: Option<SiteChoice> = None;
+    let mut last_resort: Option<SiteChoice> = None;
+    let home = faction.home_tile;
+    let preferred_edge_for = |parcel: &Parcel| -> TileEdge {
+        parcel
+            .frontage_edge
+            .unwrap_or_else(|| TileEdge::toward(parcel.centre(), home))
+    };
+    for (base_score, parcel) in pre {
+        let tile = parcel.centre();
+        let preferred = preferred_edge_for(parcel);
+        for (bk_axis, half_w, half_h, edge, doormat) in
+            residential_entrance_options(build_kind, tile, home)
+        {
+            // Footprint must fit per this axis.
+            if !footprint_clear(tile, half_w, half_h, chunk_map, maps, bp_map, doormat_res, brain) {
+                continue;
+            }
+            // Doormat must be a clear walkable tile (not wall / structure /
+            // already-reserved doormat / road would be fine but commons
+            // disc keepout still applies).
+            if doormat_res.is_reserved(doormat) {
+                continue;
+            }
+            if !chunk_map.is_passable(doormat.0, doormat.1) {
+                continue;
+            }
+            let Some(stats) = reach::path_stats(
+                chunk_map,
+                road_field,
+                reach::resolve3(chunk_map, doormat),
+                home,
+            ) else {
+                continue;
+            };
+            let mut score = base_score + residential_route_score(stats);
+            // Tiny lift for the parcel's pre-existing preferred frontage so
+            // we don't churn when two cardinals tie.
+            if edge == preferred {
+                score += 0.25;
+            }
+            let is_last_resort = stats.detour_ratio > ROUTE_DETOUR_RATIO_LAST_RESORT;
+            let choice = SiteChoice {
+                tile,
+                build_kind: bk_axis,
+                door_dir: edge,
+                score,
+                is_last_resort,
+            };
+            let slot = if is_last_resort {
+                &mut last_resort
+            } else {
+                &mut best
+            };
+            *slot = match *slot {
+                None => Some(choice),
+                Some(cur) => {
+                    if score > cur.score + ROUTE_TIE_BREAK_EPSILON
+                        || ((score - cur.score).abs() <= ROUTE_TIE_BREAK_EPSILON
+                            && (choice.tile, choice.door_dir as u8)
+                                < (cur.tile, cur.door_dir as u8))
+                    {
+                        Some(choice)
+                    } else {
+                        Some(cur)
+                    }
+                }
+            };
+        }
+    }
+    best.or(last_resort)
 }
 
 fn choose_site_for_intent(
@@ -3455,6 +3755,7 @@ fn choose_site_for_intent(
     doormat: &crate::simulation::doormat::DoormatReservations,
     occupied: &AHashSet<(i32, i32)>,
     seed_mode: bool,
+    road_field: &crate::simulation::placement_reachability::RoadField,
 ) -> Option<(i32, i32)> {
     let mut candidates: Vec<(f32, (i32, i32))> = Vec::new();
     let road_frontage_required =
@@ -3566,6 +3867,7 @@ fn choose_site_for_intent(
         occupied,
         commons_blocks,
         road_frontage_required,
+        road_field,
     )
 }
 
@@ -3587,6 +3889,7 @@ fn home_radial_fallback(
     occupied: &AHashSet<(i32, i32)>,
     commons_blocks: bool,
     road_frontage_required: bool,
+    road_field: &crate::simulation::placement_reachability::RoadField,
 ) -> Option<(i32, i32)> {
     // Frontage-required intents (Hut / Longhouse / CompositeHouse) still
     // run the radial fallback when no road-fronted parcel was found.
@@ -3601,7 +3904,7 @@ fn home_radial_fallback(
     let home = faction.home_tile;
     let (half_w, half_h) = match build_kind {
         OrganicBuildKind::Hut(_) => (1, 1),
-        OrganicBuildKind::Longhouse(_) => (2, 1),
+        OrganicBuildKind::Longhouse { axis, .. } => axis.longhouse_halves(),
         // Composite footprints aren't emitted by the organic pressure
         // path (composite shelter is disabled in `pressure_to_intent` —
         // the 2×2+2×1 mask has no interior bed cells). Use the longhouse
@@ -3610,8 +3913,18 @@ fn home_radial_fallback(
         OrganicBuildKind::CompositeHouse { .. } => (2, 1),
         OrganicBuildKind::Single(_) | OrganicBuildKind::PalisadeSegment(_) => (0, 0),
     };
+    use crate::simulation::placement_reachability as reach;
     let mut best: Option<(f32, (i32, i32))> = None;
+    // Don't early-return on first ring hit. Look `max_r/2` further rings so
+    // a clearly cleaner outer candidate can beat a barely-passing inner one.
+    let mut first_hit_ring: Option<i32> = None;
+    let extra_rings = (max_r / 2).max(1);
     for r in 1..=max_r {
+        if let Some(hit) = first_hit_ring {
+            if r > hit + extra_rings {
+                break;
+            }
+        }
         for dy in -r..=r {
             for dx in -r..=r {
                 if dx.abs().max(dy.abs()) != r {
@@ -3621,8 +3934,6 @@ fn home_radial_fallback(
                 if occupied.contains(&tile) {
                     continue;
                 }
-                // Footprint-rect commons check (multi-tile builds: a centre
-                // outside commons can still put walls inside the disc).
                 if commons_blocks {
                     let foot = TileRect::new(
                         tile.0 - half_w,
@@ -3641,27 +3952,32 @@ fn home_radial_fallback(
                 if !intent_site_clear(build_kind, tile, chunk_map, maps, bp_map, doormat, brain) {
                     continue;
                 }
-                if !crate::simulation::placement_reachability::tile_reachable_from_home(
-                    chunk_map, home, tile,
-                ) {
+                if !reach::tile_reachable_from_home(chunk_map, home, tile) {
                     continue;
                 }
                 let spread = well_spread_adjustment(build_kind, tile, chunk_map, maps);
-                let score = band * 100.0 + spread;
+                let mut score = band * 100.0 + spread;
+                // Route-aware lift: a candidate one ring further out with a
+                // direct walk to home should beat a closer candidate whose
+                // walked route loops around.
+                if let Some(stats) = reach::path_stats(
+                    chunk_map,
+                    road_field,
+                    reach::resolve3(chunk_map, tile),
+                    home,
+                ) {
+                    score += residential_route_score(stats);
+                }
                 if best.map_or(true, |b| score > b.0) {
                     best = Some((score, tile));
+                    if first_hit_ring.is_none() {
+                        first_hit_ring = Some(r);
+                    }
                 }
             }
         }
-        // Early-out: as soon as we have any candidate inside ring r, take
-        // the best of this ring. Bands fall off with distance, so a r+1
-        // hit would only beat a r hit on a freak spread bonus — not worth
-        // searching the whole annulus.
-        if best.is_some() {
-            return best.map(|(_, tile)| tile);
-        }
     }
-    None
+    best.map(|(_, tile)| tile)
 }
 
 /// Per-well penalty that pushes 2nd/3rd wells away from existing wells and
@@ -3708,7 +4024,7 @@ fn build_kind_requires_frontage(build_kind: OrganicBuildKind) -> bool {
     matches!(
         build_kind,
         OrganicBuildKind::Hut(_)
-            | OrganicBuildKind::Longhouse(_)
+            | OrganicBuildKind::Longhouse { .. }
             | OrganicBuildKind::CompositeHouse { .. }
     )
 }
@@ -3729,8 +4045,9 @@ fn intent_site_clear(
         OrganicBuildKind::Hut(_) => {
             footprint_clear(tile, 1, 1, chunk_map, maps, bp_map, doormat, brain)
         }
-        OrganicBuildKind::Longhouse(_) => {
-            footprint_clear(tile, 2, 1, chunk_map, maps, bp_map, doormat, brain)
+        OrganicBuildKind::Longhouse { axis, .. } => {
+            let (hw, hh) = axis.longhouse_halves();
+            footprint_clear(tile, hw, hh, chunk_map, maps, bp_map, doormat, brain)
         }
         OrganicBuildKind::PalisadeSegment(_) => {
             single_tile_clear(tile, chunk_map, maps, bp_map, doormat, brain)
@@ -3946,8 +4263,8 @@ fn required_goods(
             add(BuildSiteKind::Door, 1);
             add(BuildSiteKind::Bed, 1);
         }
-        OrganicBuildKind::Longhouse(mat) => {
-            add(BuildSiteKind::Wall(mat), 8);
+        OrganicBuildKind::Longhouse { wall_material, .. } => {
+            add(BuildSiteKind::Wall(wall_material), 8);
             add(BuildSiteKind::Door, 1);
             add(BuildSiteKind::Bed, 2);
         }
@@ -3983,8 +4300,13 @@ fn intent_tech_allowed(build_kind: OrganicBuildKind, faction: &FactionData) -> b
     let techs = crate::simulation::technology_adoption::community_adoption_bitset(faction);
     match build_kind {
         OrganicBuildKind::Single(kind) => faction_can_build(kind, &techs),
-        OrganicBuildKind::Hut(mat) | OrganicBuildKind::Longhouse(mat) => {
+        OrganicBuildKind::Hut(mat) => {
             faction_can_build(BuildSiteKind::Wall(mat), &techs)
+                && faction_can_build(BuildSiteKind::Door, &techs)
+                && faction_can_build(BuildSiteKind::Bed, &techs)
+        }
+        OrganicBuildKind::Longhouse { wall_material, .. } => {
+            faction_can_build(BuildSiteKind::Wall(wall_material), &techs)
                 && faction_can_build(BuildSiteKind::Door, &techs)
                 && faction_can_build(BuildSiteKind::Bed, &techs)
         }

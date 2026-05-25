@@ -276,6 +276,240 @@ pub fn simulate_house_reachable(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Route-aware residential placement (per-tick `RoadField` + bounded off-road).
+// ---------------------------------------------------------------------------
+
+/// BFS over the road graph (carved `TileKind::Road` tiles ∪ a planned-spine
+/// set) rooted at the road tile closest to `home`. Built once per faction
+/// per planning tick by `organic_settlement::settlement_morphology_system`
+/// and passed by reference to every residential candidate evaluation. Cost
+/// scales with road tile count, **not** city radius — a 1000-tile sprawl
+/// with a 300-tile road network costs the same as a 30-tile hamlet with
+/// the same road density.
+#[derive(Default, Debug)]
+pub struct RoadField {
+    /// Road tile (`x, y`) → step count along the road graph from
+    /// `home_road_tile`. Missing key means the road tile is in a
+    /// disconnected fragment or no road graph was built.
+    pub road_steps_to_home: AHashMap<(i32, i32), u16>,
+    /// The road tile the field is rooted at (closest carved/planned road to
+    /// `home`). `None` when no road exists within the tiny seed search.
+    pub home_road_tile: Option<(i32, i32)>,
+}
+
+/// Safety cap on `RoadField` BFS. Real road networks are 100s of tiles even
+/// in mature cities; this cap is effectively infinite.
+pub const MAX_ROAD_TILES: usize = 8_000;
+
+/// Cap on `nearest_road_cost`'s bounded local A*. Anything farther from a
+/// road than this (~36 m at 1.5 m/tile) is a bad residential lot.
+pub const MAX_ROAD_CONNECTOR_STEPS: u16 = 24;
+
+#[inline]
+fn is_road_tile(chunk_map: &ChunkMap, planned: &AHashSet<(i32, i32)>, t: (i32, i32)) -> bool {
+    if chunk_map.tile_kind_at(t.0, t.1) == Some(crate::world::tile::TileKind::Road) {
+        return true;
+    }
+    planned.contains(&t)
+}
+
+/// Build a `RoadField` rooted at the road tile nearest to `home`. Seeds with
+/// carved `Road` tiles AND the planner's `road_tiles` set (so seed-time, when
+/// no road has been carved yet, the planned spine still seeds the field).
+pub fn road_field_from_home(
+    chunk_map: &ChunkMap,
+    planned_roads: &AHashSet<(i32, i32)>,
+    home: (i32, i32),
+) -> RoadField {
+    use std::collections::VecDeque;
+    // Locate root: home itself if road, else nearest road within ring 8.
+    let mut root: Option<(i32, i32)> = None;
+    if is_road_tile(chunk_map, planned_roads, home) {
+        root = Some(home);
+    } else {
+        'search: for r in 1i32..=8 {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if dx.abs().max(dy.abs()) != r {
+                        continue;
+                    }
+                    let t = (home.0 + dx, home.1 + dy);
+                    if is_road_tile(chunk_map, planned_roads, t) {
+                        root = Some(t);
+                        break 'search;
+                    }
+                }
+            }
+        }
+    }
+    let Some(home_road_tile) = root else {
+        return RoadField::default();
+    };
+    // 8-connected BFS over road-only adjacency.
+    let mut steps: AHashMap<(i32, i32), u16> = AHashMap::new();
+    let mut q: VecDeque<(i32, i32)> = VecDeque::new();
+    steps.insert(home_road_tile, 0);
+    q.push_back(home_road_tile);
+    while let Some(cur) = q.pop_front() {
+        if steps.len() >= MAX_ROAD_TILES {
+            break;
+        }
+        let g = *steps.get(&cur).unwrap_or(&0);
+        for (dx, dy) in DIRS8 {
+            let nbr = (cur.0 + dx, cur.1 + dy);
+            if !is_road_tile(chunk_map, planned_roads, nbr) {
+                continue;
+            }
+            if steps.contains_key(&nbr) {
+                continue;
+            }
+            steps.insert(nbr, g.saturating_add(1));
+            q.push_back(nbr);
+        }
+    }
+    RoadField {
+        road_steps_to_home: steps,
+        home_road_tile: Some(home_road_tile),
+    }
+}
+
+/// Bounded local A* from `from` (3D) to the nearest road tile (carved OR
+/// planned, via the same `RoadField.road_steps_to_home` set). Returns
+/// `(off_road_steps, road_tile)` or `None` when no road is within
+/// `max_steps`. Cap protects worst-case ~600 expansions per candidate.
+pub fn nearest_road_cost(
+    chunk_map: &ChunkMap,
+    field: &RoadField,
+    from: (i32, i32, i32),
+    max_steps: u16,
+) -> Option<(u16, (i32, i32))> {
+    if field.road_steps_to_home.is_empty() {
+        return None;
+    }
+    // Fast path: caller IS a road tile already.
+    if field.road_steps_to_home.contains_key(&(from.0, from.1)) {
+        return Some((0, (from.0, from.1)));
+    }
+    let mut g: AHashMap<(i32, i32, i32), u16> = AHashMap::new();
+    let mut open: BinaryHeap<Reverse<(u16, u16, (i32, i32, i32))>> = BinaryHeap::new();
+    g.insert(from, 0);
+    open.push(Reverse((0, 0, from)));
+    let mut expansions: usize = 0;
+    while let Some(Reverse((_f, gc, cur))) = open.pop() {
+        if let Some(&ent) = field.road_steps_to_home.get(&(cur.0, cur.1)) {
+            // Only count it as "reached" if the road tile is actually in a
+            // road-connected fragment that links back to home; a saturating
+            // u16::MAX entry would mean disconnected.
+            let _ = ent;
+            return Some((gc, (cur.0, cur.1)));
+        }
+        if gc > *g.get(&cur).unwrap_or(&u16::MAX) {
+            continue;
+        }
+        if gc >= max_steps {
+            continue;
+        }
+        expansions += 1;
+        if expansions > 4_000 {
+            return None;
+        }
+        for (dx, dy) in DIRS8 {
+            let nx = cur.0 + dx;
+            let ny = cur.1 + dy;
+            let mut stepped = None;
+            for ndz in [0i32, 1, -1] {
+                let nz = cur.2 + ndz;
+                if nz < Z_MIN || nz > Z_MAX {
+                    continue;
+                }
+                let nbr = (nx, ny, nz);
+                if passable_diagonal_step(chunk_map, cur, nbr) {
+                    stepped = Some(nbr);
+                    break;
+                }
+            }
+            let Some(nbr) = stepped else { continue };
+            let ng = gc.saturating_add(1);
+            if ng < *g.get(&nbr).unwrap_or(&u16::MAX) {
+                g.insert(nbr, ng);
+                // Heuristic = 0 (we don't know a road's tile until found).
+                open.push(Reverse((ng, ng, nbr)));
+            }
+        }
+    }
+    None
+}
+
+/// Per-candidate composite route summary used by the residential scorer.
+#[derive(Clone, Copy, Debug)]
+pub struct PathStats {
+    pub off_road_steps: u16,
+    pub on_road_steps: u16,
+    pub total_steps: u16,
+    /// Chebyshev distance from candidate to `home` — the "ideal" baseline
+    /// against which detour is measured.
+    pub direct: u16,
+    pub detour: i32,
+    pub detour_ratio: f32,
+    /// One of the underlying searches hit its expansion cap. Treat as
+    /// last-resort: a sealed pocket would have returned `None` instead.
+    pub saturated: bool,
+}
+
+/// Compose `nearest_road_cost` + `RoadField.road_steps_to_home` lookup into a
+/// single per-candidate score. Returns `None` when the candidate is too far
+/// from any road OR the road tile reached sits in a disconnected fragment
+/// (`road_steps_to_home` only stores tiles reachable from `home_road_tile`).
+///
+/// **Empty-roads fallback**: when `field.home_road_tile.is_none()` (very
+/// first seed ticks — no road carved or planned yet), falls through to a
+/// single bounded `path_exists`-style A* `home → candidate` so the planner
+/// still gets a usable signal. The fallback returns `total_steps == direct`
+/// when the line of sight is open.
+pub fn path_stats(
+    chunk_map: &ChunkMap,
+    field: &RoadField,
+    candidate: (i32, i32, i32),
+    home: (i32, i32),
+) -> Option<PathStats> {
+    let direct = cheby((candidate.0, candidate.1), home).max(1) as u16;
+    // Empty-roads fallback for very first seed ticks.
+    if field.home_road_tile.is_none() {
+        let home3 = resolve3(chunk_map, home);
+        let reachable = path_exists(chunk_map, home3, candidate, ReachOpts::seed());
+        if !reachable {
+            return None;
+        }
+        // We don't know the actual step count without a second search; use
+        // direct as an optimistic estimate. Detour = 0 is the right
+        // semantic for "the road graph isn't built yet, score on chebyshev".
+        return Some(PathStats {
+            off_road_steps: 0,
+            on_road_steps: direct,
+            total_steps: direct,
+            direct,
+            detour: 0,
+            detour_ratio: 1.0,
+            saturated: false,
+        });
+    }
+    let (off, road_tile) = nearest_road_cost(chunk_map, field, candidate, MAX_ROAD_CONNECTOR_STEPS)?;
+    let on = *field.road_steps_to_home.get(&road_tile)?;
+    let total = off.saturating_add(on);
+    let detour = (total as i32) - (direct as i32);
+    let detour_ratio = (total as f32) / (direct as f32);
+    Some(PathStats {
+        off_road_steps: off,
+        on_road_steps: on,
+        total_steps: total,
+        direct,
+        detour,
+        detour_ratio,
+        saturated: false,
+    })
+}
+
 /// Yield up to `n` distinct tiles reachable from `home` by flooding outward
 /// (so every spawned member / household tile is reachable-from-home *by
 /// construction* rather than random-scatter-then-test). BFS over the canonical
@@ -486,6 +720,112 @@ mod tests {
             &walls,
             &beds
         ));
+    }
+
+    /// Paint a horizontal road from (x0,y) to (x1,y) inclusive at z=0.
+    fn road_h(map: &mut ChunkMap, y: i32, x0: i32, x1: i32) {
+        for x in x0..=x1 {
+            map.set_tile(
+                x,
+                y,
+                0,
+                TileData {
+                    kind: TileKind::Road,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn road_field_straight_line() {
+        let mut map = flat_map();
+        road_h(&mut map, 5, 1, 20);
+        let planned = AHashSet::new();
+        let field = road_field_from_home(&map, &planned, (1, 5));
+        assert_eq!(field.home_road_tile, Some((1, 5)));
+        for x in 1..=20 {
+            let want = (x - 1) as u16;
+            assert_eq!(field.road_steps_to_home.get(&(x, 5)).copied(), Some(want));
+        }
+        assert!(!field.road_steps_to_home.contains_key(&(5, 7)));
+    }
+
+    #[test]
+    fn road_field_planned_only_no_carved() {
+        let map = flat_map();
+        let mut planned: AHashSet<(i32, i32)> = AHashSet::new();
+        for x in 1..=10 {
+            planned.insert((x, 5));
+        }
+        let field = road_field_from_home(&map, &planned, (1, 5));
+        assert_eq!(field.home_road_tile, Some((1, 5)));
+        assert!(field.road_steps_to_home.contains_key(&(10, 5)));
+    }
+
+    #[test]
+    fn road_field_disconnected_fragment_absent() {
+        let mut map = flat_map();
+        road_h(&mut map, 5, 1, 5);
+        road_h(&mut map, 5, 11, 15);
+        let planned = AHashSet::new();
+        let field = road_field_from_home(&map, &planned, (1, 5));
+        assert!(field.road_steps_to_home.contains_key(&(5, 5)));
+        assert!(!field.road_steps_to_home.contains_key(&(11, 5)));
+        assert!(!field.road_steps_to_home.contains_key(&(15, 5)));
+    }
+
+    #[test]
+    fn nearest_road_cost_adjacent() {
+        let mut map = flat_map();
+        road_h(&mut map, 5, 1, 10);
+        let planned = AHashSet::new();
+        let field = road_field_from_home(&map, &planned, (1, 5));
+        let cand = resolve3(&map, (5, 4));
+        let (off, road) = nearest_road_cost(&map, &field, cand, 24).expect("reaches road");
+        assert_eq!(off, 1);
+        assert_eq!(road.1, 5);
+    }
+
+    #[test]
+    fn nearest_road_cost_too_far_returns_none() {
+        let mut map = flat_map();
+        road_h(&mut map, 5, 1, 5);
+        let planned = AHashSet::new();
+        let field = road_field_from_home(&map, &planned, (1, 5));
+        // Candidate 25 chebyshev east of the road end; max_steps = 24 → None.
+        let cand = resolve3(&map, (30, 5));
+        assert!(nearest_road_cost(&map, &field, cand, 24).is_none());
+    }
+
+    #[test]
+    fn path_stats_direct_lot() {
+        let mut map = flat_map();
+        road_h(&mut map, 5, 1, 20);
+        let planned = AHashSet::new();
+        let field = road_field_from_home(&map, &planned, (1, 5));
+        // Lot at (10, 4): 1 off-road north of the road, ~9 along road to (1,5).
+        let cand = resolve3(&map, (10, 4));
+        let stats = path_stats(&map, &field, cand, (1, 5)).expect("reachable");
+        assert_eq!(stats.off_road_steps, 1);
+        assert!(
+            (8..=10).contains(&stats.on_road_steps),
+            "on_road_steps={}",
+            stats.on_road_steps
+        );
+        assert_eq!(stats.direct, 9);
+    }
+
+    #[test]
+    fn path_stats_empty_roads_fallback() {
+        let map = flat_map();
+        let planned = AHashSet::new();
+        let field = road_field_from_home(&map, &planned, (1, 1));
+        assert!(field.home_road_tile.is_none());
+        let cand = resolve3(&map, (10, 10));
+        let stats = path_stats(&map, &field, cand, (1, 1)).expect("open grass should reach");
+        assert_eq!(stats.detour, 0);
+        assert_eq!(stats.total_steps, stats.direct);
     }
 
     #[test]

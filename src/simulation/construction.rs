@@ -2406,7 +2406,7 @@ fn blocks_cardinal_corridor(cx: i32, cy: i32, half_w: i32, half_h: i32, home: (i
 /// be a flat side (not a corner). For even-length sides the cell closest to
 /// `camp_home` along the perpendicular axis is chosen so multi-building rows
 /// flow naturally toward the village core.
-fn entrance_cell_for_edge(
+pub(crate) fn entrance_cell_for_edge(
     half_w: i32,
     half_h: i32,
     edge: crate::simulation::land::TileEdge,
@@ -2767,8 +2767,13 @@ enum BuildIntent {
     Single(BuildSiteKind),
     /// 1×1 walled hut: 4 wall tiles + 1 door + 1 interior bed.
     Hut(WallMaterial),
-    /// 2×1 walled longhouse: 8 perimeter tiles + 1 door + 2 interior beds.
-    Longhouse(WallMaterial),
+    /// 5×3 or 3×5 walled longhouse (depending on `axis`): 8 perimeter tiles
+    /// + 1 door + 2 interior beds + 1 interior hearth. `EastWest` is the
+    /// legacy 5×3; `NorthSouth` rotates the long axis vertically.
+    Longhouse {
+        wall_material: WallMaterial,
+        axis: crate::simulation::organic_settlement::HouseAxis,
+    },
     /// One palisade segment along the settlement perimeter.
     PalisadeSegment(WallMaterial, i32 /*buffer*/),
     /// Composite house with an irregular footprint (L-shape, courtyard, …).
@@ -2790,9 +2795,13 @@ fn build_candidate_from_organic(
             BuildIntent::Single(kind)
         }
         crate::simulation::organic_settlement::OrganicBuildKind::Hut(mat) => BuildIntent::Hut(mat),
-        crate::simulation::organic_settlement::OrganicBuildKind::Longhouse(mat) => {
-            BuildIntent::Longhouse(mat)
-        }
+        crate::simulation::organic_settlement::OrganicBuildKind::Longhouse {
+            wall_material,
+            axis,
+        } => BuildIntent::Longhouse {
+            wall_material,
+            axis,
+        },
         crate::simulation::organic_settlement::OrganicBuildKind::PalisadeSegment(mat) => {
             BuildIntent::PalisadeSegment(mat, 2)
         }
@@ -2836,7 +2845,10 @@ fn candidate_footprint_tiles(candidate: &BuildCandidate) -> Vec<(i32, i32)> {
     match candidate.intent {
         BuildIntent::Single(_) | BuildIntent::PalisadeSegment(_, _) => vec![candidate.tile],
         BuildIntent::Hut(_) => rect_tiles(candidate.tile, 1, 1),
-        BuildIntent::Longhouse(_) => rect_tiles(candidate.tile, 2, 1),
+        BuildIntent::Longhouse { axis, .. } => {
+            let (hw, hh) = axis.longhouse_halves();
+            rect_tiles(candidate.tile, hw, hh)
+        }
         BuildIntent::CompositeHouse {
             shape, rotation, ..
         } => crate::simulation::building_template::shape_tiles(shape, candidate.tile, rotation),
@@ -2873,8 +2885,8 @@ impl BuildIntent {
                 push(BuildSiteKind::Door);
                 push(BuildSiteKind::Bed);
             }
-            BuildIntent::Longhouse(mat) => {
-                push(BuildSiteKind::Wall(mat));
+            BuildIntent::Longhouse { wall_material, .. } => {
+                push(BuildSiteKind::Wall(wall_material));
                 push(BuildSiteKind::Door);
                 push(BuildSiteKind::Bed);
                 push(BuildSiteKind::Campfire);
@@ -3155,11 +3167,22 @@ fn spawn_intent(
                 author,
             );
         }
-        BuildIntent::Longhouse(wall_mat) => {
-            // 5×3 longhouse: beds at ±1 along the long axis, interior
-            // hearth at centre. Each kin-group dwelling carries its own
-            // fire — matches the original settlement-bootstrap intent of
-            // "extra hearths come from dwelling templates, not pop math".
+        BuildIntent::Longhouse {
+            wall_material,
+            axis,
+        } => {
+            // 5×3 (EastWest) or 3×5 (NorthSouth) longhouse: beds at ±1 along
+            // the long axis, interior hearth at centre. Each kin-group
+            // dwelling carries its own fire.
+            let (half_w, half_h) = axis.longhouse_halves();
+            let beds: [(i32, i32); 2] = match axis {
+                crate::simulation::organic_settlement::HouseAxis::EastWest => {
+                    [(-1, 0), (1, 0)]
+                }
+                crate::simulation::organic_settlement::HouseAxis::NorthSouth => {
+                    [(0, -1), (0, 1)]
+                }
+            };
             plan_building(
                 commands,
                 bp_map,
@@ -3170,13 +3193,13 @@ fn spawn_intent(
                 doormat,
                 tile.0 as i32,
                 tile.1 as i32,
-                2,
-                1,
+                half_w,
+                half_h,
                 faction_id,
                 home,
-                &[(-1, 0), (1, 0)],
+                &beds,
                 Some((0, 0)),
-                wall_mat,
+                wall_material,
                 door_dir,
                 author,
             );
@@ -3507,26 +3530,40 @@ fn seed_apply_intent(
             seed_techs,
             brain,
         ),
-        BuildIntent::Longhouse(wall_mat) => seed_walled_house_or_nearby(
-            commands,
-            maps,
-            chunk_map,
-            tile_changed,
-            used,
-            (tile.0, tile.1),
-            2,
-            1,
-            &[(-1, 0), (1, 0)],
-            Some((0, 0)),
-            wall_mat,
-            faction_id,
-            home,
-            door_dir,
-            doormat,
-            road_carve,
-            seed_techs,
-            brain,
-        ),
+        BuildIntent::Longhouse {
+            wall_material,
+            axis,
+        } => {
+            let (half_w, half_h) = axis.longhouse_halves();
+            let beds: [(i32, i32); 2] = match axis {
+                crate::simulation::organic_settlement::HouseAxis::EastWest => {
+                    [(-1, 0), (1, 0)]
+                }
+                crate::simulation::organic_settlement::HouseAxis::NorthSouth => {
+                    [(0, -1), (0, 1)]
+                }
+            };
+            seed_walled_house_or_nearby(
+                commands,
+                maps,
+                chunk_map,
+                tile_changed,
+                used,
+                (tile.0, tile.1),
+                half_w,
+                half_h,
+                &beds,
+                Some((0, 0)),
+                wall_material,
+                faction_id,
+                home,
+                door_dir,
+                doormat,
+                road_carve,
+                seed_techs,
+                brain,
+            )
+        }
         BuildIntent::PalisadeSegment(wall_mat, _) => seed_apply_wall_tile(
             commands,
             maps,
@@ -4116,6 +4153,14 @@ where
         TileEdge::South,
         TileEdge::West,
     ];
+    // Build a `RoadField` from carved roads only (no planned-spine info
+    // available at this layer). Cheap — walks road tiles once.
+    let empty_planned: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::new();
+    let road_field = crate::simulation::placement_reachability::road_field_from_home(
+        chunk_map,
+        &empty_planned,
+        home,
+    );
     let try_edge = |e: TileEdge| -> Option<(TileEdge, (i32, i32), (i32, i32), i64)> {
         let entrance_offset = entrance_cell_for_edge(half_w, half_h, e, home, centre);
         let door_tile = (centre.0 + entrance_offset.0, centre.1 + entrance_offset.1);
@@ -4133,7 +4178,19 @@ where
         if !doormat_reaches_home(chunk_map, dm, home) {
             return None;
         }
-        let d = ((dm.0 - home.0) as i64).pow(2) + ((dm.1 - home.1) as i64).pow(2);
+        // Rank by `total_steps` (off-road + on-road) when the road graph
+        // exists. Fall back to squared-distance when no road has been
+        // carved yet (very first seed ticks).
+        let d = if road_field.home_road_tile.is_some() {
+            use crate::simulation::placement_reachability as reach;
+            reach::path_stats(chunk_map, &road_field, reach::resolve3(chunk_map, dm), home)
+                .map(|s| s.total_steps as i64)
+                .unwrap_or_else(|| {
+                    ((dm.0 - home.0) as i64).pow(2) + ((dm.1 - home.1) as i64).pow(2)
+                })
+        } else {
+            ((dm.0 - home.0) as i64).pow(2) + ((dm.1 - home.1) as i64).pow(2)
+        };
         Some((e, entrance_offset, dm, d))
     };
     if let Some((e, off, dm, _)) = try_edge(preferred) {
@@ -4214,7 +4271,27 @@ pub fn find_door_connector_target(
         )
     };
 
-    // Walk rings; return the first reachable carved road we find.
+    // Build a road field rooted at the doormat (closest carved/planned road
+    // to it). The connector should prefer a road tile that lies on the main
+    // flow back toward home — i.e. minimize
+    // `chebyshev(doormat→road) + road_steps_to_home[road]`.
+    let empty_planned: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::new();
+    let planned_for_field: &ahash::AHashSet<(i32, i32)> = brain
+        .map(|b| &b.road_tiles)
+        .unwrap_or(&empty_planned);
+    // Field rooted at the brain's home_tile (or doormat as proxy if no
+    // brain) — this is the "to home" direction.
+    let field_root = brain.map(|b| b.home_tile).unwrap_or(doormat);
+    let road_field_home = crate::simulation::placement_reachability::road_field_from_home(
+        chunk_map,
+        planned_for_field,
+        field_root,
+    );
+
+    // Walk rings; collect reachable carved roads, then pick the lowest
+    // `chebyshev(doormat→road) + road_steps_to_home[road]`. Falls back to
+    // first-found behaviour when the field is empty (no home road tile).
+    let mut best_carved: Option<(u32, (i32, i32))> = None;
     for r in 1..=radius {
         for dy in -r..=r {
             for dx in -r..=r {
@@ -4225,11 +4302,33 @@ pub fn find_door_connector_target(
                 if chunk_map.tile_kind_at(tile.0, tile.1) != Some(TileKind::Road) {
                     continue;
                 }
-                if try_tile(tile) {
-                    return DoorConnectorTarget::Road(tile);
+                if !try_tile(tile) {
+                    continue;
+                }
+                let on_road = road_field_home
+                    .road_steps_to_home
+                    .get(&tile)
+                    .copied()
+                    .unwrap_or(u16::MAX);
+                let off_road = (tile.0 - doormat.0).abs().max((tile.1 - doormat.1).abs()) as u32;
+                let cost = off_road.saturating_add(on_road as u32);
+                if best_carved.map_or(true, |(c, _)| cost < c) {
+                    best_carved = Some((cost, tile));
                 }
             }
         }
+        // Early-out at the first ring that yielded a reachable carved road
+        // (a road r tiles closer can't be beaten by one farther) — unless
+        // the road graph distance dominates, in which case we keep scanning
+        // up to `radius` to find a better-aligned road.
+        if let Some((c, _)) = best_carved {
+            if r as u32 + (c.saturating_sub(r as u32)) >= radius as u32 {
+                break;
+            }
+        }
+    }
+    if let Some((_, tile)) = best_carved {
+        return DoorConnectorTarget::Road(tile);
     }
 
     // No carved road within radius. Fall back to the planned spine.
@@ -7217,6 +7316,14 @@ pub fn seed_starting_buildings_system(
 
             let mut applied_any = false;
             let mut chosen_tiles: AHashSet<(i32, i32)> = AHashSet::default();
+            // Seed-time RoadField: rebuilt per outer iteration so newly
+            // carved roads (intercalated `road_carve_system` runs after the
+            // seed pass) feed back in next iteration.
+            let road_field = crate::simulation::placement_reachability::road_field_from_home(
+                &chunk_map,
+                &brain.road_tiles,
+                faction.home_tile,
+            );
             for pressure in &pressures {
                 let intent_opt = {
                     let organic_view = maps.organic_view(&structure_index);
@@ -7231,6 +7338,7 @@ pub fn seed_starting_buildings_system(
                         &archetypes,
                         &mut chosen_tiles,
                         civic_gate,
+                        &road_field,
                     )
                 };
                 let Some(intent) = intent_opt else {
