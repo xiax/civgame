@@ -4099,7 +4099,7 @@ pub fn chief_tablet_posting_system(
 
         // Tally adult awareness across faction members.
         let mut adults = 0u32;
-        let mut aware_count = [0u32; 64];
+        let mut aware_count = [0u32; TECH_COUNT];
         for (m, k, stats, lod) in members_query.iter() {
             if m.faction_id != faction_id || *lod == LodLevel::Dormant {
                 continue;

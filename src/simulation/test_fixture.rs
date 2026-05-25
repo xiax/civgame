@@ -15354,6 +15354,88 @@ mod baseline_behaviour {
         );
     }
 
+    /// Regression: `chief_tablet_posting_system` must tally awareness for the
+    /// full knowledge catalog, including ids beyond the old 64-bit boundary.
+    #[test]
+    fn chief_tablet_posting_handles_high_id_tech() {
+        use crate::economy::core_ids;
+        use crate::simulation::construction::WorkbenchMap;
+        use crate::simulation::crafting::RECIPE_CLAY_TABLET;
+        use crate::simulation::faction::{FactionChief, FactionRegistry};
+        use crate::simulation::jobs::{JobBoard, JobKind, JobProgress};
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::schedule::SimClock;
+        use crate::simulation::technology::FIRE_USE;
+        use crate::world::seasons::TICKS_PER_DAY;
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut sim = TestSim::new(2026_05_25);
+        sim.flat_world(2, 0, TileKind::Grass);
+
+        let fid = sim.player_faction_id;
+        let chief = sim.spawn_person(fid, (0, 0), |_| {});
+        let followers = [
+            sim.spawn_person(fid, (1, 0), |_| {}),
+            sim.spawn_person(fid, (2, 0), |_| {}),
+            sim.spawn_person(fid, (3, 0), |_| {}),
+        ];
+
+        sim.app.world_mut().entity_mut(chief).insert(FactionChief);
+        {
+            let world = sim.app.world_mut();
+            let mut chief_knowledge = world.get_mut::<PersonKnowledge>(chief).unwrap();
+            chief_knowledge.aware.set(FIRE_USE);
+            chief_knowledge.learned.set(FIRE_USE);
+        }
+        for follower in followers {
+            let world = sim.app.world_mut();
+            let mut knowledge = world.get_mut::<PersonKnowledge>(follower).unwrap();
+            knowledge.aware.clear(FIRE_USE);
+            knowledge.learned.clear(FIRE_USE);
+        }
+
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            for _ in 0..4 {
+                registry.add_member(fid);
+            }
+            let faction = registry.factions.get_mut(&fid).unwrap();
+            faction.chief_entity = Some(chief);
+            faction.resource_supply.insert(core_ids::stone(), 1);
+            faction.resource_supply.insert(core_ids::wood(), 1);
+        }
+
+        let bench = sim.app.world_mut().spawn_empty().id();
+        sim.app
+            .world_mut()
+            .resource_mut::<WorkbenchMap>()
+            .0
+            .insert((0, 0), bench);
+        sim.app.world_mut().resource_mut::<SimClock>().tick = TICKS_PER_DAY as u64;
+
+        sim.app
+            .world_mut()
+            .run_system_once(crate::simulation::jobs::chief_tablet_posting_system)
+            .expect("chief_tablet_posting_system should run without panicking");
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let posted = board.faction_postings(fid).iter().any(|p| {
+            p.kind == JobKind::Craft
+                && matches!(
+                    p.progress,
+                    JobProgress::Crafting {
+                        recipe: RECIPE_CLAY_TABLET,
+                        tech_payload: Some(FIRE_USE),
+                        ..
+                    }
+                )
+        });
+        assert!(
+            posted,
+            "chief should post a clay-tablet craft job carrying FIRE_USE as its tech payload"
+        );
+    }
+
     /// Fix 3a: the Haul-branch dispatcher uses material already in the
     /// agent's hands/inventory and dispatches `HaulToBlueprint` directly,
     /// skipping the redundant `WithdrawMaterial` round-trip to storage.
