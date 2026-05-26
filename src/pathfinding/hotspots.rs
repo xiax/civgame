@@ -107,6 +107,29 @@ impl HotspotFlowFields {
         self.field_count = self.entries.len() as u32;
     }
 
+    /// Drop every entry registered at `tile` regardless of `HotspotKind`,
+    /// pushing each key onto `dirty` for the next rebuild pass. Called by
+    /// the path worker's fast-path bad-step branch as a same-Update
+    /// self-heal: PostUpdate's invalidator runs only once per Update, but
+    /// FixedUpdate (and thus Sequential tile mutations + the worker drain)
+    /// can fire multiple times per Update at higher speed presets, so the
+    /// cache can be stale between mid-Update worker calls even when every
+    /// emit site is correct. Evicting here keeps subsequent requests this
+    /// same Update from re-walking the same stale field.
+    pub fn evict_field_for_goal(&mut self, tile: (i32, i32, i8)) {
+        let mut evicted = false;
+        for &kind in &ALL_KINDS {
+            let key = HotspotKey { tile, kind };
+            if self.entries.remove(&key).is_some() {
+                self.dirty.insert(key);
+                evicted = true;
+            }
+        }
+        if evicted {
+            self.field_count = self.entries.len() as u32;
+        }
+    }
+
     /// Returns the encoded direction (0..=7) that an agent at `agent_pos`
     /// should step to walk toward the hotspot tile, or `None` when:
     /// - no hotspot of any kind is registered at `tile`,
@@ -252,6 +275,44 @@ mod tests {
     fn lookup_field_misses_when_unregistered() {
         let fields = HotspotFlowFields::default();
         assert!(fields.lookup_field((1, 2, 0)).is_none());
+    }
+
+    #[test]
+    fn evict_field_for_goal_drops_entry_and_requeues_dirty() {
+        let mut fields = HotspotFlowFields::default();
+        let goal_tile = (5i32, 6i32, 0i8);
+        fields.register(goal_tile, HotspotKind::FactionCenter);
+
+        // Drive the rebuild logic to populate `entries`.
+        let coord = ChunkCoord(0, 0);
+        let chunk_map = flat_chunk_map(coord, 0);
+        let dirty: Vec<HotspotKey> = fields.dirty.drain().collect();
+        for key in dirty {
+            let (gx, gy, gz) = key.tile;
+            let csz = CHUNK_SIZE as i32;
+            let chunk = ChunkCoord((gx as i32).div_euclid(csz), (gy as i32).div_euclid(csz));
+            let goal_local = (
+                (gx as i32 - chunk.0 * csz) as u8,
+                (gy as i32 - chunk.1 * csz) as u8,
+            );
+            let field = build_flow_field(&chunk_map, chunk, goal_local, gz, &|_| 0u16);
+            fields.entries.insert(key, HotspotEntry { field });
+        }
+        fields.field_count = fields.entries.len() as u32;
+        assert!(fields.lookup_field(goal_tile).is_some(), "precondition: field built");
+        assert!(fields.dirty.is_empty(), "precondition: nothing dirty");
+
+        fields.evict_field_for_goal(goal_tile);
+
+        assert!(
+            fields.lookup_field(goal_tile).is_none(),
+            "evicted entry must drop from lookup",
+        );
+        assert!(
+            fields.dirty.contains(&HotspotKey { tile: goal_tile, kind: HotspotKind::FactionCenter }),
+            "evicted key must land back in dirty for the next rebuild",
+        );
+        assert_eq!(fields.field_count, 0);
     }
 
     #[test]

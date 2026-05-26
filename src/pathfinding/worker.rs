@@ -171,6 +171,11 @@ struct ComputeOutcome {
     astar_calls: u32,
     astar_iters: u32,
     astar_iters_max_single: u32,
+    /// Goal tile whose hotspot flow field the worker detected as stale
+    /// (fast-path emitted a path that failed `first_invalid_step`). The
+    /// serial post-pass evicts the field so subsequent requests this same
+    /// Update don't re-walk it before PostUpdate's invalidator runs.
+    evict_hotspot_goal: Option<(i32, i32, i8)>,
 }
 
 enum OutcomeBody {
@@ -233,6 +238,7 @@ fn fail_outcome(req: PathRequest, body: FailureBody) -> ComputeOutcome {
         astar_calls: 0,
         astar_iters: 0,
         astar_iters_max_single: 0,
+        evict_hotspot_goal: None,
     }
 }
 
@@ -249,6 +255,7 @@ fn fail_outcome_with_metrics(
         astar_calls,
         astar_iters,
         astar_iters_max_single,
+        evict_hotspot_goal: None,
     }
 }
 
@@ -266,7 +273,7 @@ pub fn drain_path_requests_system(
     graph: Res<ChunkGraph>,
     router: Res<ChunkRouter>,
     conn: Res<ChunkConnectivity>,
-    hotspots: Res<HotspotFlowFields>,
+    mut hotspots: ResMut<HotspotFlowFields>,
     flags: Res<PathDebugFlags>,
     mut pool: ResMut<AStarPool>,
     mut diag: ResMut<PathfindingDiagnostics>,
@@ -328,6 +335,15 @@ pub fn drain_path_requests_system(
     });
 
     let dispatched = outcomes.len() as u32;
+    // Self-heal stale hotspot fields detected during the parallel walk.
+    // PostUpdate's invalidator only fires once per Update; without this,
+    // subsequent FixedUpdate iterations in the same Update would re-walk
+    // the same stale field. See `HotspotFlowFields::evict_field_for_goal`.
+    for outcome in &outcomes {
+        if let Some(goal) = outcome.evict_hotspot_goal {
+            hotspots.evict_field_for_goal(goal);
+        }
+    }
     for outcome in outcomes {
         apply_outcome(
             outcome,
@@ -499,6 +515,10 @@ fn compute_land(
     // chunk and the agent's cell reached the goal at the agent's Z.
     let mut hotspot_miss = false;
     let mut hotspot_bad_step = false;
+    // Populated when the fast path detects cache drift; consumed by the
+    // serial post-pass to evict the stale field. See
+    // `HotspotFlowFields::evict_field_for_goal` for the rationale.
+    let mut evict_hotspot_goal: Option<(i32, i32, i8)> = None;
     if chunk_route.len() == 1 {
         let goal_tile = (req.goal.0 as i32, req.goal.1 as i32, req.goal.2);
         if let Some(field) = hotspots.lookup_field(goal_tile) {
@@ -523,6 +543,7 @@ fn compute_land(
                         // `walk_to_goal` returning `None`.
                         hotspot_bad_step = true;
                         hotspot_miss = true;
+                        evict_hotspot_goal = Some(goal_tile);
                         if flags.verbose_logs {
                             let prev = if bad == 0 {
                                 req.start
@@ -549,6 +570,7 @@ fn compute_land(
                             astar_calls: 0,
                             astar_iters: 0,
                             astar_iters_max_single: 0,
+                            evict_hotspot_goal: None,
                         };
                     }
                 } else {
@@ -625,13 +647,15 @@ fn compute_land(
                 let mut body = FailureBody::basic(FailSubReason::BudgetExhausted, segment_target);
                 body.hotspot_fastpath_miss = hotspot_miss;
                 body.hotspot_fastpath_bad_step = hotspot_bad_step;
-                return fail_outcome_with_metrics(
+                let mut outcome = fail_outcome_with_metrics(
                     req,
                     body,
                     astar_calls,
                     astar_iters_total,
                     astar_iters_max,
                 );
+                outcome.evict_hotspot_goal = evict_hotspot_goal;
+                return outcome;
             }
             // BestEffort: walk one tile toward best_so_far.
             (
@@ -649,13 +673,15 @@ fn compute_land(
             let mut body = FailureBody::basic(FailSubReason::UnreachableAstar, segment_target);
             body.hotspot_fastpath_miss = hotspot_miss;
             body.hotspot_fastpath_bad_step = hotspot_bad_step;
-            return fail_outcome_with_metrics(
+            let mut outcome = fail_outcome_with_metrics(
                 req,
                 body,
                 astar_calls,
                 astar_iters_total,
                 astar_iters_max,
             );
+            outcome.evict_hotspot_goal = evict_hotspot_goal;
+            return outcome;
         }
     };
 
@@ -678,13 +704,15 @@ fn compute_land(
         let mut body = FailureBody::basic(FailSubReason::NoRouteStepContinuity, segment_target);
         body.hotspot_fastpath_miss = hotspot_miss;
         body.hotspot_fastpath_bad_step = hotspot_bad_step;
-        return fail_outcome_with_metrics(
+        let mut outcome = fail_outcome_with_metrics(
             req,
             body,
             astar_calls,
             astar_iters_total,
             astar_iters_max,
         );
+        outcome.evict_hotspot_goal = evict_hotspot_goal;
+        return outcome;
     }
 
     ComputeOutcome {
@@ -699,6 +727,7 @@ fn compute_land(
         astar_calls,
         astar_iters: astar_iters_total,
         astar_iters_max_single: astar_iters_max,
+        evict_hotspot_goal,
     }
 }
 
@@ -805,6 +834,7 @@ fn compute_amphibious(
         astar_calls,
         astar_iters: iters_total,
         astar_iters_max_single: iters_max,
+        evict_hotspot_goal: None,
     }
 }
 
@@ -1312,6 +1342,11 @@ mod tests {
         // Worker must report success — A* recovers against live state.
         // The bad-step flag must propagate so diagnostics can count
         // cache-drift events.
+        assert_eq!(
+            outcome.evict_hotspot_goal,
+            Some(goal_tile),
+            "expected the worker to flag the goal tile for hotspot eviction on bad-step",
+        );
         match outcome.body {
             OutcomeBody::Success {
                 hotspot_fastpath_bad_step,
