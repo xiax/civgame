@@ -28,6 +28,7 @@ use std::time::Duration;
 pub mod bootstrap;
 pub mod cli;
 pub mod client;
+pub mod lan;
 pub mod lobby_state;
 pub mod protocol;
 pub mod protocol_plugin;
@@ -163,14 +164,60 @@ impl Plugin for NetPlugin {
             .init_resource::<ConnectedRemotes>()
             // Loopback runs in `PreUpdate` so the sim's `Input`
             // (`drain_player_command_events_system`) sees fresh
-            // `PlayerCommandEvent`s the same FixedUpdate tick.
-            .add_systems(PreUpdate, command_loopback_system);
+            // `PlayerCommandEvent`s the same FixedUpdate tick. Gated
+            // off in `Client` mode — the client never *runs* the sim
+            // locally, so re-emitting commands as `PlayerCommandEvent`
+            // would only thrash state the server hasn't authorized yet.
+            // Client's own UI command path will ride
+            // `net::client::send_command_frames_system` instead.
+            .add_systems(
+                PreUpdate,
+                command_loopback_system.run_if(|mode: Res<NetMode>| {
+                    !matches!(*mode, NetMode::Client)
+                }),
+            );
 
         let mode = app
             .world()
             .get_resource::<NetMode>()
             .copied()
             .unwrap_or_default();
+
+        // LAN browser: install in any mode that has UI. Cheap (one
+        // listener thread that recv-times-out every 500ms), so the
+        // singleplayer MainMenu can preview discovered hosts before
+        // committing to Host/Join. Dedicated headless server doesn't
+        // need a browser.
+        if !matches!(mode, NetMode::DedicatedServer) {
+            let browser = lan::spawn_listener_thread();
+            app.insert_resource(browser);
+        }
+
+        // Host-side LAN advertiser: bind a broadcasting UDP socket so
+        // remote clients see this lobby in their browser. Drives one
+        // `LanAdvert` per second from a per-tick run-condition system.
+        if matches!(mode, NetMode::ListenServer | NetMode::DedicatedServer) {
+            let net_cfg = app
+                .world()
+                .get_resource::<cli::NetConfig>()
+                .cloned()
+                .unwrap_or_default();
+            let bind_port = net_cfg
+                .bind_addr
+                .map(|a| a.port())
+                .unwrap_or(5000);
+            let host_name = net_cfg.player_name.unwrap_or_else(|| "Host".into());
+            if let Some(advertiser) = lan::LanAdvertiser::new(
+                format!("{}'s Game", host_name),
+                host_name,
+                bind_port,
+                /*world_seed*/ 0,
+                /*max_players*/ 4,
+            ) {
+                app.insert_resource(advertiser);
+                app.add_systems(Update, broadcast_lan_advert_system);
+            }
+        }
 
         match mode {
             NetMode::Local => {
@@ -200,6 +247,27 @@ impl Plugin for NetPlugin {
         // when no remote ever connects.
         app.add_systems(Update, (apply_disconnect_policy_system, speed_lock_system));
     }
+}
+
+/// Tick the host-side LAN advertiser at most once per
+/// `lan::BROADCAST_INTERVAL`. Runs in every host App regardless of
+/// game state — the lobby browser is supposed to find the host even
+/// before its first client picks a start.
+pub fn broadcast_lan_advert_system(
+    mut advertiser: ResMut<lan::LanAdvertiser>,
+    state: Res<State<crate::GameState>>,
+    server_conns: Option<Res<server::ServerConnections>>,
+) {
+    let phase = if matches!(state.get(), crate::GameState::Playing) {
+        lan::AdvertPhase::InGame
+    } else {
+        lan::AdvertPhase::Lobby
+    };
+    let players = server_conns
+        .as_ref()
+        .map(|c| c.by_client.len() as u8)
+        .unwrap_or(0);
+    advertiser.maybe_broadcast(players, phase);
 }
 
 fn install_server(app: &mut App, mode: NetMode) {
@@ -409,6 +477,7 @@ pub fn apply_disconnect_policy_system(
     mut controlled: ResMut<crate::simulation::faction::ControlledFactions>,
     policy: Res<DisconnectPolicy>,
     mut virtual_time: Option<ResMut<Time<Virtual>>>,
+    mut remotes: ResMut<ConnectedRemotes>,
 ) {
     let Some(pending) = pending.as_mut() else {
         return;
@@ -417,6 +486,11 @@ pub fn apply_disconnect_policy_system(
         return;
     }
     for faction_id in pending.0.drain(..) {
+        // Symmetric with the server-side connect increment: every
+        // disconnect drops the live-remote count so `speed_lock_system`
+        // releases the 1× lock once the last remote leaves. Saturating
+        // because a stray duplicate disconnect can't underflow.
+        remotes.count = remotes.count.saturating_sub(1);
         match *policy {
             DisconnectPolicy::AiTakeover | DisconnectPolicy::DropFaction => {
                 controlled.remove(faction_id);

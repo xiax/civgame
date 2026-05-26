@@ -55,6 +55,7 @@ pub fn hud_system(
     persons: Query<(), With<Person>>,
     professions: Query<(Entity, &Profession, &FactionMember), With<Person>>,
     mut sender: CommandSender,
+    connected_remotes: Option<Res<crate::net::ConnectedRemotes>>,
 ) {
     let clock = &mut *res.clock;
     let speed = &mut *res.speed;
@@ -105,17 +106,34 @@ pub fn hud_system(
 
                         ui.label(egui::RichText::new("Speed:").color(egui::Color32::WHITE));
 
+                        let mp_locked = connected_remotes
+                            .as_ref()
+                            .map(|r| r.count > 0)
+                            .unwrap_or(false);
                         let active_fill = egui::Color32::from_rgb(60, 120, 200);
-                        for preset in SpeedPreset::all() {
-                            let btn = egui::Button::new(preset.label());
-                            let btn = if speed.current == preset {
-                                btn.fill(active_fill)
-                            } else {
-                                btn
-                            };
-                            if ui.add(btn).clicked() {
-                                speed.set(preset);
+                        ui.scope(|ui| {
+                            // MP locks speed to 1× (pause / 2× / 5× would
+                            // desync clients), so disable the alt buttons
+                            // with a visual cue.
+                            ui.set_enabled(!mp_locked);
+                            for preset in SpeedPreset::all() {
+                                let btn = egui::Button::new(preset.label());
+                                let btn = if speed.current == preset {
+                                    btn.fill(active_fill)
+                                } else {
+                                    btn
+                                };
+                                if ui.add(btn).clicked() {
+                                    speed.set(preset);
+                                }
                             }
+                        });
+                        if mp_locked {
+                            ui.label(
+                                egui::RichText::new("MP — speed locked to 1×")
+                                    .color(egui::Color32::from_rgb(220, 200, 100))
+                                    .small(),
+                            );
                         }
 
                         ui.separator();

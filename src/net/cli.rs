@@ -41,6 +41,12 @@ pub struct NetConfig {
     /// What the server does when a client controlling a faction
     /// disconnects. Defaults to `AiTakeover`.
     pub on_disconnect: DisconnectPolicy,
+    /// `--lobby-config <path>` — path to a RON file the host process
+    /// reads on boot to populate `LobbyConfig` (seed, era, economy,
+    /// maturity, max_players) without retyping in the UI. Written by the
+    /// MainMenu's Host LAN Game button into a tempfile and passed
+    /// through to the re-launched binary.
+    pub lobby_config_path: Option<String>,
 }
 
 /// Errors a malformed argv can produce. Caller decides whether to abort
@@ -141,6 +147,11 @@ where
                 let policy = DisconnectPolicy::parse(&value)
                     .ok_or_else(|| CliError::UnknownDisconnectPolicy(value.clone()))?;
                 cfg.on_disconnect = policy;
+                continue;
+            }
+            "--lobby-config" => {
+                let value = next_value(&argv, &mut i, "--lobby-config")?;
+                cfg.lobby_config_path = Some(value);
                 continue;
             }
             _ => {} // unknown — passes through (e.g. --sandbox)

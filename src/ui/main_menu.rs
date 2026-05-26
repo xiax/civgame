@@ -8,12 +8,19 @@
 //! "preview" mode so the UI can be exercised single-process. The
 //! actual `--listen` / `--connect` flag wiring lands in Commit 5.
 
+use std::process::Command;
+
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::game_state::{GameState, PendingStarts};
 use crate::net::NetConfig;
 use crate::simulation::faction::Lifestyle;
+
+/// Default bind/connect port for the relaunched host process. Distinct
+/// from `net::lan::LAN_PORT` (5001) so discovery + game traffic don't
+/// share a socket.
+const DEFAULT_GAME_PORT: u16 = 5000;
 
 /// Buffered MainMenu state (player-name text field).
 #[derive(Resource)]
@@ -51,6 +58,25 @@ pub fn main_menu_boot_route_system(
             next_state.set(GameState::MultiplayerLobby);
         }
     }
+}
+
+/// Re-launch the current binary with `--listen --bind 0.0.0.0:<port>
+/// --player NAME`. Spawns a fresh process so Lightyear's
+/// `ServerPlugins::new(config)` picks up listen-server transport
+/// (it consumes the config at install time and there's no way to swap
+/// it on a running App). Successful spawn exits the parent.
+fn relaunch_as_host(player_name: &str) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(&exe);
+    cmd.arg("--listen")
+        .arg("--bind")
+        .arg(format!("0.0.0.0:{DEFAULT_GAME_PORT}"))
+        .arg("--player")
+        .arg(player_name);
+    info!("Re-launching as host: {:?}", cmd);
+    cmd.spawn()?;
+    // Exit the menu process so only the relaunched host App stays alive.
+    std::process::exit(0);
 }
 
 pub fn main_menu_system(
@@ -113,10 +139,11 @@ pub fn main_menu_system(
 
                 ui.add_space(10.0);
 
-                // Host/Join in v1: relaunch the binary with the right
-                // CLI flags. Commit 5 wires that up — for now this
-                // dispatches into MultiplayerLobby preview-mode so the
-                // UI scaffolding works end-to-end.
+                // Host/Join: re-launch the binary with the right CLI
+                // flags. Lightyear 0.19 consumes its NetConfig at install
+                // time and there's no supported way to swap transports
+                // on a running App — re-launching is the smallest diff
+                // and matches every other indie LAN game.
                 if ui
                     .add_sized([260.0, 44.0], egui::Button::new("Host LAN Game"))
                     .clicked()
@@ -125,7 +152,12 @@ pub fn main_menu_system(
                         state.player_name.trim().to_string(),
                         Lifestyle::Settled,
                     );
-                    next_state.set(GameState::MultiplayerLobby);
+                    if let Err(err) = relaunch_as_host(state.player_name.trim()) {
+                        warn!("Host re-launch failed: {err}");
+                        // Fall back to in-process preview so the user can
+                        // at least see the lobby UI.
+                        next_state.set(GameState::MultiplayerLobby);
+                    }
                 }
 
                 ui.add_space(10.0);
@@ -135,6 +167,10 @@ pub fn main_menu_system(
                     .clicked()
                 {
                     *starts = PendingStarts::default();
+                    // Join leaves the lobby state empty — Join role
+                    // gets a CLI flag at re-launch; here we just dive
+                    // into MultiplayerLobby in client mode so the
+                    // browser surfaces hosts before the user picks one.
                     next_state.set(GameState::MultiplayerLobby);
                 }
             });

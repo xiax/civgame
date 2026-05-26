@@ -13,6 +13,7 @@ use crate::game_state::{
     EconomyPreset, GameStartOptions, GameState, PendingStarts, StartSettlementMaturity, WorldSeed,
     HOST_SERVER_LOCAL_CLIENT_ID,
 };
+use crate::net::lan::LanBrowser;
 use crate::net::{NetConfig, NetMode};
 use crate::simulation::faction::Lifestyle;
 use crate::simulation::technology::Era;
@@ -40,6 +41,7 @@ pub fn lobby_system(
     mut options: ResMut<GameStartOptions>,
     mut world_seed: ResMut<WorldSeed>,
     mut next_state: ResMut<NextState<GameState>>,
+    lan_browser: Option<Res<LanBrowser>>,
 ) {
     let ctx = contexts.ctx_mut();
 
@@ -66,7 +68,7 @@ pub fn lobby_system(
             if is_host {
                 host_config_ui(ui, &mut ui_state, &mut options, &mut world_seed);
             } else {
-                join_config_ui(ui, &mut ui_state);
+                join_config_ui(ui, &mut ui_state, lan_browser.as_deref());
             }
 
             ui.add_space(20.0);
@@ -196,7 +198,49 @@ fn host_config_ui(
     });
 }
 
-fn join_config_ui(ui: &mut egui::Ui, ui_state: &mut LobbyUiState) {
+fn join_config_ui(
+    ui: &mut egui::Ui,
+    ui_state: &mut LobbyUiState,
+    lan_browser: Option<&LanBrowser>,
+) {
+    ui.label(egui::RichText::new("LAN browser").strong());
+    if let Some(browser) = lan_browser {
+        let live = browser.fresh();
+        if live.is_empty() {
+            ui.label(
+                egui::RichText::new("(no hosts seen on this LAN — broadcasts every 1s)")
+                    .small()
+                    .weak(),
+            );
+        } else {
+            for entry in live {
+                let addr = format!("{}:{}", entry.host_addr.ip(), entry.advert.game_port);
+                if ui
+                    .selectable_label(
+                        ui_state.manual_join_addr == addr,
+                        format!(
+                            "{} — {} ({}/{} players)",
+                            entry.advert.game_name,
+                            addr,
+                            entry.advert.players,
+                            entry.advert.max_players
+                        ),
+                    )
+                    .clicked()
+                {
+                    ui_state.manual_join_addr = addr;
+                }
+            }
+        }
+    } else {
+        ui.label(
+            egui::RichText::new("(LAN listener not started in this mode)")
+                .small()
+                .weak(),
+        );
+    }
+
+    ui.add_space(8.0);
     ui.label(egui::RichText::new("Server address").strong());
     if ui_state.manual_join_addr.is_empty() {
         ui_state.manual_join_addr = "127.0.0.1:5000".into();
@@ -206,7 +250,7 @@ fn join_config_ui(ui: &mut egui::Ui, ui_state: &mut LobbyUiState) {
             .desired_width(180.0),
     );
     ui.label(
-        egui::RichText::new("Manual join — LAN browser arrives in a later commit.")
+        egui::RichText::new("Manual entry overrides the browser selection.")
             .small()
             .weak(),
     );
