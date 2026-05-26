@@ -16,14 +16,19 @@ use ahash::AHashMap;
 use bevy::prelude::*;
 use std::collections::VecDeque;
 
+use crate::simulation::access_grant::{
+    classify_intent, permits, AccessGrantTable, IntruderIntent,
+};
 use crate::simulation::diplomacy::{
     record_incident, DiplomacyLedger, IncidentKind, TreatyKind, TreatySet,
 };
+use crate::simulation::diplomatic_personality::DiplomaticPersonality;
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
-use crate::simulation::person::Person;
+use crate::simulation::person::{Drafted, Person, Profession};
 use crate::simulation::schedule::SimClock;
+use crate::simulation::settlement::{Settlement, SettlementMap};
 use crate::simulation::territory::TerritoryMap;
-use crate::world::seasons::TICKS_PER_DAY;
+use crate::world::seasons::{Calendar, TICKS_PER_DAY};
 use crate::world::terrain::TILE_SIZE;
 
 /// Per-(intruder-faction, owner-faction) cooldown ticks between
@@ -116,12 +121,37 @@ impl TerritoryDefenseQueue {
 }
 
 /// Pure helper: classify whether an intruder's presence on owner's
-/// territory is legal under treaties / root.
+/// territory is legal under treaties + grant table + intent (Smart-
+/// diplomacy P2). Same-root always allowed; war always hostile.
+/// Otherwise, defers to `permits` against `grants`; non-permitted
+/// neutrals become `Neutral` (warn-then-escalate).
 ///
-/// `Allowed` covers: same root, alliance, non-aggression. `TradePact`
-/// alone permits transit only inside the road corridor / market disc —
-/// that finer-grained check is deferred to the caller (today we treat
-/// TradePact as fully Allowed; v2 will narrow).
+/// `legacy_is_trespass` (treaty-only) remains for the pure test
+/// surface.
+pub fn classify_trespass(
+    treaties: TreatySet,
+    same_root: bool,
+    grants: &[crate::simulation::access_grant::AccessGrant],
+    intent: IntruderIntent,
+    tile: (i32, i32),
+    settlements: &[(crate::simulation::settlement::SettlementId, (i32, i32))],
+    season: crate::world::seasons::Season,
+) -> TrespassClassification {
+    if same_root {
+        return TrespassClassification::Allowed;
+    }
+    if treaties.has(TreatyKind::War) {
+        return TrespassClassification::Hostile;
+    }
+    if permits(grants, intent, tile, settlements, season) {
+        return TrespassClassification::Allowed;
+    }
+    TrespassClassification::Neutral
+}
+
+/// Legacy treaty-only classifier kept for pure-fn tests + any code path
+/// that doesn't have the grant table in hand. Same shape as the P1
+/// version, minus the P2 intent filter.
 pub fn is_trespass(
     treaties: TreatySet,
     same_root: bool,
@@ -157,12 +187,25 @@ pub fn trespass_detection_system(
     territory: Res<TerritoryMap>,
     ledger: Res<DiplomacyLedger>,
     registry: Res<FactionRegistry>,
+    grants: Res<AccessGrantTable>,
+    calendar: Res<Calendar>,
+    settlement_map: Res<SettlementMap>,
+    settlements_q: Query<&Settlement>,
     mut state: ResMut<TrespassRegistry>,
     mut events: EventWriter<TrespassEvent>,
-    persons: Query<(Entity, &Transform, &FactionMember), (With<Person>, Changed<Transform>)>,
+    persons: Query<
+        (
+            Entity,
+            &Transform,
+            &FactionMember,
+            Option<&Drafted>,
+            Option<&Profession>,
+        ),
+        (With<Person>, Changed<Transform>),
+    >,
 ) {
     let now = clock.tick;
-    for (entity, transform, member) in persons.iter() {
+    for (entity, transform, member, drafted, profession) in persons.iter() {
         let intruder_fid = member.faction_id;
         if intruder_fid == SOLO {
             continue;
@@ -177,7 +220,44 @@ pub fn trespass_detection_system(
         }
         let same_root = registry.root_faction(intruder_fid) == registry.root_faction(owner_fid);
         let treaties = ledger.treaties(intruder_fid, owner_fid);
-        let class = is_trespass(treaties, same_root);
+        // Intent — drafted = Hostile; raid-party membership too (no
+        // entity tag for that today, so derive from FactionData).
+        let intruder_root = registry.root_faction(intruder_fid);
+        let in_raid_party = registry
+            .factions
+            .get(&intruder_root)
+            .map(|d| d.raid_party.contains(&entity))
+            .unwrap_or(false);
+        let is_trader = matches!(profession, Some(Profession::Trader));
+        let home_is_mobile = registry
+            .factions
+            .get(&intruder_root)
+            .map(|d| d.caps.home.is_mobile())
+            .unwrap_or(false);
+        let intent = classify_intent(drafted.is_some(), in_raid_party, is_trader, home_is_mobile);
+        // Build the per-pair grant view + settlement view.
+        let pair_grants = grants.grants(owner_fid, intruder_root);
+        let owner_settlements: Vec<(crate::simulation::settlement::SettlementId, (i32, i32))> =
+            settlement_map
+                .for_faction(owner_fid)
+                .iter()
+                .filter_map(|sid| {
+                    settlement_map
+                        .by_id
+                        .get(sid)
+                        .and_then(|e| settlements_q.get(*e).ok())
+                        .map(|s| (s.id, s.market_tile))
+                })
+                .collect();
+        let class = classify_trespass(
+            treaties,
+            same_root,
+            pair_grants,
+            intent,
+            (tx, ty),
+            &owner_settlements,
+            calendar.season,
+        );
         if matches!(class, TrespassClassification::Allowed) {
             continue;
         }
@@ -242,9 +322,32 @@ pub fn trespass_handling_system(
                 queue_defense = true;
             }
             TrespassClassification::Neutral => {
-                // First incident this day: warning (no rep change).
-                // Second+ : record as IgnoredWarning + repeat trespass.
-                let warned = pair.incidents_today > 1;
+                // Smart-diplomacy P2 — personality-aware grace.
+                // Defensive / martial / unknown: 0 extra; mercantile:
+                // +1; high trust (> 40): +1 more. Grace shifts every
+                // escalation threshold by the same amount.
+                let owner_data = registry.factions.get(&ev.owner_faction);
+                let trust = ledger
+                    .relation(ev.owner_faction, ev.intruder_faction)
+                    .map(|r| r.reputation.trust)
+                    .unwrap_or(0);
+                let mut grace: i32 = 0;
+                if let Some(d) = owner_data {
+                    let pers = DiplomaticPersonality::from_culture(
+                        &d.culture,
+                        d.caps.home.is_mobile(),
+                    );
+                    grace += pers.trespass_warn_grace as i32;
+                }
+                if trust > 40 {
+                    grace += 1;
+                }
+                let warn_at = 1 + grace; // warning vs no rep change
+                let ignore_at = 2 + grace; // IgnoredWarning + grievance
+                let queue_at = 3 + grace; // Defense queue push
+
+                let incidents = pair.incidents_today as i32;
+                let warned = incidents > warn_at;
                 record_incident(
                     &mut ledger,
                     ev.intruder_faction,
@@ -255,7 +358,7 @@ pub fn trespass_handling_system(
                         warned,
                     },
                 );
-                if pair.incidents_today >= 2 {
+                if incidents >= ignore_at {
                     record_incident(
                         &mut ledger,
                         ev.intruder_faction,
@@ -263,7 +366,7 @@ pub fn trespass_handling_system(
                         now,
                         IncidentKind::IgnoredWarning,
                     );
-                    queue_defense = pair.incidents_today >= 3;
+                    queue_defense = incidents >= queue_at;
                 }
             }
             TrespassClassification::Allowed => {

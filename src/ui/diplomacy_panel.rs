@@ -8,6 +8,7 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
+use crate::simulation::access_grant::{AccessGrantTable, AccessKind};
 use crate::simulation::diplomacy::{
     DiplomacyLedger, DiplomacyProposal, ProposalResponse, TreatyKind,
 };
@@ -36,6 +37,7 @@ pub fn diplomacy_panel_system(
     ledger: Res<DiplomacyLedger>,
     registry: Res<FactionRegistry>,
     contact_book: Res<DiplomaticContactBook>,
+    grants: Res<AccessGrantTable>,
     player_faction: Res<PlayerFaction>,
     mut sender: CommandSender,
 ) {
@@ -237,6 +239,40 @@ pub fn diplomacy_panel_system(
                     cols[1].label("(no pending proposals from this faction)");
                 }
 
+                // ── Grants section (Smart-diplomacy P2) ────────
+                cols[1].separator();
+                cols[1].label(egui::RichText::new("Access grants").strong());
+                let mine = grants.grants(self_fid, target);
+                let theirs = grants.grants(target, self_fid);
+                if mine.is_empty() && theirs.is_empty() {
+                    cols[1].label(egui::RichText::new("(no grants)").italics());
+                } else {
+                    if !mine.is_empty() {
+                        cols[1].label(format!("We grant them:"));
+                        for g in mine {
+                            cols[1].horizontal(|ui| {
+                                ui.label(format!("  {}", grant_summary(g.kind)));
+                                if ui.button("Revoke").clicked() {
+                                    sender.send(
+                                        Vec::new(),
+                                        PlayerCommand::RevokeAccessGrant {
+                                            faction_id: self_fid,
+                                            target_faction_id: target,
+                                            kind: g.kind,
+                                        },
+                                    );
+                                }
+                            });
+                        }
+                    }
+                    if !theirs.is_empty() {
+                        cols[1].label(format!("They grant us:"));
+                        for g in theirs {
+                            cols[1].label(format!("  {}", grant_summary(g.kind)));
+                        }
+                    }
+                }
+
                 cols[1].separator();
                 cols[1].label(egui::RichText::new("Actions").strong());
                 let treaties = relation.map(|r| r.treaties).unwrap_or_default();
@@ -321,6 +357,21 @@ pub fn diplomacy_panel_system(
                 }
             });
         });
+}
+
+fn grant_summary(k: AccessKind) -> String {
+    match k {
+        AccessKind::MarketCorridor { settlement_id, radius } => format!(
+            "Market Corridor (settlement {}, r={})",
+            settlement_id.0, radius
+        ),
+        AccessKind::SeasonalCamp { center, radius, .. } => format!(
+            "Seasonal Camp ({}x{}) r={}",
+            center.0, center.1, radius
+        ),
+        AccessKind::SafePassage { .. } => "Safe Passage".to_string(),
+        AccessKind::FullTerritory => "Full Territory".to_string(),
+    }
 }
 
 fn fairness_color_label(f: FairnessLabel) -> (&'static str, egui::Color32) {

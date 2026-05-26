@@ -259,6 +259,14 @@ pub enum PlayerCommand {
         target_faction_id: u32,
         treaty: crate::simulation::diplomacy::TreatyKind,
     },
+    /// Smart-diplomacy P2 — revoke a directional `AccessGrant` from our
+    /// faction to the target. Routes through the AccessGrantTable's
+    /// `revoke(...)` API. No-op if the grant doesn't exist.
+    RevokeAccessGrant {
+        faction_id: u32,
+        target_faction_id: u32,
+        kind: crate::simulation::access_grant::AccessKind,
+    },
 }
 
 /// Per-actor authority marker. Replaces `PlayerOrder` once Commit 3 lands.
@@ -353,6 +361,7 @@ pub fn drain_player_command_events_system(
     mut debug_drive: DebugTestDriveResources,
     net_ids: Res<NetIdMap>,
     mut ledger: ResMut<crate::simulation::diplomacy::DiplomacyLedger>,
+    mut grants: ResMut<crate::simulation::access_grant::AccessGrantTable>,
 ) {
     let now = clock.tick as u32;
     for ev in reader.read() {
@@ -368,7 +377,8 @@ pub fn drain_player_command_events_system(
                 | PlayerCommand::SendDiplomacyProposal { faction_id, .. }
                 | PlayerCommand::RespondDiplomacyProposal { faction_id, .. }
                 | PlayerCommand::DeclareWar { faction_id, .. }
-                | PlayerCommand::BreakTreaty { faction_id, .. } => Some(*faction_id),
+                | PlayerCommand::BreakTreaty { faction_id, .. }
+                | PlayerCommand::RevokeAccessGrant { faction_id, .. } => Some(*faction_id),
                 _ => None,
             };
             if let Some(fid) = payload_faction {
@@ -665,6 +675,16 @@ pub fn drain_player_command_events_system(
                         clock.tick,
                     );
                 }
+                PlayerCommand::RevokeAccessGrant {
+                    faction_id,
+                    target_faction_id,
+                    kind,
+                } => {
+                    if faction_id == target_faction_id {
+                        continue;
+                    }
+                    grants.revoke(faction_id, target_faction_id, kind);
+                }
                 _ => {
                     // Other commands need actors; skip a malformed event.
                 }
@@ -890,7 +910,8 @@ pub fn player_command_lifecycle_system(
             | PlayerCommand::SendDiplomacyProposal { .. }
             | PlayerCommand::RespondDiplomacyProposal { .. }
             | PlayerCommand::DeclareWar { .. }
-            | PlayerCommand::BreakTreaty { .. } => Some(CommandStatus::Completed),
+            | PlayerCommand::BreakTreaty { .. }
+            | PlayerCommand::RevokeAccessGrant { .. } => Some(CommandStatus::Completed),
             // Lookout never auto-completes — the worker holds the anchor
             // until the player supersedes the command or `aq.cancel`
             // drops the chain via another dispatch.
@@ -1771,7 +1792,8 @@ fn dispatch_one(
         | SendDiplomacyProposal { .. }
         | RespondDiplomacyProposal { .. }
         | DeclareWar { .. }
-        | BreakTreaty { .. } => {
+        | BreakTreaty { .. }
+        | RevokeAccessGrant { .. } => {
             // Faction-level — applied directly in
             // `drain_player_command_events_system` (empty `actors`). If an
             // event ever arrives carrying actors, the dispatch is a no-op.

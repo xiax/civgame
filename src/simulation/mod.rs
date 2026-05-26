@@ -14,6 +14,7 @@ pub mod civic_milestones;
 pub mod clear_obstacle;
 pub mod cohort;
 pub mod combat;
+pub mod access_grant;
 pub mod construction;
 pub mod corpse;
 pub mod crafting;
@@ -315,6 +316,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(territory::TerritoryMap::default())
             .insert_resource(diplomacy::DiplomacyLedger::default())
             .insert_resource(diplomatic_contact::DiplomaticContactBook::default())
+            .insert_resource(access_grant::AccessGrantTable::default())
             .insert_resource(trespass::TrespassRegistry::default())
             .insert_resource(trespass::TerritoryDefenseQueue::default())
             .add_event::<trespass::TrespassEvent>()
@@ -1753,6 +1755,8 @@ impl Plugin for SimulationPlugin {
                         .before(diplomacy::ai_diplomacy_proposal_system),
                     diplomacy::ai_diplomacy_response_system,
                     diplomacy::ai_diplomacy_proposal_system,
+                    access_grant::treaty_to_grant_sync_system
+                        .after(diplomacy::ai_diplomacy_response_system),
                 )
                     .in_set(SimulationSet::Economy),
             )

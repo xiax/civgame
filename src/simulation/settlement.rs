@@ -27,7 +27,7 @@ use crate::world::terrain::TILE_SIZE;
 // ─── Pluralist Economy R1: Settlement entity ────────────────────────
 
 /// Stable per-settlement identity, allocated by `SettlementMap::alloc_id`.
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct SettlementId(pub u32);
 
 /// A settlement is owned by exactly one faction. A megachunk can host

@@ -124,7 +124,7 @@ Pure unit tests in evaluator module (no `App`):
 Behavioural test via `test_fixture`:
 - Two factions; inject `MemoryKind::HostileFactionSighting` for one; tick a week; assert proposal arrives only after contact source recorded.
 
-## Phase 2 — Directional access grants + intent-aware trespass
+## Phase 2 — Directional access grants + intent-aware trespass — **SHIPPED 2026-05-26**
 
 P2 adds finer trespass semantics without touching the deal model.
 

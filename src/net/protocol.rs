@@ -23,7 +23,7 @@ use crate::world::water_runtime::RuntimeWaterCell;
 /// Wire protocol version negotiated at connect time. Bump whenever the
 /// shape of any wire message in this module changes; mismatched clients
 /// are rejected by `accept_connections_system` before any state transfer.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// One UI- (or remote-client-)issued command, scoped to the faction that
 /// claims to be sending it. The loopback validates `sender_faction_id`
@@ -923,6 +923,39 @@ mod tests {
                 assert_eq!(treaty, TreatyKind::TradePact);
             }
             other => panic!("expected BreakTreaty, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn revoke_access_grant_round_trips() {
+        use crate::simulation::access_grant::AccessKind;
+        use crate::simulation::settlement::SettlementId;
+        let original = PlayerCommand::RevokeAccessGrant {
+            faction_id: 1,
+            target_faction_id: 4,
+            kind: AccessKind::MarketCorridor {
+                settlement_id: SettlementId(7),
+                radius: 6,
+            },
+        };
+        let restored = round_trip(&original);
+        match restored {
+            PlayerCommand::RevokeAccessGrant {
+                faction_id,
+                target_faction_id,
+                kind,
+            } => {
+                assert_eq!(faction_id, 1);
+                assert_eq!(target_faction_id, 4);
+                match kind {
+                    AccessKind::MarketCorridor { settlement_id, radius } => {
+                        assert_eq!(settlement_id, SettlementId(7));
+                        assert_eq!(radius, 6);
+                    }
+                    other => panic!("expected MarketCorridor, got {:?}", other),
+                }
+            }
+            other => panic!("expected RevokeAccessGrant, got {:?}", other),
         }
     }
 }
