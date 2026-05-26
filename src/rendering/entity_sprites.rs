@@ -484,7 +484,15 @@ fn vehicle_sprite_plan_internal(
     };
 
     let bounds = design.grid.bounds();
-    let stock_flat = design.author_faction.is_none()
+    // Only fall through to the hand-drawn Stock cart sprite when there is
+    // genuinely no per-cell data to compose. The data-aware path always has
+    // sprite keys available (`VehicleData` in hand), so spawned vehicles
+    // render the composed grid + asymmetric per-view art instead of the
+    // single static cart fallback. The colour-only `vehicle_sprite_plan`
+    // wrapper (designer preview / headless tests) still routes here with
+    // `data == None`, where Stock keeps producing a sensible placeholder.
+    let stock_flat = data.is_none()
+        && design.author_faction.is_none()
         && bounds.map(|(lo, hi)| hi.z - lo.z == 0).unwrap_or(true);
     if stock_flat {
         return VehicleSpritePlan::Stock;
@@ -764,96 +772,160 @@ fn push_connector_overlays<F: Fn(f32, f32, f32) -> Vec3>(
     }
 }
 
-/// Vehicle system: reactively attach the child sprite(s) to every `Vehicle`.
-/// Stock 1-tall designs reuse the hand-drawn `entity_cart` sprite; freeform
-/// and multi-Z designs render as a composed grid — one `VisualChild` colored
-/// quad per cell, XY-placed and lifted by Z so a tall body extends upward.
-/// Vehicles are mobile, so — like Person / animal sprites — they omit
-/// `FogPersistent`.
-pub fn spawn_vehicle_sprites(
-    mut commands: Commands,
-    query: Query<(Entity, &Vehicle), Without<VehicleVisual>>,
-    registry: Res<VehicleDesignRegistry>,
-    sprite_lib: Res<SpriteLibrary>,
-    data: Res<VehicleData>,
+/// Spawn `VisualChild` cells for one vehicle entity. Used by
+/// `refresh_vehicle_sprites_system` for both first-time attach and
+/// post-rebuild repopulation. Builds the data-aware sprite plan and
+/// spawns one colour-quad-or-sprite child per cell. Stock 1-tall designs
+/// (designer preview path with no `VehicleData`) reuse the hand-drawn
+/// `entity_cart`; the in-world path always composes from cells.
+fn spawn_vehicle_visual_cells(
+    commands: &mut Commands,
+    parent: Entity,
+    design: &VehicleDesign,
+    heading: u8,
+    sprite_lib: &SpriteLibrary,
+    data: &VehicleData,
 ) {
-    for (entity, vehicle) in query.iter() {
-        commands
-            .entity(entity)
-            .insert((VehicleVisual, EntityFogState::default()));
-
-        let Some(design) = registry.get(vehicle.design_id) else {
-            continue;
-        };
-        match vehicle_sprite_plan_with_data(design, vehicle.heading, &data) {
-            VehicleSpritePlan::Stock => {
-                let Some(handle) = sprite_lib.get("entity_cart") else {
-                    continue;
-                };
-                let mut sprite = Sprite::from_image(handle.clone());
-                sprite.anchor = Anchor::BottomCenter;
-                commands.entity(entity).with_children(|parent| {
-                    parent.spawn((
+    match vehicle_sprite_plan_with_data(design, heading, data) {
+        VehicleSpritePlan::Stock => {
+            let Some(handle) = sprite_lib.get("entity_cart") else {
+                return;
+            };
+            let mut sprite = Sprite::from_image(handle.clone());
+            sprite.anchor = Anchor::BottomCenter;
+            commands.entity(parent).with_children(|p| {
+                p.spawn((
+                    VisualChild,
+                    sprite,
+                    Transform::from_xyz(0.0, -8.0, 0.1),
+                    GlobalTransform::default(),
+                    Visibility::Inherited,
+                    InheritedVisibility::default(),
+                ));
+            });
+        }
+        VehicleSpritePlan::Composed { cells } => {
+            commands.entity(parent).with_children(|p| {
+                for cell in cells {
+                    let resolved = cell
+                        .sprite_key
+                        .as_deref()
+                        .and_then(|key| sprite_lib.get(key).cloned())
+                        .or_else(|| {
+                            cell.fallback_sprite_key
+                                .as_deref()
+                                .and_then(|key| sprite_lib.get(key).cloned())
+                        });
+                    let mut sprite = match resolved {
+                        Some(img) => {
+                            let mut s = Sprite::from_image(img);
+                            s.flip_x = cell.flip_x;
+                            s.custom_size = Some(cell.size);
+                            s
+                        }
+                        None => Sprite::from_color(cell.color, cell.size),
+                    };
+                    sprite.anchor = Anchor::BottomCenter;
+                    p.spawn((
                         VisualChild,
+                        // `VehicleCellTint` survives the fog-tint sweep
+                        // (`apply_entity_fog_tint_system`) AND exempts the
+                        // cell from `update_animations`' (0,-8) rest-position
+                        // reset, which assumes a single per-entity child.
+                        VehicleCellTint(cell.color),
                         sprite,
-                        Transform::from_xyz(0.0, -8.0, 0.1),
+                        Transform::from_xyz(
+                            cell.local_offset.x,
+                            cell.local_offset.y,
+                            cell.local_offset.z,
+                        ),
                         GlobalTransform::default(),
                         Visibility::Inherited,
                         InheritedVisibility::default(),
                     ));
-                });
-            }
-            VehicleSpritePlan::Composed { cells } => {
-                commands.entity(entity).with_children(|parent| {
-                    for cell in cells {
-                        // Try the per-cell sprite key first; chain
-                        // variant→base if the variant has no distinct
-                        // art. On total miss, fall back to a colour
-                        // quad so unregistered parts still render.
-                        let resolved = cell
-                            .sprite_key
-                            .as_deref()
-                            .and_then(|key| sprite_lib.get(key).cloned())
-                            .or_else(|| {
-                                cell.fallback_sprite_key
-                                    .as_deref()
-                                    .and_then(|key| sprite_lib.get(key).cloned())
-                            });
-                        let mut sprite = match resolved {
-                            Some(img) => {
-                                let mut s = Sprite::from_image(img);
-                                s.flip_x = cell.flip_x;
-                                // Custom size makes a 16×16 source render at
-                                // the requested footprint (matters for
-                                // module composites that span >1 cell).
-                                s.custom_size = Some(cell.size);
-                                s
-                            }
-                            None => Sprite::from_color(cell.color, cell.size),
-                        };
-                        sprite.anchor = Anchor::BottomCenter;
-                        parent.spawn((
-                            VisualChild,
-                            // `VehicleCellTint` survives the fog-tint sweep
-                            // (`apply_entity_fog_tint_system`) AND exempts
-                            // the cell from `update_animations`' (0,-8)
-                            // rest-position reset, which assumes a single
-                            // per-entity child (Person/animal).
-                            VehicleCellTint(cell.color),
-                            sprite,
-                            Transform::from_xyz(
-                                cell.local_offset.x,
-                                cell.local_offset.y,
-                                cell.local_offset.z,
-                            ),
-                            GlobalTransform::default(),
-                            Visibility::Inherited,
-                            InheritedVisibility::default(),
-                        ));
-                    }
-                });
+                }
+            });
+        }
+    }
+}
+
+/// Vehicle render driver — attaches `VisualChild` cells on first sight and
+/// rebuilds them whenever `Vehicle.heading % 4` or `Vehicle.state` changes
+/// (the two axes that flip per-cell sprite art via `view_for_heading` /
+/// asymmetric `_BACK` variants). Other `Vehicle` field churn (anchor_tile,
+/// z, hauler) does **not** trigger a refresh — the parent `Transform`
+/// already moves the children along for free.
+///
+/// Vehicles are mobile, so — like Person / animal sprites — they omit
+/// `FogPersistent`. Only `VisualChild`-marked children are torn down on
+/// rebuild; `EntityFogState`, hauler joints, etc. survive.
+pub fn refresh_vehicle_sprites_system(
+    mut commands: Commands,
+    new_q: Query<(Entity, &Vehicle), Without<VehicleVisual>>,
+    mut refresh_q: Query<(Entity, &Vehicle, &mut VehicleVisual, Option<&Children>)>,
+    visual_child_q: Query<(), With<VisualChild>>,
+    registry: Res<VehicleDesignRegistry>,
+    sprite_lib: Res<SpriteLibrary>,
+    data: Res<VehicleData>,
+) {
+    // First-attach pass.
+    for (entity, vehicle) in new_q.iter() {
+        let bucket = vehicle.heading % 4;
+        commands.entity(entity).insert((
+            VehicleVisual {
+                design_id: vehicle.design_id,
+                heading_bucket: bucket,
+                state: vehicle.state,
+            },
+            EntityFogState::default(),
+        ));
+        let Some(design) = registry.get(vehicle.design_id) else {
+            continue;
+        };
+        spawn_vehicle_visual_cells(
+            &mut commands,
+            entity,
+            design,
+            vehicle.heading,
+            &sprite_lib,
+            &data,
+        );
+    }
+
+    // Refresh pass: rebuild children when heading bucket / state flips.
+    for (entity, vehicle, mut visual, children) in refresh_q.iter_mut() {
+        let bucket = vehicle.heading % 4;
+        if visual.heading_bucket == bucket
+            && visual.state == vehicle.state
+            && visual.design_id == vehicle.design_id
+        {
+            continue;
+        }
+        visual.heading_bucket = bucket;
+        visual.state = vehicle.state;
+        visual.design_id = vehicle.design_id;
+
+        // Despawn only `VisualChild`-marked children — leaves hauler joints,
+        // crew indicators, name labels, etc. intact.
+        if let Some(children) = children {
+            for &child in children.iter() {
+                if visual_child_q.get(child).is_ok() {
+                    commands.entity(child).despawn();
+                }
             }
         }
+
+        let Some(design) = registry.get(vehicle.design_id) else {
+            continue;
+        };
+        spawn_vehicle_visual_cells(
+            &mut commands,
+            entity,
+            design,
+            vehicle.heading,
+            &sprite_lib,
+            &data,
+        );
     }
 }
 

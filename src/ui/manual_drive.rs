@@ -1,16 +1,15 @@
-//! Debug Test-Drive manual input — WASD/QE tap-to-step controls for a
+//! Debug Test-Drive manual input — WASD/QE hold-to-step controls for a
 //! Vehicle armed via the designer's "Test Drive" button.
 //!
-//! Coexists with the existing right-click `VehicleOrderKind::MoveTo` flow:
-//! while a `VehiclePathFollow` is in flight (from either source) movement
-//! keys are dropped (no buffering); press `S` to cancel the current step,
-//! then press `W` to take over.
+//! Movement keys (W/A/D/Q/E) read `pressed`: as soon as the current
+//! `VehiclePathFollow` clears the next held intent dispatches a fresh
+//! step. `S` and `Esc` stay `just_pressed` so cancel + release are
+//! deliberate one-shot actions. While a `VehiclePathFollow` is in flight
+//! (from either source) movement keys are dropped — no buffering.
 //!
 //! `Esc` clears `ManualDriveState.active`, releasing the camera-pan
 //! suppression in `camera::camera_input_system`. Egui keyboard focus is
 //! gated upstream — typing in the designer's name field doesn't drive.
-//!
-//! See plan: `~/.claude/plans/evaluate-the-users-xiao1-civgame-plans-v-optimized-squirrel.md`.
 
 use bevy::prelude::*;
 use bevy_egui::EguiContexts;
@@ -21,12 +20,12 @@ use crate::simulation::vehicle::{
 };
 use crate::world::chunk::ChunkMap;
 
-/// Update-set system. Reads `just_pressed` so a held W taps once per frame
-/// rather than spamming dispatches; the next press only registers once the
-/// current `VehiclePathFollow` has completed (per the design's tap-to-step
-/// choice). `S` clears an in-flight `VehiclePathFollow`. `Esc` releases
-/// manual drive entirely. Egui keyboard focus suppresses every key so the
-/// designer's text fields keep working.
+/// Update-set system. Movement keys read `pressed` so holding W keeps
+/// committing steps as each `VehiclePathFollow` clears; the in-flight gate
+/// prevents queueing a step while the prior one is still walking. `S`
+/// (clear in-flight path) and `Esc` (release manual drive) stay
+/// `just_pressed` — both are deliberate one-shot actions. Egui keyboard
+/// focus suppresses every key so the designer's text fields keep working.
 pub fn manual_drive_input_system(
     mut commands: Commands,
     mut contexts: EguiContexts,
@@ -67,15 +66,17 @@ pub fn manual_drive_input_system(
     if follow.is_some() {
         return;
     }
-    let intent = if keys.just_pressed(KeyCode::KeyW) || keys.just_pressed(KeyCode::ArrowUp) {
+    // Hold-to-drive: movement keys are `pressed` so the next held intent
+    // dispatches the moment the prior `VehiclePathFollow` clears (above).
+    let intent = if keys.pressed(KeyCode::KeyW) || keys.pressed(KeyCode::ArrowUp) {
         Some(ManualIntent::Forward)
-    } else if keys.just_pressed(KeyCode::KeyA) || keys.just_pressed(KeyCode::ArrowLeft) {
+    } else if keys.pressed(KeyCode::KeyA) || keys.pressed(KeyCode::ArrowLeft) {
         Some(ManualIntent::TurnCCW)
-    } else if keys.just_pressed(KeyCode::KeyD) || keys.just_pressed(KeyCode::ArrowRight) {
+    } else if keys.pressed(KeyCode::KeyD) || keys.pressed(KeyCode::ArrowRight) {
         Some(ManualIntent::TurnCW)
-    } else if keys.just_pressed(KeyCode::KeyQ) {
+    } else if keys.pressed(KeyCode::KeyQ) {
         Some(ManualIntent::ForwardLeft)
-    } else if keys.just_pressed(KeyCode::KeyE) {
+    } else if keys.pressed(KeyCode::KeyE) {
         Some(ManualIntent::ForwardRight)
     } else {
         None

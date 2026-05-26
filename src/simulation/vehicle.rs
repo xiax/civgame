@@ -460,10 +460,18 @@ pub struct Vehicle {
     pub hauler: Option<Entity>,
 }
 
-/// Render marker — `entity_sprites::spawn_vehicle_sprites` attaches the child
-/// sprite once and stamps this so it isn't re-attached.
+/// Render state — `entity_sprites::refresh_vehicle_sprites_system` attaches the
+/// child sprites and stamps this so per-tick refresh can diff against it.
+/// The refresh system rebuilds the `VisualChild` tree whenever
+/// `heading_bucket = heading % 4` OR `state` changes — matches the rotation
+/// granularity baked into `vehicle_sprite_plan_with_data` and the per-state
+/// visual variations (e.g. Parked vs Overturned).
 #[derive(Component, Clone, Copy, Debug)]
-pub struct VehicleVisual;
+pub struct VehicleVisual {
+    pub design_id: VehicleDesignId,
+    pub heading_bucket: u8,
+    pub state: VehicleState,
+}
 
 /// A planned multi-tile route for a `Vehicle`, authoritative on the `Vehicle`
 /// entity (Phase 4 — the vehicle *leads*, crew follow). `path` is a node
@@ -603,6 +611,92 @@ pub fn crew_seat_count(design: &VehicleDesign) -> u8 {
         .filter(|(_, c)| c.kind == VehiclePartKind::CrewSeat)
         .count()
         .min(255) as u8
+}
+
+/// Total rider slots — sums `PartDef.crew_capacity` over CrewSeat cells, with
+/// `crew_seat_count(design).max(1)` as a floor so designs with no seat-data
+/// still seat at least the driver (matches the previous `AssignCrew` behaviour).
+pub fn vehicle_operator_capacity(design: &VehicleDesign, data: &VehicleData) -> usize {
+    let mut total: usize = 0;
+    for (_, cell) in &design.grid.cells {
+        if cell.kind != VehiclePartKind::CrewSeat {
+            continue;
+        }
+        if let Some(part) = data.part(cell.kind) {
+            total = total.saturating_add(part.crew_capacity as usize);
+        } else {
+            total = total.saturating_add(1);
+        }
+    }
+    total.max(crew_seat_count(design).max(1) as usize)
+}
+
+/// How many gunner slots the design needs at full crew. Sums
+/// `VehicleModuleDef.gunner_required` over ranged modules and adds **one**
+/// per legacy single-cell `Turret` / ranged `WeaponMount` not owned by a
+/// module. Drives the `AssignCrew` driver→gunners→passengers fill order.
+pub fn vehicle_gunner_demand(design: &VehicleDesign, data: &VehicleData) -> usize {
+    let mut demand: usize = 0;
+    for inst in &design.grid.modules {
+        if let Some(def) = data.module_def(inst.def) {
+            if def.range > 0 {
+                demand = demand.saturating_add(def.gunner_required as usize);
+            }
+        }
+    }
+    for (_, cell) in &design.grid.cells {
+        if cell.module_id.is_some() {
+            continue;
+        }
+        let ranged_legacy = match cell.kind {
+            VehiclePartKind::Turret => true,
+            VehiclePartKind::WeaponMount => data
+                .part(cell.kind)
+                .map(|p| p.mounted_weapon_range > 0)
+                .unwrap_or(false),
+            _ => false,
+        };
+        if ranged_legacy {
+            demand = demand.saturating_add(1);
+        }
+    }
+    demand
+}
+
+/// Pool of agents qualified to operate a weapon — gunners are the dedicated
+/// slot, passengers serve as assistant loaders / overflow operators. Driver
+/// is *not* counted: keeping their hands on the reins matters more than
+/// shooting.
+pub fn available_weapon_operators(crew: &VehicleCrew) -> usize {
+    crew.gunners.len() + crew.passengers.len()
+}
+
+/// True when the design carries any ranged weapon (module or legacy single
+/// cell). Drives the `Fire Here` menu visibility.
+pub fn design_has_any_ranged_weapon(design: &VehicleDesign, data: &VehicleData) -> bool {
+    for inst in &design.grid.modules {
+        if let Some(def) = data.module_def(inst.def) {
+            if def.range > 0 {
+                return true;
+            }
+        }
+    }
+    for (_, cell) in &design.grid.cells {
+        if cell.module_id.is_some() {
+            continue;
+        }
+        if matches!(
+            cell.kind,
+            VehiclePartKind::Turret | VehiclePartKind::WeaponMount
+        ) {
+            if let Some(part) = data.part(cell.kind) {
+                if part.mounted_weapon_range > 0 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 // ── design validation ─────────────────────────────────────────────────────
@@ -2596,6 +2690,45 @@ pub fn vehicle_assembly_system(
 #[derive(Resource, Default)]
 pub struct VehicleOccupancyIndex(pub ahash::AHashMap<(i32, i32), Entity>);
 
+/// Outward-spiral search for a passable tile a rider can disembark onto.
+/// Skips the vehicle's own footprint, tiles claimed by a different vehicle
+/// in `VehicleOccupancyIndex`, the `used` set (other riders chosen this
+/// disembark pass), and tiles `ChunkMap::passable_at` rejects. Capped at
+/// `DISEMBARK_SEARCH_RADIUS = 6` tiles to bound the worst-case cost.
+pub fn find_disembark_landing(
+    anchor: (i32, i32),
+    z: i8,
+    footprint: &ahash::AHashSet<(i32, i32)>,
+    used: &ahash::AHashSet<(i32, i32)>,
+    chunk_map: &ChunkMap,
+    occupancy: &VehicleOccupancyIndex,
+) -> Option<(i32, i32)> {
+    const DISEMBARK_SEARCH_RADIUS: i32 = 6;
+    let z32 = z as i32;
+    for ring in 1..=DISEMBARK_SEARCH_RADIUS {
+        for dx in -ring..=ring {
+            for dy in -ring..=ring {
+                // Only walk the outermost layer for this ring.
+                if dx.abs() != ring && dy.abs() != ring {
+                    continue;
+                }
+                let tile = (anchor.0 + dx, anchor.1 + dy);
+                if footprint.contains(&tile)
+                    || used.contains(&tile)
+                    || occupancy.0.contains_key(&tile)
+                {
+                    continue;
+                }
+                if !chunk_map.passable_at(tile.0, tile.1, z32) {
+                    continue;
+                }
+                return Some(tile);
+            }
+        }
+    }
+    None
+}
+
 /// The XY tiles a design occupies when parked at `anchor` facing `heading`.
 pub fn footprint_tiles(
     design: &VehicleDesign,
@@ -3906,13 +4039,45 @@ pub enum VehicleOrderKind {
     Deconstruct,
     /// Order a siege-capable vehicle to batter the wall at this tile.
     SiegeWall((i32, i32)),
+    /// Eject every rider from the vehicle onto adjacent passable tiles.
+    /// Riders for whom no landing tile can be found stay boarded and a
+    /// `warn!` is logged.
+    DisembarkCrew,
+    /// Direct the vehicle's weapons to prioritise hostile targets within
+    /// `FIRE_ORDER_RADIUS` tiles of the clicked tile. Refreshes the TTL
+    /// when re-issued; expires after `FIRE_ORDER_TTL_TICKS`, after which
+    /// auto-fire target selection resumes.
+    FireAt((i32, i32)),
 }
 
 /// Standing order on a siege-capable `Vehicle` to batter a wall tile —
-/// consumed by `vehicle_siege_system`. Removed once the wall falls.
+/// consumed by `vehicle_siege_system`. When the vehicle isn't adjacent to
+/// the target it plans a route to a passable neighbour; `last_route_attempt_tick`
+/// throttles replanning so an unreachable wall doesn't spin the planner.
+/// Removed once the wall falls or `design_siege_capable` flips false.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct SiegeOrder {
     pub target_tile: (i32, i32),
+    pub last_route_attempt_tick: u64,
+}
+
+/// Time-to-live for an inserted `VehicleFireOrder`, in sim ticks (~4s @ 20Hz).
+pub const FIRE_ORDER_TTL_TICKS: u64 = 80;
+
+/// Chebyshev radius within which `VehicleFireOrder` directs weapons to
+/// prioritise hostile targets.
+pub const FIRE_ORDER_RADIUS: i32 = 3;
+
+/// Player-issued fire focus on a `Vehicle`. While present every weapon on
+/// the vehicle restricts target acquisition to hostiles whose tile is
+/// within `FIRE_ORDER_RADIUS` chebyshev of `target_tile`. Weapons that
+/// can't pick anything in the focus area stay silent until the order
+/// expires (`tick >= expires_tick`); they do **not** fall back to
+/// auto-fire while the order is live.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct VehicleFireOrder {
+    pub target_tile: (i32, i32),
+    pub expires_tick: u64,
 }
 
 /// Pending player vehicle orders, drained by `vehicle_player_command_system`.
@@ -3991,6 +4156,9 @@ pub fn vehicle_player_command_system(
                     &occupancy,
                 ) {
                     v.state = VehicleState::Moving;
+                    // Explicit move overrides any active siege so the
+                    // player isn't fighting the siege-route planner.
+                    commands.entity(vehicle_e).remove::<SiegeOrder>();
                     commands.entity(vehicle_e).insert(VehiclePathFollow {
                         path,
                         cursor: ROUTE_CURSOR_START,
@@ -4006,10 +4174,14 @@ pub fn vehicle_player_command_system(
             }
             VehicleOrderKind::SiegeWall(tile) => {
                 // Stamp the standing siege order; `vehicle_siege_system`
-                // batters the wall once the vehicle is parked adjacent.
-                commands
-                    .entity(vehicle_e)
-                    .insert(SiegeOrder { target_tile: tile });
+                // batters the wall once the vehicle is parked adjacent,
+                // or plans a route to an adjacent passable tile first.
+                // A fresh `SiegeWall` overrides any active manual-`MoveTo`.
+                commands.entity(vehicle_e).remove::<VehiclePathFollow>();
+                commands.entity(vehicle_e).insert(SiegeOrder {
+                    target_tile: tile,
+                    last_route_attempt_tick: 0,
+                });
             }
             VehicleOrderKind::Load => {
                 let payload_g = design_payload_g(&design, &data);
@@ -4063,14 +4235,20 @@ pub fn vehicle_player_command_system(
                 }
             }
             VehicleOrderKind::AssignCrew => {
-                // Seat idle faction members onto the vehicle: the first fills
-                // the driver slot, the rest become passengers up to the crew
-                // capacity (count of `CrewSeat` cells; a Cargo design with no
-                // seats still gets a single driver). Each boards via
-                // `BoardedVehicle` so `vehicle_crew_sync_system` rides them
-                // and `combat_system` fights through them.
-                let capacity = (crew_seat_count(&design) as usize).max(1);
-                let mut seated = crew.driver.iter().count() + crew.passengers.len();
+                // Seat idle faction members onto the vehicle in priority
+                // order: driver → gunners (up to `vehicle_gunner_demand`) →
+                // passengers. `vehicle_turret_fire_system` counts gunners
+                // first and falls back to passengers as overflow operators
+                // (`available_weapon_operators`), so passengers double as
+                // loaders. Each boards via `BoardedVehicle` so
+                // `vehicle_crew_sync_system` rides them. Vehicle leaves
+                // any leftover `Overturned` state (manual `Right` is still
+                // needed if the vehicle is currently overturned).
+                let capacity = vehicle_operator_capacity(&design, &data);
+                let gunner_demand = vehicle_gunner_demand(&design, &data);
+                let mut seated = crew.driver.iter().count()
+                    + crew.gunners.len()
+                    + crew.passengers.len();
                 for (person, fm) in members_q.iter() {
                     if seated >= capacity {
                         break;
@@ -4081,6 +4259,8 @@ pub fn vehicle_player_command_system(
                     crew_claimed.insert(person);
                     if crew.driver.is_none() {
                         crew.driver = Some(person);
+                    } else if crew.gunners.len() < gunner_demand {
+                        crew.gunners.push(person);
                     } else {
                         crew.passengers.push(person);
                     }
@@ -4089,6 +4269,92 @@ pub fn vehicle_player_command_system(
                         .insert(BoardedVehicle { vehicle: vehicle_e });
                     seated += 1;
                 }
+                if v.state != VehicleState::Overturned && crew.driver.is_some() {
+                    v.state = VehicleState::Parked;
+                }
+            }
+            VehicleOrderKind::DisembarkCrew => {
+                // Drop every rider onto the nearest passable, non-vehicle-
+                // footprint tile via a chebyshev spiral from `anchor`. The
+                // rider whose landing tile can't be found stays boarded
+                // (logged) so the player can move the vehicle and retry.
+                // Movement/PlayerPiloted state is cleared so the vehicle
+                // truly parks.
+                commands.entity(vehicle_e).remove::<VehiclePathFollow>();
+                commands.entity(vehicle_e).remove::<PlayerPiloted>();
+                if v.state != VehicleState::Overturned {
+                    v.state = VehicleState::Parked;
+                }
+                let riders: Vec<Entity> = crew
+                    .driver
+                    .iter()
+                    .copied()
+                    .chain(crew.gunners.iter().copied())
+                    .chain(crew.passengers.iter().copied())
+                    .collect();
+                let footprint: ahash::AHashSet<(i32, i32)> =
+                    footprint_tiles(&design, anchor, v.heading)
+                        .into_iter()
+                        .collect();
+                let mut used: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::default();
+                let mut still_boarded: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+                for rider in riders {
+                    if let Some(tile) = find_disembark_landing(
+                        anchor,
+                        v.z,
+                        &footprint,
+                        &used,
+                        &chunk_map,
+                        &occupancy,
+                    ) {
+                        used.insert(tile);
+                        commands.entity(rider).remove::<BoardedVehicle>();
+                        // Update Transform + PersonAI in lockstep so
+                        // `sync_indexed_after_move_system` reindexes via
+                        // the `Changed<Transform>` filter.
+                        let wp = crate::world::terrain::tile_to_world(tile.0, tile.1);
+                        commands.entity(rider).insert(Transform::from_xyz(
+                            wp.x, wp.y, 0.5,
+                        ));
+                    } else {
+                        warn!(
+                            "DisembarkCrew: no landing tile for rider {:?} around \
+                             vehicle {:?} at {:?}; keeping boarded",
+                            rider, vehicle_e, anchor
+                        );
+                        still_boarded.insert(rider);
+                    }
+                }
+                // Drain crew slots, putting any still-boarded riders back
+                // into their original bucket — keeps `vehicle_crew_sync_system`
+                // pinning them at the vehicle.
+                let driver = crew.driver.take();
+                let old_gunners = std::mem::take(&mut crew.gunners);
+                let old_passengers = std::mem::take(&mut crew.passengers);
+                if let Some(d) = driver {
+                    if still_boarded.contains(&d) {
+                        crew.driver = Some(d);
+                    }
+                }
+                for g in old_gunners {
+                    if still_boarded.contains(&g) {
+                        crew.gunners.push(g);
+                    }
+                }
+                for p in old_passengers {
+                    if still_boarded.contains(&p) {
+                        crew.passengers.push(p);
+                    }
+                }
+            }
+            VehicleOrderKind::FireAt(tile) => {
+                // Insert / refresh a `VehicleFireOrder` — no movement, no
+                // chassis rotation. `vehicle_turret_fire_system` consults
+                // it to filter candidate targets to those near `tile`.
+                commands.entity(vehicle_e).insert(VehicleFireOrder {
+                    target_tile: tile,
+                    expires_tick: (clock.tick as u64).saturating_add(FIRE_ORDER_TTL_TICKS),
+                });
             }
             VehicleOrderKind::Hitch => {
                 let want = design.required_animals as usize;
@@ -4471,8 +4737,38 @@ pub fn target_in_arc(facing: (i32, i32), origin: (i32, i32), target: (i32, i32))
     dot >= cross.abs()
 }
 
-/// Acquire the nearest enemy `Person` within `range` of `origin` (LOS-filtered;
-/// optionally arc-filtered). Returns `(entity, tile, chebyshev distance)`.
+/// Filter on candidate hostile targets — `FireAt` orders restrict to a
+/// chebyshev radius around the focus tile.
+#[derive(Clone, Copy, Debug)]
+pub struct TargetingFilter {
+    pub focus: Option<(i32, i32)>,
+    pub focus_radius: i32,
+}
+
+impl TargetingFilter {
+    pub fn none() -> Self {
+        Self {
+            focus: None,
+            focus_radius: 0,
+        }
+    }
+
+    pub fn passes(&self, tile: (i32, i32)) -> bool {
+        match self.focus {
+            None => true,
+            Some(c) => {
+                (tile.0 - c.0).abs().max((tile.1 - c.1).abs()) <= self.focus_radius
+            }
+        }
+    }
+}
+
+/// Acquire the nearest enemy `Person` OR `Vehicle` within `range` of `origin`
+/// (LOS-filtered; optionally arc-filtered; optionally restricted to a focus
+/// disc by `TargetingFilter`). For the focus path, candidates are ranked by
+/// distance to the focus tile (closer wins), then by distance to the weapon
+/// origin. For the default path, the nearest-to-origin candidate wins.
+/// Returns `(entity, tile, chebyshev-distance-to-origin)`.
 #[allow(clippy::too_many_arguments)]
 fn acquire_weapon_target(
     origin: (i32, i32),
@@ -4480,40 +4776,69 @@ fn acquire_weapon_target(
     range: i32,
     arc_facing: Option<(i32, i32)>,
     owner_faction: u32,
+    filter: TargetingFilter,
     spatial: &SpatialIndex,
     chunk_map: &ChunkMap,
     door_map: &DoorMap,
     person_q: &Query<(&Transform, &FactionMember), With<Person>>,
+    vehicle_q: &Query<(&Vehicle, &VehicleHealth), Without<Person>>,
 ) -> Option<(Entity, (i32, i32), i32)> {
     let (ox, oy) = origin;
-    let mut best: Option<(Entity, (i32, i32), i32)> = None;
+    // (entity, target_tile, dist_to_origin, focus_rank)
+    let mut best: Option<(Entity, (i32, i32), i32, i32)> = None;
+    let mut consider = |e: Entity, tile: (i32, i32)| {
+        let (tx, ty) = tile;
+        if let Some(facing) = arc_facing {
+            if !target_in_arc(facing, origin, (tx, ty)) {
+                return;
+            }
+        }
+        if !filter.passes((tx, ty)) {
+            return;
+        }
+        if !has_los(chunk_map, door_map, (ox, oy, z), (tx, ty, z)) {
+            return;
+        }
+        let d = (tx - ox).abs().max((ty - oy).abs());
+        let focus_rank = match filter.focus {
+            Some(c) => (tx - c.0).abs().max((ty - c.1).abs()),
+            None => 0,
+        };
+        let better = match best {
+            None => true,
+            Some((_, _, bd, br)) => (focus_rank, d) < (br, bd),
+        };
+        if better {
+            best = Some((e, (tx, ty), d, focus_rank));
+        }
+    };
     for dy in -range..=range {
         for dx in -range..=range {
             for &e in spatial.get(ox + dx, oy + dy) {
-                let Ok((tf, fm)) = person_q.get(e) else {
-                    continue;
-                };
-                if fm.faction_id == owner_faction {
-                    continue;
-                }
-                let tx = (tf.translation.x / TILE_SIZE).floor() as i32;
-                let ty = (tf.translation.y / TILE_SIZE).floor() as i32;
-                if let Some(facing) = arc_facing {
-                    if !target_in_arc(facing, origin, (tx, ty)) {
+                // Try Person first; if that misses, try Vehicle.
+                if let Ok((tf, fm)) = person_q.get(e) {
+                    if fm.faction_id == owner_faction {
                         continue;
                     }
-                }
-                if !has_los(chunk_map, door_map, (ox, oy, z), (tx, ty, z)) {
+                    let tx = (tf.translation.x / TILE_SIZE).floor() as i32;
+                    let ty = (tf.translation.y / TILE_SIZE).floor() as i32;
+                    consider(e, (tx, ty));
                     continue;
                 }
-                let d = (tx - ox).abs().max((ty - oy).abs());
-                if best.map(|(_, _, bd)| d < bd).unwrap_or(true) {
-                    best = Some((e, (tx, ty), d));
+                if let Ok((target_v, target_health)) = vehicle_q.get(e) {
+                    if target_v.owner_faction == owner_faction {
+                        continue;
+                    }
+                    // A wreck (all cells destroyed) is no target.
+                    if target_health.intact_cells() == 0 {
+                        continue;
+                    }
+                    consider(e, target_v.anchor_tile);
                 }
             }
         }
     }
-    best
+    best.map(|(e, t, d, _)| (e, t, d))
 }
 
 /// Sequential (after `combat_system`): vehicle ranged fire. Iterates weapon
@@ -4524,20 +4849,28 @@ fn acquire_weapon_target(
 /// cooldown. An un-crewed vehicle does not fire.
 #[allow(clippy::too_many_arguments)]
 pub fn vehicle_turret_fire_system(
+    mut commands: Commands,
     clock: Res<SimClock>,
     chunk_map: Res<ChunkMap>,
     door_map: Res<DoorMap>,
     spatial: Res<SpatialIndex>,
     registry: Res<VehicleDesignRegistry>,
     data: Res<VehicleData>,
-    vehicles: Query<(Entity, &Vehicle, &VehicleHealth, &VehicleCrew)>,
+    vehicles: Query<(
+        Entity,
+        &Vehicle,
+        &VehicleHealth,
+        &VehicleCrew,
+        Option<&VehicleFireOrder>,
+    )>,
     person_q: Query<(&Transform, &FactionMember), With<Person>>,
+    target_vehicle_q: Query<(&Vehicle, &VehicleHealth), Without<Person>>,
     mut cell_cooldowns: Local<ahash::AHashMap<(Entity, IVec3), u64>>,
     mut module_cooldowns: Local<ahash::AHashMap<(Entity, VehicleModuleId), u64>>,
     mut projectile: EventWriter<ProjectileFired>,
 ) {
     let now = clock.tick;
-    for (ve, v, health, crew) in vehicles.iter() {
+    for (ve, v, health, crew, fire_order) in vehicles.iter() {
         // Un-crewed vehicles can't operate a weapon.
         let manned = crew.driver.is_some()
             || !crew.gunners.is_empty()
@@ -4549,6 +4882,28 @@ pub fn vehicle_turret_fire_system(
             continue;
         };
         let (ox, oy) = v.anchor_tile;
+
+        // Expired focus order self-clears; the next tick reverts to
+        // unrestricted auto-fire.
+        let active_fire_order = match fire_order {
+            Some(o) if now >= o.expires_tick => {
+                commands.entity(ve).remove::<VehicleFireOrder>();
+                None
+            }
+            other => other,
+        };
+        let filter = match active_fire_order {
+            Some(o) => TargetingFilter {
+                focus: Some(o.target_tile),
+                focus_radius: FIRE_ORDER_RADIUS,
+            },
+            None => TargetingFilter::none(),
+        };
+
+        // The operator pool counts gunners + passengers (passengers are
+        // assistant loaders / overflow). The driver is intentionally not
+        // counted — keeping hands on the reins matters more than firing.
+        let operators = available_weapon_operators(crew);
 
         // ── Weapon modules — one shot per module per cooldown ─────────────
         for inst in &design.grid.modules {
@@ -4563,8 +4918,9 @@ pub fn vehicle_turret_fire_system(
             if inst.cells.iter().any(|c| health.cell_health(*c) == 0) {
                 continue;
             }
-            // Gunner requirement (global pool — no per-module seating in v2).
-            if (crew.gunners.len() as u8) < def.gunner_required {
+            // Need at least one operator; modules with `gunner_required > 0`
+            // demand that many.
+            if operators < (def.gunner_required as usize).max(1) {
                 continue;
             }
             let key = (ve, inst.id);
@@ -4582,10 +4938,12 @@ pub fn vehicle_turret_fire_system(
                 def.range as i32,
                 arc,
                 v.owner_faction,
+                filter,
                 &spatial,
                 &chunk_map,
                 &door_map,
                 &person_q,
+                &target_vehicle_q,
             );
             if let Some((target, dest_tile, _)) = target {
                 // Muzzle sits one tile toward the module facing.
@@ -4624,6 +4982,10 @@ pub fn vehicle_turret_fire_system(
             if health.cell_health(*pos) == 0 {
                 continue;
             }
+            // Legacy mounts need at least one weapon operator.
+            if operators == 0 {
+                continue;
+            }
             let key = (ve, *pos);
             if cell_cooldowns.get(&key).map(|&t| now < t).unwrap_or(false) {
                 continue;
@@ -4634,10 +4996,12 @@ pub fn vehicle_turret_fire_system(
                 part.mounted_weapon_range as i32,
                 None,
                 v.owner_faction,
+                filter,
                 &spatial,
                 &chunk_map,
                 &door_map,
                 &person_q,
+                &target_vehicle_q,
             );
             if let Some((target, dest_tile, _)) = target {
                 let origin_xy = tile_to_world(ox, oy);
@@ -4680,54 +5044,159 @@ pub fn design_siege_damage(design: &VehicleDesign, data: &VehicleData) -> u8 {
 /// Ticks between siege strikes from one engine.
 const SIEGE_COOLDOWN_TICKS: u64 = 60;
 
-/// Sequential: a crewed, siege-capable `Vehicle` carrying a `SiegeOrder` and
-/// parked chebyshev-1 adjacent to the target `WallMap` tile ticks
-/// `apply_wall_damage` on a cooldown. `wall_destruction_system` despawns the
-/// wall once HP reaches zero; the order self-clears when the wall is gone.
+/// Throttle: replan the siege route at most once every `SIEGE_REROUTE_TICKS`
+/// when the vehicle isn't adjacent — keeps the planner off an unreachable
+/// wall.
+const SIEGE_REROUTE_TICKS: u64 = 30;
+
+/// Sequential: a crewed, siege-capable `Vehicle` carrying a `SiegeOrder`
+/// either damages the target wall (when parked chebyshev-1 adjacent) or
+/// plans a vehicle route to the nearest passable neighbour of the wall
+/// (when not). `wall_destruction_system` despawns the wall once HP reaches
+/// zero; the order self-clears when the wall is gone or the design loses
+/// its siege capability.
+#[allow(clippy::too_many_arguments)]
 pub fn vehicle_siege_system(
     mut commands: Commands,
     clock: Res<SimClock>,
     registry: Res<VehicleDesignRegistry>,
     data: Res<VehicleData>,
     wall_map: Res<WallMap>,
-    vehicles: Query<(Entity, &Vehicle, &VehicleCrew, &SiegeOrder)>,
+    chunk_map: Res<ChunkMap>,
+    occupancy: Res<VehicleOccupancyIndex>,
+    mut vehicles: Query<(
+        Entity,
+        &mut Vehicle,
+        &VehicleCrew,
+        &mut SiegeOrder,
+        Option<&VehiclePathFollow>,
+    )>,
     mut wall_q: Query<(&mut Health, &Wall)>,
     mut cooldowns: Local<ahash::AHashMap<Entity, u64>>,
+    mut scratch: Local<VehiclePathScratch>,
 ) {
     let now = clock.tick;
-    for (ve, v, crew, order) in vehicles.iter() {
+    for (ve, mut v, crew, mut order, follow) in vehicles.iter_mut() {
         let target_tile = order.target_tile;
         // Wall already gone — clear the order.
         let Some(&wall_e) = wall_map.0.get(&target_tile) else {
             commands.entity(ve).remove::<SiegeOrder>();
             continue;
         };
-        let Some(design) = registry.get(v.design_id) else {
+        let Some(design) = registry.get(v.design_id).cloned() else {
             continue;
         };
-        if !design_is_siege_capable(design, &data) {
+        if !design_is_siege_capable(&design, &data) {
             commands.entity(ve).remove::<SiegeOrder>();
             continue;
         }
-        // An un-crewed siege engine does no damage.
-        if crew.driver.is_none() {
-            continue;
-        }
-        let fp = footprint_tiles(design, v.anchor_tile, v.heading);
+        let fp = footprint_tiles(&design, v.anchor_tile, v.heading);
         let adjacent = fp.iter().any(|&(tx, ty)| {
             (tx - target_tile.0).abs().max((ty - target_tile.1).abs()) <= 1
         });
-        if !adjacent {
-            continue;
-        }
-        if cooldowns.get(&ve).map(|&t| now < t).unwrap_or(false) {
-            continue;
-        }
-        cooldowns.insert(ve, now + SIEGE_COOLDOWN_TICKS);
-        if let Ok((mut health, wall)) = wall_q.get_mut(wall_e) {
-            apply_wall_damage(&mut health, design_siege_damage(design, &data), wall.material);
+
+        if adjacent {
+            // An un-crewed siege engine adjacent to a wall still does no
+            // damage — keep the order standing so a future crew assignment
+            // continues the siege.
+            if crew.driver.is_none() {
+                continue;
+            }
+            if cooldowns.get(&ve).map(|&t| now < t).unwrap_or(false) {
+                continue;
+            }
+            cooldowns.insert(ve, now + SIEGE_COOLDOWN_TICKS);
+            if let Ok((mut health, wall)) = wall_q.get_mut(wall_e) {
+                apply_wall_damage(
+                    &mut health,
+                    design_siege_damage(&design, &data),
+                    wall.material,
+                );
+            }
+        } else {
+            // Not adjacent — plan a vehicle route to the nearest passable
+            // chebyshev-1 neighbour of the wall tile. Only plan while no
+            // active path is in flight and the throttle has elapsed.
+            if follow.is_some() {
+                continue;
+            }
+            if now.saturating_sub(order.last_route_attempt_tick) < SIEGE_REROUTE_TICKS {
+                continue;
+            }
+            order.last_route_attempt_tick = now;
+            let Some(landing) = find_passable_adjacent_to_wall(
+                target_tile,
+                v.z,
+                ve,
+                &design,
+                &chunk_map,
+                &occupancy,
+            ) else {
+                continue;
+            };
+            if let Some(path) = plan_vehicle_route(
+                &mut scratch,
+                &design,
+                &data,
+                ve,
+                v.anchor_tile,
+                v.z,
+                v.heading,
+                landing,
+                &chunk_map,
+                &occupancy,
+            ) {
+                v.state = VehicleState::Moving;
+                commands.entity(ve).insert(VehiclePathFollow {
+                    path,
+                    cursor: ROUTE_CURSOR_START,
+                    tip_torque: 0.0,
+                });
+            }
         }
     }
+}
+
+/// Walk the 8 cardinal+diagonal neighbours of `wall_tile` and return the
+/// closest passable one (by chebyshev distance to the wall), filtered by the
+/// vehicle's footprint clearance (`vertical_clearance_at`) and other-vehicle
+/// occupancy. `plan_vehicle_route` then plans the trip to that tile.
+pub fn find_passable_adjacent_to_wall(
+    wall_tile: (i32, i32),
+    z: i8,
+    self_e: Entity,
+    design: &VehicleDesign,
+    chunk_map: &ChunkMap,
+    occupancy: &VehicleOccupancyIndex,
+) -> Option<(i32, i32)> {
+    let footprint = VehicleFootprint::from_grid(&design.grid);
+    let height_z = footprint.height_z.max(1) as i32;
+    let z32 = z as i32;
+    let mut best: Option<((i32, i32), i32)> = None;
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let tile = (wall_tile.0 + dx, wall_tile.1 + dy);
+            if !chunk_map.passable_at(tile.0, tile.1, z32) {
+                continue;
+            }
+            if chunk_map.vertical_clearance_at(tile.0, tile.1) < height_z {
+                continue;
+            }
+            if let Some(&occ) = occupancy.0.get(&tile) {
+                if occ != self_e {
+                    continue;
+                }
+            }
+            let d = dx.abs().max(dy.abs());
+            if best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                best = Some((tile, d));
+            }
+        }
+    }
+    best.map(|(t, _)| t)
 }
 
 #[cfg(test)]

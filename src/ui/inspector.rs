@@ -124,6 +124,9 @@ pub struct VehicleInspectorParams<'w, 's> {
             &'static crate::simulation::vehicle::VehicleDraft,
             &'static crate::simulation::vehicle::VehicleCrew,
             Option<&'static crate::simulation::vehicle::VehiclePathFollow>,
+            Option<&'static crate::simulation::vehicle::VehicleFireOrder>,
+            Option<&'static crate::simulation::vehicle::SiegeOrder>,
+            Option<&'static crate::simulation::vehicle::VehicleHealth>,
         ),
     >,
     pub registry: Res<'w, crate::simulation::vehicle::VehicleDesignRegistry>,
@@ -208,8 +211,13 @@ pub fn inspector_panel_system(
     let Some(entity) = selected.0 else { return };
 
     // ── Vehicle inspector ────────────────────────────────────────────────
-    if let Ok((vehicle, inv, draft, crew, path)) = task_display.vehicle.vehicles.get(entity) {
-        use crate::simulation::vehicle::{derive_stats, VehicleState};
+    if let Ok((vehicle, inv, draft, crew, path, fire_order, siege_order, vhealth)) =
+        task_display.vehicle.vehicles.get(entity)
+    {
+        use crate::simulation::vehicle::{
+            derive_stats, vehicle_gunner_demand, vehicle_operator_capacity,
+            VehicleDisableFlags, VehicleState,
+        };
         let design = task_display.vehicle.registry.get(vehicle.design_id);
         egui::Window::new("Inspector")
             .default_pos([10.0, 10.0])
@@ -272,14 +280,40 @@ pub fn inspector_panel_system(
                                 ));
                             }
                         }
-                        match vehicle.hauler {
+                        // Driver: prefer the explicit `VehicleCrew.driver`
+                        // (player-assigned) and fall back to the cargo-haul
+                        // legacy `hauler` field.
+                        let driver = crew.driver.or(vehicle.hauler);
+                        match driver {
                             Some(h) => ui.label(format!("Driver: entity {}", h.index())),
                             None => ui.label("Driver: none (parked)"),
                         };
-                        ui.label(format!(
-                            "Crew: {} passenger(s)",
-                            crew.passengers.len()
-                        ));
+                        if let Some(design) = design {
+                            let capacity = vehicle_operator_capacity(
+                                design,
+                                &task_display.vehicle.data,
+                            );
+                            let demand = vehicle_gunner_demand(
+                                design,
+                                &task_display.vehicle.data,
+                            );
+                            let driver_count = if driver.is_some() { 1 } else { 0 };
+                            let other_seats = capacity.saturating_sub(driver_count);
+                            let passenger_cap = other_seats.saturating_sub(demand);
+                            ui.label(format!(
+                                "Gunners: {}/{}",
+                                crew.gunners.len(),
+                                demand
+                            ));
+                            ui.label(format!(
+                                "Passengers: {}/{}",
+                                crew.passengers.len(),
+                                passenger_cap
+                            ));
+                        } else {
+                            ui.label(format!("Gunners: {}", crew.gunners.len()));
+                            ui.label(format!("Passengers: {}", crew.passengers.len()));
+                        }
                         ui.label(format!(
                             "Draft: {}/{} animal(s) hitched",
                             draft.hitched.len(),
@@ -293,6 +327,40 @@ pub fn inspector_panel_system(
                             )),
                             None => ui.label("Route: idle"),
                         };
+                        if let Some(order) = fire_order {
+                            let remaining = order
+                                .expires_tick
+                                .saturating_sub(sim_clock.tick);
+                            ui.label(format!(
+                                "Fire order: ({}, {})  · {} ticks left",
+                                order.target_tile.0, order.target_tile.1, remaining
+                            ));
+                        }
+                        if let Some(order) = siege_order {
+                            ui.label(format!(
+                                "Siege order: ({}, {})",
+                                order.target_tile.0, order.target_tile.1
+                            ));
+                        }
+                        if let Some(health) = vhealth {
+                            let flags = health.disabled;
+                            let mut parts: Vec<&str> = Vec::new();
+                            if flags.has(VehicleDisableFlags::MOVEMENT) {
+                                parts.push("Mobility");
+                            }
+                            if flags.has(VehicleDisableFlags::STEERING) {
+                                parts.push("Steering");
+                            }
+                            if flags.has(VehicleDisableFlags::CARGO) {
+                                parts.push("Cargo");
+                            }
+                            if !parts.is_empty() {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 160, 60),
+                                    format!("Disabled: {}", parts.join(", ")),
+                                );
+                            }
+                        }
                         if vehicle.state == VehicleState::Overturned {
                             ui.colored_label(
                                 egui::Color32::from_rgb(220, 90, 60),

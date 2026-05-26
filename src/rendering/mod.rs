@@ -119,7 +119,7 @@ impl Plugin for RenderingPlugin {
                     entity_sprites::spawn_workbench_sprites,
                     entity_sprites::spawn_loom_sprites,
                     entity_sprites::spawn_well_sprites,
-                    entity_sprites::spawn_vehicle_sprites,
+                    entity_sprites::refresh_vehicle_sprites_system,
                     entity_sprites::spawn_blueprint_sprites,
                 ),
             )

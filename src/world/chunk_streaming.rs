@@ -137,6 +137,14 @@ pub fn update_simulation_focus_system(
     camera_q: Query<&Transform, With<Camera>>,
     map_view_mode: Res<crate::rendering::projection::MapViewMode>,
     map_projection: Res<crate::rendering::projection::MapProjection>,
+    test_drive_q: Query<
+        &Transform,
+        (
+            With<crate::simulation::vehicle::DebugTestDriveVehicle>,
+            With<crate::simulation::vehicle::PlayerPiloted>,
+            Without<Camera>,
+        ),
+    >,
 ) {
     use crate::simulation::region::{FocusPoint, MegaChunkCoord};
 
@@ -167,6 +175,20 @@ pub fn update_simulation_focus_system(
         focus.points.push(FocusPoint {
             world_pos,
             chunk_radius: REGION_LOAD_RADIUS,
+            is_camera: false,
+        });
+    }
+
+    // Test-drive anchor — keep `ChunkMap::passable_at` answering as the
+    // player drives the debug vehicle past the camera-loaded ring. Data
+    // only (small radius, `is_camera = false`); no auto-follow camera in
+    // this pass. Anchor disappears automatically when `PlayerPiloted` is
+    // removed (Esc).
+    const TEST_DRIVE_FOCUS_RADIUS: i32 = 3;
+    for transform in test_drive_q.iter() {
+        focus.points.push(FocusPoint {
+            world_pos: transform.translation.truncate(),
+            chunk_radius: TEST_DRIVE_FOCUS_RADIUS,
             is_camera: false,
         });
     }

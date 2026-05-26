@@ -346,6 +346,7 @@ pub fn vehicle_designer_system(
 
     let ctx = contexts.ctx_mut();
     let mut open = state.open;
+    let mut close_request = false;
     egui::Window::new("Vehicle Designer")
         .open(&mut open)
         .default_width(760.0)
@@ -493,11 +494,23 @@ pub fn vehicle_designer_system(
                                 faction_id: player_faction.faction_id,
                             },
                         );
+                        // Close the designer + surrender egui keyboard focus
+                        // so the manual-drive handler isn't gated by
+                        // `wants_keyboard_input()` (a clicked-into name field
+                        // keeps focus even after the window closes). The
+                        // window's `&mut open` borrow blocks writing `open`
+                        // from inside the closure — defer to a flag.
+                        close_request = true;
+                        ui.ctx().memory_mut(|m| {
+                            if let Some(id) = m.focused() {
+                                m.surrender_focus(id);
+                            }
+                        });
                     }
                 }
             });
         });
-    state.open = open;
+    state.open = open && !close_request;
 }
 
 /// Left column — part / variant / material / module palette.

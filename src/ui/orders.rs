@@ -139,18 +139,26 @@ fn vehicle_order_label(kind: crate::simulation::vehicle::VehicleOrderKind) -> &'
         K::Unhitch => "Unhitch Animals",
         K::Deconstruct => "Salvage Vehicle",
         K::SiegeWall(_) => "Siege Wall Here",
+        K::DisembarkCrew => "Disembark Crew",
+        K::FireAt(_) => "Fire Here",
     }
 }
 
 /// Build the right-click order list for one `Vehicle` entity. `include_move`
 /// adds a "Move Vehicle Here" entry targeting `target_tile` — used when the
 /// vehicle itself is selected and the player clicks a destination.
+/// `fire_target` adds "Fire Here" when the design is ranged-capable;
+/// `disembark` adds "Disembark Crew" when the vehicle has any rider.
 fn build_vehicle_ops(
     vehicle: Entity,
     target_tile: (i32, i32),
     include_move: bool,
     vehicle_q: &Query<&crate::simulation::vehicle::Vehicle>,
+    crew_q: &Query<&crate::simulation::vehicle::VehicleCrew>,
+    registry: &crate::simulation::vehicle::VehicleDesignRegistry,
+    data: &crate::simulation::vehicle::VehicleData,
     siege_target: Option<(i32, i32)>,
+    fire_target: Option<(i32, i32)>,
 ) -> Vec<(MenuAction, String)> {
     use crate::simulation::vehicle::{VehicleOrderKind as K, VehicleState};
     let Ok(v) = vehicle_q.get(vehicle) else {
@@ -175,9 +183,25 @@ fn build_vehicle_ops(
     if let Some(wall_tile) = siege_target {
         push(K::SiegeWall(wall_tile));
     }
+    if let Some(fire_tile) = fire_target {
+        if let Some(design) = registry.get(v.design_id) {
+            if crate::simulation::vehicle::design_has_any_ranged_weapon(design, data) {
+                push(K::FireAt(fire_tile));
+            }
+        }
+    }
     push(K::Load);
     push(K::Unload);
     push(K::AssignCrew);
+    let has_crew = crew_q
+        .get(vehicle)
+        .map(|c| {
+            c.driver.is_some() || !c.gunners.is_empty() || !c.passengers.is_empty()
+        })
+        .unwrap_or(false);
+    if has_crew {
+        push(K::DisembarkCrew);
+    }
     push(K::Hitch);
     push(K::Unhitch);
     push(K::Deconstruct);
@@ -286,6 +310,15 @@ pub struct TileDisplayQueries<'w, 's> {
     pub profession_q: Query<'w, 's, &'static Profession>,
 }
 
+/// Bundles the three vehicle-side queries the right-click menu needs into
+/// one `SystemParam` so the host system stays under Bevy's 16-param ceiling.
+#[derive(SystemParam)]
+pub struct VehicleMenuQueries<'w, 's> {
+    pub yard_q: Query<'w, 's, &'static crate::simulation::vehicle::VehicleYard>,
+    pub vehicle_q: Query<'w, 's, &'static crate::simulation::vehicle::Vehicle>,
+    pub crew_q: Query<'w, 's, &'static crate::simulation::vehicle::VehicleCrew>,
+}
+
 /// All routing resources bundled to stay under the 16-param system limit.
 #[derive(SystemParam)]
 pub struct RoutingResources<'w, 's> {
@@ -336,11 +369,13 @@ pub fn right_click_context_menu_system(
     spatial: Res<SpatialIndex>,
     tile_display: TileDisplayQueries,
     routing: RoutingResources,
-    vehicle_yard_q: Query<&crate::simulation::vehicle::VehicleYard>,
-    vehicle_q: Query<&crate::simulation::vehicle::Vehicle>,
+    vehicle_qs: VehicleMenuQueries,
     mut menu_state: ResMut<ContextMenuState>,
     mut sender: crate::simulation::player_command::CommandSender,
 ) {
+    let vehicle_yard_q = &vehicle_qs.yard_q;
+    let vehicle_q = &vehicle_qs.vehicle_q;
+    let vehicle_crew_q = &vehicle_qs.crew_q;
     // Require a selected player-faction member.
     let Some(sel_entity) = selected.0 else {
         menu_state.open = false;
@@ -393,8 +428,17 @@ pub fn right_click_context_menu_system(
                     } else {
                         None
                     };
-                    menu_state.vehicle_ops =
-                        build_vehicle_ops(sv, pick.tile, true, &vehicle_q, siege_target);
+                    menu_state.vehicle_ops = build_vehicle_ops(
+                        sv,
+                        pick.tile,
+                        true,
+                        &vehicle_q,
+                        &vehicle_crew_q,
+                        &routing.vehicle_registry,
+                        &routing.vehicle_data,
+                        siege_target,
+                        Some(pick.tile),
+                    );
                     menu_state.open = true;
                     menu_state.screen_pos =
                         egui::pos2(pick.screen_pos.x, pick.screen_pos.y);
@@ -595,8 +639,22 @@ pub fn right_click_context_menu_system(
                             .map(|v| v.owner_faction == player_faction.faction_id)
                             .unwrap_or(false)
                         {
-                            menu_state.vehicle_ops =
-                                build_vehicle_ops(veh_e, pos_tile, false, &vehicle_q, None);
+                            // Right-clicking a parked vehicle (no selection)
+                            // also exposes Fire Here / Disembark Crew when
+                            // applicable; SiegeWall stays selection-only
+                            // because the click anchor isn't a wall by
+                            // definition (it's the vehicle's tile).
+                            menu_state.vehicle_ops = build_vehicle_ops(
+                                veh_e,
+                                pos_tile,
+                                false,
+                                &vehicle_q,
+                                &vehicle_crew_q,
+                                &routing.vehicle_registry,
+                                &routing.vehicle_data,
+                                None,
+                                None,
+                            );
                         }
                     }
 
