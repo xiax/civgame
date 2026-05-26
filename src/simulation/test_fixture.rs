@@ -97,6 +97,15 @@ impl TestSim {
         app.init_state::<crate::GameState>();
         app.add_sub_state::<crate::SimulationState>();
         app.insert_resource(crate::PendingSpawn::default());
+        // PendingStarts is the multi-slot input read by spawn_population.
+        // Tests use the default (empty slots) and let spawn_population
+        // auto-fill one singleplayer slot — same shape as a stock SP boot
+        // that bypassed MainMenu.
+        app.insert_resource(crate::PendingStarts::default());
+        // `legacy_pending_spawn_compat_system` (game_state::PreUpdate) would
+        // normally back-fill PendingSpawn from PendingStarts.primary_start;
+        // the fixture skips GameStatePlugin, so tests that need a custom
+        // megachunk still write PendingSpawn directly.
         app.insert_resource(crate::game_state::WorldSeed(seed));
         // GameStartOptions is consumed by `bonding_system` (to apply
         // the world's `EconomyPreset` to bonding-formed factions) in
@@ -18480,6 +18489,20 @@ mod onenter_era_seeding {
             let mut pending = sim.app.world_mut().resource_mut::<crate::PendingSpawn>();
             pending.0 = Some((0, 0));
         }
+        {
+            // Multi-start contract: spawn_population reads PendingStarts.
+            // Mirror the legacy PendingSpawn into a singleplayer slot so
+            // existing OnEnter tests don't have to switch APIs.
+            let mut starts = sim.app.world_mut().resource_mut::<crate::PendingStarts>();
+            starts.primary_start = Some((0, 0));
+            starts.slots.clear();
+            let mut slot = crate::game_state::PlayerStartSlot::singleplayer(
+                "Player",
+                crate::simulation::faction::Lifestyle::Settled,
+            );
+            slot.megachunk = Some((0, 0));
+            starts.slots.push(slot);
+        }
         sim
     }
 
@@ -18500,6 +18523,63 @@ mod onenter_era_seeding {
             .set(crate::GameState::Playing);
         // First update flushes the state transition + runs OnEnter.
         sim.tick();
+    }
+
+    /// Multi-start coverage: two human slots → two human factions in
+    /// `ControlledFactions`, both assigned `faction_id`, and the local
+    /// slot owns `PlayerFaction`. AI rivals back-fill the rest.
+    #[test]
+    fn spawn_population_two_human_slots() {
+        let mut sim = TestSim::new(0xE7A_5EED);
+        // Wider flat world so two pre-gen windows fit comfortably.
+        sim.flat_world(40, 4, TileKind::Grass);
+        {
+            let mut starts = sim
+                .app
+                .world_mut()
+                .resource_mut::<crate::PendingStarts>();
+            starts.slots.clear();
+            // Slot 0 = local host at (0, 0).
+            let mut s0 = crate::game_state::PlayerStartSlot::singleplayer(
+                "Host",
+                crate::simulation::faction::Lifestyle::Settled,
+            );
+            s0.slot_id = 0;
+            s0.megachunk = Some((0, 0));
+            starts.slots.push(s0);
+            // Slot 1 = remote client; far enough not to collide.
+            let mut s1 = crate::game_state::PlayerStartSlot {
+                slot_id: 1,
+                player_name: "Guest".into(),
+                client_id: 42,
+                megachunk: Some((1, 0)),
+                lifestyle: crate::simulation::faction::Lifestyle::Settled,
+                ready: true,
+                faction_id: None,
+            };
+            // 42 differs from HOST_SERVER_LOCAL_CLIENT_ID so this slot is
+            // NOT the local human — PlayerFaction stays on slot 0.
+            let _ = &mut s1;
+            starts.slots.push(s1);
+            starts.primary_start = Some((0, 0));
+        }
+        trigger_onenter(&mut sim);
+
+        let world = sim.app.world();
+        let starts = world.resource::<crate::PendingStarts>();
+        let controlled = world.resource::<crate::simulation::faction::ControlledFactions>();
+        let player = world.resource::<crate::simulation::faction::PlayerFaction>();
+
+        assert_eq!(starts.slots.len(), 2, "two slots input");
+        let fid0 = starts.slots[0].faction_id.expect("slot 0 assigned");
+        let fid1 = starts.slots[1].faction_id.expect("slot 1 assigned");
+        assert_ne!(fid0, fid1, "each slot maps to a distinct faction");
+        assert!(controlled.contains(fid0), "host slot in ControlledFactions");
+        assert!(controlled.contains(fid1), "guest slot in ControlledFactions");
+        assert_eq!(
+            player.faction_id, fid0,
+            "PlayerFaction is the host (local) slot"
+        );
     }
 
     fn player_seeded_beds_near_home(sim: &TestSim) -> (usize, u32, (i32, i32)) {

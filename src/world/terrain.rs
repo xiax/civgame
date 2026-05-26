@@ -1095,7 +1095,7 @@ pub fn spawn_world_system(
     mut chunk_map: ResMut<ChunkMap>,
     globe: Res<Globe>,
     sandbox: Option<Res<crate::sandbox::SandboxMode>>,
-    pending: Res<crate::PendingSpawn>,
+    starts: Res<crate::PendingStarts>,
 ) {
     let now = Instant::now();
     use crate::world::globe::MEGACHUNK_SIZE_CHUNKS;
@@ -1106,37 +1106,59 @@ pub fn spawn_world_system(
         (WORLD_CHUNKS_X, WORLD_CHUNKS_Y)
     };
 
-    // Centre the initial chunk pre-gen on the player-picked mega-chunk
-    // (PendingSpawn) — fall back to globe centre when nothing was picked
-    // (sandbox / no-spawn-select path).
-    let (center_cx, center_cy) = match pending.0 {
-        Some((mx, my)) => (
-            mx * MEGACHUNK_SIZE_CHUNKS + MEGACHUNK_SIZE_CHUNKS / 2,
-            my * MEGACHUNK_SIZE_CHUNKS + MEGACHUNK_SIZE_CHUNKS / 2,
-        ),
-        None => (
+    // Multi-start pre-gen: every human slot gets a `chunks_x × chunks_y`
+    // window around its picked megachunk. Sandbox stays single-window.
+    let mut centers: Vec<(i32, i32)> = if sandbox.is_some() {
+        vec![]
+    } else {
+        starts
+            .slots
+            .iter()
+            .filter_map(|s| {
+                s.megachunk.map(|(mx, my)| {
+                    (
+                        mx * MEGACHUNK_SIZE_CHUNKS + MEGACHUNK_SIZE_CHUNKS / 2,
+                        my * MEGACHUNK_SIZE_CHUNKS + MEGACHUNK_SIZE_CHUNKS / 2,
+                    )
+                })
+            })
+            .collect()
+    };
+    // Fall back to globe centre when no human slot has a pick (sandbox /
+    // headless test fixture).
+    if centers.is_empty() {
+        centers.push((
             (GLOBE_WIDTH / 2) * GLOBE_CELL_CHUNKS,
             (GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS,
-        ),
-    };
+        ));
+    }
 
-    let start_cx = center_cx - (chunks_x / 2);
-    let start_cy = center_cy - (chunks_y / 2);
-
-    for dy in 0..chunks_y {
-        for dx in 0..chunks_x {
-            let coord = ChunkCoord(start_cx + dx, start_cy + dy);
-            let chunk = generate_chunk_from_globe(coord, &globe, &gen);
-            chunk_map.0.insert(coord, chunk);
+    let mut total = 0usize;
+    let mut deduped: ahash::AHashSet<ChunkCoord> = ahash::AHashSet::with_capacity(
+        centers.len() * (chunks_x as usize) * (chunks_y as usize),
+    );
+    for (center_cx, center_cy) in &centers {
+        let start_cx = center_cx - (chunks_x / 2);
+        let start_cy = center_cy - (chunks_y / 2);
+        for dy in 0..chunks_y {
+            for dx in 0..chunks_x {
+                let coord = ChunkCoord(start_cx + dx, start_cy + dy);
+                if !deduped.insert(coord) {
+                    continue;
+                }
+                let chunk = generate_chunk_from_globe(coord, &globe, &gen);
+                chunk_map.0.insert(coord, chunk);
+                total += 1;
+            }
         }
     }
 
     info!(
-        "Initial area generated: {}x{} chunks centered at chunk ({},{}) in {:?}",
+        "Initial area generated: {} chunks across {} window(s) of {}×{} in {:?}",
+        total,
+        centers.len(),
         chunks_x,
         chunks_y,
-        center_cx,
-        center_cy,
         now.elapsed()
     );
 }

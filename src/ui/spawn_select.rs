@@ -6,7 +6,7 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::game_state::{
-    EconomyPreset, GameStartOptions, GameState, PendingSpawn, RegenerateWorldRequest,
+    EconomyPreset, GameStartOptions, GameState, PendingStarts, RegenerateWorldRequest,
     StartSettlementMaturity, WorldSeed,
 };
 use crate::simulation::faction::Lifestyle;
@@ -36,7 +36,7 @@ pub fn spawn_select_system(
     mut contexts: EguiContexts,
     globe: Res<Globe>,
     mut tex_cache: ResMut<SpawnSelectTexture>,
-    mut pending: ResMut<PendingSpawn>,
+    mut starts: ResMut<PendingStarts>,
     mut options: ResMut<GameStartOptions>,
     mut world_seed: ResMut<WorldSeed>,
     mut regen_w: EventWriter<RegenerateWorldRequest>,
@@ -409,7 +409,16 @@ pub fn spawn_select_system(
                     });
 
                     if response.clicked() && habitable {
-                        pending.0 = Some((mx, my));
+                        // SP slot zero owns the local human start.
+                        if starts.slots.is_empty() {
+                            starts.slots.push(crate::game_state::PlayerStartSlot::singleplayer(
+                                "Player",
+                                options.lifestyle,
+                            ));
+                        }
+                        starts.slots[0].megachunk = Some((mx, my));
+                        starts.slots[0].lifestyle = options.lifestyle;
+                        starts.primary_start = Some((mx, my));
                         info!("Spawn picked: mega-chunk ({mx},{my}) tile ({tx},{ty})");
                         next_state.set(GameState::Playing);
                     }

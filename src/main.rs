@@ -12,8 +12,9 @@ mod ui;
 mod world;
 
 pub use game_state::{
-    EconomyPreset, GameStartOptions, GameState, PendingSpawn, RegenerateWorldRequest,
-    SimulationState, WorldSeed,
+    EconomyPreset, GameStartOptions, GameState, GameStatePlugin, PendingSpawn, PendingStarts,
+    PlayerStartSlot, RegenerateWorldRequest, SimulationState, WorldSeed,
+    HOST_SERVER_LOCAL_CLIENT_ID,
 };
 
 fn main() {
@@ -74,10 +75,7 @@ fn main() {
         }));
     }
 
-    app.init_state::<GameState>()
-    .add_sub_state::<SimulationState>()
-    .insert_resource(PendingSpawn::default())
-    .insert_resource(GameStartOptions::default())
+    app.add_plugins(GameStatePlugin)
     .insert_resource(simulation::region::SettledRegions::default())
     .insert_resource(simulation::region::SimulationFocus::default())
     .add_plugins(net_id::NetIdPlugin)

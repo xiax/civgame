@@ -9,6 +9,8 @@ pub mod hover;
 pub mod hud;
 pub mod inspector;
 pub mod job_board;
+pub mod lobby;
+pub mod main_menu;
 pub mod manual_drive;
 pub mod migration_panel;
 pub mod orders;
@@ -41,6 +43,17 @@ impl Plugin for UiPlugin {
             .insert_resource(activity_log::CameraFocusRequest::default())
             .insert_resource(inspector::PendingInspectorAction::default())
             .insert_resource(spawn_select::SpawnSelectTexture::default())
+            .insert_resource(main_menu::MainMenuState::default())
+            .insert_resource(lobby::LobbyUiState::default())
+            .add_systems(Startup, main_menu::main_menu_boot_route_system)
+            .add_systems(
+                Update,
+                main_menu::main_menu_system.run_if(in_state(crate::GameState::MainMenu)),
+            )
+            .add_systems(
+                Update,
+                lobby::lobby_system.run_if(in_state(crate::GameState::MultiplayerLobby)),
+            )
             .insert_resource(migration_panel::MigrationPanelOpen::default())
             .insert_resource(vehicle_designer::VehicleDesignerState::default())
             .insert_resource(diplomacy_panel::DiplomacyPanelOpen::default())

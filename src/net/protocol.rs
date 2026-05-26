@@ -23,7 +23,7 @@ use crate::world::water_runtime::RuntimeWaterCell;
 /// Wire protocol version negotiated at connect time. Bump whenever the
 /// shape of any wire message in this module changes; mismatched clients
 /// are rejected by `accept_connections_system` before any state transfer.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// One UI- (or remote-client-)issued command, scoped to the faction that
 /// claims to be sending it. The loopback validates `sender_faction_id`
@@ -425,6 +425,128 @@ pub struct ClientCameraFocus {
 pub struct EntityRemoved {
     pub net_ids: Vec<NetId>,
 }
+
+// ============================================================================
+// Phase 4 lobby (LAN multiplayer)
+// ============================================================================
+//
+// Lobby messages ride the existing `OrderedReliableChannel`. Two state
+// machines: server-side `LobbyState` (Hosting → SelectingStarts → Starting
+// → InGame) and client-side stub appliers (`LobbySnapshot` →
+// `LobbyStartGame` → swap GameState into `Playing`).
+//
+// `LobbyJoin` replaces `ClientHello` while in `MultiplayerLobby`. Once
+// `LobbyStartGame` fires, reconnects fall back to the existing
+// `ClientHello` + `PendingReconnect` path keyed on `player_name`.
+
+/// Client→Server. Sent on connect while either side is in
+/// `MultiplayerLobby`. Server validates `protocol_version`, then either
+/// reclaims the player's existing slot (matched by `player_name`) or
+/// allocates a fresh one and broadcasts the resulting `LobbySnapshot`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LobbyJoin {
+    pub protocol_version: u32,
+    pub player_name: String,
+}
+
+/// Client→Server. Player picked / re-picked their starting mega-chunk.
+/// Server validates (habitable, unclaimed, ≥ `MIN_HUMAN_MEGACHUNK_DISTANCE`
+/// from every other slot) and either accepts (folded into next
+/// `LobbySnapshot`) or replies with `LobbyReject`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct LobbySelectStart {
+    pub megachunk: (i32, i32),
+}
+
+/// Client→Server. Player toggled their Ready flag.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct LobbySetReady {
+    pub ready: bool,
+}
+
+/// Client→Server. Player voluntarily left the lobby (Back to Main Menu).
+/// The server frees the slot; reconnect-by-name still works for the
+/// `RECONNECT_GRACE_TICKS` window in case it was a UI mis-click.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct LobbyLeave;
+
+/// Subset of `PlayerStartSlot` visible to every client (omits private
+/// per-client implementation detail). Slot order is stable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LobbySlotPublic {
+    pub slot_id: u8,
+    pub player_name: String,
+    pub megachunk: Option<(i32, i32)>,
+    /// Lifestyle the player chose for their own faction.
+    pub lifestyle_is_nomadic: bool,
+    pub ready: bool,
+    /// Whether this slot is the local client (filled in client-side from
+    /// the matching `FactionAssignment.client_id`; server always ships
+    /// `false`).
+    #[serde(default)]
+    pub is_local: bool,
+}
+
+/// Server→Client. Broadcast snapshot of the full lobby state. Sent on
+/// every slot mutation (join, select, ready, leave). v1 broadcasts the
+/// whole snapshot — slot count is bounded by `max_players`, so payload
+/// stays trivial.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LobbySnapshot {
+    pub game_name: String,
+    pub world_seed: u64,
+    pub era_index: u8,
+    pub economy_index: u8,
+    pub maturity_index: u8,
+    pub max_players: u8,
+    pub slots: Vec<LobbySlotPublic>,
+}
+
+/// Server→Client. Hard rejection of a lobby request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LobbyReject {
+    pub reason: LobbyRejectReason,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LobbyRejectReason {
+    /// Sender's `protocol_version` doesn't match the server's.
+    ProtocolMismatch,
+    /// Lobby's `max_players` cap reached and the sender isn't reclaiming
+    /// a held slot.
+    LobbyFull,
+    /// Picked megachunk fails one of the start-validation gates
+    /// (uninhabitable / claimed / too close to another slot).
+    StartInvalid,
+    /// Game already entered `Playing`; only `PendingReconnect`-keyed
+    /// reconnects accepted from here.
+    GameAlreadyStarted,
+}
+
+/// Server→Client. Host pressed Start. Carries every slot's final
+/// `(slot_id, client_id, faction_id, megachunk)` assignment so each
+/// client can mirror the layout it'll see in `PendingStarts` on
+/// `OnEnter(Playing)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LobbyStartGame {
+    pub slot_assignments: Vec<LobbySlotAssignment>,
+    pub world_seed: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct LobbySlotAssignment {
+    pub slot_id: u8,
+    pub client_id: u64,
+    pub faction_id: u32,
+    pub megachunk: (i32, i32),
+}
+
+/// Phase 4 spawn-validation distance floor (mega-chunks). Two human slots
+/// must sit at least this many mega-chunks apart so no spacing drift
+/// inside `spawn_population::faction_spacing_score`'s saturation distance
+/// can collapse them into the same cluster.
+pub const MIN_HUMAN_MEGACHUNK_DISTANCE: i32 = 3;
 
 #[cfg(test)]
 mod tests {
@@ -1015,4 +1137,199 @@ mod tests {
             other => panic!("expected RespondDiplomacyDealPackage, got {:?}", other),
         }
     }
+
+    // -----------------------------------------------------------------
+    // Phase 4 lobby protocol round-trips
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn lobby_join_round_trips() {
+        use super::LobbyJoin;
+        let msg = LobbyJoin {
+            protocol_version: super::PROTOCOL_VERSION,
+            player_name: "Alice".into(),
+        };
+        let bytes = bincode::serialize(&msg).unwrap();
+        let back: LobbyJoin = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.protocol_version, super::PROTOCOL_VERSION);
+        assert_eq!(back.player_name, "Alice");
+    }
+
+    #[test]
+    fn lobby_select_start_round_trips() {
+        use super::LobbySelectStart;
+        let msg = LobbySelectStart {
+            megachunk: (3, -2),
+        };
+        let bytes = bincode::serialize(&msg).unwrap();
+        let back: LobbySelectStart = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.megachunk, (3, -2));
+    }
+
+    #[test]
+    fn lobby_set_ready_round_trips() {
+        use super::LobbySetReady;
+        let msg = LobbySetReady { ready: true };
+        let bytes = bincode::serialize(&msg).unwrap();
+        let back: LobbySetReady = bincode::deserialize(&bytes).unwrap();
+        assert!(back.ready);
+    }
+
+    #[test]
+    fn lobby_leave_round_trips() {
+        use super::LobbyLeave;
+        let bytes = bincode::serialize(&LobbyLeave).unwrap();
+        let _back: LobbyLeave = bincode::deserialize(&bytes).unwrap();
+    }
+
+    #[test]
+    fn lobby_snapshot_round_trips() {
+        use super::{LobbySlotPublic, LobbySnapshot};
+        let snap = LobbySnapshot {
+            game_name: "Test Lobby".into(),
+            world_seed: 1234,
+            era_index: 2,
+            economy_index: 1,
+            maturity_index: 1,
+            max_players: 4,
+            slots: vec![
+                LobbySlotPublic {
+                    slot_id: 0,
+                    player_name: "Host".into(),
+                    megachunk: Some((4, 7)),
+                    lifestyle_is_nomadic: false,
+                    ready: true,
+                    is_local: false,
+                },
+                LobbySlotPublic {
+                    slot_id: 1,
+                    player_name: "Guest".into(),
+                    megachunk: None,
+                    lifestyle_is_nomadic: true,
+                    ready: false,
+                    is_local: false,
+                },
+            ],
+        };
+        let bytes = bincode::serialize(&snap).unwrap();
+        let back: LobbySnapshot = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.game_name, "Test Lobby");
+        assert_eq!(back.slots.len(), 2);
+        assert_eq!(back.slots[0].player_name, "Host");
+        assert_eq!(back.slots[1].megachunk, None);
+    }
+
+    #[test]
+    fn lobby_reject_round_trips() {
+        use super::{LobbyReject, LobbyRejectReason};
+        for reason in [
+            LobbyRejectReason::ProtocolMismatch,
+            LobbyRejectReason::LobbyFull,
+            LobbyRejectReason::StartInvalid,
+            LobbyRejectReason::GameAlreadyStarted,
+        ] {
+            let msg = LobbyReject {
+                reason,
+                detail: Some("err".into()),
+            };
+            let bytes = bincode::serialize(&msg).unwrap();
+            let back: LobbyReject = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(back.reason, reason);
+            assert_eq!(back.detail.as_deref(), Some("err"));
+        }
+    }
+
+    #[test]
+    fn lobby_start_game_round_trips() {
+        use super::{LobbySlotAssignment, LobbyStartGame};
+        let msg = LobbyStartGame {
+            world_seed: 99,
+            slot_assignments: vec![
+                LobbySlotAssignment {
+                    slot_id: 0,
+                    client_id: 1,
+                    faction_id: 1,
+                    megachunk: (0, 0),
+                },
+                LobbySlotAssignment {
+                    slot_id: 1,
+                    client_id: 42,
+                    faction_id: 2,
+                    megachunk: (4, 4),
+                },
+            ],
+        };
+        let bytes = bincode::serialize(&msg).unwrap();
+        let back: LobbyStartGame = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.world_seed, 99);
+        assert_eq!(back.slot_assignments.len(), 2);
+        assert_eq!(back.slot_assignments[0].faction_id, 1);
+        assert_eq!(back.slot_assignments[1].megachunk, (4, 4));
+    }
+
+    // Server-side validation predicates (pure functions) get their own
+    // unit coverage so the lobby state machine can stay deterministic
+    // even before the full server wiring lands.
+
+    #[test]
+    fn lobby_start_validation_rejects_duplicates() {
+        let other_slots: &[(i32, i32)] = &[(0, 0)];
+        assert!(!super::is_start_megachunk_acceptable((0, 0), other_slots));
+    }
+
+    #[test]
+    fn lobby_start_validation_enforces_min_distance() {
+        let other_slots: &[(i32, i32)] = &[(0, 0)];
+        // Less than MIN_HUMAN_MEGACHUNK_DISTANCE = 3 → reject.
+        assert!(!super::is_start_megachunk_acceptable((2, 0), other_slots));
+        // Exactly the floor distance → accept.
+        assert!(super::is_start_megachunk_acceptable((3, 0), other_slots));
+        // Comfortable spread → accept.
+        assert!(super::is_start_megachunk_acceptable((4, 4), other_slots));
+    }
+
+    #[test]
+    fn lobby_readiness_rules() {
+        use super::LobbySlotPublic;
+        let mk = |ready, mc: Option<(i32, i32)>| LobbySlotPublic {
+            slot_id: 0,
+            player_name: "p".into(),
+            megachunk: mc,
+            lifestyle_is_nomadic: false,
+            ready,
+            is_local: false,
+        };
+        assert!(!super::lobby_ready_to_start(&[]));
+        assert!(!super::lobby_ready_to_start(&[mk(false, Some((0, 0)))]));
+        assert!(!super::lobby_ready_to_start(&[mk(true, None)]));
+        assert!(super::lobby_ready_to_start(&[mk(true, Some((0, 0)))]));
+        assert!(!super::lobby_ready_to_start(&[
+            mk(true, Some((0, 0))),
+            mk(false, Some((4, 0))),
+        ]));
+    }
+}
+
+/// Pure validator for a candidate start megachunk: passable position-wise,
+/// not duplicate, and ≥ `MIN_HUMAN_MEGACHUNK_DISTANCE` from every existing
+/// slot. Habitability is checked separately against the Globe.
+pub fn is_start_megachunk_acceptable(
+    candidate: (i32, i32),
+    other_slots: &[(i32, i32)],
+) -> bool {
+    let (cx, cy) = candidate;
+    other_slots.iter().all(|&(ox, oy)| {
+        let dx = (cx - ox).abs();
+        let dy = (cy - oy).abs();
+        dx.max(dy) >= MIN_HUMAN_MEGACHUNK_DISTANCE
+    })
+}
+
+/// True iff every slot has a megachunk AND every slot ticked Ready AND
+/// the slot list isn't empty. Host's Start button gates on this.
+pub fn lobby_ready_to_start(slots: &[LobbySlotPublic]) -> bool {
+    !slots.is_empty()
+        && slots
+            .iter()
+            .all(|s| s.ready && s.megachunk.is_some())
 }

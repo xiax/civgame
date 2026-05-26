@@ -126,12 +126,51 @@ pub fn release_net_ids_on_despawn(
     }
 }
 
+/// Tag any freshly-added `T` Component with `NeedsNetId` so the next
+/// `assign_net_ids_system` pass folds it into the `NetIdMap`. Spawn sites
+/// no longer have to remember to insert `NeedsNetId` manually — the
+/// observer enforces "this archetype is replicable" centrally.
+///
+/// `Without<NeedsNetId>` + `Without<Networked>` make double-insertion
+/// idempotent (manual sites that still insert `NeedsNetId` cost nothing).
+pub fn auto_tag_replicable<T: Component>(
+    mut commands: Commands,
+    added: Query<Entity, (Added<T>, Without<NeedsNetId>, Without<Networked>)>,
+) {
+    for e in &added {
+        commands.entity(e).insert(NeedsNetId);
+    }
+}
+
 pub struct NetIdPlugin;
 
 impl Plugin for NetIdPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<NetIdMap>()
             .add_event::<NetworkedRemovedEvent>()
+            // Phase 6: central auto-tagger. Every archetype that should be
+            // visible across the network gets one `auto_tag_replicable<T>`
+            // registration here — spawn sites stay clean. PostUpdate, before
+            // `assign_net_ids_system` (which is in the same chain).
+            .add_systems(
+                PostUpdate,
+                (
+                    auto_tag_replicable::<crate::simulation::person::Person>,
+                    auto_tag_replicable::<crate::simulation::vehicle::Vehicle>,
+                    auto_tag_replicable::<crate::simulation::items::GroundItem>,
+                    auto_tag_replicable::<crate::simulation::plants::Plant>,
+                    auto_tag_replicable::<crate::simulation::corpse::Corpse>,
+                    auto_tag_replicable::<crate::simulation::construction::Blueprint>,
+                    auto_tag_replicable::<crate::simulation::construction::Bed>,
+                    auto_tag_replicable::<crate::simulation::construction::Door>,
+                    auto_tag_replicable::<crate::simulation::construction::Wall>,
+                    auto_tag_replicable::<crate::simulation::construction::Workbench>,
+                    auto_tag_replicable::<crate::simulation::construction::Campfire>,
+                    auto_tag_replicable::<crate::simulation::settlement::Settlement>,
+                    auto_tag_replicable::<crate::simulation::camp::Camp>,
+                )
+                    .before(assign_net_ids_system),
+            )
             .add_systems(
                 PostUpdate,
                 (assign_net_ids_system, release_net_ids_on_despawn).chain(),
@@ -198,6 +237,30 @@ mod tests {
         let id2 = map.alloc(e);
         assert_eq!(id1, id2);
         assert_eq!(map.len(), 1);
+    }
+
+    /// Phase 6 contract: spawning a generic `T` (here a stand-in `Foo`)
+    /// without manual `NeedsNetId` tagging ends up `Networked` after the
+    /// `auto_tag_replicable::<T>` observer + `assign_net_ids_system` chain
+    /// runs in PostUpdate.
+    #[test]
+    fn auto_tag_replicable_spawns_networked_without_manual_tag() {
+        #[derive(Component)]
+        struct Foo;
+
+        let mut app = App::new();
+        app.add_plugins(NetIdPlugin);
+        // Register the generic observer for our test component.
+        app.add_systems(
+            PostUpdate,
+            auto_tag_replicable::<Foo>.before(assign_net_ids_system),
+        );
+
+        let entity = app.world_mut().spawn(Foo).id();
+        // First update: observer tags + assign in same chain.
+        app.update();
+        let networked = app.world().entity(entity).get::<Networked>().copied();
+        assert!(networked.is_some(), "Foo should be Networked without manual NeedsNetId");
     }
 
     #[test]

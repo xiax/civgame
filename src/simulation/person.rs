@@ -379,7 +379,8 @@ pub fn spawn_population(
     mut player_faction: ResMut<PlayerFaction>,
     mut controlled: ResMut<crate::simulation::faction::ControlledFactions>,
     mut settled: ResMut<crate::simulation::region::SettledRegions>,
-    pending: Res<crate::PendingSpawn>,
+    mut starts: ResMut<crate::PendingStarts>,
+    net_cfg: Option<Res<crate::net::NetConfig>>,
     world_seed: Res<crate::WorldSeed>,
     options: Res<crate::GameStartOptions>,
     catalog: Res<crate::economy::resource_catalog::ResourceCatalog>,
@@ -391,17 +392,52 @@ pub fn spawn_population(
         GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH, MEGACHUNK_SIZE_CHUNKS,
     };
 
-    // Centre the spawn region on the player-picked mega-chunk; fall back to
-    // globe centre if nothing was picked.
-    let (center_cx, center_cy) = match pending.0 {
-        Some((mx, my)) => (
-            mx * MEGACHUNK_SIZE_CHUNKS + MEGACHUNK_SIZE_CHUNKS / 2,
-            my * MEGACHUNK_SIZE_CHUNKS + MEGACHUNK_SIZE_CHUNKS / 2,
-        ),
-        None => (
-            (GLOBE_WIDTH / 2) * GLOBE_CELL_CHUNKS,
-            (GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS,
-        ),
+    // Ensure at least one slot exists so the legacy `PendingSpawn`-driven SP
+    // path (e.g. headless test fixture that never went through MainMenu)
+    // still spawns a player faction.
+    if starts.slots.is_empty() {
+        let mut slot =
+            crate::game_state::PlayerStartSlot::singleplayer("Player", options.lifestyle);
+        // Mirror in legacy `PendingSpawn` if the caller wrote one (e.g. the
+        // headless test fixture). When both are set, `PendingStarts` wins.
+        // (Resource access via `World::get_resource` so the fixture isn't
+        // forced to add `PendingSpawn` if it doesn't use it.)
+        // Note: we can't reach `World` from a system fn; in practice the
+        // test fixture writes BOTH `PendingSpawn` and now also default
+        // `PendingStarts`, so we read `PendingSpawn` indirectly via
+        // `legacy_pending_spawn_compat_system` running first. Tests that
+        // need a specific megachunk should write
+        // `PendingStarts.slots[0].megachunk` directly — same one-line
+        // change as MainMenu / spawn-select.
+        if let Some(mc) = starts.primary_start {
+            slot.megachunk = Some(mc);
+        }
+        starts.slots.push(slot);
+    }
+
+    // Multi-start centre = centroid of every slot's picked megachunk. Used
+    // for the 32×32 AI rival search window. Slots without a pick fall back
+    // to globe centre, mirroring the legacy `PendingSpawn::None` behaviour.
+    let (center_cx, center_cy) = {
+        let picks: Vec<(i32, i32)> = starts
+            .slots
+            .iter()
+            .filter_map(|s| s.megachunk)
+            .collect();
+        if picks.is_empty() {
+            (
+                (GLOBE_WIDTH / 2) * GLOBE_CELL_CHUNKS,
+                (GLOBE_HEIGHT / 2) * GLOBE_CELL_CHUNKS,
+            )
+        } else {
+            let (sx, sy) = picks.iter().fold((0i64, 0i64), |(ax, ay), (mx, my)| {
+                let cx = (*mx) * MEGACHUNK_SIZE_CHUNKS + MEGACHUNK_SIZE_CHUNKS / 2;
+                let cy = (*my) * MEGACHUNK_SIZE_CHUNKS + MEGACHUNK_SIZE_CHUNKS / 2;
+                (ax + cx as i64, ay + cy as i64)
+            });
+            let n = picks.len() as i64;
+            ((sx / n) as i32, (sy / n) as i32)
+        }
     };
     let start_cx = center_cx - (WORLD_CHUNKS_X / 2);
     let start_cy = center_cy - (WORLD_CHUNKS_Y / 2);
@@ -414,23 +450,41 @@ pub fn spawn_population(
     let start_ty = start_cy * CHUNK_SIZE as i32;
 
     let num_groups = INITIAL_POPULATION / GROUP_SIZE;
-    // Only the player faction plus `NEARBY_RIVAL_COUNT` rivals spawn as full
-    // entity groups in the pre-generated window. The remaining slots are
-    // seeded abstractly on the world map by `seed_abstract_factions_system`.
+    // Player slots + `NEARBY_RIVAL_COUNT` rivals spawn as full entity groups
+    // in the pre-generated window. Remaining slots seed abstractly via
+    // `seed_abstract_factions_system`. Human slots eat into the cap before
+    // AI rivals.
+    let human_count = starts.slots.len() as u32;
     let near_factions = (NEARBY_RIVAL_COUNT + 1).min(num_groups);
+    let ai_rival_count = near_factions.saturating_sub(human_count);
     let mut spawned = 0u32;
     let mut spawned_homes: Vec<(i32, i32)> = Vec::new();
+
+    // Resolve which slot belongs to the local client. ListenServer host +
+    // singleplayer both use HOST_SERVER_LOCAL_CLIENT_ID; remote clients
+    // get their own NetConfig-derived id when client mode lands. For now
+    // any slot at HOST_SERVER_LOCAL_CLIENT_ID owns the PlayerFaction +
+    // camera seat.
+    let local_client_id = net_cfg
+        .as_ref()
+        .map(|cfg| {
+            use crate::net::NetMode;
+            match cfg.mode {
+                NetMode::Client => cfg
+                    .player_name
+                    .as_deref()
+                    .map(crate::net::derive_client_id)
+                    .unwrap_or(crate::HOST_SERVER_LOCAL_CLIENT_ID),
+                _ => crate::HOST_SERVER_LOCAL_CLIENT_ID,
+            }
+        })
+        .unwrap_or(crate::HOST_SERVER_LOCAL_CLIENT_ID);
 
     // Score a candidate home tile: positive = better. Combines river-proximity
     // (riverside camps preferred over arid interior) with a continuous
     // farthest-point inter-faction spacing reward (`faction_spacing_score`).
-    // Inside the channel itself is penalised (we don't want spawns on water
-    // tiles even though that's already rejected by the passability check —
-    // guards against future passable shallow-water variants).
     let score_home_candidate = |tx: i32, ty: i32, others: &[(i32, i32)]| -> i32 {
         let spacing = faction_spacing_score(tx, ty, others);
-        // Settlements need to fit on one bank — `base_r` for a 20-person band
-        // is ~12 tiles, and bridges aren't available until Chalcolithic.
         let river_score = match chunk_map.river_distance_at(tx, ty) {
             0..=4 => -80,
             5..=9 => -20,
@@ -442,20 +496,58 @@ pub fn spawn_population(
         spacing + river_score + relief_score
     };
 
-    // AI factions get the same hard reject as the player: never seed on
-    // mountain slopes/ridges or ocean shelf. Treats rejected tiles like
-    // impassable for the AI search loop.
     let tile_landform_ok = |tx: i32, ty: i32| -> bool {
         !globe.sample_relief(tx, ty).class.rejects_settlement()
     };
 
-    for group_idx in 0..near_factions {
-        // The player faction (group_idx==0) is constrained to the selected
-        // mega-chunk via the deterministic shared helper so the spawn-select
-        // preview marker matches what actually spawns. AI factions keep the
-        // wider 32×32-chunk search so neighbours fan out around the player.
-        let home = if group_idx == 0 {
-            if let Some((mx, my)) = pending.0 {
+    // Search for an AI rival home inside the pre-gen window. Shared between
+    // the "no-megachunk human fallback" and the AI rival loop.
+    let mut pick_ai_rival_home = |spawned_homes: &[(i32, i32)],
+                                  rng: &mut rand::rngs::ThreadRng|
+     -> Option<(i32, i32)> {
+        let mut best: Option<((i32, i32), i32)> = None;
+        for _ in 0..200 {
+            let tx = start_tx + rng.gen_range(0..total_tiles_x);
+            let ty = start_ty + rng.gen_range(0..total_tiles_y);
+            if !chunk_map.is_passable(tx, ty)
+                || matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone))
+                || !tile_landform_ok(tx, ty)
+            {
+                continue;
+            }
+            let score = score_home_candidate(tx, ty, spawned_homes);
+            if best.as_ref().map_or(true, |(_, s)| score > *s) {
+                best = Some(((tx, ty), score));
+            }
+        }
+        best.map(|(t, _)| t).or_else(|| {
+            let mut result = None;
+            for _ in 0..500 {
+                let tx = start_tx + rng.gen_range(0..total_tiles_x);
+                let ty = start_ty + rng.gen_range(0..total_tiles_y);
+                if chunk_map.is_passable(tx, ty)
+                    && !matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone))
+                    && tile_landform_ok(tx, ty)
+                {
+                    result = Some((tx, ty));
+                    break;
+                }
+            }
+            result
+        })
+    };
+
+    // --- Phase 1: human slots ---
+    //
+    // Each slot resolves its home via `pick_player_home_in_megachunk` when
+    // the user picked a megachunk; otherwise falls through to the AI search.
+    // PlayerFaction is set for the slot whose client_id matches the local
+    // client. Every human slot is added to ControlledFactions.
+    let mut human_slot_homes: Vec<(usize, (i32, i32))> = Vec::with_capacity(starts.slots.len());
+    for slot_idx in 0..starts.slots.len() {
+        let slot_mc = starts.slots[slot_idx].megachunk;
+        let home: Option<(i32, i32)> = slot_mc
+            .map(|(mx, my)| {
                 let pick = crate::simulation::region::pick_player_home_in_megachunk(
                     &chunk_map,
                     &globe,
@@ -463,58 +555,54 @@ pub fn spawn_population(
                     my,
                     world_seed.0,
                 );
-                Some(pick.tile)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-        .or_else(|| {
-            // AI factions (and the no-PendingSpawn fallback for the player):
-            // best-of-200 over 200 candidates inside the 32×32 search window.
-            let mut best: Option<((i32, i32), i32)> = None;
-            for _ in 0..200 {
-                let tx = start_tx + rng.gen_range(0..total_tiles_x);
-                let ty = start_ty + rng.gen_range(0..total_tiles_y);
-                if !chunk_map.is_passable(tx, ty)
-                    || matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone))
-                    || !tile_landform_ok(tx, ty)
-                {
-                    continue;
-                }
-                let score = score_home_candidate(tx, ty, &spawned_homes);
-                if best.as_ref().map_or(true, |(_, s)| score > *s) {
-                    best = Some(((tx, ty), score));
-                }
-            }
-            // Fallback: if no candidate scored well, take any passable tile
-            // (still landform-OK so we don't drop the AI onto a cliff face).
-            best.map(|(t, _)| t).or_else(|| {
-                let mut result = None;
-                for _ in 0..500 {
-                    let tx = start_tx + rng.gen_range(0..total_tiles_x);
-                    let ty = start_ty + rng.gen_range(0..total_tiles_y);
-                    if chunk_map.is_passable(tx, ty)
-                        && !matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone))
-                        && tile_landform_ok(tx, ty)
-                    {
-                        result = Some((tx, ty));
-                        break;
-                    }
-                }
-                result
+                pick.tile
             })
-        });
+            .or_else(|| pick_ai_rival_home(&spawned_homes, &mut rng));
 
         let Some((home_tx, home_ty)) = home else {
             continue;
         };
         spawned_homes.push((home_tx, home_ty));
+        human_slot_homes.push((slot_idx, (home_tx, home_ty)));
+    }
 
+    // --- Phase 2: AI rivals ---
+    let mut ai_homes: Vec<(i32, i32)> = Vec::with_capacity(ai_rival_count as usize);
+    for _ in 0..ai_rival_count {
+        if let Some(home) = pick_ai_rival_home(&spawned_homes, &mut rng) {
+            spawned_homes.push(home);
+            ai_homes.push(home);
+        }
+    }
+
+    // --- Spawn loop: humans first, then AI rivals ---
+    //
+    // Stamps PlayerFaction on the local-client slot's faction; every human
+    // slot lands in ControlledFactions. AI rivals never enter ControlledFactions.
+    let mut total_factions = 0u32;
+    let mut spawn_for_faction = |commands: &mut Commands,
+                                 registry: &mut FactionRegistry,
+                                 clock: &mut SimClock,
+                                 player_faction: &mut PlayerFaction,
+                                 controlled: &mut crate::simulation::faction::ControlledFactions,
+                                 settled: &mut crate::simulation::region::SettledRegions,
+                                 home: (i32, i32),
+                                 slot_ix: Option<usize>|
+     -> (u32, u32, Vec<Entity>) {
+        let (home_tx, home_ty) = home;
         let faction_id = registry.create_faction((home_tx as i32, home_ty as i32));
 
-        // Apply economy preset to this faction's `economic_policy` map.
+        let is_human = slot_ix.is_some();
+        // Lifestyle for this faction:
+        // - Human slot: read the slot's per-player lifestyle (lobby picks
+        //   independently per player; SP slot mirrors GameStartOptions.lifestyle).
+        // - AI rival: stay Settled by default (matches legacy behaviour).
+        let faction_lifestyle = if let Some(ix) = slot_ix {
+            starts.slots[ix].lifestyle
+        } else {
+            crate::simulation::faction::Lifestyle::Settled
+        };
+
         if let Some(faction_data) = registry.factions.get_mut(&faction_id) {
             crate::economy::policy::apply_preset(
                 &mut faction_data.economic_policy,
@@ -522,98 +610,93 @@ pub fn spawn_population(
                 &catalog,
             );
             faction_data.land_policy = crate::economy::policy::land_policy_for(options.economy);
-            // Apply lifestyle: only the player faction reads the user-picked
-            // option. AI factions stay Settled by default. Households inherit
-            // via `spawn_household` so a nomadic player faction's bonded pairs
-            // form nomadic households automatically.
-            if group_idx == 0 {
-                faction_data.lifestyle = options.lifestyle;
-                // Phase 1: player-driven nomadic factions take the
-                // manual command flow (Pack/Pitch + Scout + Route).
-                // AI nomadic factions keep autopilot on.
-                if matches!(
-                    options.lifestyle,
+            faction_data.lifestyle = faction_lifestyle;
+            if is_human
+                && matches!(
+                    faction_lifestyle,
                     crate::simulation::faction::Lifestyle::Nomadic
-                ) {
-                    faction_data.nomad_autopilot = false;
-                }
+                )
+            {
+                // Human-driven nomadic factions take the manual command flow
+                // (Pack/Pitch + Scout + Route). AI nomadic factions keep
+                // autopilot on.
+                faction_data.nomad_autopilot = false;
             }
-            // P5: route through the archetype registry. `derive_from_archetype_key`
-            // hits the registry when the key is authored (today: the
-            // four supported legacy archetypes inserted by
-            // `default_registry`); falls back to `derive_from_legacy`
-            // for any caller that hands us an unknown key. The fallback
-            // is what keeps the bit-for-bit P1a invariant intact while
-            // RON loading lands.
             let key = crate::simulation::archetype::legacy_archetype_key(
-                faction_data.lifestyle,
+                faction_lifestyle,
                 options.economy,
             );
             faction_data.caps = crate::simulation::archetype::derive_from_archetype_key(
                 &archetype_registry,
                 key,
-                Some((faction_data.lifestyle, options.economy, &catalog)),
+                Some((faction_lifestyle, options.economy, &catalog)),
             )
             .expect("derive_from_archetype_key with legacy fallback always returns Some");
         }
 
         let home_world = tile_to_world(home_tx, home_ty);
 
-        if group_idx == 0 {
-            player_faction.faction_id = faction_id;
+        if let Some(ix) = slot_ix {
             controlled.add(faction_id);
+            starts.slots[ix].faction_id = Some(faction_id);
 
-            // Mark the player's faction center
-            commands.spawn((
-                FactionCenter,
-                PlayerFactionMarker,
-                Transform::from_xyz(home_world.x, home_world.y, 0.5),
-                GlobalTransform::default(),
-                Visibility::Visible,
-                InheritedVisibility::default(),
-            ));
+            // Local client owns PlayerFaction + the marked FactionCenter.
+            let is_local = starts.slots[ix].client_id == local_client_id;
+            if is_local {
+                player_faction.faction_id = faction_id;
 
-            // Seed the player's first settled region.
-            let megachunk = MegaChunkCoord::from_tile(home_tx, home_ty);
-            settled.settle(megachunk, clock.tick, "Home".to_string(), home_world, true);
+                commands.spawn((
+                    FactionCenter,
+                    PlayerFactionMarker,
+                    Transform::from_xyz(home_world.x, home_world.y, 0.5),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                ));
+
+                let megachunk = MegaChunkCoord::from_tile(home_tx, home_ty);
+                settled.settle(megachunk, clock.tick, "Home".to_string(), home_world, true);
+            }
         }
 
-        // Player faction respects the user-chosen population; AI factions
-        // stay at the hardcoded GROUP_SIZE.
-        let group_size = if group_idx == 0 {
+        // Per-slot group size: humans use options.player_population (today
+        // shared across all human slots; per-slot pop is a follow-up the
+        // lobby can wire later). AI rivals stay on GROUP_SIZE.
+        let group_size = if is_human {
             options.player_population
         } else {
             GROUP_SIZE
         };
 
-        // Spawn the band — home storage tile, members (drawn from a
-        // reachable flood out of the home tile), and chief designation.
-        // Shared verbatim with the runtime materialisation path
-        // (`abstract_faction::materialize_abstract_faction_system`).
         let band = spawn_faction_band(
-            &mut commands,
+            commands,
             &chunk_map,
-            &mut registry,
-            &mut clock,
+            registry,
+            clock,
             faction_id,
             (home_tx, home_ty),
             group_size,
             options.era,
         );
-        let spawned_members = band.members;
-        spawned += spawned_members.len() as u32;
+        total_factions += 1;
+        let n = band.members.len() as u32;
+        (faction_id, n, band.members)
+    };
 
-        // M2: under Market preset, every spawned adult founds a one-person
-        // household with its own home tile near the village center, its own
-        // `FactionStorageTile`, and a seeded treasury so it can post paid
-        // contracts on the next `HOUSEHOLD_POSTING_CADENCE` cycle. Cosleep
-        // bond households continue to form later via
-        // `household_formation_system`. Subsistence/Mixed presets skip this
-        // — those villages keep household formation gated on bonding.
-        // Capability check: archetypes whose `inheritance.seed_storage_tile`
-        // is true seed one-person households at spawn (today: Market only).
-        // Subsistence/Mixed villages keep household formation gated on
-        // bonding (`household_formation_system`).
+    for (slot_ix, home) in human_slot_homes.clone() {
+        let (faction_id, count, members) = spawn_for_faction(
+            &mut commands,
+            &mut registry,
+            &mut clock,
+            &mut player_faction,
+            &mut controlled,
+            &mut settled,
+            home,
+            Some(slot_ix),
+        );
+        spawned += count;
+
+        // M2: Market preset spawn-time household seeding for human factions.
         let seed_households_for_archetype = registry
             .factions
             .get(&faction_id)
@@ -626,20 +709,52 @@ pub fn spawn_population(
                 &chunk_map,
                 &catalog,
                 faction_id,
-                (home_tx as i32, home_ty as i32),
-                &spawned_members,
+                home,
+                &members,
             );
         }
+    }
+
+    for home in ai_homes.clone() {
+        let (_fid, count, _members) = spawn_for_faction(
+            &mut commands,
+            &mut registry,
+            &mut clock,
+            &mut player_faction,
+            &mut controlled,
+            &mut settled,
+            home,
+            None,
+        );
+        spawned += count;
+    }
+
+    // Promote the local-client slot's home into PendingStarts.primary_start
+    // so downstream readers (camera, world pre-gen) see the right anchor.
+    if let Some(local_slot) = starts.slots.iter().find(|s| s.client_id == local_client_id) {
+        if let Some((hx, hy)) = local_slot.megachunk {
+            starts.primary_start = Some((hx, hy));
+        }
+    }
+
+    // Drop the helper-scope-only buffers (silences unused warnings for
+    // intermediate planning state).
+    {
+        let _ = &spawned_homes;
+        let _ = &human_slot_homes;
+        let _ = &ai_homes;
+        let _ = total_factions;
     }
 
     clock.population = spawned;
     clock.current_end = clock.bucket_size.min(spawned);
 
     info!(
-        "Spawned {} people in {} near factions of {} ({} faction slots reserved for the world map) in {:?}",
+        "Spawned {} people across {} human slot(s) + {} AI rival(s) (of {} groups, {} faction slots reserved for the world map) in {:?}",
         spawned,
-        near_factions,
-        GROUP_SIZE,
+        human_count,
+        ai_rival_count,
+        num_groups,
         num_groups.saturating_sub(near_factions),
         now.elapsed()
     );

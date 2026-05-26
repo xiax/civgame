@@ -28,6 +28,7 @@ use std::time::Duration;
 pub mod bootstrap;
 pub mod cli;
 pub mod client;
+pub mod lobby_state;
 pub mod protocol;
 pub mod protocol_plugin;
 pub mod server;

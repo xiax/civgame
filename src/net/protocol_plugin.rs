@@ -27,7 +27,9 @@ use lightyear::prelude::*;
 
 use crate::net::protocol::{
     BootstrapSnapshot, ChunkOverlayDelta, ClientCameraFocus, ClientHello, EntityRemoved,
-    EntityStateDelta, FactionAssignment, NetCommandAck, NetCommandFrame,
+    EntityStateDelta, FactionAssignment, LobbyJoin, LobbyLeave, LobbyReject,
+    LobbySelectStart, LobbySetReady, LobbySnapshot, LobbyStartGame, NetCommandAck,
+    NetCommandFrame,
 };
 
 /// The single reliable channel every Phase 2 control message rides.
@@ -57,5 +59,14 @@ impl Plugin for ProtocolPlugin {
         app.register_message::<EntityStateDelta>(ChannelDirection::ServerToClient);
         app.register_message::<EntityRemoved>(ChannelDirection::ServerToClient);
         app.register_message::<NetCommandAck>(ChannelDirection::ServerToClient);
+
+        // Phase 4 lobby messages — all reliable, both directions.
+        app.register_message::<LobbyJoin>(ChannelDirection::ClientToServer);
+        app.register_message::<LobbySelectStart>(ChannelDirection::ClientToServer);
+        app.register_message::<LobbySetReady>(ChannelDirection::ClientToServer);
+        app.register_message::<LobbyLeave>(ChannelDirection::ClientToServer);
+        app.register_message::<LobbySnapshot>(ChannelDirection::ServerToClient);
+        app.register_message::<LobbyReject>(ChannelDirection::ServerToClient);
+        app.register_message::<LobbyStartGame>(ChannelDirection::ServerToClient);
     }
 }
