@@ -4,7 +4,7 @@ use super::construction::{Bed, BedMap, ChairMap, LoomMap, TableMap, WorkbenchMap
 use super::faction::{FactionMember, FactionRegistry};
 use super::goal_contract::{self, BlockedReason};
 use super::goals::AgentGoal;
-use super::htn::MethodHistory;
+use super::htn::{record_routing_failure, MethodHistory};
 use super::items::GroundItem;
 use super::lod::LodLevel;
 use super::memory::RelationshipMemory;
@@ -55,13 +55,34 @@ pub struct MountedOn(pub Entity);
 /// the debug overlay keep drawing on a frozen agent, and leaving the agent
 /// off-center traps them in the `dist > 2.0 && target_tile == current_tile`
 /// loop where the worker returns an empty path and the agent never moves.
+///
+/// **HTN outcome accounting.** This is a cancel surface (every caller is a
+/// route-failure or terrain-strand recovery). Matches the
+/// `gather::finish_gather` / `items::finish_scavenge` /
+/// `production::finish_withdraw_material` cancel-path convention
+/// (`simulation/CLAUDE.md` → "Cancel paths record failure"): record
+/// `MethodOutcome::FailedRouting` against the agent's `active_method` and
+/// clear it before `aq.cancel()`. Without the clear,
+/// `htn_method_completion_system` observes the idle queue next tick and
+/// writes a phantom `Success` against the stale method — see
+/// `plans/fix-sleep-stalls.md`.
 fn release_to_idle(
     ai: &mut PersonAI,
     pf: &mut PathFollow,
     aq: &mut ActionQueue,
+    history: &mut MethodHistory,
     transform: &mut Transform,
     here: (i32, i32),
+    now: u64,
 ) {
+    // Record the HTN cancel BEFORE clearing queue state — `record_routing_failure`
+    // reads `ai.active_method` and takes it. Order also matters because
+    // `htn_method_completion_system` observes `(current == Idle, active_method.is_some())`
+    // as Success.
+    if ai.active_method.is_some() {
+        record_routing_failure(history, ai, now);
+    }
+
     ai.state = AiState::Idle;
     ai.target_tile = (here.0 as i32, here.1 as i32);
     ai.dest_tile = ai.target_tile;
@@ -282,7 +303,15 @@ pub fn movement_system(
                     // Worker rejected the request; release so dispatch picks
                     // a different goal. Re-requesting the same goal would
                     // just fail again.
-                    release_to_idle(&mut ai, &mut pf, &mut aq, &mut transform, (cur_tx, cur_ty));
+                    release_to_idle(
+                        &mut ai,
+                        &mut pf,
+                        &mut aq,
+                        &mut history,
+                        &mut transform,
+                        (cur_tx, cur_ty),
+                        now,
+                    );
                     continue;
                 }
                 FollowStatus::Pending => {
@@ -306,8 +335,10 @@ pub fn movement_system(
                             &mut ai,
                             &mut pf,
                             &mut aq,
+                            &mut history,
                             &mut transform,
                             (cur_tx, cur_ty),
+                            now,
                         );
                         continue;
                     }
@@ -370,8 +401,10 @@ pub fn movement_system(
                                 &mut ai,
                                 &mut pf,
                                 &mut aq,
+                                &mut history,
                                 &mut transform,
                                 (cur_tx, cur_ty),
+                                now,
                             );
                             continue;
                         }
@@ -617,8 +650,10 @@ pub fn movement_system(
                 &mut ai,
                 &mut pf,
                 &mut aq,
+                &mut history,
                 &mut transform,
                 (prev_tx, prev_ty),
+                now,
             );
             continue;
         }
@@ -1079,19 +1114,22 @@ pub fn mount_check_system(
 /// so the index sees the corrected coordinates this tick.
 pub fn recover_stranded_agents_system(
     chunk_map: Res<ChunkMap>,
+    clock: Res<SimClock>,
     mut query: Query<
         (
             Entity,
             &mut Transform,
             &mut PersonAI,
             &mut ActionQueue,
+            &mut MethodHistory,
             &LodLevel,
             &mut PathFollow,
         ),
         (With<Person>, Without<MountedOn>, Without<BoardedVehicle>),
     >,
 ) {
-    for (entity, mut transform, mut ai, mut aq, lod, mut pf) in query.iter_mut() {
+    let now = clock.tick;
+    for (entity, mut transform, mut ai, mut aq, mut history, lod, mut pf) in query.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -1114,7 +1152,15 @@ pub fn recover_stranded_agents_system(
         );
         ai.current_z = new_z as i8;
         ai.target_z = new_z as i8;
-        release_to_idle(&mut ai, &mut pf, &mut aq, &mut transform, (tx, ty));
+        release_to_idle(
+            &mut ai,
+            &mut pf,
+            &mut aq,
+            &mut history,
+            &mut transform,
+            (tx, ty),
+            now,
+        );
     }
 }
 
@@ -1130,3 +1176,94 @@ pub fn horse_position_sync_system(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simulation::htn::{MethodId, MethodOutcome};
+    use crate::simulation::typed_task::Task;
+    use crate::pathfinding::path_request::PathFollow;
+
+    /// Regression for `plans/fix-sleep-stalls.md`: a movement-layer route
+    /// cancel must record `MethodOutcome::FailedRouting` against the
+    /// agent's `active_method` and clear it, so the next tick's
+    /// `htn_method_completion_system` does not observe
+    /// `current == Idle && active_method.is_some()` and write a phantom
+    /// Success against the stale method.
+    #[test]
+    fn release_to_idle_records_failed_routing_not_phantom_success() {
+        let mut ai = PersonAI {
+            state: AiState::Seeking,
+            active_method: Some(MethodId::SLEEP),
+            target_tile: (3, 4),
+            dest_tile: (7, 8),
+            current_z: 0,
+            target_z: 0,
+            ..Default::default()
+        };
+        let mut pf = PathFollow::default();
+        pf.status = FollowStatus::Following;
+        pf.goal = (7, 8, 0);
+
+        let mut aq = ActionQueue::idle();
+        // Promote a Sleep task into `current` to mirror the live-stall
+        // shape — the cancel surface must observe a non-Idle current
+        // when the dispatcher previously stamped `active_method`.
+        aq.dispatch(Task::Sleep { bed: None });
+        assert!(
+            matches!(aq.current, Task::Sleep { .. }),
+            "precondition: queue holds Sleep task",
+        );
+
+        let mut history = MethodHistory::default();
+        let mut transform = Transform::default();
+        let now: u64 = 42;
+
+        release_to_idle(
+            &mut ai,
+            &mut pf,
+            &mut aq,
+            &mut history,
+            &mut transform,
+            (1, 2),
+            now,
+        );
+
+        // The cancel must clear `active_method`. Without this clear,
+        // `htn_method_completion_system` writes a phantom Success on the
+        // next tick.
+        assert!(
+            ai.active_method.is_none(),
+            "release_to_idle must clear active_method so htn_method_completion_system cannot write phantom Success",
+        );
+
+        // The cancel must record FailedRouting against the just-cancelled
+        // method, both for telemetry and so `score_method_with_history`
+        // biases the agent away from re-picking the same broken plan
+        // next dispatch.
+        let mut found_failed_routing = false;
+        for slot in history.entries.iter() {
+            if let Some((mid, outcome, tick)) = slot {
+                if *mid == MethodId::SLEEP {
+                    assert_eq!(
+                        *outcome,
+                        MethodOutcome::FailedRouting,
+                        "expected FailedRouting outcome for cancelled Sleep, got {outcome:?}",
+                    );
+                    assert_eq!(*tick, now, "outcome must be stamped with `now`");
+                    found_failed_routing = true;
+                }
+            }
+        }
+        assert!(
+            found_failed_routing,
+            "MethodHistory missing a FailedRouting entry for cancelled SLEEP method",
+        );
+
+        // The queue must also reset — without `aq.cancel()` the executor
+        // would silently re-run the dead Sleep task.
+        assert!(matches!(aq.current, Task::Idle), "current must reset to Idle");
+        assert_eq!(ai.state, AiState::Idle, "PersonAI state must reset to Idle");
+    }
+}
+

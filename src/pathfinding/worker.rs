@@ -62,6 +62,13 @@ pub struct PathfindingDiagnostics {
     /// Hotspot field existed for the goal but `walk_to_goal` returned None,
     /// forcing a fallthrough to A*. Running total.
     pub hotspot_fastpath_misses: u64,
+    /// Hotspot field returned a path, but `first_invalid_step` rejected it
+    /// against live `ChunkMap` state (stale `cell_z` after terrain
+    /// mutation). Treated as a recoverable cache miss — falls through to
+    /// A* instead of returning `NoRouteStepContinuity`. Non-zero values
+    /// indicate hotspot-field invalidation drift; see
+    /// `plans/fix-sleep-stalls.md` Deferred follow-up.
+    pub hotspot_fastpath_bad_steps: u64,
     /// `PathReady`/`PathFailed` arrived for an outdated `request_id`.
     /// Running total.
     pub stale_id_discards: u64,
@@ -172,6 +179,7 @@ enum OutcomeBody {
         segment_path: Vec<(i32, i32, i8)>,
         ready_kind: PathReadyKind,
         flow_field_hit: bool,
+        hotspot_fastpath_bad_step: bool,
     },
     Failure(FailureBody),
 }
@@ -181,6 +189,10 @@ struct FailureBody {
     segment_target: (i32, i32, i8),
     connectivity_reject: bool,
     hotspot_fastpath_miss: bool,
+    /// Hotspot fast path produced a path that failed `first_invalid_step`
+    /// against live chunk state. Bumped even when A* later recovers — it
+    /// counts cache-drift events, not request failures.
+    hotspot_fastpath_bad_step: bool,
     /// Set when the failure is specifically "agent's start tile has no
     /// component classification" — separately tracked because it's a
     /// transient race (terrain mutated between request enqueue and
@@ -196,6 +208,7 @@ impl FailureBody {
             segment_target,
             connectivity_reject: false,
             hotspot_fastpath_miss: false,
+            hotspot_fastpath_bad_step: false,
             component_lookup_failed_start: false,
             component_lookup_failed_goal: false,
         }
@@ -206,6 +219,7 @@ impl FailureBody {
             segment_target,
             connectivity_reject: true,
             hotspot_fastpath_miss: false,
+            hotspot_fastpath_bad_step: false,
             component_lookup_failed_start: false,
             component_lookup_failed_goal: false,
         }
@@ -484,6 +498,7 @@ fn compute_land(
     // Fast path: hotspot flow-field walk if the goal is in the start
     // chunk and the agent's cell reached the goal at the agent's Z.
     let mut hotspot_miss = false;
+    let mut hotspot_bad_step = false;
     if chunk_route.len() == 1 {
         let goal_tile = (req.goal.0 as i32, req.goal.1 as i32, req.goal.2);
         if let Some(field) = hotspots.lookup_field(goal_tile) {
@@ -496,6 +511,18 @@ fn compute_land(
                     if let Some(bad) =
                         first_invalid_step(chunk_map, req.start, &path, TraversalProfile::Land)
                     {
+                        // Stale hotspot cache: the cached `cell_z` field
+                        // matched live z at the start cell, but somewhere
+                        // along the emitted path a per-step continuity
+                        // check failed against live `ChunkMap` state. Treat
+                        // as a recoverable cache miss and fall through to
+                        // A* — A* re-routing against live state is the
+                        // authoritative fallback. Distinct counter from
+                        // `hotspot_fastpath_misses` so cache-drift events
+                        // can be diagnosed in telemetry independent of
+                        // `walk_to_goal` returning `None`.
+                        hotspot_bad_step = true;
+                        hotspot_miss = true;
                         if flags.verbose_logs {
                             let prev = if bad == 0 {
                                 req.start
@@ -504,29 +531,26 @@ fn compute_land(
                                 (p.0 as i32, p.1 as i32, p.2)
                             };
                             let cur = path[bad];
-                            warn!(
-                                "[path] flow-field emitted bad step agent={:?} prev={:?} -> {:?}",
+                            debug!(
+                                "[path] hotspot fastpath bad step agent={:?} prev={:?} -> {:?} (falling through to A*)",
                                 req.agent, prev, cur
                             );
                         }
-                        let goal = req.goal;
-                        return fail_outcome(
+                    } else {
+                        return ComputeOutcome {
+                            body: OutcomeBody::Success {
+                                chunk_route,
+                                segment_path: path,
+                                ready_kind: PathReadyKind::Strict,
+                                flow_field_hit: true,
+                                hotspot_fastpath_bad_step: false,
+                            },
                             req,
-                            FailureBody::basic(FailSubReason::NoRouteStepContinuity, goal),
-                        );
+                            astar_calls: 0,
+                            astar_iters: 0,
+                            astar_iters_max_single: 0,
+                        };
                     }
-                    return ComputeOutcome {
-                        body: OutcomeBody::Success {
-                            chunk_route,
-                            segment_path: path,
-                            ready_kind: PathReadyKind::Strict,
-                            flow_field_hit: true,
-                        },
-                        req,
-                        astar_calls: 0,
-                        astar_iters: 0,
-                        astar_iters_max_single: 0,
-                    };
                 } else {
                     hotspot_miss = true;
                     if flags.verbose_logs {
@@ -600,6 +624,7 @@ fn compute_land(
                 }
                 let mut body = FailureBody::basic(FailSubReason::BudgetExhausted, segment_target);
                 body.hotspot_fastpath_miss = hotspot_miss;
+                body.hotspot_fastpath_bad_step = hotspot_bad_step;
                 return fail_outcome_with_metrics(
                     req,
                     body,
@@ -623,6 +648,7 @@ fn compute_land(
             }
             let mut body = FailureBody::basic(FailSubReason::UnreachableAstar, segment_target);
             body.hotspot_fastpath_miss = hotspot_miss;
+            body.hotspot_fastpath_bad_step = hotspot_bad_step;
             return fail_outcome_with_metrics(
                 req,
                 body,
@@ -651,6 +677,7 @@ fn compute_land(
         }
         let mut body = FailureBody::basic(FailSubReason::NoRouteStepContinuity, segment_target);
         body.hotspot_fastpath_miss = hotspot_miss;
+        body.hotspot_fastpath_bad_step = hotspot_bad_step;
         return fail_outcome_with_metrics(
             req,
             body,
@@ -666,6 +693,7 @@ fn compute_land(
             segment_path,
             ready_kind,
             flow_field_hit: false,
+            hotspot_fastpath_bad_step: hotspot_bad_step,
         },
         req,
         astar_calls,
@@ -771,6 +799,7 @@ fn compute_amphibious(
             segment_path,
             ready_kind,
             flow_field_hit: false,
+            hotspot_fastpath_bad_step: false,
         },
         req,
         astar_calls,
@@ -808,6 +837,7 @@ fn apply_outcome(
             segment_path,
             ready_kind,
             flow_field_hit,
+            hotspot_fastpath_bad_step,
         } => {
             let route_len = chunk_route.len() as u32;
             if route_len > diag.chunk_route_len_max_last_tick {
@@ -816,6 +846,9 @@ fn apply_outcome(
             if flow_field_hit {
                 diag.flow_field_hits_per_tick += 1;
                 diag.flow_field_hits_total += 1;
+            }
+            if hotspot_fastpath_bad_step {
+                diag.hotspot_fastpath_bad_steps += 1;
             }
             write_success(
                 &req,
@@ -833,6 +866,7 @@ fn apply_outcome(
             segment_target,
             connectivity_reject,
             hotspot_fastpath_miss,
+            hotspot_fastpath_bad_step,
             component_lookup_failed_start,
             component_lookup_failed_goal,
         }) => {
@@ -841,6 +875,9 @@ fn apply_outcome(
             }
             if hotspot_fastpath_miss {
                 diag.hotspot_fastpath_misses += 1;
+            }
+            if hotspot_fastpath_bad_step {
+                diag.hotspot_fastpath_bad_steps += 1;
             }
             if component_lookup_failed_start {
                 diag.component_lookup_failed_at_start += 1;
@@ -1184,5 +1221,118 @@ mod tests {
         map.0.insert(ChunkCoord(0, 0), flat_chunk(0));
         let path = vec![(6i32, 6i32, 0i8)];
         assert_eq!(first_invalid_step(&map, (5, 5, 0), &path, TraversalProfile::Land), None);
+    }
+
+    /// Regression for `plans/fix-sleep-stalls.md`: the hotspot fast path
+    /// must not return `NoRouteStepContinuity` when its cached `cell_z`
+    /// has drifted from live chunk state. It must set
+    /// `hotspot_fastpath_bad_step` and fall through to the A* path, which
+    /// re-routes against live state and succeeds.
+    #[test]
+    fn hotspot_bad_step_falls_through_to_astar() {
+        use crate::pathfinding::chunk_graph::{rebuild_chunk_graph_sync, ChunkGraph};
+        use crate::pathfinding::chunk_router::ChunkRouter;
+        use crate::pathfinding::connectivity::{
+            populate_connectivity_from_graph, ChunkConnectivity,
+        };
+        use crate::pathfinding::flow_field::{build_flow_field, FlowField};
+        use crate::pathfinding::hotspots::{HotspotEntry, HotspotFlowFields, HotspotKey, HotspotKind};
+        use crate::pathfinding::path_request::{PathDebugFlags, PathKind, PathRequest};
+        use crate::pathfinding::pool::AStarScratch;
+        use crate::simulation::typed_task::UNEMPLOYED_TASK_KIND;
+
+        let mut chunk_map = ChunkMap::default();
+        chunk_map.0.insert(ChunkCoord(0, 0), flat_chunk(0));
+        // Build the live planner state against the clean flat chunk.
+        let mut graph = ChunkGraph::default();
+        rebuild_chunk_graph_sync(&chunk_map, &mut graph);
+        let mut conn = ChunkConnectivity::default();
+        populate_connectivity_from_graph(&graph, &mut conn);
+        let router = ChunkRouter::default();
+
+        // Build a real flow field whose path is valid against the current
+        // chunk_map, then poison `cell_z` at the start cell to z=5. The
+        // chunk's only standable layer is z=0, so emitting a step at z=5
+        // fails `first_invalid_step` — exactly the cache-drift symptom.
+        let goal_local = (10u8, 5u8);
+        let start_local = (5u8, 5u8);
+        let mut field: FlowField = build_flow_field(
+            &chunk_map,
+            ChunkCoord(0, 0),
+            goal_local,
+            0,
+            &|_: (i32, i32)| 0u16,
+        );
+        // Poison the cell immediately stepped onto by `walk_to_goal` —
+        // start is (5,5), first step lands on (6,5). MUST leave the
+        // start cell's `cell_z` matching live `req.start.2` (the worker
+        // gates entry to the fast path on that equality), and MUST keep
+        // `cell_z[goal_idx] == goal_z` so the field is internally
+        // consistent. Only the intermediate `(6,5)` cell — the first
+        // step in the emitted path — is corrupted; `first_invalid_step`
+        // catches it on step 0.
+        let bad_idx = goal_local.1 as usize * CHUNK_SIZE + (start_local.0 as usize + 1);
+        field.cell_z[bad_idx] = 5;
+
+        let mut hotspots = HotspotFlowFields::default();
+        let goal_tile = (goal_local.0 as i32, goal_local.1 as i32, 0i8);
+        hotspots.entries.insert(
+            HotspotKey {
+                tile: goal_tile,
+                kind: HotspotKind::FactionCenter,
+            },
+            HotspotEntry { field },
+        );
+        hotspots.field_count = 1;
+
+        let flags = PathDebugFlags::default();
+        let mut scratch = AStarScratch::default();
+        let req = PathRequest {
+            id: 1,
+            agent: Entity::from_raw(0),
+            start: (start_local.0 as i32, start_local.1 as i32, 0i8),
+            goal: goal_tile,
+            kind: PathKind::Strict,
+            max_budget: 4096,
+            task_id: UNEMPLOYED_TASK_KIND,
+            profile: TraversalProfile::Land,
+        };
+
+        let outcome = compute_outcome(
+            req,
+            &chunk_map,
+            &graph,
+            &router,
+            &conn,
+            &hotspots,
+            &flags,
+            &mut scratch,
+        );
+
+        // Worker must report success — A* recovers against live state.
+        // The bad-step flag must propagate so diagnostics can count
+        // cache-drift events.
+        match outcome.body {
+            OutcomeBody::Success {
+                hotspot_fastpath_bad_step,
+                flow_field_hit,
+                ..
+            } => {
+                assert!(
+                    hotspot_fastpath_bad_step,
+                    "expected the hotspot bad-step flag to be set when the cached field emits an invalid step",
+                );
+                assert!(
+                    !flow_field_hit,
+                    "expected fallthrough to A* (no flow-field hit) on bad-step",
+                );
+            }
+            OutcomeBody::Failure(body) => {
+                panic!(
+                    "expected A* fallback Success, got Failure(sub={:?}, bad_step={})",
+                    body.sub, body.hotspot_fastpath_bad_step,
+                );
+            }
+        }
     }
 }
