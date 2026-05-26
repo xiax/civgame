@@ -194,3 +194,5 @@ I want to add a lot more plant varieties to the game, plants that would be nativ
 I want the plant and animal seeding to be more natural and realistic to real life.
 
 
+/Users/xiao1/civgame/plans/sleep-arrival-panic.md
+task-outcome-feedback-contract.mddiplomacy-marriage.mddiplomacy-espionage.mddiplomacy-federations.md

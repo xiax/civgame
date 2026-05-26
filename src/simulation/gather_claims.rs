@@ -144,8 +144,8 @@ pub fn release_gather_claim(
     ai: &mut crate::simulation::person::PersonAI,
     actor: Entity,
 ) {
-    if let Some((tile, kind)) = ai.active_gather_claim {
-        claims.release(tile, kind, actor);
+    if let Some(target) = ai.active_gather_claim {
+        claims.release(target.tile, target.kind, actor);
     }
     ai.active_gather_claim = None;
 }

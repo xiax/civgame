@@ -996,6 +996,16 @@ pub struct PlannerCtx {
     /// Sleep / Eat / AcquireFood / haul-claim AcquireGood dispatchers leave
     /// it at `None`.
     pub gather_target_tile: Option<(i32, i32)>,
+    /// Dispatch-time preflight result for `gather_target_tile`
+    /// (`plans/fix-repeating-gather-fail-loops.md` §3). When the
+    /// target tile no longer resolves to a live, harvestable resource
+    /// of the expected kind, the dispatcher sets this `false` so
+    /// `GatherFromKnownMethod` / its food + craft cousins fall out of
+    /// the concrete partition and the fallback (`Explore`) wins
+    /// cleanly. Defaults `true` so non-gather dispatchers that leave
+    /// `gather_target_tile = None` don't accidentally suppress unrelated
+    /// methods (the methods themselves also check `gather_target_tile.is_some()`).
+    pub gather_target_valid: bool,
     /// A known loose `GroundItem` of the `AcquireGood` target material —
     /// fallen wood / surface stone / dropped fruit, etc. Paired with
     /// `scavenge_target_tile` (the entity's current tile) so the dispatcher
@@ -1900,7 +1910,13 @@ impl Method for GatherFromKnownMethod {
         if !matches!(abstract_task, AbstractTask::AcquireGood { .. }) {
             return false;
         }
-        ctx.gather_target_tile.is_some()
+        // `gather_target_valid` is the dispatch-time preflight result
+        // (`plans/fix-repeating-gather-fail-loops.md` §3) — `false` ⇒
+        // the tile no longer carries a harvestable resource of the
+        // expected kind. Drops this concrete out of the partition so
+        // the `Explore` fallback wins cleanly instead of looping on
+        // the stale tile.
+        ctx.gather_target_tile.is_some() && ctx.gather_target_valid
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
@@ -2352,7 +2368,7 @@ impl Method for ForageFromKnownMethod {
         if !matches!(abstract_task, AbstractTask::AcquireFood) {
             return false;
         }
-        ctx.gather_target_tile.is_some()
+        ctx.gather_target_tile.is_some() && ctx.gather_target_valid
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
@@ -2404,7 +2420,10 @@ impl Method for ForageFromKnownForStorageMethod {
         // good (trailing Task::DepositToFactionStorage { good, target_faction_id: None }).
         // Without the good the chain can't be expressed in typed form, even
         // though the deposit executor itself is parameterless.
-        ctx.gather_target_tile.is_some() && ctx.forage_food_good.is_some()
+        // Preflight: `gather_target_valid == false` ⇒ stale tile, drop.
+        ctx.gather_target_tile.is_some()
+            && ctx.gather_target_valid
+            && ctx.forage_food_good.is_some()
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
@@ -2986,6 +3005,7 @@ impl Method for GatherAndHaulToPersonalBlueprintMethod {
         }
         ctx.personal_bp_resource.is_some()
             && ctx.gather_target_tile.is_some()
+            && ctx.gather_target_valid
             && ctx.claimed_blueprint.is_some()
     }
 
@@ -3640,6 +3660,7 @@ pub fn htn_sleep_dispatch_system(
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -3876,6 +3897,7 @@ pub fn htn_eat_dispatch_system(
                 claimed_blueprint: None,
                 claimed_blueprint_tile: None,
                 gather_target_tile: None,
+            gather_target_valid: true,
                 scavenge_target_entity: None,
                 scavenge_target_tile: None,
                 scavenge_food_good: None,
@@ -4298,6 +4320,26 @@ pub fn htn_acquire_food_dispatch_system(
                 None
             };
 
+            // Dispatch preflight (`plans/fix-repeating-gather-fail-loops.md` §3):
+            // gate the AnyEdible forage tile against live world state.
+            let plant_lookup_food = |e: Entity| -> Option<(PlantKind, GrowthStage)> {
+                plant_query.get(e).ok().map(|p| (p.kind, p.stage))
+            };
+            let item_lookup_food = |e: Entity| -> Option<(crate::economy::resource_catalog::ResourceId, u32)> {
+                item_query.get(e).ok().map(|gi| (gi.item.resource_id, gi.qty))
+            };
+            let gather_target_valid = match gather_target_tile {
+                None => true,
+                Some(t) => crate::simulation::gather::is_target_still_valid(
+                    t,
+                    MemoryKind::AnyEdible,
+                    &plant_map,
+                    plant_lookup_food,
+                    &chunk_map,
+                    &spatial_index,
+                    item_lookup_food,
+                ),
+            };
             let ctx = PlannerCtx {
                 scope: context_aware_scope(&calendar, needs),
                 tile: (cur_tx, cur_ty),
@@ -4315,6 +4357,7 @@ pub fn htn_acquire_food_dispatch_system(
                 claimed_blueprint: None,
                 claimed_blueprint_tile: None,
                 gather_target_tile,
+                gather_target_valid,
                 scavenge_target_entity,
                 scavenge_target_tile,
                 scavenge_food_good: None,
@@ -4592,7 +4635,12 @@ pub fn htn_acquire_food_dispatch_system(
                         actor,
                         suggested_expiry(now, (cur_tx, cur_ty), gather_tile),
                     );
-                    ai.active_gather_claim = Some((gather_tile, kind));
+                    ai.active_gather_claim = Some(gk.resolve_target(
+                        member.faction_id,
+                        viewer_household,
+                        gather_tile,
+                        kind,
+                    ));
                     aq.dispatch(Task::Gather { tile: gather_tile });
                 }
                 Task::Fish { spot_tile, .. } => {
@@ -4630,7 +4678,12 @@ pub fn htn_acquire_food_dispatch_system(
                         actor,
                         suggested_expiry(now, (cur_tx, cur_ty), spot_tile),
                     );
-                    ai.active_gather_claim = Some((spot_tile, kind));
+                    ai.active_gather_claim = Some(gk.resolve_target(
+                        member.faction_id,
+                        viewer_household,
+                        spot_tile,
+                        kind,
+                    ));
                     aq.dispatch(head);
                 }
                 _ => {
@@ -4965,6 +5018,31 @@ pub fn htn_acquire_good_dispatch_system(
                 } else {
                     ScoringScope::Geometric
                 };
+                // Dispatch preflight (`plans/fix-repeating-gather-fail-loops.md` §3):
+                // re-validate the picked tile against live world state. Stale tiles
+                // (felled tree, harvested grain, picked-up loose item) flunk and
+                // `GatherFromKnown` drops out of the partition, letting `Explore`
+                // win cleanly. (Cluster-side invalidation happens on the next
+                // gather attempt's failure path which holds `ResMut<SharedKnowledge>`;
+                // the precondition `false` short-circuits the dispatch this tick.)
+                let plant_lookup = |e: Entity| -> Option<(PlantKind, GrowthStage)> {
+                    gk.plant_q.get(e).ok().map(|p| (p.kind, p.stage))
+                };
+                let item_lookup = |e: Entity| -> Option<(crate::economy::resource_catalog::ResourceId, u32)> {
+                    item_query.get(e).ok().map(|gi| (gi.item.resource_id, gi.qty))
+                };
+                let gather_target_valid = match gather_target_tile {
+                    None => true,
+                    Some(t) => crate::simulation::gather::is_target_still_valid(
+                        t,
+                        memory_kind,
+                        &gk.plant_map,
+                        plant_lookup,
+                        &chunk_map,
+                        &spatial,
+                        item_lookup,
+                    ),
+                };
                 let ctx = PlannerCtx {
                     scope: scope_for_branch,
                     tile: (cur_tx, cur_ty),
@@ -4981,6 +5059,7 @@ pub fn htn_acquire_good_dispatch_system(
                     claimed_blueprint: None,
                     claimed_blueprint_tile: None,
                     gather_target_tile,
+                    gather_target_valid,
                     scavenge_target_entity,
                     scavenge_target_tile,
                     scavenge_food_good: None,
@@ -5067,7 +5146,12 @@ pub fn htn_acquire_good_dispatch_system(
                             actor,
                             suggested_expiry(now, (cur_tx, cur_ty), gather_tile),
                         );
-                        ai.active_gather_claim = Some((gather_tile, memory_kind));
+                        ai.active_gather_claim = Some(gk.resolve_target(
+                            member.faction_id,
+                            viewer_household,
+                            gather_tile,
+                            memory_kind,
+                        ));
                         aq.dispatch(Task::Gather { tile: gather_tile });
                     }
                     Task::Scavenge { target } => {
@@ -5369,6 +5453,7 @@ pub fn htn_acquire_good_dispatch_system(
             // method falls back to its prior storage-only signal).
             claimed_blueprint_tile: bp_query.get(blueprint).ok().map(|bp| bp.tile),
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -5787,6 +5872,27 @@ pub fn htn_stockpile_food_dispatch_system(
                 )
             });
 
+            // Dispatch preflight (`plans/fix-repeating-gather-fail-loops.md` §3):
+            // re-validate the picked tile against live world state.
+            let plant_lookup_sf = |e: Entity| -> Option<(PlantKind, GrowthStage)> {
+                plant_query.get(e).ok().map(|p| (p.kind, p.stage))
+            };
+            let item_lookup_sf = |e: Entity| -> Option<(crate::economy::resource_catalog::ResourceId, u32)> {
+                item_query.get(e).ok().map(|gi| (gi.item.resource_id, gi.qty))
+            };
+            let gather_target_valid = match gather_target_tile {
+                None => true,
+                Some(t) => crate::simulation::gather::is_target_still_valid(
+                    t,
+                    MemoryKind::AnyEdible,
+                    &plant_map,
+                    plant_lookup_sf,
+                    &chunk_map,
+                    &spatial_index,
+                    item_lookup_sf,
+                ),
+            };
+
             // Fishing system: nearest fishable water (ChunkMap-only scan),
             // populated only when the faction knows FISHING so
             // `FishForStorageMethod`'s `fish_spot_tile.is_some()` precondition
@@ -5822,6 +5928,7 @@ pub fn htn_stockpile_food_dispatch_system(
                 claimed_blueprint: None,
                 claimed_blueprint_tile: None,
                 gather_target_tile,
+                gather_target_valid,
                 scavenge_target_entity,
                 scavenge_target_tile,
                 scavenge_food_good,
@@ -6035,7 +6142,12 @@ pub fn htn_stockpile_food_dispatch_system(
                         actor,
                         suggested_expiry(now, (cur_tx, cur_ty), gather_tile),
                     );
-                    ai.active_gather_claim = Some((gather_tile, kind));
+                    ai.active_gather_claim = Some(gk.resolve_target(
+                        member.faction_id,
+                        viewer_household,
+                        gather_tile,
+                        kind,
+                    ));
                     aq.dispatch(Task::Gather { tile: gather_tile });
                 }
                 Task::Fish { spot_tile, .. } => {
@@ -6072,7 +6184,12 @@ pub fn htn_stockpile_food_dispatch_system(
                         actor,
                         suggested_expiry(now, (cur_tx, cur_ty), spot_tile),
                     );
-                    ai.active_gather_claim = Some((spot_tile, kind));
+                    ai.active_gather_claim = Some(gk.resolve_target(
+                        member.faction_id,
+                        viewer_household,
+                        spot_tile,
+                        kind,
+                    ));
                     aq.dispatch(head);
                 }
                 _ => {
@@ -6259,6 +6376,7 @@ pub fn htn_equip_hunting_spear_dispatch_system(
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -6469,6 +6587,7 @@ pub fn htn_scout_dispatch_system(
                 claimed_blueprint: None,
                 claimed_blueprint_tile: None,
                 gather_target_tile: None,
+            gather_target_valid: true,
                 scavenge_target_entity: None,
                 scavenge_target_tile: None,
                 scavenge_food_good: None,
@@ -6687,6 +6806,7 @@ pub fn htn_return_surplus_dispatch_system(
                 claimed_blueprint: None,
                 claimed_blueprint_tile: None,
                 gather_target_tile: None,
+            gather_target_valid: true,
                 scavenge_target_entity: None,
                 scavenge_target_tile: None,
                 // Reuses `scavenge_food_good` as the "food being deposited"
@@ -6936,6 +7056,7 @@ pub fn htn_tame_animal_dispatch_system(
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             // The `scavenge_target_*` ctx slots double as "any entity to walk
             // to and interact with" — the TameWildAnimalMethod reads them.
             scavenge_target_entity: Some(horse_entity),
@@ -7608,6 +7729,7 @@ pub fn htn_plant_from_storage_dispatch_system(
             // semantically "go work at this tile" matches the slot's existing
             // role in gather/forage chains.
             gather_target_tile: Some(plant_tile),
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -8222,6 +8344,11 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             claimed_blueprint: Some(bp_entity),
             claimed_blueprint_tile: Some((bp_tile.0, bp_tile.1)),
             gather_target_tile,
+            // Personal-blueprint gather chain: dispatcher hasn't run live
+            // preflight here, so default `true` and rely on the gather
+            // executor's failure path to invalidate. The chain is
+            // MF_UNINTERRUPTIBLE so it can't re-pick mid-run anyway.
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -8481,6 +8608,7 @@ pub fn htn_deliver_hunt_kill_dispatch_system(
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -8805,6 +8933,7 @@ pub fn htn_engage_prey_dispatch_system(
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -9069,6 +9198,7 @@ pub fn htn_join_hunt_party_dispatch_system(
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -9296,6 +9426,7 @@ pub fn htn_socialize_dispatch_system(
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: best.map(|(e, _)| e),
             scavenge_target_tile: best.map(|(_, t)| t),
             scavenge_food_good: None,
@@ -9552,6 +9683,7 @@ pub fn htn_combat_faction_dispatch_system(
             } else {
                 Some(dest)
             },
+            gather_target_valid: true,
             // RescueAlly carries (attacker_entity, attacker_tile) via the
             // scavenge slots — semantically "any entity to walk to".
             scavenge_target_entity: target_entity,
@@ -10065,6 +10197,7 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -10344,6 +10477,7 @@ pub fn htn_work_on_craft_order_dispatch_system(
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -10677,6 +10811,8 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: Some(grain_tile),
+            // Picker just validated `plant.stage == Mature` + grain kind.
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -10760,7 +10896,12 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
                     actor,
                     suggested_expiry(now, (cur_tx, cur_ty), tile),
                 );
-                ai.active_gather_claim = Some((tile, kind));
+                ai.active_gather_claim = Some(gk.resolve_target(
+                    member.faction_id,
+                    viewer_household,
+                    tile,
+                    kind,
+                ));
                 aq.dispatch(Task::Gather { tile });
             }
             _ => {
@@ -11024,6 +11165,7 @@ pub fn htn_harvest_plant_dispatch_system(
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: Some(plant_tile),
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -11743,6 +11885,7 @@ pub fn htn_play_dispatch_system(
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -12259,6 +12402,7 @@ mod tests {
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -12308,6 +12452,7 @@ mod tests {
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -12357,6 +12502,7 @@ mod tests {
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -12410,6 +12556,7 @@ mod tests {
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -12462,6 +12609,7 @@ mod tests {
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -12524,6 +12672,7 @@ mod tests {
             claimed_blueprint: blueprint,
             claimed_blueprint_tile: blueprint_tile,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -12886,6 +13035,7 @@ mod tests {
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: tile,
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -13063,6 +13213,7 @@ mod tests {
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: target,
             scavenge_target_tile: tile,
             scavenge_food_good: None,
@@ -13276,6 +13427,7 @@ mod tests {
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: target,
             scavenge_target_tile: tile,
             scavenge_food_good: None,
@@ -13526,6 +13678,7 @@ mod tests {
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: None,
             scavenge_target_tile: None,
             scavenge_food_good: None,
@@ -14201,6 +14354,7 @@ mod tests {
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: target,
             scavenge_target_tile: tile,
             scavenge_food_good: good,
@@ -14834,6 +14988,7 @@ mod tests {
             claimed_blueprint: None,
             claimed_blueprint_tile: None,
             gather_target_tile: None,
+            gather_target_valid: true,
             scavenge_target_entity: Some(Entity::from_raw(1)),
             scavenge_target_tile: Some((0, 0)),
             scavenge_food_good: None,

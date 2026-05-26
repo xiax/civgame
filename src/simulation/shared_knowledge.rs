@@ -36,6 +36,34 @@ pub const CLUSTER_DECAY_CADENCE: u64 = crate::world::seasons::TICKS_PER_DAY as u
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct ClusterId(pub u32);
 
+impl ClusterId {
+    /// Sentinel for "this `GatherTarget` was picked from a source that
+    /// doesn't have a cluster id" — e.g., the underfoot fast path or the
+    /// `CurrentVision` picker that returns a tile from live world state.
+    /// Failure paths that see this skip exact-cluster invalidation and
+    /// fall back to per-tier `invalidate_tile` over the actor's tier
+    /// set.
+    pub const UNKNOWN: ClusterId = ClusterId(u32::MAX);
+}
+
+/// Typed provenance for a single gather pick: the tile to walk to, the
+/// `MemoryKind` slot it was pulled from, and the `(tier, cluster_id)`
+/// pair that produced it. Threaded through `GatherClaim` /
+/// `PersonAI.active_gather_claim` / the gather executor failure paths so
+/// depletion writes target the *exact* cluster that emitted the tile —
+/// not whatever `cluster_at(tile)` finds today, which can drift with
+/// reps + merges. Also lets failure paths walk every tier and strip
+/// promoted reps, fixing the read/write asymmetry between
+/// `nearest_in_tier_set` (finest-first walk) and `report_depleted`
+/// (single-tier write).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GatherTarget {
+    pub tile: (i32, i32),
+    pub kind: MemoryKind,
+    pub source_tier: KnowledgeTier,
+    pub cluster_id: ClusterId,
+}
+
 /// Who can harvest a remembered resource without committing theft. Wild
 /// (default) means anyone; a stamped owner gates HTN dispatch through
 /// `is_accessible_to`. Theft / raiding is a separate goal that explicitly
@@ -545,6 +573,110 @@ impl SharedKnowledge {
         }
     }
 
+    /// Resolve `tile/kind` against the actor's `tier_set`, finest-first,
+    /// returning the first tier whose `cluster_at(tile)` succeeds. Used
+    /// by dispatchers that picked a tile from a live-world source
+    /// (underfoot / `CurrentVision`) to populate the typed
+    /// `GatherTarget.{source_tier, cluster_id}` slots so depletion can
+    /// still invalidate the exact cluster. Returns a `GatherTarget` with
+    /// `cluster_id = ClusterId::UNKNOWN` if no tier knows about the
+    /// tile — failure paths handle that by falling back to per-tier
+    /// `invalidate_tile`.
+    pub fn resolve_target(
+        &self,
+        tier_set: TierSet,
+        tile: (i32, i32),
+        kind: MemoryKind,
+    ) -> GatherTarget {
+        for tier in tier_set.tiers() {
+            if let Some(m) = self.tiers.get(&tier) {
+                if let Some(cid) = m.cluster_at(tile, kind) {
+                    return GatherTarget {
+                        tile,
+                        kind,
+                        source_tier: tier,
+                        cluster_id: cid,
+                    };
+                }
+            }
+        }
+        GatherTarget {
+            tile,
+            kind,
+            // Fall back to faction-tier so per-tier `invalidate_tile`
+            // walks at least one bucket even when no cluster currently
+            // claims the tile.
+            source_tier: KnowledgeTier::Faction(tier_set.faction),
+            cluster_id: ClusterId::UNKNOWN,
+        }
+    }
+
+    /// Exact-tile invalidation. Drops `tile` from the rep buffer of the
+    /// cluster of `kind` at `tier` (if any), decrements `estimated_count`,
+    /// despawns the cluster if it hits zero. Unlike `report_depleted`,
+    /// this is a no-op when no cluster of the given `kind` claims the
+    /// tile — i.e., it does NOT call `cluster_at` and is safe for
+    /// callers that already know the cluster id (it still goes through
+    /// the tier's index for symmetry but ignores tiles that don't map).
+    pub fn invalidate_tile(&mut self, tier: KnowledgeTier, kind: MemoryKind, tile: (i32, i32)) {
+        self.report_depleted(tier, tile, kind);
+    }
+
+    /// Walk every tier in `tier_set` and invalidate `tile/kind`.
+    /// Symmetric counterpart to `nearest_in_tier_set`: where the reader
+    /// walks finest-first across all three tiers, the writer must clear
+    /// any rep that the reader could have picked up. Used by gather
+    /// failure paths whose stored `GatherTarget.cluster_id ==
+    /// ClusterId::UNKNOWN` (i.e. the pick came from a live-world
+    /// source, no specific cluster id available).
+    pub fn invalidate_tile_across_tier_set(
+        &mut self,
+        tier_set: TierSet,
+        kind: MemoryKind,
+        tile: (i32, i32),
+    ) {
+        for tier in tier_set.tiers() {
+            self.report_depleted(tier, tile, kind);
+        }
+    }
+
+    /// Exact-cluster invalidation across every tier the cluster was
+    /// promoted into. Walks `self.tiers` and despawns the cluster from
+    /// each map that holds it. Used by gather-failure paths so a tile
+    /// invalidation can't leave a stale Faction/Settlement rep that
+    /// the next read picks up (the read/write asymmetry root cause).
+    pub fn invalidate_cluster(&mut self, cluster_id: ClusterId) {
+        for m in self.tiers.values_mut() {
+            if let Some(c) = m.clusters.remove(&cluster_id) {
+                m.remove_from_indices(&c);
+            }
+        }
+    }
+
+    /// Partial-depletion variant: shrink `estimated_count` by `by` on
+    /// every tier that holds `cluster_id`; despawn the cluster from any
+    /// tier whose count reaches zero. Doesn't touch rep tiles — callers
+    /// that want exact-tile semantics should use `invalidate_tile`.
+    pub fn decrement_cluster(&mut self, cluster_id: ClusterId, by: u32) {
+        let by_u16 = by.min(u16::MAX as u32) as u16;
+        let mut to_evict: Vec<(KnowledgeTier, ClusterId)> = Vec::new();
+        for (tier, m) in self.tiers.iter_mut() {
+            if let Some(c) = m.clusters.get_mut(&cluster_id) {
+                c.estimated_count = c.estimated_count.saturating_sub(by_u16);
+                if c.estimated_count == 0 {
+                    to_evict.push((*tier, cluster_id));
+                }
+            }
+        }
+        for (tier, cid) in to_evict {
+            if let Some(m) = self.tiers.get_mut(&tier) {
+                if let Some(c) = m.clusters.remove(&cid) {
+                    m.remove_from_indices(&c);
+                }
+            }
+        }
+    }
+
     /// Record that `tile` no longer holds `kind` (harvested, depleted, etc.).
     /// Decrements the containing cluster's `estimated_count`; when the count
     /// hits zero, despawns the cluster from every index.
@@ -674,19 +806,29 @@ impl SharedKnowledge {
 /// shared-knowledge lookups. Collapses three params into one so dispatchers
 /// don't trip Bevy's 16-param ceiling on already-large `Query` lists.
 #[derive(SystemParam)]
-pub struct GatherKnowledge<'w> {
+pub struct GatherKnowledge<'w, 's> {
     pub shared: Res<'w, SharedKnowledge>,
     pub settlement_map: Res<'w, crate::simulation::settlement::SettlementMap>,
     pub claims: Res<'w, crate::simulation::gather_claims::GatherClaims>,
     pub chunk_router: Res<'w, crate::pathfinding::chunk_router::ChunkRouter>,
     pub chunk_graph: Res<'w, crate::pathfinding::chunk_graph::ChunkGraph>,
     pub chunk_map: Res<'w, crate::world::chunk::ChunkMap>,
+    /// Dispatch preflight for `is_target_still_valid`
+    /// (`plans/fix-repeating-gather-fail-loops.md` §3). Bundled here so
+    /// large dispatchers don't bust Bevy's 16-param ceiling.
+    pub plant_map: Res<'w, crate::simulation::plants::PlantMap>,
+    pub plant_q: Query<'w, 's, &'static crate::simulation::plants::Plant>,
 }
 
-impl<'w> GatherKnowledge<'w> {
+impl<'w, 's> GatherKnowledge<'w, 's> {
     /// Convenience: nearest accessible cluster's target tile for an agent
     /// described by `(actor, faction_id, household_id)`. Wraps tier-set
     /// resolution + owner filter + claim-pressure penalty.
+    ///
+    /// Legacy shape returning just the tile — preserved for read-only
+    /// callers (existence checks, etc.). New dispatchers that need to
+    /// stamp a typed `GatherTarget` on `PersonAI.active_gather_claim`
+    /// should call `nearest_target(..)` instead.
     pub fn nearest_target_tile(
         &self,
         actor: Entity,
@@ -736,6 +878,78 @@ impl<'w> GatherKnowledge<'w> {
                 16,
             )
             .map(|(_, _, tile)| tile)
+    }
+
+    /// Resolve a tile picked from a live-world source (underfoot fast
+    /// path or `CurrentVision`) to a typed `GatherTarget` so the gather
+    /// executor's failure paths can invalidate the matching cluster.
+    /// Walks the actor's tier-set finest-first via
+    /// `SharedKnowledge::resolve_target`; returns `ClusterId::UNKNOWN`
+    /// when no tier knows about the tile.
+    pub fn resolve_target(
+        &self,
+        faction_id: u32,
+        household_id: Option<u32>,
+        tile: (i32, i32),
+        kind: MemoryKind,
+    ) -> GatherTarget {
+        let tier_set = agent_tier_set(faction_id, household_id, &self.settlement_map);
+        self.shared.resolve_target(tier_set, tile, kind)
+    }
+
+    /// Same shape as `nearest_target_tile` but returns the full typed
+    /// `GatherTarget { tile, kind, source_tier, cluster_id }`. Used by
+    /// every dispatcher that stamps `ai.active_gather_claim` so the
+    /// gather executor's failure paths can invalidate the *exact*
+    /// cluster that produced the pick, regardless of how reps drift
+    /// in the meantime.
+    pub fn nearest_target(
+        &self,
+        actor: Entity,
+        faction_id: u32,
+        household_id: Option<u32>,
+        kind: MemoryKind,
+        from: (i32, i32),
+        agent_z: i8,
+        now: u64,
+    ) -> Option<GatherTarget> {
+        let tier_set = agent_tier_set(faction_id, household_id, &self.settlement_map);
+        let viewer_settlement = self.settlement_map.first_for_faction(faction_id);
+        let owner_filter = move |o: ResourceOwner| {
+            o.is_accessible_to(actor, household_id, viewer_settlement, faction_id)
+        };
+        let claim_pen = |t: (i32, i32)| self.claims.pressure(t, now, actor) * 4;
+        let cluster_filter = |c: &ResourceCluster| {
+            !self.claims.cluster_is_saturated(
+                c.representative_tiles.iter().filter_map(|s| *s),
+                now,
+                actor,
+            )
+        };
+        let est = crate::pathfinding::detour::DetourEstimator::new(
+            &self.chunk_router,
+            &self.chunk_graph,
+        );
+        let z_of =
+            |t: (i32, i32)| self.chunk_map.nearest_standable_z(t.0, t.1, agent_z as i32) as i8;
+        let dist = est.from(from, agent_z, z_of);
+        self.shared
+            .nearest_in_tier_set_with_cluster_filter(
+                tier_set,
+                kind,
+                from,
+                owner_filter,
+                claim_pen,
+                cluster_filter,
+                &dist,
+                16,
+            )
+            .map(|(tier, cluster_id, tile)| GatherTarget {
+                tile,
+                kind,
+                source_tier: tier,
+                cluster_id,
+            })
     }
 }
 

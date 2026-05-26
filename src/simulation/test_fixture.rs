@@ -217,6 +217,36 @@ impl TestSim {
         );
     }
 
+    /// Spawn a real mature `Plant` entity at `tile` and register it in
+    /// `PlantMap`. Used by gather tests that need the dispatch preflight
+    /// (`gather::is_target_still_valid`, plans/fix-repeating-gather-fail-loops.md
+    /// §3) to validate the sighting against live world state. Without a
+    /// backing Plant the preflight returns `false` and the dispatcher
+    /// falls through to `Explore`.
+    pub fn spawn_mature_plant(
+        &mut self,
+        tile: (i32, i32),
+        kind: crate::simulation::plants::PlantKind,
+    ) -> bevy::prelude::Entity {
+        use crate::simulation::plants::{GrowthStage, Plant, PlantMap};
+        let entity = self
+            .app
+            .world_mut()
+            .spawn(Plant {
+                kind,
+                stage: GrowthStage::Mature,
+                growth: 0,
+                tile_pos: tile,
+            })
+            .id();
+        self.app
+            .world_mut()
+            .resource_mut::<PlantMap>()
+            .0
+            .insert(tile, entity);
+        entity
+    }
+
     /// Insert a flat patch of `kind`-tiles at `surface_z` covering
     /// chunks `[(-radius, -radius)..=(radius, radius)]` (inclusive).
     pub fn flat_world(&mut self, radius: i32, surface_z: i8, kind: TileKind) {
@@ -11294,6 +11324,11 @@ mod baseline_behaviour {
             *goal = AgentGoal::GatherWood;
         }
         sim.inject_faction_sighting(sim.player_faction_id, memory_tile, MemoryKind::wood());
+        // Back the sighting with a real mature Tree entity so the dispatch
+        // preflight (`gather::is_target_still_valid`,
+        // `plans/fix-repeating-gather-fail-loops.md` §3) validates against
+        // live world state and the gather method stays in the partition.
+        sim.spawn_mature_plant(memory_tile, crate::simulation::plants::PlantKind::Tree);
 
         // Two ticks: ParallelA's `goal_update_system` skips (JobClaim
         // present), Economy's `job_goal_lock_system` confirms goal as
@@ -11383,6 +11418,11 @@ mod baseline_behaviour {
         let cluster_b = (-40, 0);
         sim.inject_faction_sighting(sim.player_faction_id, cluster_a, MemoryKind::wood());
         sim.inject_faction_sighting(sim.player_faction_id, cluster_b, MemoryKind::wood());
+        // Back both sightings with real mature Tree entities so the
+        // dispatch preflight (`is_target_still_valid`) doesn't drop the
+        // method out of the partition.
+        sim.spawn_mature_plant(cluster_a, crate::simulation::plants::PlantKind::Tree);
+        sim.spawn_mature_plant(cluster_b, crate::simulation::plants::PlantKind::Tree);
 
         // Pre-stake a claim on cluster_b owned by a sentinel entity (the
         // chief stand-in here — `pressure` excludes only the viewer's own
@@ -14762,7 +14802,7 @@ mod baseline_behaviour {
                     .world()
                     .get::<crate::simulation::person::PersonAI>(worker)
                     .and_then(|ai| ai.active_gather_claim)
-                    .map(|(t, _)| t == primary_tile)
+                    .map(|target| target.tile == primary_tile)
                     .unwrap_or(false);
                 if claimed {
                     sim.app.world_mut().despawn(primary_entity);

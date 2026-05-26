@@ -107,6 +107,97 @@ pub const P6B_RETARGET_RADIUS: i32 = 2;
 /// `MemoryKind → PlantKind` filter.  `AnyEdible` admits Grain | BerryBush;
 /// `Resource(WOOD)` admits Tree; everything else returns `None`
 /// (Resource(STONE) lives on the tile branch, not the plant branch).
+/// Dispatch-time validator (`plans/fix-repeating-gather-fail-loops.md` §3).
+/// Returns `true` iff the picked tile still resolves to a live, harvestable
+/// resource of the expected kind in the current world.
+///
+/// Wood → mature `Tree` (or any tree if axe-less — deadwood is gatherable).
+/// AnyEdible → mature `BerryBush`/`Grain`, or edible `GroundItem` on tile.
+/// `MemoryKind::Resource(rid)` → tile actually carries that resource (mature
+///   plant whose harvest yield matches, or `GroundItem` of the rid).
+/// `MemoryKind::stone()` → tile is currently `is_stone_like()` / `Wall` /
+///   `Ore` and reachable at the expected Z.
+///
+/// On `false`, dispatcher invalidates via the §1/§2 APIs and drops the
+/// concrete from the partition; the fallback `Explore` then wins cleanly.
+pub fn is_target_still_valid(
+    tile: (i32, i32),
+    kind: MemoryKind,
+    plant_map: &PlantMap,
+    plant_lookup: impl Fn(Entity) -> Option<(PlantKind, GrowthStage)>,
+    chunk_map: &ChunkMap,
+    spatial_index: &crate::world::spatial::SpatialIndex,
+    ground_item_lookup: impl Fn(Entity) -> Option<(ResourceId, u32)>,
+) -> bool {
+    let wood = MemoryKind::wood();
+    let stone = MemoryKind::stone();
+
+    let plant_kind_ok = |pk: PlantKind, expected: MemoryKind| -> bool {
+        if expected == MemoryKind::AnyEdible {
+            matches!(pk, PlantKind::Grain | PlantKind::BerryBush)
+        } else if expected == wood {
+            matches!(pk, PlantKind::Tree)
+        } else if let MemoryKind::Resource(rid) = expected {
+            let (yid, _) = pk.harvest_yield(false);
+            yid == rid
+        } else {
+            false
+        }
+    };
+
+    // Plant slot.
+    if let Some(&entity) = plant_map.0.get(&tile) {
+        if let Some((pk, stage)) = plant_lookup(entity) {
+            if plant_kind_ok(pk, kind) {
+                // Tree-on-no-Axe still validates: we'd switch to deadwood,
+                // not bounce the chain.
+                if pk == PlantKind::Tree {
+                    return true;
+                }
+                if stage == GrowthStage::Mature {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Ground-item slot (edible scavenge or named resource). Iterate the
+    // tile's spatial entry and filter via the caller's GroundItem closure.
+    if matches!(kind, MemoryKind::AnyEdible) || matches!(kind, MemoryKind::Resource(_)) {
+        for &entity in spatial_index.get(tile.0, tile.1) {
+            if let Some((rid, qty)) = ground_item_lookup(entity) {
+                if qty == 0 {
+                    continue;
+                }
+                match kind {
+                    MemoryKind::AnyEdible => {
+                        if rid.is_edible() {
+                            return true;
+                        }
+                    }
+                    MemoryKind::Resource(want) => {
+                        if rid == want {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Stone / Wall / Ore tile slot.
+    if kind == stone {
+        if let Some(tk) = chunk_map.tile_kind_at(tile.0, tile.1) {
+            if matches!(tk, TileKind::Wall | TileKind::Ore) || tk.is_stone_like() {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 fn retarget_neighbor(
     plant_map: &PlantMap,
     plant_query: &Query<(
@@ -216,6 +307,9 @@ pub struct GatherRoutingResources<'w, 's> {
     pub excavation_map: ResMut<'w, crate::simulation::excavation::ExcavationMap>,
     /// Emitted only at level-7 finalize; `aquifer_seep_emitter_system` reads it.
     pub tile_carved: EventWriter<'w, crate::world::chunk_streaming::TileCarvedEvent>,
+    /// Threaded through to `agent_tier_set` for symmetric depletion in
+    /// the failure paths (`plans/fix-repeating-gather-fail-loops.md`).
+    pub settlement_map: Res<'w, crate::simulation::settlement::SettlementMap>,
 }
 
 /// Phase 5c-ii-c-ii chain handoff: called by every `gather_system` exit path
@@ -453,7 +547,6 @@ pub fn gather_system(
         Option<&crate::simulation::tools::ToolKit>,
     )>,
 ) {
-    use crate::simulation::shared_knowledge::KnowledgeTier;
     for (
         actor,
         mut ai,
@@ -475,13 +568,14 @@ pub fn gather_system(
         // Resolve the finest tier the agent writes to — same rule as
         // `vision_system`. Depletion writes only to this tier; gossip
         // propagation handles settlement / faction visibility.
-        let agent_tier = if let Some(hm) = household_member {
-            KnowledgeTier::Household(hm.household_id)
-        } else if let Some(fm) = faction_member {
-            KnowledgeTier::Faction(fm.faction_id)
-        } else {
-            KnowledgeTier::Faction(0)
-        };
+        // Depletion writes use the full tier-set (Household → Settlement →
+        // Faction). Symmetric with `nearest_in_tier_set`'s finest-first
+        // walk so a worker can't read a faction-tier rep it just emptied.
+        let agent_tiers = crate::simulation::shared_knowledge::agent_tier_set(
+            faction_member.map(|fm| fm.faction_id).unwrap_or(0),
+            household_member.map(|hm| hm.household_id),
+            &routing.settlement_map,
+        );
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -529,7 +623,9 @@ pub fn gather_system(
                 let cooldown_ok =
                     clock.tick.saturating_sub(ai.last_retarget_tick) >= P6B_RETARGET_COOLDOWN;
                 if cooldown_ok {
-                    if let Some((claim_tile, claim_kind)) = ai.active_gather_claim {
+                    if let Some(claim_target) = ai.active_gather_claim {
+                        let claim_tile = claim_target.tile;
+                        let claim_kind = claim_target.kind;
                         if let Some((new_tile, _new_entity)) = retarget_neighbor(
                             &plant_map,
                             &plant_query,
@@ -571,14 +667,31 @@ pub fn gather_system(
                                 routing
                                     .gather_claims
                                     .add(new_tile, claim_kind, actor, expires);
-                                ai.active_gather_claim = Some((new_tile, claim_kind));
+                                // Preserve the original source_tier +
+                                // cluster_id so failure invalidation
+                                // still walks the right cluster after a
+                                // P6b retarget.
+                                ai.active_gather_claim =
+                                    Some(crate::simulation::shared_knowledge::GatherTarget {
+                                        tile: new_tile,
+                                        kind: claim_kind,
+                                        source_tier: claim_target.source_tier,
+                                        cluster_id: claim_target.cluster_id,
+                                    });
                                 ai.last_retarget_tick = clock.tick;
                                 ai.work_progress = 0;
                                 aq.current = Task::Gather { tile: new_tile };
                                 // Prune the now-stale cluster entry so subsequent
-                                // dispatches don't re-pick it.
+                                // dispatches don't re-pick it. Symmetric depletion:
+                                // walk every tier the cluster could have been
+                                // promoted into so a finer-tier strip doesn't
+                                // leave a stale faction-tier rep.
                                 if !plant_map.0.contains_key(&(tx, ty)) {
-                                    shared.report_depleted(agent_tier, (tx, ty), claim_kind);
+                                    shared.invalidate_tile_across_tier_set(
+                                        agent_tiers,
+                                        claim_kind,
+                                        (tx, ty),
+                                    );
                                 }
                                 continue;
                             }
@@ -587,18 +700,42 @@ pub fn gather_system(
                 }
 
                 // Fall through: no neighbor / cooldown / no active claim.
-                // Original behavior — push FailedTarget + finish_gather.
+                // Push FailedTarget + finish_gather.
+                //
+                // Symmetric depletion (plans/fix-repeating-gather-fail-loops.md
+                // §2): the reader walks Household → Settlement → Faction
+                // finest-first, so the writer must clear every tier the
+                // cluster was promoted into. Two paths:
+                //   1) `active_gather_claim` carries a concrete cluster id
+                //      (`cluster_id != UNKNOWN`): invalidate the whole
+                //      cluster across all tiers in one shot.
+                //   2) No concrete id (live-world pick from underfoot /
+                //      vision): walk the agent's tier-set and clear the
+                //      tile via per-tier `invalidate_tile`.
                 let stale_plant_kind = plant_query.get(entity).ok().map(|(p, _)| p.kind);
-                if plant_query.get(entity).is_err() {
+                let plant_gone = plant_query.get(entity).is_err();
+                if plant_gone {
                     plant_map.0.remove(&(tx, ty));
-                    shared.report_depleted(agent_tier, (tx, ty), MemoryKind::AnyEdible);
-                    shared.report_depleted(agent_tier, (tx, ty), MemoryKind::wood());
+                }
+                let mut depleted_kinds: [Option<MemoryKind>; 2] = [None, None];
+                if plant_gone {
+                    depleted_kinds[0] = Some(MemoryKind::AnyEdible);
+                    depleted_kinds[1] = Some(MemoryKind::wood());
                 } else if let Some(k) = stale_plant_kind {
-                    let kind = match k {
+                    depleted_kinds[0] = Some(match k {
                         PlantKind::BerryBush | PlantKind::Grain => MemoryKind::AnyEdible,
                         PlantKind::Tree => MemoryKind::wood(),
-                    };
-                    shared.report_depleted(agent_tier, (tx, ty), kind);
+                    });
+                }
+                if let Some(target) = ai.active_gather_claim {
+                    if target.cluster_id
+                        != crate::simulation::shared_knowledge::ClusterId::UNKNOWN
+                    {
+                        shared.invalidate_cluster(target.cluster_id);
+                    }
+                }
+                for kind in depleted_kinds.iter().flatten() {
+                    shared.invalidate_tile_across_tier_set(agent_tiers, *kind, (tx, ty));
                 }
                 if let Some(method_id) = ai.active_method.take() {
                     method_history.push(method_id, MethodOutcome::FailedTarget, clock.tick);
@@ -832,11 +969,13 @@ pub fn gather_system(
                 );
                 // Depletion: a despawning harvest removes the resource from
                 // the cluster's accounting so other agents stop routing here.
+                // Symmetric strip across Household → Settlement → Faction so
+                // the worker can't read a faction-tier rep it just emptied.
                 let depleted_kind = match kind {
                     PlantKind::BerryBush | PlantKind::Grain => MemoryKind::AnyEdible,
                     PlantKind::Tree => MemoryKind::wood(),
                 };
-                shared.report_depleted(agent_tier, (tx, ty), depleted_kind);
+                shared.invalidate_tile_across_tier_set(agent_tiers, depleted_kind, (tx, ty));
             } else if tree_fell_blocked {
                 // No-Axe deadwood collection — leave the tree standing and
                 // Mature so it can be properly felled later. The cluster
@@ -848,7 +987,7 @@ pub fn gather_system(
                     PlantKind::BerryBush | PlantKind::Grain => MemoryKind::AnyEdible,
                     PlantKind::Tree => MemoryKind::wood(),
                 };
-                shared.report_depleted(agent_tier, (tx, ty), depleted_kind);
+                shared.invalidate_tile_across_tier_set(agent_tiers, depleted_kind, (tx, ty));
             }
 
             // Seasonal-farming jellyfish: credit an Autumn `FieldWork`
@@ -1120,10 +1259,18 @@ pub fn gather_system(
                     );
                 }
             } else {
-                // Not a stone/wall tile and not a plant -> target is invalid or already harvested
-                shared.report_depleted(agent_tier, (tx, ty), MemoryKind::stone());
-                shared.report_depleted(agent_tier, (tx, ty), MemoryKind::AnyEdible);
-                shared.report_depleted(agent_tier, (tx, ty), MemoryKind::wood());
+                // Not a stone/wall tile and not a plant -> target is invalid or already harvested.
+                // Symmetric strip so a faction-tier rep doesn't survive a fine-tier-only write.
+                shared.invalidate_tile_across_tier_set(agent_tiers, MemoryKind::stone(), (tx, ty));
+                shared.invalidate_tile_across_tier_set(agent_tiers, MemoryKind::AnyEdible, (tx, ty));
+                shared.invalidate_tile_across_tier_set(agent_tiers, MemoryKind::wood(), (tx, ty));
+                if let Some(target) = ai.active_gather_claim {
+                    if target.cluster_id
+                        != crate::simulation::shared_knowledge::ClusterId::UNKNOWN
+                    {
+                        shared.invalidate_cluster(target.cluster_id);
+                    }
+                }
                 if let Some(method_id) = ai.active_method.take() {
                     method_history.push(method_id, MethodOutcome::FailedTarget, clock.tick);
                 }

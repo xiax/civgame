@@ -779,6 +779,10 @@ pub fn movement_system(
                         // different candidate. For player Move arrivals
                         // (UNEMPLOYED task kind) keep the legacy Idle drop
                         // so `PlayerOrder` teardown can reap `Commanded`.
+                        // For live non-adjacent typed tasks (Sleep, Eat,
+                        // Migrate, …) `assert_idle` would panic on the
+                        // typed-task invariant — treat as routing failure
+                        // and `cancel_chain`.
                         stand_reservations.release_for_worker(entity);
                         if is_adjacent_task {
                             goal_contract::blocked(
@@ -789,8 +793,11 @@ pub fn movement_system(
                                 BlockedReason::NoAdjacentStandTile,
                             );
                             aq.cancel_chain(&mut ai);
-                        } else {
+                        } else if aq.current_task_kind() == UNEMPLOYED_TASK_KIND {
                             aq.assert_idle(&mut ai);
+                        } else {
+                            record_routing_failure(&mut history, &mut ai, now);
+                            aq.cancel_chain(&mut ai);
                         }
                         pf.status = FollowStatus::Idle;
                         pf.segment_path.clear();
@@ -1279,6 +1286,99 @@ mod tests {
         // would silently re-run the dead Sleep task.
         assert!(matches!(aq.current, Task::Idle), "current must reset to Idle");
         assert_eq!(ai.state, AiState::Idle, "PersonAI state must reset to Idle");
+    }
+
+    /// Regression for `plans/sleep-arrival-panic.md`: the
+    /// `!bumped && !is_adjacent_task` arm of `movement_system`'s
+    /// arrival-collision recovery used to call `aq.assert_idle(&mut ai)`
+    /// unconditionally, which `debug_assert!`s on `current == Task::Idle`.
+    /// An agent arriving at a blocked bed tile with a live
+    /// `Task::Sleep { bed: Some(_) }` (or any non-adjacent typed task)
+    /// therefore panicked. The fix splits the arm by task kind: live typed
+    /// tasks go through `record_routing_failure + aq.cancel_chain`. This
+    /// test exercises that exact cancel sequence and asserts no panic +
+    /// FailedRouting telemetry + clean Idle queue state.
+    #[test]
+    fn sleep_arrival_cancel_records_failed_routing() {
+        let mut ai = PersonAI {
+            state: AiState::Seeking,
+            active_method: Some(MethodId::SLEEP),
+            target_tile: (3, 4),
+            dest_tile: (3, 4),
+            current_z: 0,
+            target_z: 0,
+            ..Default::default()
+        };
+        let mut aq = ActionQueue::idle();
+        aq.dispatch(Task::Sleep { bed: None });
+        assert!(
+            matches!(aq.current, Task::Sleep { .. }),
+            "precondition: queue holds Sleep task — the panicking shape",
+        );
+
+        let mut history = MethodHistory::default();
+        let now: u64 = 99;
+
+        // Mirror the new arm in `movement_system`:
+        //   record_routing_failure(&mut history, &mut ai, now);
+        //   aq.cancel_chain(&mut ai);
+        // Crucially, this must NOT panic — the prior code's `assert_idle`
+        // here would `debug_assert!` because `current != Task::Idle`.
+        record_routing_failure(&mut history, &mut ai, now);
+        aq.cancel_chain(&mut ai);
+
+        assert!(
+            ai.active_method.is_none(),
+            "record_routing_failure must take active_method to prevent phantom Success",
+        );
+        let mut found = false;
+        for slot in history.entries.iter() {
+            if let Some((mid, outcome, tick)) = slot {
+                if *mid == MethodId::SLEEP {
+                    assert_eq!(*outcome, MethodOutcome::FailedRouting);
+                    assert_eq!(*tick, now);
+                    found = true;
+                }
+            }
+        }
+        assert!(
+            found,
+            "MethodHistory missing FailedRouting entry for cancelled SLEEP method",
+        );
+        assert!(
+            matches!(aq.current, Task::Idle),
+            "cancel_chain must reset current to Idle",
+        );
+        assert_eq!(
+            ai.state,
+            AiState::Idle,
+            "cancel_chain must atomically reset ai.state to Idle",
+        );
+    }
+
+    /// The taskless arrival arm (player `Move` order, `UNEMPLOYED_TASK_KIND`)
+    /// must still go through `aq.assert_idle` so `PlayerOrder` teardown can
+    /// reap `Commanded`. Verify the precondition holds for the legacy path.
+    #[test]
+    fn taskless_arrival_keeps_assert_idle() {
+        let mut ai = PersonAI {
+            state: AiState::Seeking,
+            active_method: None,
+            ..Default::default()
+        };
+        let aq = ActionQueue::idle();
+        // `current == Task::Idle` is the precondition for `assert_idle`.
+        // `current_task_kind() == UNEMPLOYED_TASK_KIND` is what the new arm
+        // checks to select this branch.
+        assert!(matches!(aq.current, Task::Idle));
+        assert_eq!(
+            aq.current_task_kind(),
+            crate::simulation::person::UNEMPLOYED_TASK_KIND,
+        );
+
+        // Must not panic.
+        aq.assert_idle(&mut ai);
+        assert_eq!(ai.state, AiState::Idle);
     }
 }
 

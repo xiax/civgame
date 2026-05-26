@@ -4417,6 +4417,11 @@ pub fn job_claim_system(
             // pass; missing component falls back to the neutral 1.5×
             // median (matching `Disposition::default()`).
             Option<&crate::simulation::goal_scorers::Disposition>,
+            // §4: skip postings whose mapped goal is on cooldown for
+            // this worker (`plans/fix-repeating-gather-fail-loops.md`).
+            // `Option<&_>` so workers with no cooldown component still
+            // claim normally.
+            Option<&crate::simulation::goals::GoalCooldown>,
         ),
         Without<JobClaim>,
     >,
@@ -4458,6 +4463,7 @@ pub fn job_claim_system(
         knowledge_opt,
         agent_econ,
         disposition_opt,
+        goal_cooldown_opt,
     ) in workers.iter()
     {
         if *lod == LodLevel::Dormant {
@@ -4567,6 +4573,16 @@ pub fn job_claim_system(
             // Skip postings that completed but haven't been removed yet.
             if p.progress.is_complete() {
                 continue;
+            }
+            // §4: skip postings whose mapped goal is on cooldown for this
+            // worker (`plans/fix-repeating-gather-fail-loops.md`). Set by
+            // `job_claim_release_system` when `fail_count >= MAX_FAIL_COUNT`
+            // — keeps a stuck worker from re-claiming the same posting on
+            // the very next sweep.
+            if let Some(cooldown) = goal_cooldown_opt {
+                if cooldown.is_active(posting_goal(p), clock.tick) {
+                    continue;
+                }
             }
             // Farm-planner §9: plot-scoped Farm postings restrict claiming
             // to the assigned farmer entity. Anyone else fails this gate
@@ -5151,6 +5167,15 @@ const RELEASE_SWEEP_INTERVAL: u64 = 60;
 const STUCK_FAIL_INTERVAL: u64 = 180;
 const MAX_FAIL_COUNT: u8 = 3;
 
+/// `GoalCooldown` window stamped when a `JobClaim` is released at
+/// `fail_count >= MAX_FAIL_COUNT` (`plans/fix-repeating-gather-fail-loops.md` §4).
+/// Prevents the worker re-claiming the same posting next sweep — they
+/// have to pick a different goal until the cooldown elapses. 600 ticks
+/// ≈ 30 s at 20 Hz fixed update; long enough for cluster knowledge to
+/// reshape but short enough not to strand a faction with one stale
+/// posting.
+pub const JOB_CLAIM_BACKOFF_TICKS: u64 = 600;
+
 /// Process external `JobBoardCommand` events (UI / scripted overrides). Posts
 /// new postings, cancels existing ones (releasing claimants), and updates
 /// priority. Player-sourced postings supersede a Chief posting on the same
@@ -5278,6 +5303,7 @@ pub fn job_claim_release_system(
         &PersonAI,
         &crate::simulation::typed_task::ActionQueue,
         &mut JobClaim,
+        Option<&mut crate::simulation::goals::GoalCooldown>,
     )>,
     entities: &Entities,
 ) {
@@ -5333,7 +5359,7 @@ pub fn job_claim_release_system(
     // than STUCK_FAIL_INTERVAL since the claim was posted have their
     // fail_count incremented; once they hit MAX_FAIL_COUNT the claim is
     // released so the worker can pick something else.
-    for (worker, goal, _ai, aq, mut claim) in workers.iter_mut() {
+    for (worker, goal, _ai, aq, mut claim, mut cooldown_opt) in workers.iter_mut() {
         if is_maintenance_goal(*goal) {
             continue;
         }
@@ -5348,6 +5374,21 @@ pub fn job_claim_release_system(
         claim.posted_tick = now;
         if claim.fail_count >= MAX_FAIL_COUNT {
             let job_id = claim.job_id;
+            // §4: stamp `GoalCooldown` on the claim's mapped goal so
+            // the worker can't re-claim the same posting next sweep.
+            // `posting_goal` maps `JobKind` → `AgentGoal` (Stockpile →
+            // GatherFood, Plow → Farm, etc.).
+            if let Some((fid, idx)) = board.locate(job_id) {
+                let posting = &board.postings.get(&fid).unwrap()[idx];
+                let cooldown_goal = posting_goal(posting);
+                if let Some(ref mut cooldown) = cooldown_opt {
+                    cooldown.push(cooldown_goal, clock.tick + JOB_CLAIM_BACKOFF_TICKS);
+                } else {
+                    let mut fresh = crate::simulation::goals::GoalCooldown::default();
+                    fresh.push(cooldown_goal, clock.tick + JOB_CLAIM_BACKOFF_TICKS);
+                    commands.entity(worker).insert(fresh);
+                }
+            }
             commands.entity(worker).remove::<JobClaim>();
             commands.entity(worker).remove::<ClaimTarget>();
             release_claimant(&mut board, job_id, worker);

@@ -253,7 +253,10 @@ pub struct PersonAI {
     /// dispatchers when picking a gather/scavenge target tile from
     /// `SharedKnowledge`, cleared by gather/scavenge finish helpers via
     /// `release_gather_claim`. `None` when no gather chain is in flight.
-    pub active_gather_claim: Option<((i32, i32), crate::simulation::memory::MemoryKind)>,
+    /// Carries the full typed `GatherTarget` (tile + kind + source tier +
+    /// cluster id) so failure paths can invalidate the *exact* cluster
+    /// that produced the pick, across every tier it was promoted into.
+    pub active_gather_claim: Option<crate::simulation::shared_knowledge::GatherTarget>,
     /// Last tick `gather_system` re-targeted this agent's `Task::Gather` to a
     /// neighboring tile after arriving to find the original plant despawned
     /// or immature (P6b). Throttles retargeting to one swap per ~40 ticks so
