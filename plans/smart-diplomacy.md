@@ -14,7 +14,7 @@ This plan turns that scalar-threshold AI into a utility-driven engine that perce
 - Trespass classification depends on the intruder's *role* (trader, nomad, soldier), not only treaty state.
 - Player-facing surface (proposal cards, accept/reject, panel labels) stays clear: AI's deal labels (`Fair`, `Generous`, `HardBargain`, `Exploitative`) are visible.
 
-## Phase 1 — Utility evaluator + non-omniscient contact book (single-term deals only)
+## Phase 1 — Utility evaluator + non-omniscient contact book (single-term deals only) — **SHIPPED 2026-05-26**
 
 P1 keeps the existing 6 `DiplomacyProposal` variants on the wire (no protocol bump) and replaces the brain.
 

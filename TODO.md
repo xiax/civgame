@@ -185,11 +185,11 @@ I want to add diplomacy AI that allows AI to initiate and make deals with other 
 
 Barter economies
 
-Add volume to items and carrying capacity, remove hard number limit
+X - Add volume to items and carrying capacity, remove hard number limit
 
 Debug toggle for how quickly workers learn new knowledge
 
-I want to add a lot more plant varieties to the game, plants that would be native to different biomes and were historically useful for human development. I want every biome to have at least a few native plants.
+I want to add a lot more plant varieties to the game, plants that would be native to different biomes and were historically useful for human development. I want every biome to have at least a few unique native plants, so there is more incentive for exploration.
 
 I want the plant and animal seeding to be more natural and realistic to real life.
 

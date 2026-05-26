@@ -347,7 +347,7 @@ pub fn drain_player_command_events_system(
     mut vehicle_registry: ResMut<crate::simulation::vehicle::VehicleDesignRegistry>,
     vehicle_data: Res<crate::simulation::vehicle::VehicleData>,
     mut pending_vehicle_ops: ResMut<crate::simulation::vehicle::PendingVehicleOps>,
-    factions: Res<crate::simulation::faction::FactionRegistry>,
+    mut factions: ResMut<crate::simulation::faction::FactionRegistry>,
     // Debug Test-Drive dependencies — only consumed by the
     // `DebugSpawnTestVehicle` arm (which is `cfg!(debug_assertions)`-gated).
     mut debug_drive: DebugTestDriveResources,
@@ -612,6 +612,19 @@ pub fn drain_player_command_events_system(
                             p.proposal,
                             clock.tick,
                         );
+                        // Smart-diplomacy P1 — tribute accept also
+                        // flips the dominance axis. Proposer is the
+                        // dominant side (they demanded; we accepted).
+                        if matches!(
+                            p.proposal,
+                            crate::simulation::diplomacy::DiplomacyProposal::DemandTribute
+                        ) {
+                            crate::simulation::diplomacy::set_tribute_acceptance(
+                                &mut factions,
+                                p.from_faction,
+                                p.to_faction,
+                            );
+                        }
                     }
                 }
                 PlayerCommand::DeclareWar {

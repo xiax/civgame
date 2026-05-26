@@ -11,6 +11,11 @@ use bevy_egui::{egui, EguiContexts};
 use crate::simulation::diplomacy::{
     DiplomacyLedger, DiplomacyProposal, ProposalResponse, TreatyKind,
 };
+use crate::simulation::diplomatic_contact::DiplomaticContactBook;
+use crate::simulation::diplomatic_evaluator::{
+    evaluate_proposal_v2, FairnessLabel, Perspective,
+};
+use crate::simulation::diplomatic_personality::DiplomaticPersonality;
 use crate::simulation::faction::{FactionRegistry, PlayerFaction, SOLO};
 use crate::simulation::player_command::{CommandSender, PlayerCommand};
 
@@ -30,6 +35,7 @@ pub fn diplomacy_panel_system(
     mut selection: ResMut<DiplomacyPanelSelection>,
     ledger: Res<DiplomacyLedger>,
     registry: Res<FactionRegistry>,
+    contact_book: Res<DiplomaticContactBook>,
     player_faction: Res<PlayerFaction>,
     mut sender: CommandSender,
 ) {
@@ -45,9 +51,11 @@ pub fn diplomacy_panel_system(
     };
     let self_root = registry.root_faction(self_fid);
 
-    // Collect known foreign factions: every materialised non-SOLO
-    // faction except households we own. Player has at least heard of
-    // them through the world-map / spawn-select layer.
+    // Smart-diplomacy P1 — gate the list on `DiplomaticContactBook`. A
+    // faction the player has never contacted shouldn't appear (drops
+    // omniscient pre-meeting visibility). We also surface any faction
+    // we *currently have an open proposal/ledger relation with* —
+    // first-contact via diplomatic mail counts as known.
     let mut foreign: Vec<u32> = registry
         .factions
         .iter()
@@ -56,6 +64,11 @@ pub fn diplomacy_panel_system(
                 && **fid != self_fid
                 && data.parent_faction.is_none()
                 && registry.root_faction(**fid) != self_root
+                && (contact_book.is_known(self_root, registry.root_faction(**fid))
+                    || ledger
+                        .relation(self_fid, **fid)
+                        .map(|r| !r.incident_log.is_empty() || r.last_contact_tick > 0)
+                        .unwrap_or(false))
         })
         .map(|(fid, _)| *fid)
         .collect();
@@ -170,8 +183,34 @@ pub fn diplomacy_panel_system(
                         continue;
                     }
                     any_for_target = true;
+                    // Smart-diplomacy P1 — score the proposal from the
+                    // *player's* (receiver) perspective so the panel
+                    // can surface a one-word fairness label.
+                    let fairness_str = self_data.parent_faction.is_none().then(|| {
+                        let pers = DiplomaticPersonality::from_culture(
+                            &self_data.culture,
+                            self_data.caps.home.is_mobile(),
+                        );
+                        let relation = ledger
+                            .relation(p.from_faction, self_fid)
+                            .cloned()
+                            .unwrap_or_default();
+                        let contact = contact_book.record_of(self_root, registry.root_faction(p.from_faction));
+                        let util = evaluate_proposal_v2(
+                            p.proposal,
+                            &relation,
+                            &pers,
+                            self_data.home_tile,
+                            contact,
+                            Perspective::Receiver,
+                        );
+                        fairness_color_label(util.fairness)
+                    });
                     cols[1].horizontal(|ui| {
                         ui.label(format!("{:?}", p.proposal));
+                        if let Some((label, color)) = fairness_str {
+                            ui.label(egui::RichText::new(format!("[{}]", label)).color(color));
+                        }
                         if ui.button("Accept").clicked() {
                             sender.send(
                                 Vec::new(),
@@ -282,6 +321,15 @@ pub fn diplomacy_panel_system(
                 }
             });
         });
+}
+
+fn fairness_color_label(f: FairnessLabel) -> (&'static str, egui::Color32) {
+    match f {
+        FairnessLabel::Generous => ("Generous", egui::Color32::from_rgb(120, 220, 140)),
+        FairnessLabel::Fair => ("Fair", egui::Color32::from_rgb(220, 220, 220)),
+        FairnessLabel::HardBargain => ("Hard Bargain", egui::Color32::from_rgb(220, 180, 90)),
+        FairnessLabel::Exploitative => ("Bad Deal", egui::Color32::from_rgb(220, 80, 80)),
+    }
 }
 
 fn treaty_summary(t: crate::simulation::diplomacy::TreatySet) -> String {

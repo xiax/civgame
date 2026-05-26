@@ -18,6 +18,9 @@ pub mod construction;
 pub mod corpse;
 pub mod crafting;
 pub mod diplomacy;
+pub mod diplomatic_contact;
+pub mod diplomatic_evaluator;
+pub mod diplomatic_personality;
 pub mod dig;
 pub mod doormat;
 pub mod excavation;
@@ -311,6 +314,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(gather_claims::GatherClaims::default())
             .insert_resource(territory::TerritoryMap::default())
             .insert_resource(diplomacy::DiplomacyLedger::default())
+            .insert_resource(diplomatic_contact::DiplomaticContactBook::default())
             .insert_resource(trespass::TrespassRegistry::default())
             .insert_resource(trespass::TerritoryDefenseQueue::default())
             .add_event::<trespass::TrespassEvent>()
@@ -1744,6 +1748,9 @@ impl Plugin for SimulationPlugin {
                         .after(territory::recompute_territory_system),
                     diplomacy::reputation_decay_system,
                     diplomacy::proposal_expiry_system,
+                    diplomatic_contact::contact_book_update_system
+                        .before(diplomacy::ai_diplomacy_response_system)
+                        .before(diplomacy::ai_diplomacy_proposal_system),
                     diplomacy::ai_diplomacy_response_system,
                     diplomacy::ai_diplomacy_proposal_system,
                 )

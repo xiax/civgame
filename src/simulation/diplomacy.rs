@@ -18,6 +18,12 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
+use crate::simulation::diplomatic_contact::DiplomaticContactBook;
+use crate::simulation::diplomatic_evaluator::{
+    acceptance_blocked, evaluate_proposal_v2, passes_proposer_gate, passes_receiver_gate,
+    Perspective,
+};
+use crate::simulation::diplomatic_personality::DiplomaticPersonality;
 use crate::simulation::faction::{FactionRegistry, SOLO};
 use crate::simulation::schedule::SimClock;
 use crate::world::seasons::TICKS_PER_DAY;
@@ -46,6 +52,14 @@ pub const PROPOSAL_EXPIRY_TICKS: u64 = TICKS_PER_DAY as u64 * 7;
 
 /// Per-relation incident log ring length.
 pub const INCIDENT_LOG_LEN: usize = 16;
+
+/// Smart-diplomacy P1 — `OfferMemory` ring length per relation. Walks
+/// recent proposal fingerprints so the proposer doesn't re-spam a deal
+/// shape that just got rejected.
+pub const OFFER_MEMORY_LEN: usize = 4;
+
+/// Cooldown before the same fingerprint may be re-sent.
+pub const OFFER_RESEND_COOLDOWN_TICKS: u64 = TICKS_PER_DAY as u64 * 5;
 
 /// AI accept/reject thresholds for `evaluate_proposal`.
 pub const TRUST_ACCEPT_ALLIANCE: i16 = 40;
@@ -213,6 +227,10 @@ pub enum IncidentKind {
     SharedEnemy { common_target: u32 },
     TreatyFormed(TreatyKind),
     TreatyBroken(TreatyKind),
+    /// Smart-diplomacy P1 — a tribute demand has been accepted by the
+    /// subordinate. Records the moment the dominance axis activates so
+    /// the activity log + UI can show "Tribute Accepted".
+    TributeAccepted,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -221,12 +239,47 @@ pub struct Incident {
     pub kind: IncidentKind,
 }
 
+/// Smart-diplomacy P1 — one entry in the per-relation `OfferMemory` ring.
+/// `fingerprint` collapses a proposal to a stable u64 so we can ask "have we
+/// already proposed this shape recently?" without comparing nested enums.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OfferMemoryEntry {
+    pub fingerprint: u64,
+    pub posted_tick: u64,
+    /// `Some(accepted)` once the receiver has responded; `None` while
+    /// still pending. v1 uses Accept/Reject only; P3 will add gap data.
+    pub response: Option<bool>,
+}
+
+/// Cheap stable hash of a `DiplomacyProposal` for `OfferMemory` keying.
+/// Discriminant + payload only; no allocations.
+pub fn proposal_fingerprint(p: DiplomacyProposal) -> u64 {
+    match p {
+        DiplomacyProposal::OfferPeace => 0x01,
+        DiplomacyProposal::OfferTradePact => 0x02,
+        DiplomacyProposal::OfferAlliance => 0x03,
+        DiplomacyProposal::OfferNonAggression => 0x04,
+        DiplomacyProposal::DemandTribute => 0x05,
+        DiplomacyProposal::OfferAid { resource_id, qty } => {
+            // Pack rid (u16) + qty into 64 bits; high tag avoids collision
+            // with the bare-discriminant constants above.
+            0x06 << 56 | ((u16::from(resource_id) as u64) << 32) | qty as u64
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DiplomaticRelation {
     pub treaties: TreatySet,
     pub reputation: Reputation,
     pub last_contact_tick: u64,
     pub incident_log: VecDeque<Incident>,
+    /// Smart-diplomacy P1 — recent proposal fingerprints (cap
+    /// `OFFER_MEMORY_LEN`). Read by the AI proposer to avoid re-sending
+    /// a shape that's still inside `OFFER_RESEND_COOLDOWN_TICKS`.
+    /// Pure bias, not exclusion: the cooldown is a hard skip, but
+    /// expired entries are dropped.
+    pub offer_memory: VecDeque<OfferMemoryEntry>,
 }
 
 impl DiplomaticRelation {
@@ -236,6 +289,44 @@ impl DiplomaticRelation {
             self.incident_log.pop_front();
         }
         self.incident_log.push_back(Incident { tick, kind });
+    }
+
+    /// Smart-diplomacy P1 — push a `(fingerprint, posted_tick)` onto
+    /// the offer memory ring. Drops the oldest entry when full.
+    pub fn record_offer(&mut self, fingerprint: u64, tick: u64) {
+        if self.offer_memory.len() >= OFFER_MEMORY_LEN {
+            self.offer_memory.pop_front();
+        }
+        self.offer_memory.push_back(OfferMemoryEntry {
+            fingerprint,
+            posted_tick: tick,
+            response: None,
+        });
+    }
+
+    /// Smart-diplomacy P1 — true iff `fingerprint` was sent inside
+    /// `OFFER_RESEND_COOLDOWN_TICKS`. Used by the proposer to skip
+    /// re-spamming the same shape.
+    pub fn offer_on_cooldown(&self, fingerprint: u64, now: u64) -> bool {
+        for e in self.offer_memory.iter() {
+            if e.fingerprint == fingerprint
+                && now.saturating_sub(e.posted_tick) < OFFER_RESEND_COOLDOWN_TICKS
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Stamp the most recent matching offer with the receiver's
+    /// `accepted` response. No-op when no live entry matches.
+    pub fn record_offer_response(&mut self, fingerprint: u64, accepted: bool) {
+        for e in self.offer_memory.iter_mut().rev() {
+            if e.fingerprint == fingerprint && e.response.is_none() {
+                e.response = Some(accepted);
+                return;
+            }
+        }
     }
 }
 
@@ -446,6 +537,12 @@ pub fn record_incident(ledger: &mut DiplomacyLedger, a: u32, b: u32, tick: u64, 
         IncidentKind::TreatyFormed(_) | IncidentKind::TreatyBroken(_) => {
             // No automatic rep delta — caller decides (war is exclusive).
         }
+        IncidentKind::TributeAccepted => {
+            // Acceptance bumps familiarity only; the humiliation /
+            // grievance side already lands when the demand is sent.
+            r.reputation.familiarity =
+                r.reputation.familiarity.saturating_add(FAMILIARITY_PER_INCIDENT);
+        }
     }
     r.reputation.clamp();
     r.push_incident(tick, kind);
@@ -563,11 +660,15 @@ pub fn proposal_expiry_system(clock: Res<SimClock>, mut ledger: ResMut<Diplomacy
     }
 }
 
-/// Quarter-daily Economy pass. For every uncontrolled (AI) faction with
-/// pending proposals, drain the inbox and apply `evaluate_proposal`.
+/// Smart-diplomacy P1 — quarter-daily Economy pass. For every
+/// uncontrolled (AI) faction with pending proposals, drain the inbox
+/// and apply `evaluate_proposal_v2` against the receiver's
+/// personality + contact-book estimates.
 pub fn ai_diplomacy_response_system(
     clock: Res<SimClock>,
     controlled: Res<crate::simulation::faction::ControlledFactions>,
+    contact_book: Res<DiplomaticContactBook>,
+    mut registry: ResMut<FactionRegistry>,
     mut ledger: ResMut<DiplomacyLedger>,
 ) {
     if clock.tick == 0 || clock.tick % (TICKS_PER_DAY as u64 / 4) != 0 {
@@ -582,33 +683,94 @@ pub fn ai_diplomacy_response_system(
         .collect();
     let now = clock.tick;
     for fid in factions {
+        let Some(receiver_data) = registry.factions.get(&fid) else {
+            // No live FactionData (abstract/despawned) → drain to oblivion.
+            let _ = ledger.drain_inbox(fid);
+            continue;
+        };
+        let personality =
+            DiplomaticPersonality::from_culture(&receiver_data.culture, receiver_data.caps.home.is_mobile());
+        let receiver_home = receiver_data.home_tile;
+        let receiver_root = registry.root_faction(fid);
         let ids = ledger.drain_inbox(fid);
         for pid in ids {
             let Some(p) = ledger.consume_proposal(pid) else {
                 continue;
             };
-            let response = {
+            let proposer_root = registry.root_faction(p.from_faction);
+            let same_root = proposer_root == receiver_root;
+            let is_known = contact_book.is_known(receiver_root, proposer_root);
+            let treaties = ledger.treaties(p.from_faction, p.to_faction);
+            // Receiver re-checks blocks at acceptance time.
+            let proposer_storage_ok = match p.proposal {
+                DiplomacyProposal::OfferAid { resource_id, qty } => registry
+                    .factions
+                    .get(&p.from_faction)
+                    .map(|d| {
+                        d.storage
+                            .stock_of(crate::economy::resource_catalog::ResourceId(resource_id))
+                            >= qty
+                    })
+                    .unwrap_or(false),
+                _ => true,
+            };
+            let block = acceptance_blocked(
+                p.proposal,
+                treaties,
+                same_root,
+                is_known,
+                proposer_storage_ok,
+            );
+            let response = if block.is_some() {
+                ProposalResponse::Reject
+            } else {
                 let relation = ledger
                     .by_pair
                     .get(&FactionPair::new(p.from_faction, p.to_faction))
                     .cloned()
                     .unwrap_or_default();
-                evaluate_proposal(p.proposal, &relation)
+                let contact = contact_book.record_of(receiver_root, proposer_root);
+                let util = evaluate_proposal_v2(
+                    p.proposal,
+                    &relation,
+                    &personality,
+                    receiver_home,
+                    contact,
+                    Perspective::Receiver,
+                );
+                if passes_receiver_gate(&util, &personality) {
+                    ProposalResponse::Accept
+                } else {
+                    ProposalResponse::Reject
+                }
             };
+            // Stamp the offer memory on the *proposer's* relation row so
+            // they observe the acceptance/rejection bias next cycle.
+            let fp = proposal_fingerprint(p.proposal);
+            ledger
+                .relation_mut(p.from_faction, p.to_faction)
+                .record_offer_response(fp, response == ProposalResponse::Accept);
             if response == ProposalResponse::Accept {
                 apply_accepted_proposal(&mut ledger, p.from_faction, p.to_faction, p.proposal, now);
+                // Tribute also flips the dominance axis — proposer is
+                // the dominant side.
+                if matches!(p.proposal, DiplomacyProposal::DemandTribute) {
+                    set_tribute_acceptance(&mut registry, p.from_faction, p.to_faction);
+                }
             }
-            // Reject is a no-op on the ledger; future: emit a log entry.
         }
     }
 }
 
-/// Daily Economy pass: for every materialised non-SOLO AI faction with
-/// a meaningful diplomatic opportunity, emit one proposal. Heavily
-/// throttled — most factions emit nothing on most ticks.
+/// Smart-diplomacy P1 — daily-quarter Economy pass. Replaces the
+/// legacy threshold ladder with utility-driven motive selection. For
+/// every materialised non-SOLO AI faction, walks known partners
+/// (`contact_book.is_known`), builds the candidate motive set, scores
+/// each from both sides, and posts the argmax that clears both gates.
 pub fn ai_diplomacy_proposal_system(
     clock: Res<SimClock>,
     controlled: Res<crate::simulation::faction::ControlledFactions>,
+    contact_book: Res<DiplomaticContactBook>,
     registry: Res<FactionRegistry>,
     mut ledger: ResMut<DiplomacyLedger>,
 ) {
@@ -616,8 +778,6 @@ pub fn ai_diplomacy_proposal_system(
     if now == 0 || now % (TICKS_PER_DAY as u64 / 4) != 0 {
         return;
     }
-    // Snapshot AI factions (skip player-controlled, SOLO, household
-    // sub-factions). Households share root with their village.
     let candidates: Vec<u32> = registry
         .factions
         .iter()
@@ -632,53 +792,160 @@ pub fn ai_diplomacy_proposal_system(
     if candidates.is_empty() {
         return;
     }
-    let pair_candidates: Vec<u32> = registry
-        .factions
-        .iter()
-        .filter(|(fid, data)| **fid != SOLO && data.parent_faction.is_none())
-        .map(|(fid, _)| *fid)
-        .collect();
+
     for from in candidates {
-        // Cheap per-faction-per-day cadence: only fire when faction id
-        // matches the day-aligned offset.
+        // Per-faction-per-day cadence: faction-id-staggered.
         let day = now / TICKS_PER_DAY as u64;
         if (day + from as u64) % 5 != 0 {
             continue;
         }
-        for to in &pair_candidates {
-            if *to == from {
+        let Some(proposer_data) = registry.factions.get(&from) else {
+            continue;
+        };
+        let proposer_personality =
+            DiplomaticPersonality::from_culture(&proposer_data.culture, proposer_data.caps.home.is_mobile());
+        let proposer_home = proposer_data.home_tile;
+        let from_root = registry.root_faction(from);
+        let Some(contacts) = contact_book.contacts_of(from_root) else {
+            continue;
+        };
+        // Only consider known partners.
+        let targets: Vec<u32> = contacts
+            .known
+            .iter()
+            .filter(|(_, r)| r.contact_sources.any())
+            .map(|(target, _)| *target)
+            .collect();
+
+        for to in targets {
+            // Resolve a materialised target FactionData (skip abstract for v1).
+            let Some(target_data) = registry.factions.get(&to) else {
+                continue;
+            };
+            if !target_data.materialized {
                 continue;
             }
-            // Don't propose to a faction we share root with.
-            if registry.root_faction(from) == registry.root_faction(*to) {
+            if registry.root_faction(from) == registry.root_faction(to) {
                 continue;
             }
-            if ledger.has_treaty(from, *to, TreatyKind::War) {
-                // Maybe offer peace if we're tired.
-                let relation = ledger.relation(from, *to).cloned().unwrap_or_default();
-                if relation.reputation.fear >= FEAR_ACCEPT_PEACE
-                    || relation.reputation.grievance < 20
-                {
-                    ledger.post_proposal(from, *to, DiplomacyProposal::OfferPeace, now);
+            let treaties = ledger.treaties(from, to);
+            let at_war = treaties.has(TreatyKind::War);
+
+            // Build candidate motive set conditioned on current treaties.
+            let mut candidates_proposals: Vec<DiplomacyProposal> = Vec::with_capacity(6);
+            if at_war {
+                candidates_proposals.push(DiplomacyProposal::OfferPeace);
+            } else {
+                if !treaties.has(TreatyKind::TradePact) {
+                    candidates_proposals.push(DiplomacyProposal::OfferTradePact);
                 }
-                continue;
+                if !treaties.has(TreatyKind::Alliance) {
+                    candidates_proposals.push(DiplomacyProposal::OfferAlliance);
+                }
+                if !treaties.has(TreatyKind::NonAggression) {
+                    candidates_proposals.push(DiplomacyProposal::OfferNonAggression);
+                }
+                candidates_proposals.push(DiplomacyProposal::DemandTribute);
+                // OfferAid only when we have spare grain — keeps the
+                // candidate set realistic.
+                let grain = crate::economy::core_ids::grain();
+                let our_grain = proposer_data.storage.stock_of(grain);
+                if our_grain >= 10 {
+                    candidates_proposals.push(DiplomacyProposal::OfferAid {
+                        resource_id: grain.0,
+                        qty: 5,
+                    });
+                }
             }
-            let relation = ledger.relation(from, *to).cloned().unwrap_or_default();
-            let rep = relation.reputation;
-            // Alliance: very high trust + familiar.
-            if rep.trust >= TRUST_ACCEPT_ALLIANCE + 10
-                && rep.familiarity >= FAMILIARITY_ALLIANCE_GATE
-                && !ledger.has_treaty(from, *to, TreatyKind::Alliance)
-            {
-                ledger.post_proposal(from, *to, DiplomacyProposal::OfferAlliance, now);
-            } else if rep.trust >= TRUST_ACCEPT_TRADE
-                && rep.grievance < GRIEVANCE_BLOCK_TRADE
-                && !ledger.has_treaty(from, *to, TreatyKind::TradePact)
-            {
-                ledger.post_proposal(from, *to, DiplomacyProposal::OfferTradePact, now);
+
+            // Predict receiver's personality + relation snapshot.
+            let receiver_personality = DiplomaticPersonality::from_culture(
+                &target_data.culture,
+                target_data.caps.home.is_mobile(),
+            );
+            let receiver_root = registry.root_faction(to);
+            let receiver_home = target_data.home_tile;
+
+            // Score each candidate from both sides; keep argmax.
+            let mut best: Option<(DiplomacyProposal, f32)> = None;
+            for proposal in candidates_proposals {
+                let fp = proposal_fingerprint(proposal);
+                let relation = ledger
+                    .relation(from, to)
+                    .cloned()
+                    .unwrap_or_default();
+                if relation.offer_on_cooldown(fp, now) {
+                    continue;
+                }
+                let proposer_storage_ok = match proposal {
+                    DiplomacyProposal::OfferAid { resource_id, qty } => {
+                        proposer_data
+                            .storage
+                            .stock_of(crate::economy::resource_catalog::ResourceId(resource_id))
+                            >= qty
+                    }
+                    _ => true,
+                };
+                if acceptance_blocked(
+                    proposal,
+                    treaties,
+                    false,
+                    contact_book.is_known(receiver_root, from_root) ||
+                        contact_book.is_known(from_root, receiver_root),
+                    proposer_storage_ok,
+                )
+                .is_some()
+                {
+                    continue;
+                }
+                let contact_self = contact_book.record_of(from_root, receiver_root);
+                let contact_target = contact_book.record_of(receiver_root, from_root);
+                let proposer_util = evaluate_proposal_v2(
+                    proposal,
+                    &relation,
+                    &proposer_personality,
+                    proposer_home,
+                    contact_self,
+                    Perspective::Proposer,
+                );
+                let predicted_receiver_util = evaluate_proposal_v2(
+                    proposal,
+                    &relation,
+                    &receiver_personality,
+                    receiver_home,
+                    contact_target,
+                    Perspective::Receiver,
+                );
+                if !passes_proposer_gate(&proposer_util, &proposer_personality) {
+                    continue;
+                }
+                if !passes_receiver_gate(&predicted_receiver_util, &receiver_personality) {
+                    continue;
+                }
+                if best.map_or(true, |(_, n)| proposer_util.net > n) {
+                    best = Some((proposal, proposer_util.net));
+                }
+            }
+
+            if let Some((proposal, _)) = best {
+                let _id = ledger.post_proposal(from, to, proposal, now);
+                let fp = proposal_fingerprint(proposal);
+                ledger.relation_mut(from, to).record_offer(fp, now);
             }
         }
     }
+}
+
+/// Smart-diplomacy P1 — wire the dominance axis when a `DemandTribute`
+/// is accepted. Caller (AI response system / player command dispatcher)
+/// has the `&mut FactionRegistry` access the ledger doesn't. Idempotent
+/// via `FactionRegistry::set_dominance`.
+pub fn set_tribute_acceptance(
+    registry: &mut FactionRegistry,
+    dominant: u32,
+    subordinate: u32,
+) {
+    registry.set_dominance(dominant, subordinate);
 }
 
 /// Apply an Accept side-effect for any proposal kind. Public so the
@@ -705,11 +972,16 @@ pub fn apply_accepted_proposal(
             form_treaty(ledger, from, to, TreatyKind::NonAggression, tick);
         }
         DiplomacyProposal::DemandTribute => {
-            // No FactionData mutation yet — tribute side-effect deferred to
-            // the existing `dominance_over` / `subordinate_to` axis.
-            // Record familiarity bump only.
+            // Smart-diplomacy P1 — record the acceptance as a ledger
+            // incident; the dominance axis side-effect is wired by the
+            // caller (player command handler / AI response system) via
+            // `FactionRegistry::set_dominance`. The ledger doesn't own
+            // the registry, so the wiring happens at call sites that
+            // do; see `set_tribute_acceptance` below for the helper.
             let r = ledger.relation_mut(from, to);
-            r.reputation.familiarity = r.reputation.familiarity.saturating_add(FAMILIARITY_PER_INCIDENT);
+            r.reputation.familiarity =
+                r.reputation.familiarity.saturating_add(FAMILIARITY_PER_INCIDENT);
+            r.push_incident(tick, IncidentKind::TributeAccepted);
         }
         DiplomacyProposal::OfferAid { qty, .. } => {
             record_incident(

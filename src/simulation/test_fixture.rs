@@ -4461,8 +4461,11 @@ mod smoke {
             id
         };
 
-        // Drive acquisition: tick a game-day plus a buffer.
-        sim.tick_n(TICKS_PER_DAY as u32 + 200);
+        // Drive acquisition: tick two game-days plus a buffer. One day
+        // isn't always enough — the survey/plan/carve chain runs through
+        // the AsyncComputeTaskPool, so under suite-wide load the first
+        // daily acquisition window can fire before plots are carved.
+        sim.tick_n(TICKS_PER_DAY as u32 * 2 + 200);
 
         // Sanity: household should now hold a Leased plot.
         let leased_plot_entity: Entity;
@@ -4616,7 +4619,9 @@ mod smoke {
             id
         };
 
-        sim.tick_n(TICKS_PER_DAY as u32 + 200);
+        // Two days + buffer — the survey/plan/carve chain is async, so one
+        // day can miss the daily acquisition window under suite load.
+        sim.tick_n(TICKS_PER_DAY as u32 * 2 + 200);
 
         // Find the leased plot, then drain household treasury so the
         // next two rent cycles fail.
