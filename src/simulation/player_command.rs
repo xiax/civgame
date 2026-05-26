@@ -267,6 +267,20 @@ pub enum PlayerCommand {
         target_faction_id: u32,
         kind: crate::simulation::access_grant::AccessKind,
     },
+    /// Smart-diplomacy P3 — post a multi-term `DealPackage` onto the
+    /// receiver's inbox. Single-term shapes still go through
+    /// `SendDiplomacyProposal`; this is the compound channel.
+    SendDiplomacyDealPackage {
+        faction_id: u32,
+        target_faction_id: u32,
+        terms: Vec<crate::simulation::diplomacy::DealTerm>,
+    },
+    /// Smart-diplomacy P3 — accept / reject an incoming `DealPackage`.
+    RespondDiplomacyDealPackage {
+        faction_id: u32,
+        deal_id: crate::simulation::diplomacy::DealId,
+        response: crate::simulation::diplomacy::ProposalResponse,
+    },
 }
 
 /// Per-actor authority marker. Replaces `PlayerOrder` once Commit 3 lands.
@@ -360,9 +374,14 @@ pub fn drain_player_command_events_system(
     // `DebugSpawnTestVehicle` arm (which is `cfg!(debug_assertions)`-gated).
     mut debug_drive: DebugTestDriveResources,
     net_ids: Res<NetIdMap>,
-    mut ledger: ResMut<crate::simulation::diplomacy::DiplomacyLedger>,
-    mut grants: ResMut<crate::simulation::access_grant::AccessGrantTable>,
+    mut diplo: DiplomacyDrainParams,
 ) {
+    // Locals so existing match-arm bodies keep their `&mut ledger`
+    // / `&mut grants` shape — `ResMut` derefs to `&mut T` naturally.
+    let mut ledger = &mut *diplo.ledger;
+    let mut grants = &mut *diplo.grants;
+    let settlement_map_q = &diplo.settlement_map;
+    let settlements_q = &diplo.settlements;
     let now = clock.tick as u32;
     for ev in reader.read() {
         // Faction-level applies (no actors needed).
@@ -378,7 +397,9 @@ pub fn drain_player_command_events_system(
                 | PlayerCommand::RespondDiplomacyProposal { faction_id, .. }
                 | PlayerCommand::DeclareWar { faction_id, .. }
                 | PlayerCommand::BreakTreaty { faction_id, .. }
-                | PlayerCommand::RevokeAccessGrant { faction_id, .. } => Some(*faction_id),
+                | PlayerCommand::RevokeAccessGrant { faction_id, .. }
+                | PlayerCommand::SendDiplomacyDealPackage { faction_id, .. }
+                | PlayerCommand::RespondDiplomacyDealPackage { faction_id, .. } => Some(*faction_id),
                 _ => None,
             };
             if let Some(fid) = payload_faction {
@@ -390,7 +411,7 @@ pub fn drain_player_command_events_system(
                     continue;
                 }
             }
-            match ev.command {
+            match ev.command.clone() {
                 PlayerCommand::EncodeTablet { tech, faction_id: _ } => {
                     if player_craft.0.is_none() {
                         player_craft.0 =
@@ -685,6 +706,57 @@ pub fn drain_player_command_events_system(
                     }
                     grants.revoke(faction_id, target_faction_id, kind);
                 }
+                PlayerCommand::SendDiplomacyDealPackage {
+                    faction_id,
+                    target_faction_id,
+                    terms,
+                } => {
+                    if faction_id == target_faction_id
+                        || factions.factions.get(&target_faction_id).is_none()
+                    {
+                        continue;
+                    }
+                    if factions.root_faction(faction_id) == factions.root_faction(target_faction_id)
+                    {
+                        continue;
+                    }
+                    if terms.is_empty() {
+                        continue;
+                    }
+                    ledger.post_package(faction_id, target_faction_id, terms, clock.tick);
+                }
+                PlayerCommand::RespondDiplomacyDealPackage {
+                    faction_id,
+                    deal_id,
+                    response,
+                } => {
+                    let Some(pkg) = ledger.consume_package(deal_id) else {
+                        continue;
+                    };
+                    if pkg.to_faction != faction_id {
+                        continue;
+                    }
+                    if response == crate::simulation::diplomacy::ProposalResponse::Accept {
+                        let pending = crate::simulation::diplomacy::apply_accepted_package(
+                            &mut ledger,
+                            &mut factions,
+                            &mut grants,
+                            &pkg,
+                            clock.tick,
+                        );
+                        // Spawn obligation entities — courier dispatch
+                        // assigns + walks them in subsequent ticks.
+                        for p in &pending {
+                            let _ = crate::simulation::deal_obligation::spawn_obligation(
+                                &mut commands,
+                                &mut factions,
+                                p,
+                                &settlement_map_q,
+                                &settlements_q,
+                            );
+                        }
+                    }
+                }
                 _ => {
                     // Other commands need actors; skip a malformed event.
                 }
@@ -911,7 +983,9 @@ pub fn player_command_lifecycle_system(
             | PlayerCommand::RespondDiplomacyProposal { .. }
             | PlayerCommand::DeclareWar { .. }
             | PlayerCommand::BreakTreaty { .. }
-            | PlayerCommand::RevokeAccessGrant { .. } => Some(CommandStatus::Completed),
+            | PlayerCommand::RevokeAccessGrant { .. }
+            | PlayerCommand::SendDiplomacyDealPackage { .. }
+            | PlayerCommand::RespondDiplomacyDealPackage { .. } => Some(CommandStatus::Completed),
             // Lookout never auto-completes — the worker holds the anchor
             // until the player supersedes the command or `aq.cancel`
             // drops the chain via another dispatch.
@@ -973,6 +1047,18 @@ pub struct DebugTestDriveResources<'w, 's> {
     pub vehicle_occupancy: Res<'w, crate::simulation::vehicle::VehicleOccupancyIndex>,
     pub yards: Query<'w, 's, &'static crate::simulation::vehicle::VehicleYard>,
     pub manual_drive: ResMut<'w, crate::simulation::vehicle::ManualDriveState>,
+}
+
+/// Smart-diplomacy P3 — bundled diplomacy params for
+/// `drain_player_command_events_system`. Folds ledger + grant table +
+/// settlement query into one SystemParam so the host system stays
+/// under Bevy's 16-param ceiling.
+#[derive(SystemParam)]
+pub struct DiplomacyDrainParams<'w, 's> {
+    pub ledger: ResMut<'w, crate::simulation::diplomacy::DiplomacyLedger>,
+    pub grants: ResMut<'w, crate::simulation::access_grant::AccessGrantTable>,
+    pub settlement_map: Res<'w, crate::simulation::settlement::SettlementMap>,
+    pub settlements: Query<'w, 's, &'static crate::simulation::settlement::Settlement>,
 }
 
 /// UI-side bundle for emitting commands. Wraps the network-boundary
@@ -1793,7 +1879,9 @@ fn dispatch_one(
         | RespondDiplomacyProposal { .. }
         | DeclareWar { .. }
         | BreakTreaty { .. }
-        | RevokeAccessGrant { .. } => {
+        | RevokeAccessGrant { .. }
+        | SendDiplomacyDealPackage { .. }
+        | RespondDiplomacyDealPackage { .. } => {
             // Faction-level — applied directly in
             // `drain_player_command_events_system` (empty `actors`). If an
             // event ever arrives carrying actors, the dispatch is a no-op.

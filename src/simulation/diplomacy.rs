@@ -58,8 +58,43 @@ pub const INCIDENT_LOG_LEN: usize = 16;
 /// shape that just got rejected.
 pub const OFFER_MEMORY_LEN: usize = 4;
 
-/// Cooldown before the same fingerprint may be re-sent.
+/// Default cooldown before the same fingerprint may be re-sent (used
+/// when no `predicted_gap` is recorded — e.g. legacy callers).
 pub const OFFER_RESEND_COOLDOWN_TICKS: u64 = TICKS_PER_DAY as u64 * 5;
+
+/// Smart-diplomacy P3 — concession-ladder cooldowns indexed by
+/// proposer-side predicted gap. Small gap = nearly-fair offer → retry
+/// soon with a sweetener; mid gap = motive shift; large gap = walk
+/// away for a long while.
+pub const OFFER_NEAR_FAIR_COOLDOWN_TICKS: u64 = TICKS_PER_DAY as u64 * 1;
+pub const OFFER_MID_GAP_COOLDOWN_TICKS: u64 = TICKS_PER_DAY as u64 * 5;
+pub const OFFER_FAR_GAP_COOLDOWN_TICKS: u64 = TICKS_PER_DAY as u64 * 10;
+
+/// Threshold (in gap-vs-min-acceptance units) below which a rejected
+/// offer is considered "near fair" — eligible for retry-with-sweetener.
+pub const NEAR_FAIR_GAP_RATIO: f32 = 0.1;
+/// Above this, the deal is "far from fair" — long cooldown + motive
+/// shift on next propose cycle.
+pub const FAR_GAP_RATIO: f32 = 0.5;
+
+/// Cooldown ticks to apply for a given predicted gap. `min_acceptance`
+/// is the receiver's `min_predicted_acceptance_gain` (from their
+/// personality) — gap of zero = receiver was at the threshold;
+/// large gap = was nowhere near. Pure-fn so the AI proposer can
+/// consult per-entry.
+pub fn cooldown_ticks_for_gap(gap: f32, min_acceptance: f32) -> u64 {
+    if min_acceptance <= 0.0 || !gap.is_finite() || gap <= 0.0 {
+        return OFFER_NEAR_FAIR_COOLDOWN_TICKS;
+    }
+    let ratio = gap / min_acceptance.max(0.1);
+    if ratio < NEAR_FAIR_GAP_RATIO {
+        OFFER_NEAR_FAIR_COOLDOWN_TICKS
+    } else if ratio < FAR_GAP_RATIO {
+        OFFER_MID_GAP_COOLDOWN_TICKS
+    } else {
+        OFFER_FAR_GAP_COOLDOWN_TICKS
+    }
+}
 
 /// AI accept/reject thresholds for `evaluate_proposal`.
 pub const TRUST_ACCEPT_ALLIANCE: i16 = 40;
@@ -231,7 +266,18 @@ pub enum IncidentKind {
     /// subordinate. Records the moment the dominance axis activates so
     /// the activity log + UI can show "Tribute Accepted".
     TributeAccepted,
+    /// Smart-diplomacy P3 — multi-term deal accepted.
+    DealAccepted { deal_id: u64 },
+    /// One transfer term of a deal completed via courier delivery.
+    DealDelivered { deal_id: u64, resource_id: u16, qty: u32 },
+    /// One transfer term defaulted at deadline. Trust drops by
+    /// `TRUST_DEFAULT_PENALTY`; grievance bumps `GRIEVANCE_DEFAULT_PENALTY`.
+    DealDefaulted { deal_id: u64 },
 }
+
+/// Smart-diplomacy P3 — reputation deltas for `IncidentKind::DealDefaulted`.
+pub const TRUST_DEFAULT_PENALTY: i16 = 15;
+pub const GRIEVANCE_DEFAULT_PENALTY: i16 = 8;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Incident {
@@ -247,8 +293,14 @@ pub struct OfferMemoryEntry {
     pub fingerprint: u64,
     pub posted_tick: u64,
     /// `Some(accepted)` once the receiver has responded; `None` while
-    /// still pending. v1 uses Accept/Reject only; P3 will add gap data.
+    /// still pending.
     pub response: Option<bool>,
+    /// Smart-diplomacy P3 — receiver's predicted `DealUtility.net`
+    /// deficit at proposal time (positive = how far below their
+    /// acceptance threshold the offer was). Drives the concession
+    /// ladder: small gaps retry with a sweetener; large gaps shift
+    /// motive.
+    pub predicted_gap: f32,
 }
 
 /// Cheap stable hash of a `DiplomacyProposal` for `OfferMemory` keying.
@@ -294,6 +346,13 @@ impl DiplomaticRelation {
     /// Smart-diplomacy P1 — push a `(fingerprint, posted_tick)` onto
     /// the offer memory ring. Drops the oldest entry when full.
     pub fn record_offer(&mut self, fingerprint: u64, tick: u64) {
+        self.record_offer_with_gap(fingerprint, tick, 0.0);
+    }
+
+    /// Smart-diplomacy P3 — record an offer with the proposer-side
+    /// estimate of how far below the receiver's acceptance the deal
+    /// was. Used by the concession ladder.
+    pub fn record_offer_with_gap(&mut self, fingerprint: u64, tick: u64, predicted_gap: f32) {
         if self.offer_memory.len() >= OFFER_MEMORY_LEN {
             self.offer_memory.pop_front();
         }
@@ -301,18 +360,58 @@ impl DiplomaticRelation {
             fingerprint,
             posted_tick: tick,
             response: None,
+            predicted_gap,
         });
     }
 
+    /// Smart-diplomacy P3 — last recorded `(fingerprint, predicted_gap,
+    /// response)` triple for inspection. Used by the concession ladder
+    /// to decide whether to retry with a sweetener.
+    pub fn last_offer(&self) -> Option<&OfferMemoryEntry> {
+        self.offer_memory.back()
+    }
+
     /// Smart-diplomacy P1 — true iff `fingerprint` was sent inside
-    /// `OFFER_RESEND_COOLDOWN_TICKS`. Used by the proposer to skip
-    /// re-spamming the same shape.
-    pub fn offer_on_cooldown(&self, fingerprint: u64, now: u64) -> bool {
+    /// the per-entry cooldown window. P3 made the cooldown
+    /// gap-driven: near-fair rejections cool down for 1 day, mid-gap
+    /// for 5 days, far-gap for 10 days.
+    ///
+    /// `min_acceptance` is the receiver's
+    /// `DiplomaticPersonality::min_predicted_acceptance_gain`; pass 1.0
+    /// when unknown (legacy callers).
+    pub fn offer_on_cooldown_gap(&self, fingerprint: u64, now: u64, min_acceptance: f32) -> bool {
         for e in self.offer_memory.iter() {
-            if e.fingerprint == fingerprint
-                && now.saturating_sub(e.posted_tick) < OFFER_RESEND_COOLDOWN_TICKS
-            {
+            if e.fingerprint != fingerprint {
+                continue;
+            }
+            let cooldown = cooldown_ticks_for_gap(e.predicted_gap, min_acceptance);
+            if now.saturating_sub(e.posted_tick) < cooldown {
                 return true;
+            }
+        }
+        false
+    }
+
+    /// Legacy compatible shim — same as `offer_on_cooldown_gap` with
+    /// `min_acceptance = 1.0`. Kept for tests + callers that don't
+    /// have a personality in hand.
+    pub fn offer_on_cooldown(&self, fingerprint: u64, now: u64) -> bool {
+        self.offer_on_cooldown_gap(fingerprint, now, 1.0)
+    }
+
+    /// Smart-diplomacy P3 — true iff the most recent same-fingerprint
+    /// entry was rejected with a near-fair gap (small enough that a
+    /// sweetener could plausibly flip the receiver). Drives the AI
+    /// proposer's retry-with-sweetener branch.
+    pub fn last_offer_near_fair(&self, fingerprint: u64, min_acceptance: f32) -> bool {
+        if let Some(e) = self.offer_memory.iter().rev().find(|e| e.fingerprint == fingerprint) {
+            if matches!(e.response, Some(false)) {
+                let ratio = if min_acceptance > 0.0 {
+                    e.predicted_gap / min_acceptance.max(0.1)
+                } else {
+                    0.0
+                };
+                return ratio < NEAR_FAIR_GAP_RATIO;
             }
         }
         false
@@ -355,6 +454,118 @@ pub enum ProposalResponse {
     Reject,
 }
 
+// ── Smart-diplomacy P3: multi-term deal packages ────────────────────────
+
+/// Monotonic per-process deal id. `0` reserved for "unallocated".
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default, Serialize, Deserialize)]
+pub struct DealId(pub u64);
+
+/// Which side of the package a term moves resources / grants from.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Direction {
+    /// Proposer → Receiver.
+    FromProposerToReceiver,
+    /// Receiver → Proposer.
+    FromReceiverToProposer,
+}
+
+impl Direction {
+    pub fn flip(self) -> Direction {
+        match self {
+            Direction::FromProposerToReceiver => Direction::FromReceiverToProposer,
+            Direction::FromReceiverToProposer => Direction::FromProposerToReceiver,
+        }
+    }
+}
+
+/// One leaf of a `DealPackage`. The package commits atomically on
+/// accept; transfer terms spawn `DealObligation`s that walk physically.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DealTerm {
+    /// Form a treaty (`TradePact / Alliance / NonAggression` only; War
+    /// requires the existing `DeclareWar` command).
+    TreatyForm(TreatyKind),
+    /// Tear down an existing treaty.
+    TreatyBreak(TreatyKind),
+    /// Resource transfer with direction + quantity.
+    ResourceTransfer {
+        resource_id: u16,
+        qty: u32,
+        direction: Direction,
+    },
+    /// Currency transfer with direction + amount.
+    CurrencyTransfer {
+        amount: u32,
+        direction: Direction,
+    },
+    /// Grant an `AccessGrant` (e.g. seasonal camp permission) from one
+    /// side to the other.
+    AccessGrantTerm {
+        grant: crate::simulation::access_grant::AccessGrant,
+        direction: Direction,
+    },
+    /// Periodic tribute stream — subordinate pays dominant `daily_units`
+    /// per game-day until `until_tick`.
+    TributeStream {
+        until_tick: u64,
+        daily_units: u32,
+        direction: Direction,
+    },
+}
+
+/// A compound diplomatic deal — proposer-side construction. The receiver
+/// sees the full term list at acceptance time and either accepts the
+/// whole package or rejects atomically.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DealPackage {
+    pub id: DealId,
+    pub from_faction: u32,
+    pub to_faction: u32,
+    pub terms: Vec<DealTerm>,
+    pub posted_tick: u64,
+    pub expires_tick: u64,
+}
+
+impl DealPackage {
+    /// Convert a legacy single-shape `DiplomacyProposal` into a
+    /// one-term `DealPackage`. P1/P2 paths still produce
+    /// `DiplomacyProposal`s; the evaluator + receiver code path runs
+    /// them through this sugar so multi-term and single-term flows
+    /// converge.
+    pub fn from_legacy(
+        id: DealId,
+        from: u32,
+        to: u32,
+        proposal: DiplomacyProposal,
+        posted_tick: u64,
+    ) -> Self {
+        let term = match proposal {
+            DiplomacyProposal::OfferTradePact => DealTerm::TreatyForm(TreatyKind::TradePact),
+            DiplomacyProposal::OfferAlliance => DealTerm::TreatyForm(TreatyKind::Alliance),
+            DiplomacyProposal::OfferPeace => DealTerm::TreatyBreak(TreatyKind::War),
+            DiplomacyProposal::OfferNonAggression => DealTerm::TreatyForm(TreatyKind::NonAggression),
+            DiplomacyProposal::DemandTribute => DealTerm::TributeStream {
+                until_tick: posted_tick + (TICKS_PER_DAY as u64) * 365,
+                daily_units: 1,
+                direction: Direction::FromReceiverToProposer,
+            },
+            DiplomacyProposal::OfferAid { resource_id, qty } => DealTerm::ResourceTransfer {
+                resource_id,
+                qty,
+                direction: Direction::FromProposerToReceiver,
+            },
+        };
+        DealPackage {
+            id,
+            from_faction: from,
+            to_faction: to,
+            terms: vec![term],
+            posted_tick,
+            expires_tick: posted_tick + PROPOSAL_EXPIRY_TICKS,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingProposal {
     pub id: ProposalId,
@@ -372,6 +583,12 @@ pub struct DiplomacyLedger {
     pub proposals: AHashMap<ProposalId, PendingProposal>,
     pub inbox_by_faction: AHashMap<u32, Vec<ProposalId>>,
     pub next_proposal_id: u64,
+    /// Smart-diplomacy P3 — multi-term deal package channel. Coexists
+    /// with the legacy single-shape `proposals` channel; both can be
+    /// in flight at once.
+    pub packages: AHashMap<DealId, DealPackage>,
+    pub package_inbox_by_faction: AHashMap<u32, Vec<DealId>>,
+    pub next_deal_id: u64,
 }
 
 impl DiplomacyLedger {
@@ -432,6 +649,53 @@ impl DiplomacyLedger {
             inbox.retain(|x| *x != id);
         }
         Some(p)
+    }
+
+    // ── Smart-diplomacy P3 deal-package helpers ─────────────────────
+
+    pub fn alloc_deal_id(&mut self) -> DealId {
+        self.next_deal_id += 1;
+        DealId(self.next_deal_id)
+    }
+
+    /// Post a `DealPackage` onto the receiver's inbox.
+    pub fn post_package(
+        &mut self,
+        from: u32,
+        to: u32,
+        terms: Vec<DealTerm>,
+        tick: u64,
+    ) -> DealId {
+        let id = self.alloc_deal_id();
+        self.packages.insert(
+            id,
+            DealPackage {
+                id,
+                from_faction: from,
+                to_faction: to,
+                terms,
+                posted_tick: tick,
+                expires_tick: tick + PROPOSAL_EXPIRY_TICKS,
+            },
+        );
+        self.package_inbox_by_faction.entry(to).or_default().push(id);
+        id
+    }
+
+    pub fn package_of(&self, id: DealId) -> Option<&DealPackage> {
+        self.packages.get(&id)
+    }
+
+    pub fn consume_package(&mut self, id: DealId) -> Option<DealPackage> {
+        let p = self.packages.remove(&id)?;
+        if let Some(inbox) = self.package_inbox_by_faction.get_mut(&p.to_faction) {
+            inbox.retain(|x| *x != id);
+        }
+        Some(p)
+    }
+
+    pub fn drain_package_inbox(&mut self, to: u32) -> Vec<DealId> {
+        self.package_inbox_by_faction.remove(&to).unwrap_or_default()
     }
 }
 
@@ -542,6 +806,23 @@ pub fn record_incident(ledger: &mut DiplomacyLedger, a: u32, b: u32, tick: u64, 
             // grievance side already lands when the demand is sent.
             r.reputation.familiarity =
                 r.reputation.familiarity.saturating_add(FAMILIARITY_PER_INCIDENT);
+        }
+        IncidentKind::DealAccepted { .. } => {
+            r.reputation.familiarity =
+                r.reputation.familiarity.saturating_add(FAMILIARITY_PER_INCIDENT);
+        }
+        IncidentKind::DealDelivered { .. } => {
+            // Delivery is the proper trust signal — bumps both trust
+            // and familiarity. Per-unit bump capped by `TRUST_TRADE_PER_UNIT`.
+            r.reputation.trust = r.reputation.trust.saturating_add(2);
+            r.reputation.familiarity =
+                r.reputation.familiarity.saturating_add(FAMILIARITY_PER_TRADE);
+        }
+        IncidentKind::DealDefaulted { .. } => {
+            r.reputation.trust =
+                r.reputation.trust.saturating_sub(TRUST_DEFAULT_PENALTY);
+            r.reputation.grievance =
+                r.reputation.grievance.saturating_add(GRIEVANCE_DEFAULT_PENALTY);
         }
     }
     r.reputation.clamp();
@@ -658,6 +939,16 @@ pub fn proposal_expiry_system(clock: Res<SimClock>, mut ledger: ResMut<Diplomacy
     for id in expired {
         ledger.consume_proposal(id);
     }
+    // Smart-diplomacy P3 — also expire stale DealPackages.
+    let expired_pkgs: Vec<DealId> = ledger
+        .packages
+        .iter()
+        .filter(|(_, p)| now >= p.expires_tick)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in expired_pkgs {
+        ledger.consume_package(id);
+    }
 }
 
 /// Smart-diplomacy P1 — quarter-daily Economy pass. For every
@@ -756,6 +1047,121 @@ pub fn ai_diplomacy_response_system(
                 // the dominant side.
                 if matches!(p.proposal, DiplomacyProposal::DemandTribute) {
                     set_tribute_acceptance(&mut registry, p.from_faction, p.to_faction);
+                }
+            }
+        }
+    }
+}
+
+/// Smart-diplomacy P3 — drain AI-faction `DealPackage` inboxes and
+/// either accept (full apply + obligation spawn) or reject. Mirrors
+/// `ai_diplomacy_response_system` for the multi-term channel.
+pub fn ai_diplomacy_package_response_system(
+    clock: Res<SimClock>,
+    controlled: Res<crate::simulation::faction::ControlledFactions>,
+    contact_book: Res<DiplomaticContactBook>,
+    mut commands: bevy::prelude::Commands,
+    mut registry: ResMut<FactionRegistry>,
+    mut grants: ResMut<crate::simulation::access_grant::AccessGrantTable>,
+    mut ledger: ResMut<DiplomacyLedger>,
+    settlement_map: Res<crate::simulation::settlement::SettlementMap>,
+    settlements: bevy::prelude::Query<&crate::simulation::settlement::Settlement>,
+) {
+    if clock.tick == 0 || clock.tick % (TICKS_PER_DAY as u64 / 4) != 0 {
+        return;
+    }
+    let now = clock.tick;
+    let factions: Vec<u32> = ledger
+        .package_inbox_by_faction
+        .iter()
+        .filter(|(fid, ids)| !controlled.contains(**fid) && !ids.is_empty())
+        .map(|(fid, _)| *fid)
+        .collect();
+    for fid in factions {
+        let Some(receiver_data) = registry.factions.get(&fid) else {
+            let _ = ledger.drain_package_inbox(fid);
+            continue;
+        };
+        let personality = DiplomaticPersonality::from_culture(
+            &receiver_data.culture,
+            receiver_data.caps.home.is_mobile(),
+        );
+        let receiver_home = receiver_data.home_tile;
+        let receiver_root = registry.root_faction(fid);
+        let ids = ledger.drain_package_inbox(fid);
+        for did in ids {
+            let Some(pkg) = ledger.consume_package(did) else {
+                continue;
+            };
+            let proposer_root = registry.root_faction(pkg.from_faction);
+            let same_root = proposer_root == receiver_root;
+            let is_known = contact_book.is_known(receiver_root, proposer_root);
+            let treaties = ledger.treaties(pkg.from_faction, pkg.to_faction);
+            // Re-check proposer's ability to deliver every transfer term.
+            let proposer_storage_ok = registry
+                .factions
+                .get(&pkg.from_faction)
+                .map(|d| {
+                    pkg.terms.iter().all(|t| match t {
+                        DealTerm::ResourceTransfer { resource_id, qty, direction }
+                            if matches!(direction, Direction::FromProposerToReceiver) =>
+                        {
+                            d.storage
+                                .stock_of(crate::economy::resource_catalog::ResourceId(
+                                    *resource_id,
+                                ))
+                                >= *qty
+                        }
+                        DealTerm::CurrencyTransfer { amount, direction }
+                            if matches!(direction, Direction::FromProposerToReceiver) =>
+                        {
+                            d.treasury >= *amount as f32
+                        }
+                        _ => true,
+                    })
+                })
+                .unwrap_or(false);
+            let block = crate::simulation::diplomatic_evaluator::package_acceptance_blocked(
+                &pkg,
+                treaties,
+                same_root,
+                is_known,
+                proposer_storage_ok,
+            );
+            let accept = if block.is_some() {
+                false
+            } else {
+                let relation = ledger
+                    .relation(pkg.from_faction, pkg.to_faction)
+                    .cloned()
+                    .unwrap_or_default();
+                let contact = contact_book.record_of(receiver_root, proposer_root);
+                let util = crate::simulation::diplomatic_evaluator::evaluate_deal_package(
+                    &pkg,
+                    &relation,
+                    &personality,
+                    receiver_home,
+                    contact,
+                    Perspective::Receiver,
+                );
+                util.net >= personality.min_predicted_acceptance_gain
+            };
+            if accept {
+                let pending = apply_accepted_package(
+                    &mut ledger,
+                    &mut registry,
+                    &mut grants,
+                    &pkg,
+                    now,
+                );
+                for p in &pending {
+                    let _ = crate::simulation::deal_obligation::spawn_obligation(
+                        &mut commands,
+                        &mut registry,
+                        p,
+                        &settlement_map,
+                        &settlements,
+                    );
                 }
             }
         }
@@ -874,7 +1280,13 @@ pub fn ai_diplomacy_proposal_system(
                     .relation(from, to)
                     .cloned()
                     .unwrap_or_default();
-                if relation.offer_on_cooldown(fp, now) {
+                // Smart-diplomacy P3 concession ladder — cooldown
+                // length scales with the receiver's predicted gap.
+                if relation.offer_on_cooldown_gap(
+                    fp,
+                    now,
+                    receiver_personality.min_predicted_acceptance_gain,
+                ) {
                     continue;
                 }
                 let proposer_storage_ok = match proposal {
@@ -927,13 +1339,186 @@ pub fn ai_diplomacy_proposal_system(
                 }
             }
 
-            if let Some((proposal, _)) = best {
-                let _id = ledger.post_proposal(from, to, proposal, now);
+            if let Some((proposal, _proposer_net)) = best {
+                // Re-score receiver one more time to capture the
+                // predicted gap (in case the argmax picked a candidate
+                // whose receiver-side net we discarded).
+                let relation = ledger.relation(from, to).cloned().unwrap_or_default();
+                let contact_target = contact_book.record_of(receiver_root, from_root);
+                let predicted_receiver_util = evaluate_proposal_v2(
+                    proposal,
+                    &relation,
+                    &receiver_personality,
+                    receiver_home,
+                    contact_target,
+                    Perspective::Receiver,
+                );
+                let predicted_gap = (receiver_personality.min_predicted_acceptance_gain
+                    - predicted_receiver_util.net)
+                    .max(0.0);
                 let fp = proposal_fingerprint(proposal);
-                ledger.relation_mut(from, to).record_offer(fp, now);
+
+                // Smart-diplomacy P3 concession ladder — if the same
+                // shape was recently rejected near-fair, post a
+                // sweetened multi-term DealPackage instead of the bare
+                // proposal. Sweetener = 3 grain transfer from proposer
+                // to receiver. Only applies to treaty-form shapes that
+                // pair naturally with aid.
+                let near_fair_retry = relation.last_offer_near_fair(
+                    fp,
+                    receiver_personality.min_predicted_acceptance_gain,
+                );
+                let grain_rid = crate::economy::core_ids::grain();
+                let our_grain = proposer_data.storage.stock_of(grain_rid);
+                let sweetener_qty: u32 = 3;
+                let can_sweeten = near_fair_retry
+                    && our_grain >= sweetener_qty
+                    && matches!(
+                        proposal,
+                        DiplomacyProposal::OfferTradePact
+                            | DiplomacyProposal::OfferAlliance
+                            | DiplomacyProposal::OfferNonAggression
+                    );
+                if can_sweeten {
+                    let treaty_term = match proposal {
+                        DiplomacyProposal::OfferTradePact => {
+                            DealTerm::TreatyForm(TreatyKind::TradePact)
+                        }
+                        DiplomacyProposal::OfferAlliance => {
+                            DealTerm::TreatyForm(TreatyKind::Alliance)
+                        }
+                        DiplomacyProposal::OfferNonAggression => {
+                            DealTerm::TreatyForm(TreatyKind::NonAggression)
+                        }
+                        _ => unreachable!(),
+                    };
+                    let aid_term = DealTerm::ResourceTransfer {
+                        resource_id: grain_rid.0,
+                        qty: sweetener_qty,
+                        direction: Direction::FromProposerToReceiver,
+                    };
+                    let _ = ledger.post_package(from, to, vec![treaty_term, aid_term], now);
+                    ledger
+                        .relation_mut(from, to)
+                        .record_offer_with_gap(fp, now, predicted_gap);
+                } else {
+                    let _id = ledger.post_proposal(from, to, proposal, now);
+                    ledger
+                        .relation_mut(from, to)
+                        .record_offer_with_gap(fp, now, predicted_gap);
+                }
             }
         }
     }
+}
+
+/// Smart-diplomacy P3 — apply an accepted `DealPackage` to the ledger
+/// + grant table. Resource / currency transfers are returned as a
+/// `Vec<PendingObligation>` so the caller (Bevy system with `Commands`)
+/// can spawn `DealObligation` entities. Treaty / grant / tribute terms
+/// commit synchronously.
+///
+/// The caller is responsible for:
+/// - debiting proposer's `FactionStorage` / `treasury` up-front (an
+///   accepted package is *committed*; the goods leave storage and
+///   ride a `DealObligation` payload),
+/// - spawning a `DealObligation` per returned `PendingObligation`.
+///
+/// Returns the list of obligations to spawn. Treaty/grant/tribute
+/// terms apply immediately to ledger/registry/access table.
+#[must_use]
+pub fn apply_accepted_package(
+    ledger: &mut DiplomacyLedger,
+    registry: &mut FactionRegistry,
+    grants: &mut crate::simulation::access_grant::AccessGrantTable,
+    package: &DealPackage,
+    tick: u64,
+) -> Vec<PendingObligation> {
+    let mut obligations: Vec<PendingObligation> = Vec::new();
+    let from = package.from_faction;
+    let to = package.to_faction;
+    record_incident(ledger, from, to, tick, IncidentKind::DealAccepted { deal_id: package.id.0 });
+    for term in &package.terms {
+        match term {
+            DealTerm::TreatyForm(kind) => {
+                let _ = form_treaty(ledger, from, to, *kind, tick);
+            }
+            DealTerm::TreatyBreak(kind) => {
+                if matches!(kind, TreatyKind::War) {
+                    break_treaty(ledger, from, to, TreatyKind::War, tick);
+                    form_treaty(ledger, from, to, TreatyKind::NonAggression, tick);
+                } else {
+                    break_treaty(ledger, from, to, *kind, tick);
+                }
+            }
+            DealTerm::ResourceTransfer { resource_id, qty, direction } => {
+                let (src, dst) = match direction {
+                    Direction::FromProposerToReceiver => (from, to),
+                    Direction::FromReceiverToProposer => (to, from),
+                };
+                obligations.push(PendingObligation {
+                    deal_id: package.id,
+                    from_faction: src,
+                    to_faction: dst,
+                    payload: ObligationPayload::Resource { resource_id: *resource_id, qty: *qty },
+                    deadline_tick: tick + DEAL_OBLIGATION_DEADLINE_TICKS,
+                });
+            }
+            DealTerm::CurrencyTransfer { amount, direction } => {
+                let (src, dst) = match direction {
+                    Direction::FromProposerToReceiver => (from, to),
+                    Direction::FromReceiverToProposer => (to, from),
+                };
+                obligations.push(PendingObligation {
+                    deal_id: package.id,
+                    from_faction: src,
+                    to_faction: dst,
+                    payload: ObligationPayload::Currency { amount: *amount },
+                    deadline_tick: tick + DEAL_OBLIGATION_DEADLINE_TICKS,
+                });
+            }
+            DealTerm::AccessGrantTerm { grant, direction } => {
+                let (granter, grantee) = match direction {
+                    Direction::FromProposerToReceiver => (from, to),
+                    Direction::FromReceiverToProposer => (to, from),
+                };
+                grants.insert(granter, grantee, *grant);
+            }
+            DealTerm::TributeStream { direction, .. } => {
+                // For v1, TributeStream wires the existing dominance
+                // axis (the per-day `tribute_payment_system` already
+                // moves currency). dominant = receiving side.
+                let (subordinate, dominant) = match direction {
+                    Direction::FromProposerToReceiver => (from, to),
+                    Direction::FromReceiverToProposer => (to, from),
+                };
+                set_tribute_acceptance(registry, dominant, subordinate);
+            }
+        }
+    }
+    obligations
+}
+
+/// Smart-diplomacy P3 — courier-walk default deadline.
+/// 3 game-days at default `TICKS_PER_DAY`.
+pub const DEAL_OBLIGATION_DEADLINE_TICKS: u64 = TICKS_PER_DAY as u64 * 3;
+
+/// Smart-diplomacy P3 — payload carried by one `DealObligation`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ObligationPayload {
+    Resource { resource_id: u16, qty: u32 },
+    Currency { amount: u32 },
+}
+
+/// Smart-diplomacy P3 — descriptor returned by `apply_accepted_package`
+/// for the caller to spawn a `DealObligation` entity from.
+#[derive(Clone, Debug)]
+pub struct PendingObligation {
+    pub deal_id: DealId,
+    pub from_faction: u32,
+    pub to_faction: u32,
+    pub payload: ObligationPayload,
+    pub deadline_tick: u64,
 }
 
 /// Smart-diplomacy P1 — wire the dominance axis when a `DemandTribute`
@@ -1149,6 +1734,96 @@ mod tests {
         let r = ledger.relation(1, 2).unwrap();
         assert_eq!(r.reputation.grievance, GRIEVANCE_RAID);
         assert!(r.reputation.trust < 0);
+    }
+
+    #[test]
+    fn deal_package_post_consume_roundtrip() {
+        let mut ledger = DiplomacyLedger::default();
+        let id = ledger.post_package(
+            1,
+            2,
+            vec![DealTerm::TreatyForm(TreatyKind::TradePact)],
+            0,
+        );
+        assert!(id.0 > 0);
+        assert_eq!(
+            ledger.package_inbox_by_faction.get(&2).unwrap().len(),
+            1
+        );
+        let p = ledger.consume_package(id).unwrap();
+        assert_eq!(p.from_faction, 1);
+        assert_eq!(p.to_faction, 2);
+        assert!(ledger.packages.is_empty());
+        assert!(ledger.package_inbox_by_faction.get(&2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn from_legacy_offer_aid_produces_resource_term() {
+        let pkg = DealPackage::from_legacy(
+            DealId(7),
+            1,
+            2,
+            DiplomacyProposal::OfferAid { resource_id: 5, qty: 10 },
+            100,
+        );
+        assert_eq!(pkg.terms.len(), 1);
+        assert!(matches!(
+            pkg.terms[0],
+            DealTerm::ResourceTransfer { resource_id: 5, qty: 10, .. }
+        ));
+    }
+
+    #[test]
+    fn from_legacy_offer_peace_produces_war_break() {
+        let pkg = DealPackage::from_legacy(
+            DealId(8),
+            1,
+            2,
+            DiplomacyProposal::OfferPeace,
+            0,
+        );
+        assert!(matches!(pkg.terms[0], DealTerm::TreatyBreak(TreatyKind::War)));
+    }
+
+    #[test]
+    fn cooldown_scales_with_gap() {
+        // Tiny gap → near-fair → 1 day
+        assert_eq!(cooldown_ticks_for_gap(0.05, 1.0), OFFER_NEAR_FAIR_COOLDOWN_TICKS);
+        // Mid gap → 5 days
+        assert_eq!(cooldown_ticks_for_gap(0.3, 1.0), OFFER_MID_GAP_COOLDOWN_TICKS);
+        // Large gap → 10 days
+        assert_eq!(cooldown_ticks_for_gap(1.5, 1.0), OFFER_FAR_GAP_COOLDOWN_TICKS);
+        // Zero gap = no rejection signal recorded → near-fair retry.
+        assert_eq!(cooldown_ticks_for_gap(0.0, 1.0), OFFER_NEAR_FAIR_COOLDOWN_TICKS);
+    }
+
+    #[test]
+    fn last_offer_near_fair_only_when_rejected_close() {
+        let mut rel = DiplomaticRelation::default();
+        let fp = 0x42u64;
+        rel.record_offer_with_gap(fp, 0, 0.05);
+        // No response yet — not "rejected near fair."
+        assert!(!rel.last_offer_near_fair(fp, 1.0));
+        // Record acceptance — not "rejected near fair."
+        rel.record_offer_response(fp, true);
+        assert!(!rel.last_offer_near_fair(fp, 1.0));
+        // Fresh rejection with near-fair gap → true.
+        rel.record_offer_with_gap(0x99, 100, 0.05);
+        rel.record_offer_response(0x99, false);
+        assert!(rel.last_offer_near_fair(0x99, 1.0));
+        // Same fingerprint rejected with large gap → false.
+        rel.record_offer_with_gap(0xAA, 200, 2.0);
+        rel.record_offer_response(0xAA, false);
+        assert!(!rel.last_offer_near_fair(0xAA, 1.0));
+    }
+
+    #[test]
+    fn deal_defaulted_drops_trust_bumps_grievance() {
+        let mut ledger = DiplomacyLedger::default();
+        record_incident(&mut ledger, 1, 2, 0, IncidentKind::DealDefaulted { deal_id: 7 });
+        let r = ledger.relation(1, 2).unwrap();
+        assert!(r.reputation.trust < 0);
+        assert_eq!(r.reputation.grievance, GRIEVANCE_DEFAULT_PENALTY);
     }
 
     #[test]

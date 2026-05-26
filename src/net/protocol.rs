@@ -23,7 +23,7 @@ use crate::world::water_runtime::RuntimeWaterCell;
 /// Wire protocol version negotiated at connect time. Bump whenever the
 /// shape of any wire message in this module changes; mismatched clients
 /// are rejected by `accept_connections_system` before any state transfer.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// One UI- (or remote-client-)issued command, scoped to the faction that
 /// claims to be sending it. The loopback validates `sender_faction_id`
@@ -956,6 +956,63 @@ mod tests {
                 }
             }
             other => panic!("expected RevokeAccessGrant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn send_diplomacy_deal_package_round_trips() {
+        use crate::simulation::diplomacy::{DealTerm, Direction, TreatyKind};
+        let original = PlayerCommand::SendDiplomacyDealPackage {
+            faction_id: 2,
+            target_faction_id: 7,
+            terms: vec![
+                DealTerm::TreatyForm(TreatyKind::TradePact),
+                DealTerm::ResourceTransfer {
+                    resource_id: 5,
+                    qty: 12,
+                    direction: Direction::FromProposerToReceiver,
+                },
+                DealTerm::CurrencyTransfer {
+                    amount: 30,
+                    direction: Direction::FromReceiverToProposer,
+                },
+            ],
+        };
+        let restored = round_trip(&original);
+        match restored {
+            PlayerCommand::SendDiplomacyDealPackage {
+                faction_id,
+                target_faction_id,
+                terms,
+            } => {
+                assert_eq!(faction_id, 2);
+                assert_eq!(target_faction_id, 7);
+                assert_eq!(terms.len(), 3);
+            }
+            other => panic!("expected SendDiplomacyDealPackage, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn respond_diplomacy_deal_package_round_trips() {
+        use crate::simulation::diplomacy::{DealId, ProposalResponse};
+        let original = PlayerCommand::RespondDiplomacyDealPackage {
+            faction_id: 3,
+            deal_id: DealId(42),
+            response: ProposalResponse::Accept,
+        };
+        let restored = round_trip(&original);
+        match restored {
+            PlayerCommand::RespondDiplomacyDealPackage {
+                faction_id,
+                deal_id,
+                response,
+            } => {
+                assert_eq!(faction_id, 3);
+                assert_eq!(deal_id, DealId(42));
+                assert_eq!(response, ProposalResponse::Accept);
+            }
+            other => panic!("expected RespondDiplomacyDealPackage, got {:?}", other),
         }
     }
 }

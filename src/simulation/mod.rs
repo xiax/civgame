@@ -18,6 +18,7 @@ pub mod access_grant;
 pub mod construction;
 pub mod corpse;
 pub mod crafting;
+pub mod deal_obligation;
 pub mod diplomacy;
 pub mod diplomatic_contact;
 pub mod diplomatic_evaluator;
@@ -815,6 +816,11 @@ impl Plugin for SimulationPlugin {
                     // professions).
                     trader::trader_route_dispatch_system
                         .after(htn::bureaucrat_admin_dispatch_system),
+                    // Smart-diplomacy P3 courier route dispatcher.
+                    // Mirrors trader's shape — runs after bureaucrat
+                    // and trader so it doesn't compete on Idle agents.
+                    deal_obligation::deal_courier_route_dispatch_system
+                        .after(trader::trader_route_dispatch_system),
                     // P1: nomad-band migration dispatcher. Walks members
                     // with a `MigrationTarget` toward the new camp tile.
                     // Ordered after bureaucrat (idle agents only) and
@@ -1755,7 +1761,13 @@ impl Plugin for SimulationPlugin {
                         .before(diplomacy::ai_diplomacy_proposal_system),
                     diplomacy::ai_diplomacy_response_system,
                     diplomacy::ai_diplomacy_proposal_system,
+                    diplomacy::ai_diplomacy_package_response_system
+                        .after(diplomacy::ai_diplomacy_response_system),
                     access_grant::treaty_to_grant_sync_system
+                        .after(diplomacy::ai_diplomacy_response_system),
+                    access_grant::ai_auto_revoke_grants_system
+                        .after(access_grant::treaty_to_grant_sync_system),
+                    deal_obligation::deal_obligation_step_system
                         .after(diplomacy::ai_diplomacy_response_system),
                 )
                     .in_set(SimulationSet::Economy),

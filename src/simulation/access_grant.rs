@@ -30,7 +30,7 @@ use crate::world::seasons::Season;
 /// Cardinal-bit mask of seasons during which a `SeasonalCamp` grant is
 /// active. Defaults to "all seasons" so v1 grants never expire on the
 /// calendar wheel unless the granter explicitly tightens.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct SeasonSet(pub u8);
 
 impl SeasonSet {
@@ -53,7 +53,7 @@ impl SeasonSet {
 
 /// Kinds of access grant. Carries enough data to evaluate `permits`
 /// without further world introspection beyond the `Settlement` lookup.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AccessKind {
     /// Civilian traders / couriers permitted inside a chebyshev disc
     /// around the granter's market_tile.
@@ -69,7 +69,7 @@ pub enum AccessKind {
 }
 
 /// One grant row in the table.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AccessGrant {
     pub kind: AccessKind,
     /// `Some(tick)` for time-limited grants that auto-expire.
@@ -345,6 +345,53 @@ pub fn reconcile_pair_grants(
     }
 }
 
+/// Grievance threshold above which AI auto-revokes a `SeasonalCamp`
+/// grant toward the offending faction. Tied to `GRIEVANCE_BLOCK_TRADE`
+/// (40) — same threshold that already blocks fresh trade pacts.
+pub const GRIEVANCE_AUTO_REVOKE_THRESHOLD: i16 = 40;
+
+/// Smart-diplomacy P3 follow-up — daily Economy pass. For every pair
+/// where grievance has crossed `GRIEVANCE_AUTO_REVOKE_THRESHOLD` and
+/// the granter is **not** the player (AI factions only), revoke any
+/// `SeasonalCamp` grant the granter holds toward the offender.
+/// `SafePassage` and `MarketCorridor` are not auto-revoked — they're
+/// derived from active treaties via `treaty_to_grant_sync_system`, so
+/// a War declaration / treaty break is the right channel for those.
+/// `SeasonalCamp` is player/AI explicit and stands separately.
+pub fn ai_auto_revoke_grants_system(
+    clock: Res<crate::simulation::schedule::SimClock>,
+    controlled: Res<crate::simulation::faction::ControlledFactions>,
+    ledger: Res<crate::simulation::diplomacy::DiplomacyLedger>,
+    mut table: ResMut<AccessGrantTable>,
+) {
+    use crate::world::seasons::TICKS_PER_DAY;
+    if clock.tick == 0 || clock.tick % TICKS_PER_DAY as u64 != 0 {
+        return;
+    }
+    // Snapshot pairs to mutate.
+    let mut to_revoke: Vec<(u32, u32, AccessKind)> = Vec::new();
+    for ((granter, grantee), grants) in table.by_pair.iter() {
+        if controlled.contains(*granter) {
+            continue;
+        }
+        let rep = ledger
+            .relation(*granter, *grantee)
+            .map(|r| r.reputation.grievance)
+            .unwrap_or(0);
+        if rep < GRIEVANCE_AUTO_REVOKE_THRESHOLD {
+            continue;
+        }
+        for g in grants.iter() {
+            if matches!(g.kind, AccessKind::SeasonalCamp { .. }) {
+                to_revoke.push((*granter, *grantee, g.kind));
+            }
+        }
+    }
+    for (a, b, kind) in to_revoke {
+        table.revoke(a, b, kind);
+    }
+}
+
 /// Bevy wrapper around `reconcile_pair_grants`. Runs Economy daily,
 /// after `ai_diplomacy_response_system` so accepted-this-tick
 /// treaty-form proposals propagate same tick.
@@ -452,6 +499,14 @@ mod tests {
         assert_eq!(classify_intent(false, false, true, false), IntruderIntent::CivilianTrader);
         assert_eq!(classify_intent(false, false, false, true), IntruderIntent::Nomad);
         assert_eq!(classify_intent(false, false, false, false), IntruderIntent::Civilian);
+    }
+
+    #[test]
+    fn auto_revoke_threshold_constants_align() {
+        // Sanity-check: auto-revoke uses the same grievance gate
+        // as the trade-pact block. Drifting these apart is a smell.
+        use crate::simulation::diplomacy::GRIEVANCE_BLOCK_TRADE;
+        assert_eq!(GRIEVANCE_AUTO_REVOKE_THRESHOLD, GRIEVANCE_BLOCK_TRADE);
     }
 
     #[test]

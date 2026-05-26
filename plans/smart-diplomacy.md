@@ -180,7 +180,7 @@ P2 adds finer trespass semantics without touching the deal model.
 - Revoke command drops grant; next tick same actor trespasses.
 - Defensive personality warns on first incident, neutral personality on second.
 
-## Phase 3 — Multi-term DealPackage + courier obligations + concession ladder
+## Phase 3 — Multi-term DealPackage + courier obligations + concession ladder — **SHIPPED 2026-05-26**
 
 P3 adds the compound-deal abstraction and physical follow-through. Wire-bumped protocol.
 
@@ -283,12 +283,16 @@ After each phase:
   - **P2**: form trade pact; send a Trader through partner territory and confirm no trespass warning. Send a drafted Hunter through and confirm immediate warning + grievance.
   - **P3**: accept a 10-grain aid deal from AI; watch courier walk physical grain to our market_tile; check storage delta. Block courier path (deconstruct bridge); confirm deadline default fires `DealDefaulted` and trust drops.
 
-## Deferred (post-P3)
+## Carryovers — shipped 2026-05-26
+
+- **Concession ladder behaviour** wired on top of `OfferMemory.predicted_gap`: `cooldown_ticks_for_gap` returns 1d / 5d / 10d by gap ratio; `last_offer_near_fair` flips a sweetened multi-term DealPackage retry (treaty + 3 grain) on near-fair rejection. AI receiver now drains the package channel via `ai_diplomacy_package_response_system` — full multi-term send + receive + courier loop.
+- **AI-initiated `RevokeAccessGrant`** on grievance crossing `GRIEVANCE_AUTO_REVOKE_THRESHOLD = 40` (= existing `GRIEVANCE_BLOCK_TRADE`). v1 scope: `SeasonalCamp` grants only (treaty-derived grants stay on the War/BreakTreaty channel).
+- **Skeleton follow-up plan files** dropped per project memory rule: `plans/diplomacy-federations.md`, `plans/diplomacy-marriage.md`, `plans/diplomacy-espionage.md` — each carries Context / Goals / Critical files / Wire protocol / Open questions / Phasing / Verification.
+
+## Deferred (post-carryover)
 
 - Multi-resource auction-style market-access tariffs.
-- Federation / confederation as super-treaty above Alliance.
-- Diplomatic marriages tying `RelationshipMemory` cross-faction.
-- AI-initiated `RevokeAccessGrant` in response to repeated trespass.
-- Spy / sabotage actions (currently outside non-omniscience scope).
-
-Skeleton follow-up plans land at `plans/diplomacy-federations.md`, `plans/diplomacy-marriage.md`, `plans/diplomacy-espionage.md` at P3 close so the deferred list is actionable.
+- Federation / confederation as super-treaty above Alliance → `plans/diplomacy-federations.md`.
+- Diplomatic marriages tying `RelationshipMemory` cross-faction → `plans/diplomacy-marriage.md`.
+- Spy / sabotage actions (currently outside non-omniscience scope) → `plans/diplomacy-espionage.md`.
+- Courier durability under combat beyond carrier-despawn → Pending fallback.

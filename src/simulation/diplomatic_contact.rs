@@ -392,8 +392,12 @@ pub fn contact_book_update_system(
                 IncidentKind::TreatyFormed(_)
                 | IncidentKind::TreatyBroken(_)
                 | IncidentKind::SharedEnemy { .. }
-                | IncidentKind::TributeAccepted => {
-                    // Treaty moves imply prior contact already recorded.
+                | IncidentKind::TributeAccepted
+                | IncidentKind::DealAccepted { .. }
+                | IncidentKind::DealDelivered { .. }
+                | IncidentKind::DealDefaulted { .. } => {
+                    // Treaty moves and deal milestones imply prior
+                    // contact already recorded.
                 }
             }
         }

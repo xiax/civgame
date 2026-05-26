@@ -239,6 +239,86 @@ pub fn diplomacy_panel_system(
                     cols[1].label("(no pending proposals from this faction)");
                 }
 
+                // ── Smart-diplomacy P3 multi-term packages ──────
+                cols[1].separator();
+                cols[1].label(egui::RichText::new("Pending deal packages").strong());
+                let package_inbox: Vec<crate::simulation::diplomacy::DealId> = ledger
+                    .package_inbox_by_faction
+                    .get(&self_fid)
+                    .map(|v| v.clone())
+                    .unwrap_or_default();
+                let mut any_package = false;
+                for did in &package_inbox {
+                    let Some(p) = ledger.package_of(*did) else {
+                        continue;
+                    };
+                    if p.from_faction != target {
+                        continue;
+                    }
+                    any_package = true;
+                    // Receiver-side score from player's perspective.
+                    let fairness_str = self_data.parent_faction.is_none().then(|| {
+                        let pers = DiplomaticPersonality::from_culture(
+                            &self_data.culture,
+                            self_data.caps.home.is_mobile(),
+                        );
+                        let relation = ledger
+                            .relation(p.from_faction, self_fid)
+                            .cloned()
+                            .unwrap_or_default();
+                        let contact = contact_book
+                            .record_of(self_root, registry.root_faction(p.from_faction));
+                        let util = crate::simulation::diplomatic_evaluator::evaluate_deal_package(
+                            p,
+                            &relation,
+                            &pers,
+                            self_data.home_tile,
+                            contact,
+                            crate::simulation::diplomatic_evaluator::Perspective::Receiver,
+                        );
+                        fairness_color_label(util.fairness)
+                    });
+                    let deal_id_copy = *did;
+                    cols[1].group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Deal #{}", deal_id_copy.0));
+                            if let Some((label, color)) = fairness_str {
+                                ui.label(
+                                    egui::RichText::new(format!("[{}]", label)).color(color),
+                                );
+                            }
+                        });
+                        for t in &p.terms {
+                            ui.label(format!("  • {}", term_summary(t)));
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Accept").clicked() {
+                                sender.send(
+                                    Vec::new(),
+                                    PlayerCommand::RespondDiplomacyDealPackage {
+                                        faction_id: self_fid,
+                                        deal_id: deal_id_copy,
+                                        response: ProposalResponse::Accept,
+                                    },
+                                );
+                            }
+                            if ui.button("Reject").clicked() {
+                                sender.send(
+                                    Vec::new(),
+                                    PlayerCommand::RespondDiplomacyDealPackage {
+                                        faction_id: self_fid,
+                                        deal_id: deal_id_copy,
+                                        response: ProposalResponse::Reject,
+                                    },
+                                );
+                            }
+                        });
+                    });
+                }
+                if !any_package {
+                    cols[1].label("(no pending deal packages)");
+                }
+
                 // ── Grants section (Smart-diplomacy P2) ────────
                 cols[1].separator();
                 cols[1].label(egui::RichText::new("Access grants").strong());
@@ -357,6 +437,36 @@ pub fn diplomacy_panel_system(
                 }
             });
         });
+}
+
+fn term_summary(t: &crate::simulation::diplomacy::DealTerm) -> String {
+    use crate::simulation::diplomacy::{DealTerm, Direction};
+    let dir = |d: &Direction| match d {
+        Direction::FromProposerToReceiver => "→ us",
+        Direction::FromReceiverToProposer => "→ them",
+    };
+    match t {
+        DealTerm::TreatyForm(k) => format!("Form treaty: {:?}", k),
+        DealTerm::TreatyBreak(k) => format!("Break treaty: {:?}", k),
+        DealTerm::ResourceTransfer { resource_id, qty, direction } => format!(
+            "Transfer {}x resource[{}] {}",
+            qty,
+            resource_id,
+            dir(direction)
+        ),
+        DealTerm::CurrencyTransfer { amount, direction } => {
+            format!("Transfer {}¢ {}", amount, dir(direction))
+        }
+        DealTerm::AccessGrantTerm { grant, direction } => {
+            format!("Grant {} {}", grant_summary(grant.kind), dir(direction))
+        }
+        DealTerm::TributeStream { until_tick, daily_units, direction } => format!(
+            "Tribute {}/day until t={} {}",
+            daily_units,
+            until_tick,
+            dir(direction)
+        ),
+    }
 }
 
 fn grant_summary(k: AccessKind) -> String {
