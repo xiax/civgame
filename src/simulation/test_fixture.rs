@@ -5663,6 +5663,245 @@ mod smoke {
         }
     }
 
+    /// Foreman pass: with multiple state-owned Ag plots at different
+    /// distances, Spring `chief_job_posting_system` posts Prepare for the
+    /// nearest plot ONLY. The farther plots wait until the focused plot's
+    /// FieldWork slots saturate (proven by the next test).
+    #[test]
+    fn spring_focused_posting_targets_nearest_plot_only() {
+        use crate::economy::core_ids;
+        use crate::simulation::faction::{FactionChief, FactionRegistry};
+        use crate::simulation::jobs::{JobBoard, JobKind, JobProgress};
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
+        use crate::simulation::settlement::{TileRect, ZoneKind};
+        use crate::simulation::technology::CROP_CULTIVATION;
+
+        let mut sim = TestSim::new(0xF0CA_5);
+        // Big flat world so all three plots are reachable.
+        sim.flat_world(8, 0, TileKind::Grass);
+        let storage_tile = (0, 0);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+        sim.spawn_ground_item(storage_tile, core_ids::grain(), 200);
+        sim.spawn_ground_item(storage_tile, core_ids::grain_seed(), 64);
+
+        let chief = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        {
+            let world = sim.app.world_mut();
+            let mut knowledge = world.get_mut::<PersonKnowledge>(chief).unwrap();
+            knowledge.aware.set(CROP_CULTIVATION);
+            knowledge.learned.set(CROP_CULTIVATION);
+            world.entity_mut(chief).insert(FactionChief);
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            registry.add_member(sim.player_faction_id);
+            let faction = registry.factions.get_mut(&sim.player_faction_id).unwrap();
+            faction.chief_entity = Some(chief);
+            faction.techs.unlock(CROP_CULTIVATION);
+        }
+
+        let fid = sim.player_faction_id;
+        // Three plots at chebyshev distances ~10 (near), ~30, ~60 from home.
+        let plots = [
+            TileRect::new(10, 0, 8, 8),
+            TileRect::new(30, 0, 8, 8),
+            TileRect::new(60, 0, 8, 8),
+        ];
+        for rect in plots {
+            let world = sim.app.world_mut();
+            let pid = world.resource_mut::<PlotIndex>().alloc_id();
+            let ent = world
+                .spawn(Plot {
+                    id: pid,
+                    settlement_id: 0,
+                    faction_id: fid,
+                    rect,
+                    z: 0,
+                    zone_kind: ZoneKind::Agricultural,
+                    tenure: Tenure::StateOwned,
+                    holder: TenureHolder::State { faction_id: fid },
+                    base_value: 0.0,
+                    last_valued_tick: 0,
+                    missed_payments: 0,
+                    frontage_edge: None,
+                    access_tile: None,
+                    parent_plot: None,
+                    plowed_year: None,
+                })
+                .id();
+            world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
+        }
+
+        sim.tick_n(120);
+
+        let board = sim.app.world().resource::<JobBoard>();
+        let posted_x0s: Vec<i32> = board
+            .faction_postings(fid)
+            .iter()
+            .filter_map(|p| match p.progress {
+                JobProgress::FieldWork {
+                    area,
+                    assigned_farmer: None,
+                    ..
+                } if matches!(p.kind, JobKind::Farm) => Some(area.min.0),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !posted_x0s.is_empty(),
+            "at least the focused plot must get a posting"
+        );
+        for x0 in &posted_x0s {
+            assert_eq!(
+                *x0, 10,
+                "foreman pass must post only the nearest plot (x0=10); got plot at x0={x0}"
+            );
+        }
+    }
+
+    /// Foreman pass overflow: once the focused plot's FieldWork posting hits
+    /// `posting_target_workers` claimants, the next chief tick opens a
+    /// posting on the second-nearest plot.
+    #[test]
+    fn spring_overflow_opens_when_focused_saturates() {
+        use crate::economy::core_ids;
+        use crate::simulation::faction::{FactionChief, FactionRegistry};
+        use crate::simulation::jobs::{JobBoard, JobKind, JobProgress};
+        use crate::simulation::knowledge::PersonKnowledge;
+        use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
+        use crate::simulation::settlement::{TileRect, ZoneKind};
+        use crate::simulation::technology::CROP_CULTIVATION;
+
+        let mut sim = TestSim::new(0xF11_F0CA);
+        sim.flat_world(8, 0, TileKind::Grass);
+        let storage_tile = (0, 0);
+        sim.spawn_storage_tile(sim.player_faction_id, storage_tile);
+        sim.spawn_ground_item(storage_tile, core_ids::grain(), 200);
+        sim.spawn_ground_item(storage_tile, core_ids::grain_seed(), 64);
+
+        let chief = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        {
+            let world = sim.app.world_mut();
+            let mut knowledge = world.get_mut::<PersonKnowledge>(chief).unwrap();
+            knowledge.aware.set(CROP_CULTIVATION);
+            knowledge.learned.set(CROP_CULTIVATION);
+            world.entity_mut(chief).insert(FactionChief);
+        }
+        {
+            let mut registry = sim.app.world_mut().resource_mut::<FactionRegistry>();
+            // Bump member count so per-bucket caps don't drop the posting.
+            for _ in 0..20 {
+                registry.add_member(sim.player_faction_id);
+            }
+            let faction = registry.factions.get_mut(&sim.player_faction_id).unwrap();
+            faction.chief_entity = Some(chief);
+            faction.techs.unlock(CROP_CULTIVATION);
+        }
+
+        let fid = sim.player_faction_id;
+        let plots = [TileRect::new(10, 0, 8, 8), TileRect::new(40, 0, 8, 8)];
+        for rect in plots {
+            let world = sim.app.world_mut();
+            let pid = world.resource_mut::<PlotIndex>().alloc_id();
+            let ent = world
+                .spawn(Plot {
+                    id: pid,
+                    settlement_id: 0,
+                    faction_id: fid,
+                    rect,
+                    z: 0,
+                    zone_kind: ZoneKind::Agricultural,
+                    tenure: Tenure::StateOwned,
+                    holder: TenureHolder::State { faction_id: fid },
+                    base_value: 0.0,
+                    last_valued_tick: 0,
+                    missed_payments: 0,
+                    frontage_edge: None,
+                    access_tile: None,
+                    parent_plot: None,
+                    plowed_year: None,
+                })
+                .id();
+            world.resource_mut::<PlotIndex>().by_id.insert(pid, ent);
+        }
+
+        sim.tick_n(120);
+
+        // Sanity: only the nearest (x0=10) plot has a posting at this point.
+        let near_posting_x0s_first: Vec<i32> = sim
+            .app
+            .world()
+            .resource::<JobBoard>()
+            .faction_postings(fid)
+            .iter()
+            .filter_map(|p| match p.progress {
+                JobProgress::FieldWork { area, .. } if matches!(p.kind, JobKind::Farm) => {
+                    Some(area.min.0)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            near_posting_x0s_first.iter().all(|x| *x == 10),
+            "before saturation only near plot should be posted; got {:?}",
+            near_posting_x0s_first
+        );
+
+        // Saturate the near plot's posting by injecting placeholder claimants
+        // up to `posting_target_workers`. Use synthetic entities (the chief
+        // posting system + foreman overflow gate only reads `claimants.len()`
+        // not the entity identities).
+        {
+            let world = sim.app.world_mut();
+            let synthetic_workers: Vec<Entity> = (0..16).map(|_| world.spawn(()).id()).collect();
+            let mut board = world.resource_mut::<JobBoard>();
+            for p in board.faction_postings_mut(fid).iter_mut() {
+                if !matches!(p.kind, JobKind::Farm) {
+                    continue;
+                }
+                if !matches!(
+                    p.progress,
+                    JobProgress::FieldWork {
+                        assigned_farmer: None,
+                        ..
+                    }
+                ) {
+                    continue;
+                }
+                while (p.claimants.len() as u32)
+                    < crate::simulation::jobs::posting_target_workers(p)
+                {
+                    let next =
+                        synthetic_workers[p.claimants.len() % synthetic_workers.len()];
+                    p.claimants.push(next);
+                }
+            }
+        }
+
+        // Advance past the next CHIEF_POSTING_INTERVAL so the foreman runs again.
+        sim.tick_n(120);
+
+        let posted_x0s_after: Vec<i32> = sim
+            .app
+            .world()
+            .resource::<JobBoard>()
+            .faction_postings(fid)
+            .iter()
+            .filter_map(|p| match p.progress {
+                JobProgress::FieldWork { area, .. } if matches!(p.kind, JobKind::Farm) => {
+                    Some(area.min.0)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            posted_x0s_after.contains(&40),
+            "after near-plot saturation the second-nearest plot (x0=40) must open; got {:?}",
+            posted_x0s_after
+        );
+    }
+
     /// Seasonal jellyfish integration: a freshly-seeded belt plot lands every
     /// tile in `FieldTileIndex`, and pre-stamps a *bounded* starter patch of
     /// `Cropland` (≤ half the plot) so year 1 is a real first crop instead of

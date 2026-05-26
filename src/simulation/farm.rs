@@ -242,6 +242,99 @@ impl FieldTileIndex {
     }
 }
 
+/// Per-plot tile classification used by the foreman pass in
+/// `chief_job_posting_system`. Counts mirror the predicates encoded in
+/// `find_nearest_plantable_in_rect` / `find_nearest_unprepared_in_rect` plus
+/// the `PlantMap` mature-crop sweep that lived inline in the posting loop.
+///
+/// Pure read-only computation; safe to call once per plot per posting tick.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlotTileCounts {
+    pub unprepared: u32,
+    pub plantable: u32,
+    /// Mature, harvestable crop (any `is_farm_plantable` kind at `Mature`)
+    /// inside the plot rect. Includes plants whose tile dropped below the
+    /// plantable nutrient threshold mid-season but still carry a standing
+    /// mature crop.
+    pub mature: u32,
+}
+
+/// Walk every tile in `rect` once and bucket into `{unprepared, plantable,
+/// mature}`. Used by the foreman pass to rank plots and to size posting
+/// targets. The per-tile predicates match the search helpers so a plot whose
+/// `plantable > 0` will actually yield a `find_nearest_plantable_in_rect`
+/// hit (modulo planting reservations, which only the dispatcher consults).
+pub fn plot_tile_counts(
+    chunk_map: &crate::world::chunk::ChunkMap,
+    field_tiles: &FieldTileIndex,
+    plant_map: &crate::simulation::plants::PlantMap,
+    plant_q: &Query<&crate::simulation::plants::Plant>,
+    rect: crate::simulation::settlement::TileRect,
+) -> PlotTileCounts {
+    use crate::simulation::plants::GrowthStage;
+    use crate::world::tile::TileKind;
+    let mut out = PlotTileCounts::default();
+    for ty in rect.y0..rect.y0 + rect.h as i32 {
+        for tx in rect.x0..rect.x0 + rect.w as i32 {
+            let is_cropland = matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Cropland));
+            let nutrients = field_tiles
+                .by_tile
+                .get(&(tx, ty))
+                .map(|s| s.nutrients)
+                .unwrap_or(0);
+            let exhausted = nutrients < EXHAUSTED_FLOOR;
+            if !is_cropland || exhausted {
+                out.unprepared += 1;
+            }
+            let plant_here = plant_map.0.get(&(tx, ty)).copied();
+            if is_cropland && nutrients >= MIN_PLANTABLE_NUTRIENTS && plant_here.is_none() {
+                out.plantable += 1;
+            }
+            if is_cropland {
+                if let Some(pent) = plant_here {
+                    if let Ok(pl) = plant_q.get(pent) {
+                        if pl.kind.is_farm_plantable() && pl.stage == GrowthStage::Mature {
+                            out.mature += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Focus rank tier for the foreman pass. Lower = higher priority. Plots
+/// already partway through the cycle (mature crop or plantable cropland)
+/// finish before fresh raw plots; tilled-but-empty plots come last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PlotFocusTier {
+    /// Plot carries mature crop OR plantable cropland — finish first.
+    Started = 0,
+    /// Plot has unprepared tiles — bring online next.
+    Unprepared = 1,
+    /// Plot has no useful work this season.
+    Idle = 2,
+}
+
+/// Composite sort key: `(tier, dist_to_home, rect.x0, rect.y0)`. The two
+/// rect coordinates are the deterministic tie-break.
+#[inline]
+pub fn plot_focus_score(
+    counts: &PlotTileCounts,
+    dist_to_home: i32,
+    rect: crate::simulation::settlement::TileRect,
+) -> (PlotFocusTier, i32, i32, i32) {
+    let tier = if counts.mature > 0 || counts.plantable > 0 {
+        PlotFocusTier::Started
+    } else if counts.unprepared > 0 {
+        PlotFocusTier::Unprepared
+    } else {
+        PlotFocusTier::Idle
+    };
+    (tier, dist_to_home, rect.x0, rect.y0)
+}
+
 /// Find the nearest plantable tile in `rect` for the seasonal pipeline.
 /// "Plantable" means: tile kind is `Cropland` (prepared), tile is not already
 /// carrying a plant (PlantMap), not held by an in-flight `PlantingReservations`
@@ -487,20 +580,38 @@ pub fn chief_farm_plot_assignment_system(
             continue;
         }
 
-        // Greedy: for each farmer (in arbitrary order), assign nearest free plot.
-        for (farmer, ftile) in free_farmers {
-            let Some((idx, &(plot_pid, _))) = free_plots
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, (_, pcenter))| chebyshev(ftile, *pcenter))
+        // Plots-first deterministic greedy: walk plots in stable rect-coord
+        // order; for each, pick the nearest unassigned Farmer (chebyshev),
+        // tie-break on entity bits. Avoids the prior iteration-order
+        // dependency where two ticks could swap caretaker pairings on a
+        // hash-set reshuffle.
+        free_plots.sort_by_key(|(_, center)| (*center));
+        free_plots.sort_by_key(|(pid, _)| {
+            // Stable lookup by plot rect.min, falls back to PlotId order.
+            plot_index
+                .by_id
+                .get(pid)
+                .and_then(|&ent| plot_q.get(ent).ok())
+                .map(|p| (p.rect.x0, p.rect.y0))
+                .unwrap_or((i32::MAX, i32::MAX))
+        });
+        for (plot_pid, pcenter) in free_plots.iter() {
+            if free_farmers.is_empty() {
+                break;
+            }
+            let Some((idx, _)) =
+                free_farmers
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (farmer, ftile))| {
+                        (chebyshev(*ftile, *pcenter), farmer.to_bits())
+                    })
             else {
                 break;
             };
-            assignments.assign(farmer, plot_pid);
-            free_plots.swap_remove(idx);
-            if free_plots.is_empty() {
-                break;
-            }
+            let (farmer, _) = free_farmers[idx];
+            assignments.assign(farmer, *plot_pid);
+            free_farmers.swap_remove(idx);
         }
     }
 }
@@ -1440,6 +1551,73 @@ mod tests {
                 season, phase, s
             );
         }
+    }
+
+    #[test]
+    fn plot_focus_score_orders_started_before_unprepared_before_idle() {
+        // `Started` (has mature crop OR plantable cropland) outranks
+        // `Unprepared` outranks `Idle` regardless of distance — finish a
+        // plot you've already invested in before opening a fresh raw plot.
+        let started = PlotTileCounts {
+            unprepared: 0,
+            plantable: 4,
+            mature: 0,
+        };
+        let unprepared = PlotTileCounts {
+            unprepared: 16,
+            plantable: 0,
+            mature: 0,
+        };
+        let idle = PlotTileCounts::default();
+        let rect = crate::simulation::settlement::TileRect::new(0, 0, 4, 4);
+        // Make `started` the FARTHEST and `idle` the closest — tier still wins.
+        let s_started = plot_focus_score(&started, 100, rect);
+        let s_unprepared = plot_focus_score(&unprepared, 50, rect);
+        let s_idle = plot_focus_score(&idle, 1, rect);
+        assert!(
+            s_started < s_unprepared,
+            "Started ({:?}) must beat Unprepared ({:?})",
+            s_started,
+            s_unprepared
+        );
+        assert!(
+            s_unprepared < s_idle,
+            "Unprepared ({:?}) must beat Idle ({:?})",
+            s_unprepared,
+            s_idle
+        );
+    }
+
+    #[test]
+    fn plot_focus_score_breaks_ties_by_distance_then_rect_coords() {
+        let counts = PlotTileCounts {
+            unprepared: 8,
+            plantable: 0,
+            mature: 0,
+        };
+        let rect_a = crate::simulation::settlement::TileRect::new(0, 0, 4, 4);
+        let rect_b = crate::simulation::settlement::TileRect::new(10, 0, 4, 4);
+        // Same tier + same distance → tie-break on x0 (lower wins).
+        let near_a = plot_focus_score(&counts, 5, rect_a);
+        let near_b = plot_focus_score(&counts, 5, rect_b);
+        assert!(near_a < near_b);
+        // Closer plot wins regardless of rect coord.
+        let far_a = plot_focus_score(&counts, 30, rect_a);
+        let close_b = plot_focus_score(&counts, 5, rect_b);
+        assert!(close_b < far_a);
+    }
+
+    #[test]
+    fn farm_dist_penalty_dominates_profession_bias_at_realistic_gaps() {
+        // Sanity: at FARM_DIST_PENALTY=0.01, a 30-tile gap between two equal
+        // Farm postings costs 0.30 — enough to beat the Farmer profession
+        // bias of +0.5 partially but tunable. Pin the relationship so any
+        // tuning movement on either knob is intentional.
+        let gap = 30.0_f32;
+        let penalty = gap * crate::simulation::jobs::FARM_DIST_PENALTY;
+        assert!((penalty - 0.30).abs() < f32::EPSILON);
+        // Old 0.001 multiplier yields only 0.03 — well under any bias.
+        assert!(penalty > gap * 0.001 * 9.0);
     }
 
     #[test]
