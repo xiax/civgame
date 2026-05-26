@@ -353,7 +353,7 @@ pub fn market_sell_system(
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
-        if ai.state != AiState::Idle {
+        if ai.state() != AiState::Idle {
             continue;
         }
 

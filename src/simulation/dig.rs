@@ -73,8 +73,7 @@ pub fn dig_system(
         let kind = chunk_map.tile_kind_at(tx, ty).unwrap_or(TileKind::Air);
 
         if kind == TileKind::Air || kind.is_water_like() || surf_z <= Z_MIN {
-            ai.state = AiState::Idle;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         }
 
@@ -97,7 +96,6 @@ pub fn dig_system(
         if current_level >= depth_cap {
             // Worker can't push past their tool limit on this material.
             // Cancel chain so HTN can re-route to a workable site / acquire a pick.
-            ai.state = AiState::Idle;
             aq.cancel_chain(&mut ai);
             continue;
         }
@@ -155,8 +153,7 @@ pub fn dig_system(
             }
         };
         if next_level_blocked {
-            ai.state = AiState::Idle;
-            aq.advance();
+            aq.finish_task(&mut ai);
         }
         // else: leave ai.state = Working, work_progress resumes from 0 above.
     }

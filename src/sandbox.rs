@@ -78,14 +78,10 @@ fn setup_sandbox(
             SkillPeaks::default(),
             SkillUseTicks::default(),
             SkillsLastSeen::default(),
-            PersonAI {
-                state: AiState::Idle,
-                target_tile: (cx as i32, cy as i32),
-                dest_tile: (cx as i32, cy as i32),
-                current_z: chunk_map.surface_z_at(cx, cy) as i8,
-                target_z: chunk_map.surface_z_at(cx, cy) as i8,
-                ..PersonAI::default()
-            },
+            PersonAI::placed_at(
+                (cx as i32, cy as i32),
+                chunk_map.surface_z_at(cx, cy) as i8,
+            ),
             EconomicAgent::default(),
         ),
         (

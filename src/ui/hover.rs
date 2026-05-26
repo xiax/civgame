@@ -229,7 +229,7 @@ pub fn hover_info_system(
                             .unwrap_or("Person");
                         ui.collapsing(format!("{} ({:?})", name, sex), |ui| {
                             ui.label(format!("Health: {:.0}%", body.fraction() * 100.0));
-                            ui.label(format!("State: {:?}", ai.state));
+                            ui.label(format!("State: {:?}", ai.state()));
                             ui.label(format!("Faction: {}", faction.faction_id));
                             ui.label(format!("Mood: {} ({})", mood.label(), mood.0));
                             ui.label(format!("Hunger: {}", needs.hunger));
@@ -458,7 +458,7 @@ pub fn hover_info_system(
                             continue;
                         }
 
-                        if ai.state == AiState::Idle && dist <= 30 {
+                        if ai.state() == AiState::Idle && dist <= 30 {
                             idle_nearby += 1;
                         }
 

@@ -273,13 +273,12 @@ pub fn production_system(
                 // unplantable (race lost / no seed) — either way no other
                 // worker should keep waiting on it.
                 plant_reservations.release((tx, ty));
-                ai.state = AiState::Idle;
                 // Phase 5e-v: drain the typed channel so an HTN
                 // PlantFromStorage chain (or PlayPlant — both use this branch)
                 // doesn't leave a stale `Task::Planter` / `Task::Idle`
                 // mismatch behind. PlayPlant doesn't yet emit a typed task,
-                // so `advance()` is a no-op for that path; harmless.
-                aq.advance();
+                // so `finish_task` is a no-op for that path; harmless.
+                aq.finish_task(&mut ai);
             } else {
                 // Check if tile is still valid for planting
                 if plant_map.0.contains_key(&(tx, ty)) {
@@ -287,8 +286,7 @@ pub fn production_system(
                     // so a future planter can use the slot once the current
                     // crop clears.
                     plant_reservations.release((tx, ty));
-                    ai.state = AiState::Idle;
-                    aq.advance();
+                    aq.finish_task(&mut ai);
                 }
             }
         }
@@ -311,8 +309,7 @@ pub fn production_system(
                     });
                     needs.willpower = (needs.willpower + WILLPOWER_PLAY_BURST).clamp(0.0, 255.0);
                 }
-                ai.state = AiState::Idle;
-                aq.advance();
+                aq.finish_task(&mut ai);
             }
         }
 
@@ -383,22 +380,19 @@ pub fn withdraw_good_task_system(
         // task disagrees with task_id, the dispatcher forgot to populate it —
         // bail rather than read stale `craft_recipe_id`.
         let Some(filter) = aq.current.as_withdraw_good() else {
-            ai.state = AiState::Idle;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
 
         if member.faction_id == SOLO {
-            ai.state = AiState::Idle;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         }
 
         let (tx, ty) = ai.dest_tile;
 
         if storage_tile_map.tiles.get(&(tx, ty)) != Some(&member.faction_id) {
-            ai.state = AiState::Idle;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         }
 
@@ -442,9 +436,7 @@ pub fn withdraw_good_task_system(
             }
         }
 
-        ai.state = AiState::Idle;
-        ai.work_progress = 0;
-        aq.advance();
+        aq.finish_task(&mut ai);
     }
 }
 
@@ -578,10 +570,8 @@ pub fn withdraw_material_task_system(
             // withdrawn, the stow leg degrades to a no-op self-advance.
             let _ = took;
             if matches!(aq.current, Task::StowToolKit { .. }) {
-                ai.state = AiState::Working;
-                ai.work_progress = 0;
+                aq.begin_working(&mut ai);
             } else {
-                ai.state = AiState::Idle;
                 ai.target_entity = None;
                 if !took {
                     crate::simulation::htn::record_target_failure(
@@ -590,6 +580,7 @@ pub fn withdraw_material_task_system(
                         clock.tick,
                     );
                 }
+                aq.assert_idle(&mut ai);
             }
             continue;
         }
@@ -952,11 +943,16 @@ pub fn buy_material_task_system(world: &mut World) {
         // a permanently-stuck worker). The prefetched HaulToBlueprint leg is
         // dropped deliberately — the in-hand path re-creates it.
         let _ = bought;
+        // Two-step borrow against the World — `aq.cancel()` then mutate
+        // `ai.state` directly (simulation-internal visibility permits the
+        // raw write; the pair is observationally atomic because no other
+        // system runs between these statements).
         if let Some(mut aq) = world.get_mut::<ActionQueue>(s.entity) {
             aq.cancel();
         }
         if let Some(mut ai) = world.get_mut::<PersonAI>(s.entity) {
             ai.state = AiState::Idle;
+            ai.work_progress = 0;
             ai.target_entity = None;
         }
     }
@@ -992,9 +988,8 @@ fn route_haul_to_blueprint_tail(
     // re-evaluate next tick rather than strand the agent.
     let Ok(bp) = bp_query.get(blueprint) else {
         crate::simulation::htn::record_target_failure(method_history, ai, now);
-        aq.cancel();
-        ai.state = AiState::Idle;
         ai.target_entity = None;
+        aq.cancel_chain(ai);
         return;
     };
     let bp_tile = (bp.tile.0, bp.tile.1);
@@ -1004,6 +999,7 @@ fn route_haul_to_blueprint_tail(
         cur_chunk,
         bp_tile,
         TaskKind::HaulMaterials,
+        None,
         Some(blueprint),
         chunk_graph,
         chunk_router,
@@ -1012,13 +1008,11 @@ fn route_haul_to_blueprint_tail(
         spatial_index,
         stand_reservations,
         actor,
-        now,
-    );
+        now,);
     if !dispatched {
         crate::simulation::htn::record_routing_failure(method_history, ai, now);
-        aq.cancel();
-        ai.state = AiState::Idle;
         ai.target_entity = None;
+        aq.cancel_chain(ai);
     }
 }
 
@@ -1092,8 +1086,7 @@ fn finish_withdraw_material(
             // orders silently degrade to Idle so the agent re-evaluates.
             let Ok(order_data) = co_query.get(order) else {
                 crate::simulation::htn::record_target_failure(method_history, ai, now);
-                aq.cancel();
-                ai.state = AiState::Idle;
+                aq.cancel_chain(ai);
                 ai.target_entity = None;
                 return;
             };
@@ -1104,6 +1097,7 @@ fn finish_withdraw_material(
                 cur_chunk,
                 dest,
                 TaskKind::HaulToCraftOrder,
+                None,
                 Some(order),
                 chunk_graph,
                 chunk_router,
@@ -1112,12 +1106,10 @@ fn finish_withdraw_material(
                 spatial_index,
                 stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !dispatched {
                 crate::simulation::htn::record_routing_failure(method_history, ai, now);
-                aq.cancel();
-                ai.state = AiState::Idle;
+                aq.cancel_chain(ai);
                 ai.target_entity = None;
             }
         }
@@ -1128,8 +1120,7 @@ fn finish_withdraw_material(
             // needed. Prime the legacy channel so `equip_task_system` picks
             // up next tick. Mirrors `finish_withdraw_food`'s priming pattern
             // for the AcquireFood Eat tail.
-            ai.state = AiState::Working;
-            ai.work_progress = 0;
+            aq.begin_working(ai);
         }
         Task::Planter {
             tile,
@@ -1165,6 +1156,7 @@ fn finish_withdraw_material(
                 tile,
                 TaskKind::Planter,
                 None,
+                None,
                 chunk_graph,
                 chunk_router,
                 chunk_map,
@@ -1172,14 +1164,12 @@ fn finish_withdraw_material(
                 spatial_index,
                 stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !dispatched {
                 plant_reservations.release(tile);
                 crate::simulation::htn::record_routing_failure(method_history, ai, now);
-                aq.cancel();
-                ai.state = AiState::Idle;
                 ai.target_entity = None;
+                aq.cancel_chain(ai);
             }
         }
         Task::PlayThrow => {
@@ -1190,8 +1180,7 @@ fn finish_withdraw_material(
             // Prime the legacy channel so `production_system`'s PlayThrow
             // branch picks up next tick. Mirrors `Equip`'s priming pattern
             // for the hunter-arm chain.
-            ai.state = AiState::Working;
-            ai.work_progress = 0;
+            aq.begin_working(ai);
         }
         Task::Play { partner: _ } => {
             // Phase 5e-xii-c: PlayWithStoredToy chain.
@@ -1201,8 +1190,7 @@ fn finish_withdraw_material(
             // `play_system`'s solo branch reads the held entertainment value
             // from `Carrier`. Prime the legacy channel so the play_system
             // executor picks up next tick.
-            ai.state = AiState::Working;
-            ai.work_progress = 0;
+            aq.begin_working(ai);
             // target_entity should already be None (the WithdrawMaterial head
             // dispatch passed None to `assign_task_with_routing`) — the solo
             // branch in play_system needs target_entity = None to fall through
@@ -1241,6 +1229,7 @@ fn finish_withdraw_material(
                 tile,
                 TaskKind::PlayPlant,
                 None,
+                None,
                 chunk_graph,
                 chunk_router,
                 chunk_map,
@@ -1248,26 +1237,25 @@ fn finish_withdraw_material(
                 spatial_index,
                 stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !dispatched {
                 plant_reservations.release(tile);
                 crate::simulation::htn::record_routing_failure(method_history, ai, now);
-                aq.cancel();
-                ai.state = AiState::Idle;
                 ai.target_entity = None;
+                aq.cancel_chain(ai);
             }
         }
         Task::Idle => {
-            ai.state = AiState::Idle;
+            // `aq.advance()` above already promoted `Task::Idle` here —
+            // re-assert the FSM state to match.
+            aq.assert_idle(ai);
         }
         _ => {
             // No other task family is expected as a chained follow-up to
             // WithdrawMaterial. Drop the entire chain to Idle so a
             // mis-built expansion can't strand the agent.
             crate::simulation::htn::record_target_failure(method_history, ai, now);
-            aq.cancel();
-            ai.state = AiState::Idle;
+            aq.cancel_chain(ai);
         }
     }
 }
@@ -1383,18 +1371,14 @@ pub fn take_from_member_task_system(
         // `WalkAndTakeFromMember` is responsible for any chain handoff
         // by enqueuing a follow-on task; the prefetch ring's `advance`
         // promotes it.
-        a_aq.advance();
-        a_ai.state = AiState::Idle;
         a_ai.target_entity = None;
-        a_ai.work_progress = 0;
+        a_aq.finish_task(&mut a_ai);
     }
 
     for actor in to_finalize {
         if let Ok((_, mut ai, mut aq, _, _, _, _, _)) = query.get_mut(actor) {
-            aq.cancel();
-            ai.state = AiState::Idle;
             ai.target_entity = None;
-            ai.work_progress = 0;
+            aq.cancel_chain(&mut ai);
         }
     }
 }
@@ -1515,17 +1499,16 @@ fn finish_withdraw_food(ai: &mut PersonAI, aq: &mut crate::simulation::typed_tas
     match aq.current {
         Task::Eat => {
             // Hand off straight into the Eat executor.
-            ai.state = AiState::Working;
+            aq.begin_working(ai);
         }
         Task::Idle => {
-            ai.state = AiState::Idle;
+            aq.assert_idle(ai);
         }
         _ => {
             // No other task family is expected as a chained follow-up to
             // WithdrawFood at 5b-iii-ii. Drop the entire chain to Idle so a
             // mis-built expansion can't strand the agent.
-            aq.cancel();
-            ai.state = AiState::Idle;
+            aq.cancel_chain(ai);
         }
     }
 }
@@ -1579,13 +1562,11 @@ pub fn eat_task_system(
 
         // No food on hand or in inventory — nothing to eat. Abort cleanly.
         if total_edible(&agent, &carrier) == 0 {
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
             // Phase 6b-ii: drain the typed channel so
             // `htn_method_completion_system` can record `MethodOutcome::Success`
             // for the dispatching method (or `htn_eat_dispatch_system` doesn't
             // pile duplicate Eat tasks onto the queue ring next tick).
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         }
 
@@ -1751,13 +1732,11 @@ pub fn eat_task_system(
             }
         }
 
-        ai.state = AiState::Idle;
-        ai.work_progress = 0;
         // Phase 6b-ii: drain the typed channel on natural completion so
         // `htn_method_completion_system` (Economy, after deposit) sees
         // `aq.current == Idle` and records the dispatching method's
         // `MethodOutcome::Success` against `MethodHistory`.
-        aq.advance();
+        aq.finish_task(&mut ai);
     }
 }
 
@@ -1802,9 +1781,7 @@ pub fn tame_task_system(
         // Prefer the typed task's target for chain-integrity; fall back to
         // legacy `ai.target_entity` so the plan-driven path keeps working.
         let Some(target) = aq.current.as_tame_animal().or(ai.target_entity) else {
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
         let required_tech = if untamed_horses.get(target).is_ok() {
@@ -1819,10 +1796,8 @@ pub fn tame_task_system(
 
         let Some(tech_id) = required_tech else {
             // Target is gone, dead, already tamed, or not a tameable species
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
             ai.target_entity = None;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
 
@@ -1832,10 +1807,8 @@ pub fn tame_task_system(
             .map(|f| f.techs.has(tech_id))
             .unwrap_or(false);
         if !has_tech {
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
             ai.target_entity = None;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         }
 
@@ -1853,10 +1826,8 @@ pub fn tame_task_system(
             commands.entity(target).insert(Tamed {
                 owner_faction: member.faction_id,
             });
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
             ai.target_entity = None;
-            aq.advance();
+            aq.finish_task(&mut ai);
         }
     }
 }

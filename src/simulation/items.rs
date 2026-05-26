@@ -229,7 +229,6 @@ fn finish_scavenge(
     // Stand-tile reservation: drop at every scavenge exit so the next
     // dispatcher pass doesn't see a stale entry.
     routing.stand_reservations.release_for_worker(actor);
-    ai.state = AiState::Idle;
     ai.target_entity = None;
 
     if outcome == FinishGatherOutcome::TargetInvalid {
@@ -237,11 +236,11 @@ fn finish_scavenge(
         // tail (Deposit / Eat) was predicated on the pickup producing yield;
         // drop the chain so the agent doesn't walk to storage empty-handed.
         // `MethodHistory.FailedTarget` was recorded by the caller.
-        aq.cancel();
+        aq.cancel_chain(ai);
         return;
     }
 
-    aq.advance();
+    aq.finish_task(ai);
 
     match aq.current {
         Task::DepositToFactionStorage {
@@ -269,6 +268,7 @@ fn finish_scavenge(
                 storage_tile,
                 TaskKind::DepositResource,
                 None,
+                None,
                 &routing.chunk_graph,
                 &routing.chunk_router,
                 chunk_map,
@@ -276,8 +276,7 @@ fn finish_scavenge(
                 &routing.spatial_index,
                 &routing.stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !dispatched {
                 record_routing_failure(method_history, ai, now);
                 aq.cancel();
@@ -289,8 +288,7 @@ fn finish_scavenge(
             // just prime the legacy Eat channel directly. Mirrors
             // `production::finish_withdraw_food`'s Task::Eat handoff for the
             // [WithdrawFood, Eat] chain.
-            ai.state = AiState::Working;
-            ai.work_progress = 0;
+            aq.begin_working(ai);
         }
         _ => {
             // Idle or unrecognised follow-up: ring is empty or contains a
@@ -546,16 +544,14 @@ pub fn equip_task_system(
 
         let Some((target_slot, wanted)) = aq.current.as_equip() else {
             // Inconsistent state: task_id says Equip but typed task disagrees.
-            ai.state = AiState::Idle;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
 
         let Some((to_equip, source)) = find_best_matching_item(&agent, &carrier, wanted) else {
             // Nothing to wield — bail and let the plan layer record a
             // FailedNoTarget on its next dispatch tick.
-            ai.state = AiState::Idle;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
 
@@ -591,7 +587,6 @@ pub fn equip_task_system(
             }
         }
 
-        ai.state = AiState::Idle;
-        aq.advance();
+        aq.finish_task(&mut ai);
     }
 }

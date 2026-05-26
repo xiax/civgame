@@ -208,7 +208,15 @@ pub fn generate_person_name(sex: BiologicalSex) -> &'static str {
 /// to the legacy `TaskKind` discriminant for consumers that still read it.
 #[derive(Component, Clone, Copy)]
 pub struct PersonAI {
-    pub state: AiState,
+    /// Encapsulated. **Do not mutate directly.** Transitions go through
+    /// `ActionQueue` methods (`begin_working` / `begin_seeking` /
+    /// `begin_routing` / `begin_sleeping` / `begin_attacking` /
+    /// `finish_task` / `cancel_chain`) so `aq.current` and `ai.state` stay
+    /// consistent atomically. The orphan shape
+    /// (`current != Task::Idle && state == AiState::Idle`) is then
+    /// unrepresentable: see `src/simulation/typed_task.rs` and the
+    /// `Eliminate Orphan Task States` plan for the rationale.
+    pub(in crate::simulation) state: AiState,
     /// Progress ticks toward the next production event.
     pub work_progress: u8,
     pub target_tile: (i32, i32),
@@ -284,6 +292,31 @@ impl Default for PersonAI {
             active_gather_claim: None,
             last_retarget_tick: 0,
             last_raid_steal_tick: 0,
+        }
+    }
+}
+
+impl PersonAI {
+    /// Read-only accessor for the encapsulated AI state. The field is
+    /// `pub(in crate::simulation)` so the simulation module's `ActionQueue`
+    /// methods can mutate it (atomic with `aq.current`), while everywhere
+    /// else reads through this getter. See the field doc on `state` for the
+    /// rationale.
+    #[inline]
+    pub fn state(&self) -> AiState {
+        self.state
+    }
+
+    /// Constructor for placement-time spawn sites outside the simulation
+    /// module (e.g. `sandbox.rs`). `state` defaults to `AiState::Idle` so
+    /// callers don't need to name the encapsulated field.
+    pub fn placed_at(tile: (i32, i32), z: i8) -> Self {
+        Self {
+            target_tile: tile,
+            dest_tile: tile,
+            current_z: z,
+            target_z: z,
+            ..Self::default()
         }
     }
 }

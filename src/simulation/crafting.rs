@@ -1054,19 +1054,15 @@ pub fn craft_order_system(
             continue;
         }
         let Some(order_entity) = ai.target_entity else {
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
             // Phase 5e-xi-a: drain typed channel for HTN-driven HaulToCraftOrder
             // chains. Legacy plan-driven flow leaves `aq.current = Idle`, so
             // this is a benign no-op there.
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
         let Ok(order) = order_query.get(order_entity) else {
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
             ai.target_entity = None;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
         if is_hauler {
@@ -1361,13 +1357,11 @@ pub fn craft_order_system(
         let is_orphaned = orphaned_agents.contains(&entity);
 
         if is_completed || is_hauler_done || is_orphaned {
-            ai.state = AiState::Idle;
             ai.target_entity = None;
-            ai.work_progress = 0;
             // Phase 5e-xi-a: drain the typed channel so HTN-driven
             // HaulToCraftOrder chains complete cleanly. Legacy plan-driven
             // flows leave `aq.current = Idle`, so this is a benign no-op there.
-            aq.advance();
+            aq.finish_task(&mut ai);
 
             // Phase 5e-xi-b: chain handoff for the WorkOnCraftOrder method.
             // After `aq.advance()` promotes the queued
@@ -1400,6 +1394,7 @@ pub fn craft_order_system(
                         storage_tile,
                         TaskKind::DepositResource,
                         None,
+                        None,
                         &chunk_graph,
                         &chunk_router,
                         &chunk_map,
@@ -1408,7 +1403,7 @@ pub fn craft_order_system(
                         &stand_reservations,
                         entity,
                         clock.tick,
-                    );
+                );
                     if !dispatched {
                         aq.cancel();
                     }

@@ -3698,6 +3698,7 @@ pub fn htn_sleep_dispatch_system(
                         cur_chunk,
                         bed_tile,
                         TaskKind::Sleep,
+                        None,
                         Some(bed_entity),
                         &chunk_graph,
                         &chunk_router,
@@ -3707,7 +3708,7 @@ pub fn htn_sleep_dispatch_system(
                         &stand_reservations,
                         actor,
                         now,
-                    );
+                );
                     if routed {
                         aq.dispatch(Task::Sleep {
                             bed: Some(bed_entity),
@@ -3717,15 +3718,16 @@ pub fn htn_sleep_dispatch_system(
                         // tracks the dispatched task (otherwise the next tick
                         // re-dispatches and overflows the prefetch ring).
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
-                        ai.state = AiState::Sleeping;
                         aq.dispatch(Task::Sleep { bed: None });
+                        aq.begin_sleeping(&mut ai);
                     }
                 } else {
                     // Defensive: the method already filters bed by
                     // home_bed_tile.is_some(); drop to in-place if a future
                     // method skips that filter.
-                    ai.state = AiState::Sleeping;
                     aq.dispatch(Task::Sleep { bed: None });
+
+                    aq.begin_sleeping(&mut ai);
                 }
             }
             Task::Sleep { bed: None } => {
@@ -3740,6 +3742,7 @@ pub fn htn_sleep_dispatch_system(
                             home,
                             TaskKind::Sleep,
                             None,
+                            None,
                             &chunk_graph,
                             &chunk_router,
                             &chunk_map,
@@ -3748,19 +3751,21 @@ pub fn htn_sleep_dispatch_system(
                             &stand_reservations,
                             actor,
                             now,
-                        );
+                );
                         if routed {
                             aq.dispatch(Task::Sleep { bed: None });
                         } else {
                             history.push(chosen_id, MethodOutcome::FailedRouting, now);
-                            ai.state = AiState::Sleeping;
                             aq.dispatch(Task::Sleep { bed: None });
+
+                            aq.begin_sleeping(&mut ai);
                         }
                         continue;
                     }
                 }
-                ai.state = AiState::Sleeping;
                 aq.dispatch(Task::Sleep { bed: None });
+
+                aq.begin_sleeping(&mut ai);
             }
             _ => {
                 ai.active_method = None;
@@ -3934,9 +3939,8 @@ pub fn htn_eat_dispatch_system(
                     // state to start accumulating work_progress, and task_id
                     // discriminates the executor branch. The typed dispatch
                     // mirrors the legacy state.
-                    ai.state = AiState::Working;
-                    ai.work_progress = 0;
                     aq.dispatch(Task::Eat);
+                    aq.begin_working(&mut ai);
                 }
                 _ => {
                     // No registered Eat method returns a non-Eat head today.
@@ -4385,6 +4389,7 @@ pub fn htn_acquire_food_dispatch_system(
                         dest,
                         TaskKind::Explore,
                         None,
+                        None,
                         &chunk_graph,
                         &chunk_router,
                         &chunk_map,
@@ -4393,7 +4398,7 @@ pub fn htn_acquire_food_dispatch_system(
                         &stand_reservations,
                         actor,
                         now,
-                    );
+                );
                     if dispatched {
                         ai.active_method = Some(MethodId::TERMINAL_EXPLORE);
                         aq.dispatch(Task::Explore {
@@ -4432,6 +4437,7 @@ pub fn htn_acquire_food_dispatch_system(
                         tile,
                         TaskKind::WithdrawFood,
                         None,
+                        None,
                         &chunk_graph,
                         &chunk_router,
                         &chunk_map,
@@ -4440,7 +4446,7 @@ pub fn htn_acquire_food_dispatch_system(
                         &stand_reservations,
                         actor,
                         now,
-                    );
+                );
                     if !dispatched {
                         // Routing rejected the storage tile (no reachable
                         // adjacent standable). Record the failure so the next
@@ -4484,6 +4490,7 @@ pub fn htn_acquire_food_dispatch_system(
                         cur_chunk,
                         scav_tile,
                         TaskKind::Scavenge,
+                        None,
                         Some(target),
                         &chunk_graph,
                         &chunk_router,
@@ -4493,7 +4500,7 @@ pub fn htn_acquire_food_dispatch_system(
                         &stand_reservations,
                         actor,
                         now,
-                    );
+                );
                     if !dispatched {
                         ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
@@ -4507,7 +4514,7 @@ pub fn htn_acquire_food_dispatch_system(
                     // `AgentGoal::Survive`. Pick a random reachable tile near
                     // the faction home (or the agent's current position if
                     // unsettled), route via `assign_task_with_routing(...
-                    // TaskKind::Explore, None, ...)`, dispatch. The legacy
+                    // TaskKind::Explore, None, ...,)`, dispatch. The legacy
                     // `TaskKind::Explore` executor handles the walk + vision
                     // pickup; when matching memory is recorded en route,
                     // `vision_system` populates `AgentMemory` and the next
@@ -4534,6 +4541,7 @@ pub fn htn_acquire_food_dispatch_system(
                         dest,
                         TaskKind::Explore,
                         None,
+                        None,
                         &chunk_graph,
                         &chunk_router,
                         &chunk_map,
@@ -4542,7 +4550,7 @@ pub fn htn_acquire_food_dispatch_system(
                         &stand_reservations,
                         actor,
                         now,
-                    );
+                );
                     if !dispatched {
                         ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
@@ -4562,6 +4570,7 @@ pub fn htn_acquire_food_dispatch_system(
                         gather_tile,
                         TaskKind::Gather,
                         None,
+                        None,
                         &chunk_graph,
                         &chunk_router,
                         &chunk_map,
@@ -4570,7 +4579,7 @@ pub fn htn_acquire_food_dispatch_system(
                         &stand_reservations,
                         actor,
                         now,
-                    );
+                );
                     if !dispatched {
                         ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
@@ -4599,6 +4608,7 @@ pub fn htn_acquire_food_dispatch_system(
                         spot_tile,
                         TaskKind::Fishing,
                         None,
+                        None,
                         &chunk_graph,
                         &chunk_router,
                         &chunk_map,
@@ -4607,7 +4617,7 @@ pub fn htn_acquire_food_dispatch_system(
                         &stand_reservations,
                         actor,
                         now,
-                    );
+                );
                     if !dispatched {
                         ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
@@ -4669,7 +4679,7 @@ pub fn htn_acquire_food_dispatch_system(
 ///    `WithdrawMaterialFromStorageMethod` (utility 1.0) for haulers.
 /// 4. Reads the expansion's two-task chain `[WithdrawMaterial, HaulToBlueprint]`,
 ///    routes the head via `assign_task_with_routing(... TaskKind::WithdrawMaterial,
-///    None, ...)` to the storage tile, adds a `StorageReservations` entry, and
+///    None, ...,)` to the storage tile, adds a `StorageReservations` entry, and
 ///    dispatches the typed task. Pushes the trailing `HaulToBlueprint` onto the
 ///    prefetch ring. The handoff lives in `finish_withdraw_material`.
 ///
@@ -4687,7 +4697,7 @@ pub fn htn_acquire_food_dispatch_system(
 ///    is the only applicable one in this branch today).
 /// 4. Reads the expansion's two-task chain `[Gather, DepositToFactionStorage]`,
 ///    routes the head via `assign_task_with_routing(... TaskKind::Gather,
-///    None, ...)` to the gather tile, dispatches the typed task. Pushes the
+///    None, ...,)` to the gather tile, dispatches the typed task. Pushes the
 ///    trailing `DepositToFactionStorage` onto the prefetch ring. The handoff
 ///    lives in `finish_gather` in `gather.rs`: it advances the ring, looks up
 ///    the nearest faction storage tile via `StorageTileMap::nearest_for_faction`,
@@ -5036,6 +5046,7 @@ pub fn htn_acquire_good_dispatch_system(
                             gather_tile,
                             TaskKind::Gather,
                             None,
+                            None,
                             &chunk_graph,
                             &chunk_router,
                             &chunk_map,
@@ -5044,7 +5055,7 @@ pub fn htn_acquire_good_dispatch_system(
                             &stand_reservations,
                             actor,
                             now,
-                        );
+                );
                         if !dispatched {
                             ai.active_method = None;
                             history.push(chosen_id, MethodOutcome::FailedRouting, now);
@@ -5072,6 +5083,7 @@ pub fn htn_acquire_good_dispatch_system(
                             scav_tile,
                             TaskKind::Scavenge,
                             None,
+                            None,
                             &chunk_graph,
                             &chunk_router,
                             &chunk_map,
@@ -5080,7 +5092,7 @@ pub fn htn_acquire_good_dispatch_system(
                             &stand_reservations,
                             actor,
                             now,
-                        );
+                );
                         if !dispatched {
                             ai.active_method = None;
                             history.push(chosen_id, MethodOutcome::FailedRouting, now);
@@ -5120,6 +5132,7 @@ pub fn htn_acquire_good_dispatch_system(
                             dest,
                             TaskKind::Explore,
                             None,
+                            None,
                             &chunk_graph,
                             &chunk_router,
                             &chunk_map,
@@ -5128,7 +5141,7 @@ pub fn htn_acquire_good_dispatch_system(
                             &stand_reservations,
                             actor,
                             now,
-                        );
+                );
                         if !dispatched {
                             ai.active_method = None;
                             history.push(chosen_id, MethodOutcome::FailedRouting, now);
@@ -5203,6 +5216,7 @@ pub fn htn_acquire_good_dispatch_system(
                     cur_chunk,
                     bp_tile,
                     TaskKind::HaulMaterials,
+                    None,
                     Some(blueprint),
                     &chunk_graph,
                     &chunk_router,
@@ -5250,6 +5264,7 @@ pub fn htn_acquire_good_dispatch_system(
                         market_tile,
                         TaskKind::BuyMaterialAtMarket,
                         None,
+                        None,
                         &chunk_graph,
                         &chunk_router,
                         &chunk_map,
@@ -5258,7 +5273,7 @@ pub fn htn_acquire_good_dispatch_system(
                         &stand_reservations,
                         actor,
                         now,
-                    );
+                );
                     if dispatched {
                         // Capacity-driven batching capped at the market's
                         // listed stock for this resource (procurement budget
@@ -5415,6 +5430,7 @@ pub fn htn_acquire_good_dispatch_system(
                     cur_chunk,
                     storage_tile,
                     TaskKind::WithdrawMaterial,
+                    None,
                     None,
                     &chunk_graph,
                     &chunk_router,
@@ -5870,6 +5886,7 @@ pub fn htn_stockpile_food_dispatch_system(
                         dest,
                         TaskKind::Explore,
                         None,
+                        None,
                         &chunk_graph,
                         &chunk_router,
                         &chunk_map,
@@ -5878,7 +5895,7 @@ pub fn htn_stockpile_food_dispatch_system(
                         &stand_reservations,
                         actor,
                         now,
-                    );
+                );
                     if dispatched {
                         ai.active_method = Some(MethodId::TERMINAL_EXPLORE);
                         aq.dispatch(Task::Explore {
@@ -5926,6 +5943,7 @@ pub fn htn_stockpile_food_dispatch_system(
                         cur_chunk,
                         scav_tile,
                         TaskKind::Scavenge,
+                        None,
                         Some(target),
                         &chunk_graph,
                         &chunk_router,
@@ -5935,7 +5953,7 @@ pub fn htn_stockpile_food_dispatch_system(
                         &stand_reservations,
                         actor,
                         now,
-                    );
+                );
                     if !dispatched {
                         ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
@@ -5965,6 +5983,7 @@ pub fn htn_stockpile_food_dispatch_system(
                         dest,
                         TaskKind::Explore,
                         None,
+                        None,
                         &chunk_graph,
                         &chunk_router,
                         &chunk_map,
@@ -5973,7 +5992,7 @@ pub fn htn_stockpile_food_dispatch_system(
                         &stand_reservations,
                         actor,
                         now,
-                    );
+                );
                     if !dispatched {
                         ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
@@ -5994,6 +6013,7 @@ pub fn htn_stockpile_food_dispatch_system(
                         gather_tile,
                         TaskKind::Gather,
                         None,
+                        None,
                         &chunk_graph,
                         &chunk_router,
                         &chunk_map,
@@ -6002,7 +6022,7 @@ pub fn htn_stockpile_food_dispatch_system(
                         &stand_reservations,
                         actor,
                         now,
-                    );
+                );
                     if !dispatched {
                         ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
@@ -6030,6 +6050,7 @@ pub fn htn_stockpile_food_dispatch_system(
                         spot_tile,
                         TaskKind::Fishing,
                         None,
+                        None,
                         &chunk_graph,
                         &chunk_router,
                         &chunk_map,
@@ -6038,7 +6059,7 @@ pub fn htn_stockpile_food_dispatch_system(
                         &stand_reservations,
                         actor,
                         now,
-                    );
+                );
                     if !dispatched {
                         ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
@@ -6303,6 +6324,7 @@ pub fn htn_equip_hunting_spear_dispatch_system(
                     storage_tile,
                     TaskKind::WithdrawMaterial,
                     None,
+                    None,
                     &chunk_graph,
                     &chunk_router,
                     &chunk_map,
@@ -6349,7 +6371,7 @@ pub fn htn_equip_hunting_spear_dispatch_system(
 /// expands to a head `Task::Explore { kind: MemoryKind::Prey }`, picks a
 /// random reachable tile near faction home (mirrors the legacy
 /// `StepTarget::ScoutForPrey` resolver), routes via
-/// `assign_task_with_routing(... TaskKind::Explore ...)`, and `aq.dispatch`s
+/// `assign_task_with_routing(... TaskKind::Explore ...,)`, and `aq.dispatch`s
 /// the typed task. The `vision_system` writes `MemoryKind::Prey` whenever a
 /// hunter sees Wolf/Deer along the way; the chief's next decision cycle
 /// picks that up and posts a `Hunt` order, naturally peeling the hunter
@@ -6516,6 +6538,7 @@ pub fn htn_scout_dispatch_system(
                         dest,
                         TaskKind::Explore,
                         None,
+                        None,
                         &chunk_graph,
                         &chunk_router,
                         &chunk_map,
@@ -6524,7 +6547,7 @@ pub fn htn_scout_dispatch_system(
                         &stand_reservations,
                         actor,
                         now,
-                    );
+                );
                     if !dispatched {
                         ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
@@ -6555,7 +6578,7 @@ pub fn htn_scout_dispatch_system(
 /// the agent's hands or inventory to thread through the deposit chain's
 /// payload, build a `PlannerCtx` snapshot, argmax over the registered
 /// methods, and route the head via `assign_task_with_routing(...
-/// TaskKind::DepositResource ...)`. Replaces the legacy `ReturnSurplusFood`
+/// TaskKind::DepositResource ...,)`. Replaces the legacy `ReturnSurplusFood`
 /// plan (PlanId 24) and its single step (StepId 12 DepositGoods).
 ///
 /// SOLO agents are skipped (no faction storage). The chain executes via the
@@ -6724,6 +6747,7 @@ pub fn htn_return_surplus_dispatch_system(
                         storage_tile,
                         TaskKind::DepositResource,
                         None,
+                        None,
                         &chunk_graph,
                         &chunk_router,
                         &chunk_map,
@@ -6732,7 +6756,7 @@ pub fn htn_return_surplus_dispatch_system(
                         &stand_reservations,
                         actor,
                         now,
-                    );
+                );
                     if !dispatched {
                         ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
@@ -6767,7 +6791,7 @@ pub fn htn_return_surplus_dispatch_system(
 /// Scans `SpatialIndex` within `VIEW_RADIUS=15` for the nearest live untamed
 /// candidate of any species the faction is Aware of, snapshots `(entity, tile)`
 /// into the shared `scavenge_target_entity`/`scavenge_target_tile` ctx slots,
-/// and routes via `assign_task_with_routing(... TaskKind::TameAnimal, ...)`.
+/// and routes via `assign_task_with_routing(... TaskKind::TameAnimal, ...,)`.
 /// The executor (`tame_task_system`) re-validates the per-species tech at every
 /// tick.
 pub fn htn_tame_animal_dispatch_system(
@@ -6982,6 +7006,7 @@ pub fn htn_tame_animal_dispatch_system(
                     cur_chunk,
                     horse_tile,
                     TaskKind::TameAnimal,
+                    None,
                     Some(target),
                     &chunk_graph,
                     &chunk_router,
@@ -7029,7 +7054,7 @@ pub fn htn_tame_animal_dispatch_system(
 ///    `[WithdrawMaterial { seed, 1 }, Planter { tile }]` with
 ///    `MF_UNINTERRUPTIBLE`.
 /// 5. Routes the head WithdrawMaterial leg via
-///    `assign_task_with_routing(... TaskKind::WithdrawMaterial ...)` and
+///    `assign_task_with_routing(... TaskKind::WithdrawMaterial ...,)` and
 ///    reserves the seed at the storage tile; the trailing Planter leg lives in
 ///    the prefetch ring and is promoted by `production::finish_withdraw_material`'s
 ///    Planter arm, which routes via `TaskKind::Planter` to the destination
@@ -7664,6 +7689,7 @@ pub fn htn_plant_from_storage_dispatch_system(
                     storage_tile,
                     TaskKind::WithdrawMaterial,
                     None,
+                    None,
                     &chunk_graph,
                     &chunk_router,
                     &chunk_map,
@@ -8035,6 +8061,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
                     cur_chunk,
                     bp_tile,
                     TaskKind::HaulMaterials,
+                    None,
                     Some(bp_entity),
                     &chunk_graph,
                     &chunk_router,
@@ -8255,6 +8282,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
                     cur_chunk,
                     (bp_tile.0, bp_tile.1),
                     TaskKind::Construct,
+                    None,
                     Some(blueprint),
                     &chunk_graph,
                     &chunk_router,
@@ -8290,6 +8318,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
                     cur_chunk,
                     storage_tile,
                     TaskKind::WithdrawMaterial,
+                    None,
                     None,
                     &chunk_graph,
                     &chunk_router,
@@ -8332,6 +8361,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
                     tile,
                     TaskKind::Gather,
                     None,
+                    None,
                     &chunk_graph,
                     &chunk_router,
                     &chunk_map,
@@ -8371,7 +8401,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
 /// dispatcher silently skips them — the corpse decays in place.
 ///
 /// Routes the head `Task::HaulCorpse { dest }` via
-/// `assign_task_with_routing(... TaskKind::HaulCorpse, None ...)` and prefetches
+/// `assign_task_with_routing(... TaskKind::HaulCorpse, None ...,)` and prefetches
 /// the trailing `Task::Butcher`. Chain handoff lives in
 /// `corpse::haul_corpse_task_system`'s arrival exit (Phase 5e-vii-ii): when
 /// the queued head is `Task::Butcher`, prime `task_id = TaskKind::Butcher` +
@@ -8511,6 +8541,7 @@ pub fn htn_deliver_hunt_kill_dispatch_system(
                     cur_chunk,
                     dest,
                     TaskKind::HaulCorpse,
+                    None,
                     None,
                     &chunk_graph,
                     &chunk_router,
@@ -8841,6 +8872,7 @@ pub fn htn_engage_prey_dispatch_system(
                     cur_chunk,
                     prey_tile,
                     TaskKind::Hunter,
+                    None,
                     Some(prey),
                     &chunk_graph,
                     &chunk_router,
@@ -8870,6 +8902,7 @@ pub fn htn_engage_prey_dispatch_system(
                     cur_chunk,
                     corpse_tile,
                     TaskKind::PickUpCorpse,
+                    None,
                     Some(corpse),
                     &chunk_graph,
                     &chunk_router,
@@ -9095,6 +9128,7 @@ pub fn htn_join_hunt_party_dispatch_system(
                     hearth,
                     TaskKind::HuntPartyMuster,
                     None,
+                    None,
                     &chunk_graph,
                     &chunk_router,
                     &chunk_map,
@@ -9122,6 +9156,7 @@ pub fn htn_join_hunt_party_dispatch_system(
                     cur_chunk,
                     area_tile,
                     TaskKind::Explore,
+                    None,
                     None,
                     &chunk_graph,
                     &chunk_router,
@@ -9340,6 +9375,7 @@ pub fn htn_socialize_dispatch_system(
                     cur_chunk,
                     partner_tile,
                     TaskKind::Socialize,
+                    None,
                     Some(partner),
                     &chunk_graph,
                     &chunk_router,
@@ -9582,6 +9618,7 @@ pub fn htn_combat_faction_dispatch_system(
             cur_chunk,
             dest,
             task_kind,
+            None,
             route_target_entity,
             &chunk_graph,
             &chunk_router,
@@ -9591,7 +9628,7 @@ pub fn htn_combat_faction_dispatch_system(
             &stand_reservations,
             actor,
             now,
-        );
+                );
         if !dispatched {
             ai.active_method = None;
             history.push(chosen_id, MethodOutcome::FailedRouting, now);
@@ -9703,6 +9740,7 @@ pub fn bureaucrat_admin_dispatch_system(
             dest,
             crate::simulation::tasks::TaskKind::Lead,
             None,
+            None,
             &chunk_graph,
             &chunk_router,
             &chunk_map,
@@ -9711,7 +9749,7 @@ pub fn bureaucrat_admin_dispatch_system(
             &stand_reservations,
             actor,
             now,
-        );
+                );
         if routed {
             aq.dispatch(Task::Lead { dest });
         }
@@ -9815,7 +9853,7 @@ impl Method for WithdrawAndHaulToCraftOrderMethod {
 ///
 /// The chain handoff lives in `production::finish_withdraw_material`'s
 /// `Task::HaulToCraftOrder` arm, which routes to `order.anchor_tile` via
-/// `assign_task_with_routing(... TaskKind::HaulToCraftOrder, Some(order) ...)`.
+/// `assign_task_with_routing(... TaskKind::HaulToCraftOrder, Some(order) ...,)`.
 /// `craft_order_system`'s hauler branch already deposits-on-arrival; this PR
 /// teaches it to also `aq.advance()` so the typed channel drains on completion.
 pub fn htn_deliver_material_to_craft_order_dispatch_system(
@@ -10094,6 +10132,7 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
                     (stx, sty),
                     TaskKind::WithdrawMaterial,
                     None,
+                    None,
                     &chunk_graph,
                     &chunk_router,
                     &chunk_map,
@@ -10204,7 +10243,7 @@ impl Method for WorkOnSatisfiedCraftOrderMethod {
 /// `output_resource` into ctx.
 ///
 /// Routes via `assign_task_with_routing(... TaskKind::WorkOnCraftOrder,
-/// Some(order) ...)` to the order's `anchor_tile` and dispatches the head
+/// Some(order) ...,)` to the order's `anchor_tile` and dispatches the head
 /// `Task::WorkOnCraftOrder { order }`; the trailing
 /// `Task::DepositToFactionStorage { resource_id: output, target_faction_id: None }` rides the prefetch
 /// ring. The chain handoff lives in `craft_order_system`'s completion path:
@@ -10365,6 +10404,7 @@ pub fn htn_work_on_craft_order_dispatch_system(
                     cur_chunk,
                     anchor,
                     TaskKind::WorkOnCraftOrder,
+                    None,
                     Some(order),
                     &chunk_graph,
                     &chunk_router,
@@ -10403,7 +10443,7 @@ pub fn htn_work_on_craft_order_dispatch_system(
 /// The trailing haul's chain handoff lives in `gather::finish_gather`'s
 /// `Task::HaulToCraftOrder` arm — looks up `CraftOrder.anchor_tile` and
 /// routes via `assign_task_with_routing(... TaskKind::HaulToCraftOrder,
-/// Some(order) ...)`. `craft_order_system`'s hauler branch consumes the
+/// Some(order) ...,)`. `craft_order_system`'s hauler branch consumes the
 /// typed task on arrival and `aq.advance()`s on completion.
 ///
 /// `MF_UNINTERRUPTIBLE` so a goal flip mid-harvest doesn't drop the chain.
@@ -10453,7 +10493,7 @@ impl Method for HarvestAndHaulGrainToCraftOrderMethod {
 /// find a mature Grain plant tile. Picks the nearest such craft order.
 /// Snapshots `(gather_target_tile, target_craft_order)` into ctx and dispatches
 /// the head `Task::Gather { tile }` via `assign_task_with_routing(...
-/// TaskKind::Gather, None ...)`. The trailing `Task::HaulToCraftOrder { order }`
+/// TaskKind::Gather, None ...,)`. The trailing `Task::HaulToCraftOrder { order }`
 /// rides the prefetch ring; `gather::finish_gather` routes it on harvest
 /// completion.
 pub fn htn_harvest_grain_for_craft_order_dispatch_system(
@@ -10697,6 +10737,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
                     cur_chunk,
                     tile,
                     TaskKind::Gather,
+                    None,
                     None,
                     &chunk_graph,
                     &chunk_router,
@@ -11038,6 +11079,7 @@ pub fn htn_harvest_plant_dispatch_system(
                     tile,
                     TaskKind::Gather,
                     None,
+                    None,
                     &chunk_graph,
                     &chunk_router,
                     &chunk_map,
@@ -11068,7 +11110,7 @@ pub fn htn_harvest_plant_dispatch_system(
 /// Phase 5e-xii-a method: agent under `AgentGoal::Play` plays with another
 /// Person within play radius. Single-leg expansion `[Task::Play { partner:
 /// Some(e) }]`. The dispatcher routes the agent adjacent to the partner via
-/// `assign_task_with_routing(... TaskKind::Play, Some(partner) ...)`.
+/// `assign_task_with_routing(... TaskKind::Play, Some(partner) ...,)`.
 /// `play_system` reads the partner from `ai.target_entity` and accumulates
 /// willpower / social need fill on adjacency. Replaces the legacy `PlaySocial`
 /// plan (PlanId 26).
@@ -11115,7 +11157,7 @@ impl Method for PlayWithPartnerMethod {
 /// held or adjacent entertainment item. Single-leg expansion
 /// `[Task::Play { partner: None }]`. The dispatcher routes the agent in place
 /// (or to an adjacent entertainment ground item) via
-/// `assign_task_with_routing(... TaskKind::Play, None ...)`. `play_system`
+/// `assign_task_with_routing(... TaskKind::Play, None ...,)`. `play_system`
 /// detects the absence of a partner and falls back to the solo branch.
 /// Replaces the legacy `PlaySolo` plan (PlanId 27).
 pub struct PlaySoloMethod;
@@ -11779,6 +11821,7 @@ pub fn htn_play_dispatch_system(
                     cur_chunk,
                     dest,
                     TaskKind::Play,
+                    None,
                     partner,
                     &chunk_graph,
                     &chunk_router,
@@ -11855,6 +11898,7 @@ pub fn htn_play_dispatch_system(
                     cur_chunk,
                     storage_tile,
                     TaskKind::WithdrawMaterial,
+                    None,
                     None,
                     &chunk_graph,
                     &chunk_router,
@@ -12043,6 +12087,7 @@ pub fn htn_clear_obstacle_dispatch_system(
             cur_chunk,
             tile,
             TaskKind::ClearObstacle,
+            None,
             Some(obstacle_entity),
             &chunk_graph,
             &chunk_router,
@@ -12051,8 +12096,7 @@ pub fn htn_clear_obstacle_dispatch_system(
             &spatial_index,
             &stand_reservations,
             agent_entity,
-            now,
-        );
+            now,);
         if dispatched {
             aq.dispatch(Task::ClearObstacle {
                 entity: obstacle_entity,

@@ -467,9 +467,7 @@ fn finish_fish(
     completed: bool,
 ) {
     release_gather_claim(&routing.gather_claims, ai, actor);
-    ai.state = AiState::Idle;
     ai.target_entity = None;
-    ai.work_progress = 0;
 
     if !completed {
         // The queued tail (Eat / Deposit) was predicated on a catch. Record a
@@ -477,15 +475,15 @@ fn finish_fish(
         // fishing method down — a depleted/invalidated spot then loses to
         // forage until `fish_regen_system` refills the stock.
         record_target_failure(method_history, ai, now);
-        aq.cancel();
+        aq.cancel_chain(ai);
         return;
     }
-    aq.advance();
+    aq.finish_task(ai);
 
     match aq.current {
         Task::Eat => {
             // Survive chain: eat the catch in place.
-            ai.state = AiState::Working;
+            aq.begin_working(ai);
         }
         Task::DepositToFactionStorage {
             target_faction_id, ..
@@ -508,6 +506,7 @@ fn finish_fish(
                 storage_tile,
                 TaskKind::DepositResource,
                 None,
+                None,
                 &routing.chunk_graph,
                 &routing.chunk_router,
                 chunk_map,
@@ -515,8 +514,7 @@ fn finish_fish(
                 &routing.spatial_index,
                 &routing.stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !dispatched {
                 record_routing_failure(method_history, ai, now);
                 aq.cancel();

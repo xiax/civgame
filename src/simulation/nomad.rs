@@ -670,6 +670,7 @@ pub fn nomad_survey_dispatch_system(
             target,
             TaskKind::Explore,
             None,
+            None,
             &chunk_graph,
             &chunk_router,
             &chunk_map,
@@ -678,7 +679,7 @@ pub fn nomad_survey_dispatch_system(
             &stand_reservations,
             actor,
             now,
-        );
+                );
         if routed {
             aq.dispatch(Task::Explore {
                 kind: MemoryKind::AnyEdible,
@@ -1353,6 +1354,7 @@ fn dispatch_member_unload_tasks(world: &mut World, pitching: &[AiPitchingMigrati
             target,
             crate::simulation::tasks::TaskKind::UnloadCampCargo,
             None,
+            None,
             &chunk_graph,
             &chunk_router,
             &chunk_map,
@@ -1360,8 +1362,7 @@ fn dispatch_member_unload_tasks(world: &mut World, pitching: &[AiPitchingMigrati
             &spatial_index,
             &stand_reservations,
             e,
-            now,
-        );
+            now,);
         if routed {
             aq.cancel();
             aq.dispatch(crate::simulation::typed_task::Task::UnloadCampCargo {
@@ -1624,6 +1625,7 @@ fn dispatch_pitch_tasks(world: &mut World, pitching: &[AiPitchingMigration]) {
             req.anchor,
             crate::simulation::tasks::TaskKind::PitchStructureAt,
             None,
+            None,
             &chunk_graph,
             &chunk_router,
             &chunk_map,
@@ -1631,8 +1633,7 @@ fn dispatch_pitch_tasks(world: &mut World, pitching: &[AiPitchingMigration]) {
             &spatial_index,
             &stand_reservations,
             entity,
-            now,
-        );
+            now,);
         if routed {
             aq.cancel();
             aq.dispatch(crate::simulation::typed_task::Task::PitchStructureAt {
@@ -3536,8 +3537,7 @@ pub fn nomad_migration_dispatch_system(
             && chebyshev((cur_tx, cur_ty), route_tile) <= MIGRATE_ARRIVAL_RADIUS
         {
             target.route_tile = None;
-            aq.cancel();
-            ai.state = AiState::Idle;
+            aq.cancel_chain(&mut ai);
             continue;
         }
         // Already at final camp? Skip — arrival system will strip the marker.
@@ -3590,15 +3590,13 @@ pub fn nomad_migration_dispatch_system(
                 } else {
                     commands.entity(e).remove::<MigrationTarget>();
                     *goal = crate::simulation::goals::AgentGoal::GatherFood;
-                    aq.cancel();
-                    ai.state = AiState::Idle;
+                    aq.cancel_chain(&mut ai);
                     continue;
                 }
             } else {
                 commands.entity(e).remove::<MigrationTarget>();
                 *goal = crate::simulation::goals::AgentGoal::GatherFood;
-                aq.cancel();
-                ai.state = AiState::Idle;
+                aq.cancel_chain(&mut ai);
                 continue;
             }
         }
@@ -3609,6 +3607,7 @@ pub fn nomad_migration_dispatch_system(
             target.route_tile.unwrap_or(target.tile),
             TaskKind::Migrate,
             None,
+            None,
             &chunk_graph,
             &chunk_router,
             &chunk_map,
@@ -3617,11 +3616,10 @@ pub fn nomad_migration_dispatch_system(
             &stand_reservations,
             e,
             now,
-        );
+                );
         if !routed {
             continue;
         }
-        ai.state = AiState::Routing;
         let z = ai.target_z;
         let walk_tile = target.route_tile.unwrap_or(target.tile);
         aq.dispatch(Task::WalkTo {
@@ -3629,6 +3627,7 @@ pub fn nomad_migration_dispatch_system(
             z,
             why: WalkReason::Migration,
         });
+        aq.begin_routing(&mut ai, walk_tile, z);
         target.last_dispatched_tick = now_u32;
     }
 }
@@ -3663,8 +3662,7 @@ pub fn nomad_migration_arrival_system(
         if let Some(route_tile) = target.route_tile {
             if chebyshev((cur_tx, cur_ty), route_tile) <= MIGRATE_ARRIVAL_RADIUS {
                 target.route_tile = None;
-                aq.cancel();
-                ai.state = AiState::Idle;
+                aq.cancel_chain(&mut ai);
                 continue;
             }
         }
@@ -3691,8 +3689,7 @@ pub fn nomad_migration_arrival_system(
             force_reeval.0.insert(e);
         }
         // Stop the walk; a normal goal will pick up next tick.
-        aq.cancel();
-        ai.state = AiState::Idle;
+        aq.cancel_chain(&mut ai);
     }
 }
 

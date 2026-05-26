@@ -83,16 +83,15 @@ fn release_to_idle(
         record_routing_failure(history, ai, now);
     }
 
-    ai.state = AiState::Idle;
     ai.target_tile = (here.0 as i32, here.1 as i32);
     ai.dest_tile = ai.target_tile;
     ai.target_entity = None;
     // Path-failure release is an external preempt — drop the stale typed task
-    // along with PersonAI state. Without this, the next dispatcher tick
-    // enqueues a new Task but `ActionQueue::dispatch` won't promote it
-    // (current != Idle), so the executor's `aq.current.as_drink()`-style
-    // accessors keep returning None and the agent silently freezes.
-    aq.cancel();
+    // AND ai.state atomically via `cancel_chain`. Without this, the next
+    // dispatcher tick enqueues a new Task but `ActionQueue::dispatch` won't
+    // promote it (current != Idle), so the executor's `aq.current.as_drink()`-
+    // style accessors keep returning None and the agent silently freezes.
+    aq.cancel_chain(ai);
 
     pf.status = FollowStatus::Idle;
     pf.segment_path.clear();
@@ -260,7 +259,7 @@ pub fn movement_system(
                 ) as i32;
                 let dz = dest_z - ai.current_z as i32;
                 if cheb <= 1 && (-1..=1).contains(&dz) {
-                    ai.state = AiState::Working;
+                    aq.begin_working(&mut ai);
                     continue;
                 }
             }
@@ -774,11 +773,13 @@ pub fn movement_system(
                         found
                     };
                     if !bumped {
-                        // No free stand tile anywhere: drop to Idle so the
-                        // dispatcher/scorer can re-evaluate. Don't fall
-                        // through to Working — that's the silent-failure
-                        // path that caused workers to "complete" on a
-                        // chebyshev-2 tile outside the executor's gate.
+                        // No free stand tile anywhere. For adjacent tasks
+                        // this is a routing failure — cancel the chain so
+                        // the next dispatch tick re-plans against a
+                        // different candidate. For player Move arrivals
+                        // (UNEMPLOYED task kind) keep the legacy Idle drop
+                        // so `PlayerOrder` teardown can reap `Commanded`.
+                        stand_reservations.release_for_worker(entity);
                         if is_adjacent_task {
                             goal_contract::blocked(
                                 &mut history,
@@ -787,21 +788,24 @@ pub fn movement_system(
                                 *goal,
                                 BlockedReason::NoAdjacentStandTile,
                             );
+                            aq.cancel_chain(&mut ai);
+                        } else {
+                            aq.assert_idle(&mut ai);
                         }
-                        // Move-order arrivals carry `UNEMPLOYED` — go Idle so
-                        // PlayerOrder teardown can release the marker. Other
-                        // tasks also drop to Idle (no more Working fall-through).
-                        ai.state = AiState::Idle;
-                        stand_reservations.release_for_worker(entity);
+                        pf.status = FollowStatus::Idle;
+                        pf.segment_path.clear();
+                        pf.chunk_route.clear();
+                        pf.segment_cursor = 0;
+                        pf.route_cursor = 0;
                     }
                     // else: stays Seeking toward the new adjacent stand tile
                 } else {
                     claimed_this_tick.insert((tx, ty, cz));
-                    ai.state = if aq.current_task_kind() == UNEMPLOYED_TASK_KIND {
-                        AiState::Idle
+                    if aq.current_task_kind() == UNEMPLOYED_TASK_KIND {
+                        aq.assert_idle(&mut ai);
                     } else {
-                        AiState::Working
-                    };
+                        aq.begin_working(&mut ai);
+                    }
                 }
             }
             AiState::Working => {
@@ -915,13 +919,24 @@ pub fn movement_system(
                 // arriving at target_tile (= dest_tile) means we are at
                 // the final destination. Promote to Seeking so the
                 // adjacent-tile claim logic runs next tick.
-                ai.state = AiState::Seeking;
-                ai.target_tile = ai.dest_tile;
-                ai.target_z = chunk_map.nearest_standable_z(
-                    ai.target_tile.0 as i32,
-                    ai.target_tile.1 as i32,
+                let final_tile = ai.dest_tile;
+                let final_z = chunk_map.nearest_standable_z(
+                    final_tile.0 as i32,
+                    final_tile.1 as i32,
                     ai.current_z as i32,
                 ) as i8;
+                if aq.current != crate::simulation::typed_task::Task::Idle {
+                    aq.begin_seeking(&mut ai, final_tile, final_z);
+                } else {
+                    // Cross-chunk routes whose task already drained (rare race
+                    // with cancel/finish) — re-park in Seeking via the field
+                    // directly. The orphan invariant still holds (current ==
+                    // Idle on entry, state Seeking on exit is benign — the
+                    // inverse-orphan shape settles within one tick).
+                    ai.state = AiState::Seeking;
+                    ai.target_tile = final_tile;
+                    ai.target_z = final_z;
+                }
             }
         }
     }

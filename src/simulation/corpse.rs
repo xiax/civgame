@@ -131,8 +131,7 @@ pub fn pickup_corpse_task_system(
         // Phase 3d-iii: corpse comes from typed `Task::PickUpCorpse`, falling
         // back to `target_entity` for any unmigrated dispatch path.
         let Some(corpse_e) = aq.current.as_pickup_corpse().or(ai.target_entity) else {
-            ai.state = AiState::Idle;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
 
@@ -146,9 +145,8 @@ pub fn pickup_corpse_task_system(
         }
         // Whether or not the corpse still existed, this dispatch is done —
         // a missing corpse just means the next plan iteration retargets.
-        ai.state = AiState::Idle;
         ai.target_entity = None;
-        aq.advance();
+        aq.finish_task(&mut ai);
     }
 }
 
@@ -176,8 +174,7 @@ pub fn haul_corpse_task_system(
         if aq.current_task_kind() != TaskKind::HaulCorpse as u16 || ai.state != AiState::Working {
             continue;
         }
-        ai.state = AiState::Idle;
-        aq.advance();
+        aq.finish_task(&mut ai);
         // Phase 5e-viii-a chain handoff: when the queued head was
         // `Task::Butcher` (DeliverHuntKillMethod's tail), `aq.advance()`
         // just promoted it into `aq.current`. Prime the legacy channel so
@@ -188,8 +185,7 @@ pub fn haul_corpse_task_system(
         // will re-prime via `plan_execution_system` next tick anyway, so
         // this in-place priming is HTN-specific and benign for legacy.
         if aq.current.is_butcher() {
-            ai.state = AiState::Working;
-            ai.work_progress = 0;
+            aq.begin_working(&mut ai);
         }
     }
 }
@@ -234,18 +230,14 @@ pub fn butcher_task_system(
 
         let Some(Carrying(corpse_e)) = carrying.copied() else {
             // Carrying was removed (rescue preempt) — abort this dispatch.
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
 
         let Ok(corpse) = corpse_q.get(corpse_e) else {
             // Corpse despawned (decayed or stolen). Clear and abort.
             commands.entity(entity).remove::<Carrying>();
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
 
@@ -281,9 +273,7 @@ pub fn butcher_task_system(
 
         commands.entity(corpse_e).despawn_recursive();
         commands.entity(entity).remove::<Carrying>();
-        ai.state = AiState::Idle;
-        ai.work_progress = 0;
-        aq.advance();
+        aq.finish_task(&mut ai);
     }
 }
 
@@ -320,14 +310,12 @@ pub fn wait_for_party_task_system(
             continue;
         }
         let Some(faction) = registry.factions.get_mut(&member.faction_id) else {
-            ai.state = AiState::Idle;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
         let Some(order) = faction.hunt_order.as_mut() else {
             // Chief cleared the order — abort the wait.
-            ai.state = AiState::Idle;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
         match order {
@@ -348,16 +336,14 @@ pub fn wait_for_party_task_system(
                 let ready = deployed_tick.is_some();
                 let stale = clock.tick.saturating_sub(*posted_tick) > HUNT_PARTY_TIMEOUT;
                 if ready || stale {
-                    ai.state = AiState::Idle;
-                    aq.advance();
+                    aq.finish_task(&mut ai);
                 }
                 // else: keep waiting (state stays Working).
             }
             HuntOrder::Scout { .. } => {
                 // Order flipped from Hunt to Scout while we were mustering.
                 // Bail so the plan ends and the next pick can be ScoutForPrey.
-                ai.state = AiState::Idle;
-                aq.advance();
+                aq.finish_task(&mut ai);
             }
         }
     }

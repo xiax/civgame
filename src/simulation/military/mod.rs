@@ -91,8 +91,8 @@ pub fn military_task_system(
                 // Inconsistent state: task_id says MilitaryMove but the typed
                 // task variant disagrees. Drop back to idle so the agent
                 // doesn't loop.
-                ai.state = AiState::Idle;
                 ai.target_entity = None;
+                aq.cancel_chain(&mut ai);
                 continue;
             };
 
@@ -106,9 +106,8 @@ pub fn military_task_system(
             // steps onto the dest tile. For a Move order there is no work to
             // do, so we go straight back to Idle.
             if ai.state == AiState::Working && (cur_tx, cur_ty) == (dest.0, dest.1) {
-                ai.state = AiState::Idle;
                 ai.target_entity = None;
-                aq.advance();
+                aq.finish_task(&mut ai);
             }
             continue;
         }
@@ -118,17 +117,17 @@ pub fn military_task_system(
             let foe = match ai.target_entity {
                 Some(e) => e,
                 None => {
-                    ai.state = AiState::Idle;
                     combat.0 = None;
+                    aq.cancel_chain(&mut ai);
                     continue;
                 }
             };
             let foe_alive = health_q.get(foe).map(|h| !h.is_dead()).unwrap_or(false);
             let foe_transform = transform_q.get(foe).ok();
             if !foe_alive || foe_transform.is_none() {
-                ai.state = AiState::Idle;
                 ai.target_entity = None;
                 combat.0 = None;
+                aq.cancel_chain(&mut ai);
                 continue;
             }
             let foe_t = foe_transform.unwrap();
@@ -161,6 +160,7 @@ pub fn military_task_system(
                         cur_chunk,
                         (foe_tx as i32, foe_ty as i32),
                         TaskKind::MilitaryAttack,
+                        None,
                         Some(foe),
                         &chunk_graph,
                         &chunk_router,
@@ -170,7 +170,7 @@ pub fn military_task_system(
                         &stand_reservations,
                         actor,
                         now,
-                    );
+                );
                     if routed {
                         // Keep typed channel in sync with the rerouted attack
                         // so executors / coherence checks see consistent state.

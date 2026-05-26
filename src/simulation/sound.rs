@@ -245,13 +245,14 @@ pub fn respond_to_distress_system(
             // return after the fight. Drop any active task / plan and pivot.
             // Drop a carried corpse if any — combat takes priority over the
             // hunt; the corpse stays on the ground for later retrieval.
-            ai.state = AiState::Idle;
             ai.target_entity = None;
             // Phase 5e-vii: rescue is an external preempt — drop any
             // typed-channel task so the rescued agent doesn't fall back
             // into a stale Hunt / Haul / Butcher chain after the fight.
             if let Some(mut aq) = aq_opt {
-                aq.cancel();
+                aq.cancel_chain(&mut ai);
+            } else {
+                ai.state = AiState::Idle;
             }
             commands
                 .entity(entity)

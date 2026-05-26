@@ -94,7 +94,7 @@ pub fn sleep_task_system(
                 // sleeping; recovery starts next tick (parity with the old
                 // guard-4 -> tick_needs 1-tick handoff).
                 AiState::Working => {
-                    ai.state = AiState::Sleeping;
+                    aq.begin_sleeping(&mut ai);
                     return;
                 }
                 // Orphan: `current == Sleep` survived but the agent is neither

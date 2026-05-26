@@ -313,6 +313,7 @@ pub fn htn_provide_care_dispatch_system(
             cur_chunk,
             patient_tile,
             TaskKind::Heal,
+            None,
             Some(patient),
             &chunk_graph,
             &chunk_router,
@@ -322,7 +323,7 @@ pub fn htn_provide_care_dispatch_system(
             &stand_reservations,
             actor,
             now,
-        );
+                );
         if !dispatched {
             continue;
         }
@@ -508,6 +509,7 @@ pub fn htn_seek_care_dispatch_system(
             dest,
             TaskKind::SeekCare,
             None,
+            None,
             &chunk_graph,
             &chunk_router,
             &chunk_map,
@@ -516,7 +518,7 @@ pub fn htn_seek_care_dispatch_system(
             &stand_reservations,
             actor,
             now,
-        );
+                );
         if !dispatched {
             continue;
         }

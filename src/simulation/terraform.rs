@@ -155,6 +155,7 @@ pub fn terraform_dispatch_system(
                 tile,
                 TaskKind::Terraform,
                 None,
+                None,
                 &chunk_graph,
                 &chunk_router,
                 &chunk_map,
@@ -163,7 +164,7 @@ pub fn terraform_dispatch_system(
                 &stand_reservations,
                 actor,
                 now,
-            );
+                );
             if routed {
                 aq.dispatch(crate::simulation::typed_task::Task::Terraform { tile });
             }

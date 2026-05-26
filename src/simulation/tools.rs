@@ -747,6 +747,7 @@ pub fn htn_acquire_tool_dispatch_system(
             storage_tile,
             TaskKind::WithdrawMaterial,
             None,
+            None,
             &chunk_graph,
             &chunk_router,
             &chunk_map,
@@ -755,7 +756,7 @@ pub fn htn_acquire_tool_dispatch_system(
             &stand_reservations,
             actor,
             now,
-        );
+                );
         if !dispatched {
             continue;
         }

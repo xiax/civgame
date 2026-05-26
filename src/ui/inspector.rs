@@ -1292,7 +1292,7 @@ pub fn inspector_panel_system(
                             }
                         }
 
-                        let state_desc = match ai.state {
+                        let state_desc = match ai.state() {
                             AiState::Idle => "Idling".to_string(),
                             AiState::Routing => "Traveling (Long Range)".to_string(),
                             AiState::Seeking => "Walking to Target".to_string(),

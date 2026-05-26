@@ -1147,6 +1147,7 @@ fn dispatch_one(
                 tile,
                 TaskKind::Idle,
                 None,
+                None,
                 &routing.chunk_graph,
                 &routing.chunk_router,
                 &routing.chunk_map,
@@ -1154,8 +1155,7 @@ fn dispatch_one(
                 &routing.spatial_index,
                 &routing.stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }
@@ -1190,6 +1190,7 @@ fn dispatch_one(
                 tile,
                 TaskKind::Gather,
                 None,
+                None,
                 &routing.chunk_graph,
                 &routing.chunk_router,
                 &routing.chunk_map,
@@ -1197,8 +1198,7 @@ fn dispatch_one(
                 &routing.spatial_index,
                 &routing.stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }
@@ -1229,6 +1229,7 @@ fn dispatch_one(
                 tile,
                 TaskKind::Dig,
                 None,
+                None,
                 &routing.chunk_graph,
                 &routing.chunk_router,
                 &routing.chunk_map,
@@ -1236,8 +1237,7 @@ fn dispatch_one(
                 &routing.spatial_index,
                 &routing.stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }
@@ -1252,6 +1252,7 @@ fn dispatch_one(
                 tile,
                 TaskKind::Deconstruct,
                 None,
+                None,
                 &routing.chunk_graph,
                 &routing.chunk_router,
                 &routing.chunk_map,
@@ -1259,8 +1260,7 @@ fn dispatch_one(
                 &routing.spatial_index,
                 &routing.stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }
@@ -1280,6 +1280,7 @@ fn dispatch_one(
                 cur_chunk,
                 tile,
                 TaskKind::Scavenge,
+                None,
                 Some(item),
                 &routing.chunk_graph,
                 &routing.chunk_router,
@@ -1288,8 +1289,7 @@ fn dispatch_one(
                 &routing.spatial_index,
                 &routing.stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }
@@ -1312,6 +1312,7 @@ fn dispatch_one(
                 cur_chunk,
                 tile,
                 TaskKind::PickUpCorpse,
+                None,
                 Some(corpse),
                 &routing.chunk_graph,
                 &routing.chunk_router,
@@ -1320,8 +1321,7 @@ fn dispatch_one(
                 &routing.spatial_index,
                 &routing.stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }
@@ -1341,6 +1341,7 @@ fn dispatch_one(
                 cur_chunk,
                 tile,
                 TaskKind::MilitaryAttack,
+                None,
                 Some(foe),
                 &routing.chunk_graph,
                 &routing.chunk_router,
@@ -1349,8 +1350,7 @@ fn dispatch_one(
                 &routing.spatial_index,
                 &routing.stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }
@@ -1444,6 +1444,7 @@ fn dispatch_one(
                 cur_chunk,
                 routing_tile,
                 task_kind,
+                None,
                 bp_entity,
                 &routing.chunk_graph,
                 &routing.chunk_router,
@@ -1453,7 +1454,7 @@ fn dispatch_one(
                 &routing.stand_reservations,
                 actor,
                 now,
-            );
+                );
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }
@@ -1479,6 +1480,7 @@ fn dispatch_one(
                 cur_chunk,
                 tile,
                 TaskKind::Teach,
+                None,
                 Some(student),
                 &routing.chunk_graph,
                 &routing.chunk_router,
@@ -1487,8 +1489,7 @@ fn dispatch_one(
                 &routing.spatial_index,
                 &routing.stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }
@@ -1501,10 +1502,9 @@ fn dispatch_one(
         ReadItem { tech } => {
             // Pin the agent in place and stamp the Read task. `read_task_system`
             // accumulates study progress against the matching tablet/book in
-            // the agent's inventory.
-            ai.state = AiState::Working;
-            ai.work_progress = 0;
-            aq.dispatch(Task::Read { tech });
+            // the agent's inventory.            aq.dispatch(Task::Read { tech });
+
+            aq.begin_working(ai);
             commands.entity(actor).insert(Drafted);
             DispatchOutcome::Active
         }
@@ -1533,8 +1533,7 @@ fn dispatch_one(
             // task chain (Forage, Build, etc.) — without it the queue holds
             // a stale task that resumes when `Disband` later removes the
             // `Drafted` marker.
-            aq.cancel();
-            ai.state = AiState::Idle;
+            aq.cancel_chain(ai);
             ai.target_entity = None;
             ai.work_progress = 0;
             commands.entity(actor).remove::<Carrying>().insert(Drafted);
@@ -1544,8 +1543,7 @@ fn dispatch_one(
             // Inverse of Muster. Removes `Drafted` and idles tasks. Also
             // drops the typed queue so a stale military-side task can't bleed
             // back into autonomous execution.
-            aq.cancel();
-            ai.state = AiState::Idle;
+            aq.cancel_chain(ai);
             ai.target_entity = None;
             commands.entity(actor).remove::<Drafted>();
             if let Ok(mut ct) = combat_target_q.get_mut(actor) {
@@ -1575,6 +1573,7 @@ fn dispatch_one(
                 slot_tile,
                 TaskKind::MilitaryMove,
                 None,
+                None,
                 &routing.chunk_graph,
                 &routing.chunk_router,
                 &routing.chunk_map,
@@ -1582,8 +1581,7 @@ fn dispatch_one(
                 &routing.spatial_index,
                 &routing.stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }
@@ -1621,6 +1619,7 @@ fn dispatch_one(
                 cur_chunk,
                 tile,
                 TaskKind::MilitaryAttack,
+                None,
                 Some(foe),
                 &routing.chunk_graph,
                 &routing.chunk_router,
@@ -1629,8 +1628,7 @@ fn dispatch_one(
                 &routing.spatial_index,
                 &routing.stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }
@@ -1777,6 +1775,7 @@ fn dispatch_one(
                 tile,
                 TaskKind::Lookout,
                 None,
+                None,
                 &routing.chunk_graph,
                 &routing.chunk_router,
                 &routing.chunk_map,
@@ -1784,8 +1783,7 @@ fn dispatch_one(
                 &routing.spatial_index,
                 &routing.stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !routed {
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }

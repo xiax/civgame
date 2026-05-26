@@ -429,6 +429,7 @@ pub fn trader_route_dispatch_system(
             dest,
             TaskKind::Lead,
             None,
+            None,
             &chunk_graph,
             &chunk_router,
             &chunk_map,
@@ -437,7 +438,7 @@ pub fn trader_route_dispatch_system(
             &stand_reservations,
             actor,
             now,
-        );
+                );
         if routed {
             aq.dispatch(Task::Lead { dest });
         }

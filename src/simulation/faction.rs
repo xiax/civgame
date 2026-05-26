@@ -3594,13 +3594,12 @@ pub fn drop_items_at_destination_system(
             }
         }
 
-        ai.state = AiState::Idle;
         // Phase 5c-ii-c-ii: clear the typed `Task::DepositToFactionStorage`
         // (or any pending DepositResource variant) so the next tick's HTN
-        // dispatcher sees a clean Idle slot. `advance()` promotes any further
-        // queued task — today the gather chain ends here so the queue is
-        // empty and `current` flips to `Task::Idle`.
-        aq.advance();
+        // dispatcher sees a clean Idle slot. `finish_task` promotes any
+        // further queued task — today the gather chain ends here so the
+        // queue is empty and `current` flips to `Task::Idle`.
+        aq.finish_task(&mut ai);
     }
 }
 

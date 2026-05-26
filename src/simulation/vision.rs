@@ -239,8 +239,7 @@ pub fn lookout_task_system(
         }
 
         // Arrived — pin Working + ensure the lookout components exist.
-        ai.state = AiState::Working;
-        ai.work_progress = 0;
+        aq.begin_working(&mut ai);
         if existing_lookout.is_none() {
             let faction = member_q
                 .get(entity)
@@ -308,8 +307,7 @@ pub fn autonomous_scout_lookout_pause_system(
         // stand-and-scan pause at this tile. `aq.cancel` drops the
         // Explore; `aq.dispatch` promotes the Lookout into `current`
         // since cancel left the queue empty.
-        aq.cancel();
-        ai.state = AiState::Idle;
+        aq.cancel_chain(&mut ai);
         aq.dispatch(Task::Lookout {
             anchor: (tx, ty),
             anchor_z: ai.current_z,

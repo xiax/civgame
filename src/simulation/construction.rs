@@ -4701,6 +4701,7 @@ pub fn building_upgrade_system(
                 tile,
                 TaskKind::Deconstruct,
                 None,
+                None,
                 &chunk_graph,
                 &chunk_router,
                 &chunk_map,
@@ -4708,8 +4709,7 @@ pub fn building_upgrade_system(
                 &spatial_index,
                 &stand_reservations,
                 agent_e,
-                clock.tick,
-            );
+                clock.tick,);
             if routed {
                 aq.dispatch(crate::simulation::typed_task::Task::Deconstruct { tile });
             }
@@ -4799,9 +4799,7 @@ pub fn construction_system(
             ai.target_entity
         };
         let Some(bp_entity) = bp_entity_opt else {
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
 
@@ -4812,10 +4810,8 @@ pub fn construction_system(
             .ok()
             .map(|bp| (bp.deposits, bp.deposit_count));
         let Some((deposits, count)) = bp_info else {
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
             ai.target_entity = None;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
 
@@ -5786,10 +5782,8 @@ pub fn construction_system(
         let is_orphaned = orphaned_agents.contains(&entity);
 
         if is_completed || is_hauler_done || is_orphaned {
-            ai.state = AiState::Idle;
             ai.target_entity = None;
-            ai.work_progress = 0;
-            aq.advance();
+            aq.finish_task(&mut ai);
         } else if slice_candidates.contains(&entity)
             && ai.work_progress >= MAINTENANCE_WORK_SLICE_TICKS
         {
@@ -6713,6 +6707,7 @@ pub fn deconstruct_system(
                     storage_tile,
                     TaskKind::DepositResource,
                     None,
+                    None,
                     &chunk_graph,
                     &chunk_router,
                     &chunk_map,
@@ -6720,13 +6715,14 @@ pub fn deconstruct_system(
                     &spatial_index,
                     &stand_reservations,
                     agent_entity,
-                    now,
-                );
+                    now,);
                 if !dispatched {
                     aq.cancel_chain(&mut ai);
                 }
             } else {
-                ai.state = AiState::Idle;
+                // `aq.advance()` above already promoted Task::Idle into
+                // current — re-assert FSM state to match.
+                aq.assert_idle(&mut ai);
             }
         }
     }

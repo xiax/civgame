@@ -276,9 +276,7 @@ fn finish_gather(
     // (success/fail/handoff) so the next dispatcher pass starts clean.
     routing.stand_reservations.release_for_worker(actor);
 
-    ai.state = AiState::Idle;
     ai.target_entity = None;
-    ai.work_progress = 0;
 
     if outcome == FinishGatherOutcome::TargetInvalid {
         // The queued tail (Deposit / HaulToBlueprint / HaulToCraftOrder / Eat)
@@ -286,11 +284,11 @@ fn finish_gather(
         // with empty hands is the visible bug — drop the chain wholesale.
         // `MethodHistory.FailedTarget` was recorded by the caller; the next
         // dispatcher tick will re-plan with that bias applied.
-        aq.cancel();
+        aq.cancel_chain(ai);
         return;
     }
 
-    aq.advance();
+    aq.finish_task(ai);
 
     // Chain handoff: route based on what the prefetch ring promoted.
     match aq.current {
@@ -324,6 +322,7 @@ fn finish_gather(
                 storage_tile,
                 TaskKind::DepositResource,
                 None,
+                None,
                 &routing.chunk_graph,
                 &routing.chunk_router,
                 chunk_map,
@@ -331,8 +330,7 @@ fn finish_gather(
                 &routing.spatial_index,
                 &routing.stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !dispatched {
                 record_routing_failure(method_history, ai, now);
                 aq.cancel();
@@ -344,7 +342,7 @@ fn finish_gather(
             // the legacy channel directly so `eat_task_system` picks up next
             // tick. The Gather executor leaves harvested food in
             // hands/inventory; `eat_task_system` reads from both.
-            ai.state = AiState::Working;
+            aq.begin_working(ai);
         }
         Task::HaulToBlueprint { blueprint } => {
             // Phase 5e-xiii-b: gather-for-personal-build chain trailing leg.
@@ -366,6 +364,7 @@ fn finish_gather(
                 cur_chunk,
                 bp_tile,
                 TaskKind::HaulMaterials,
+                None,
                 Some(blueprint),
                 &routing.chunk_graph,
                 &routing.chunk_router,
@@ -374,8 +373,7 @@ fn finish_gather(
                 &routing.spatial_index,
                 &routing.stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !dispatched {
                 record_routing_failure(method_history, ai, now);
                 aq.cancel();
@@ -399,6 +397,7 @@ fn finish_gather(
                 cur_chunk,
                 dest,
                 TaskKind::HaulToCraftOrder,
+                None,
                 Some(order),
                 &routing.chunk_graph,
                 &routing.chunk_router,
@@ -407,8 +406,7 @@ fn finish_gather(
                 &routing.spatial_index,
                 &routing.stand_reservations,
                 actor,
-                now,
-            );
+                now,);
             if !dispatched {
                 record_routing_failure(method_history, ai, now);
                 aq.cancel();
@@ -556,6 +554,7 @@ pub fn gather_system(
                                 new_tile,
                                 TaskKind::Gather,
                                 None,
+                                None,
                                 &routing.chunk_graph,
                                 &routing.chunk_router,
                                 &chunk_map,
@@ -563,8 +562,7 @@ pub fn gather_system(
                                 &routing.spatial_index,
                                 &routing.stand_reservations,
                                 actor,
-                                clock.tick,
-                            );
+                                clock.tick,);
                             if dispatched {
                                 routing.gather_claims.release(claim_tile, claim_kind, actor);
                                 let expires = crate::simulation::gather_claims::suggested_expiry(

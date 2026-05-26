@@ -356,6 +356,7 @@ pub fn htn_drink_dispatch_system(
     clock: Res<crate::simulation::SimClock>,
     globe: Res<Globe>,
     well_map: Res<WellMap>,
+    well_query: Query<&crate::simulation::construction::Well>,
     runtime_water: Res<crate::world::water_runtime::RuntimeWater>,
     faction_registry: Res<FactionRegistry>,
     mut query: Query<
@@ -414,12 +415,11 @@ pub fn htn_drink_dispatch_system(
             let inv_clean =
                 agent.quantity_of_resource(clean_water) + carrier.quantity_of_resource(clean_water);
             if inv_clean > 0 {
-                ai.state = AiState::Working;
-                ai.work_progress = 0;
                 ai.dest_tile = (cur_tx, cur_ty);
                 aq.dispatch(Task::Drink {
                     source: DrinkSource::Inventory,
                 });
+                aq.begin_working(&mut ai);
                 return;
             }
 
@@ -463,16 +463,55 @@ pub fn htn_drink_dispatch_system(
 
             // Wells beat rivers locally, then reliable home/camp water is the
             // escape hatch for workers who got thirsty beyond the local scan.
+            //
+            // Drink-specific stand-tile derivation: the generic
+            // `assign_task_with_routing` would call `nearest_standable_z` on
+            // the well shaft, descend the impassable column to the basin
+            // floor, and reject every surface bank candidate via the
+            // `|nz - resource_z| ≤ 1` filter in `pick_adjacent_stand_tile`.
+            // For wells we anchor on `Well.surf_z` (the dug top); for
+            // river/marsh tiles we anchor on the agent's current Z
+            // (waterline runs at bank surface). See
+            // `tasks.rs::assign_task_with_routing` doc-comment.
+            let agent_z = ai.current_z;
             for candidate in [local_well, local_water, home_well, home_water]
                 .into_iter()
                 .flatten()
             {
+                // Already-adjacent fast path: if the worker is standing
+                // chebyshev-1 to the candidate, skip routing entirely.
+                let cheb = (cur_tx - candidate.target_tile.0)
+                    .abs()
+                    .max((cur_ty - candidate.target_tile.1).abs());
+                if cheb <= 1 {
+                    ai.dest_tile = candidate.target_tile;
+                    ai.target_tile = (cur_tx, cur_ty);
+                    ai.target_z = agent_z;
+                    stand_reservations.release_for_worker(actor);
+                    let _ = stand_reservations.try_stake(cur_tx, cur_ty, agent_z, actor, now);
+                    aq.dispatch(Task::Drink {
+                        source: candidate.source,
+                    });
+                    aq.begin_working(&mut ai);
+                    return;
+                }
+
+                let resource_z_override = match candidate.source {
+                    DrinkSource::Well { tile } => well_map
+                        .0
+                        .get(&tile)
+                        .and_then(|&e| well_query.get(e).ok())
+                        .map(|w| w.surf_z),
+                    DrinkSource::Tile { .. } => Some(agent_z),
+                    DrinkSource::Inventory => None, // unreachable for routing
+                };
                 let routed = assign_task_with_routing(
                     &mut ai,
                     (cur_tx, cur_ty),
                     cur_chunk,
                     candidate.target_tile,
                     TaskKind::Drink,
+                    resource_z_override,
                     None,
                     &chunk_graph,
                     &chunk_router,

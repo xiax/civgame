@@ -923,10 +923,9 @@ pub fn goal_update_system(
             }
 
             if invalid {
-                ai.state = AiState::Idle;
                 ai.target_entity = None;
                 target_item.0 = None;
-                aq.cancel();
+                aq.cancel_chain(&mut ai);
             }
         }
 
@@ -1020,10 +1019,9 @@ pub fn goal_update_system(
             if let Some(best_pick) = maintenance_pick {
                 if *goal != best_pick.score.goal {
                     *goal = best_pick.score.goal;
-                    ai.state = AiState::Idle;
                     ai.target_entity = None;
                     target_item.0 = None;
-                    aq.cancel();
+                    aq.cancel_chain(&mut ai);
                 }
                 if let Ok(mut decision) = scorer_inputs.decision_q.get_mut(entity) {
                     decision.record_score(best_pick.score, best_pick.scorer_name, clock.tick);
@@ -1051,10 +1049,9 @@ pub fn goal_update_system(
             };
             if *goal != resume_goal {
                 *goal = resume_goal;
-                ai.state = AiState::Idle;
                 ai.target_entity = None;
                 target_item.0 = None;
-                aq.cancel();
+                aq.cancel_chain(&mut ai);
             }
             if let Some(mut r) = reason_opt {
                 r.0 = resume_reason;
@@ -1072,8 +1069,7 @@ pub fn goal_update_system(
             if attacker_alive && !timed_out {
                 if *goal != AgentGoal::Rescue {
                     *goal = AgentGoal::Rescue;
-                    ai.state = AiState::Idle;
-                    aq.cancel();
+                    aq.cancel_chain(&mut ai);
                 }
                 if let Some(mut r) = reason_opt {
                     r.0 = "Helping Ally";
@@ -1096,8 +1092,7 @@ pub fn goal_update_system(
         if migration_target.is_some() {
             if *goal != AgentGoal::MigrateToCamp {
                 *goal = AgentGoal::MigrateToCamp;
-                ai.state = AiState::Idle;
-                aq.cancel();
+                aq.cancel_chain(&mut ai);
             }
             if let Some(mut r) = reason_opt {
                 r.0 = "Migrating to Camp";
@@ -1119,8 +1114,7 @@ pub fn goal_update_system(
             if registry.is_under_raid(member.faction_id) {
                 if *goal != AgentGoal::Defend {
                     *goal = AgentGoal::Defend;
-                    ai.state = AiState::Idle;
-                    aq.cancel();
+                    aq.cancel_chain(&mut ai);
                 }
                 if let Some(mut r) = reason_opt {
                     r.0 = "Under Raid";
@@ -1137,8 +1131,7 @@ pub fn goal_update_system(
             if defense_queue.has_target(member.faction_id) {
                 if *goal != AgentGoal::Defend {
                     *goal = AgentGoal::Defend;
-                    ai.state = AiState::Idle;
-                    aq.cancel();
+                    aq.cancel_chain(&mut ai);
                 }
                 if let Some(mut r) = reason_opt {
                     r.0 = "Defending Territory";
@@ -1150,8 +1143,7 @@ pub fn goal_update_system(
             if registry.is_raid_party_member(member.faction_id, entity) {
                 if *goal != AgentGoal::Raid {
                     *goal = AgentGoal::Raid;
-                    ai.state = AiState::Idle;
-                    aq.cancel();
+                    aq.cancel_chain(&mut ai);
                 }
                 if let Some(mut r) = reason_opt {
                     r.0 = "Participating in Raid";
@@ -1174,8 +1166,7 @@ pub fn goal_update_system(
         {
             if *goal != AgentGoal::Lead {
                 *goal = AgentGoal::Lead;
-                ai.state = AiState::Idle;
-                aq.cancel();
+                aq.cancel_chain(&mut ai);
             }
             if let Some(mut r) = reason_opt {
                 r.0 = "Leading";
@@ -1568,10 +1559,9 @@ pub fn goal_update_system(
 
         if *goal != new_goal {
             *goal = new_goal;
-            ai.state = AiState::Idle;
             ai.target_entity = None;
             target_item.0 = None;
-            aq.cancel();
+            aq.cancel_chain(&mut ai);
         }
         if let Some(mut r) = reason_opt {
             r.0 = reason;
@@ -1817,10 +1807,9 @@ pub fn earnincome_goal_override_system(
         let _ = (best.score, Disposition::default());
         if *goal != best.goal {
             *goal = best.goal;
-            ai.state = AiState::Idle;
             ai.target_entity = None;
             target_item.0 = None;
-            aq.cancel();
+            aq.cancel_chain(&mut ai);
         }
         if let Some(mut r) = reason_opt {
             r.0 = best.reason;

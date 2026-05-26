@@ -181,14 +181,12 @@ pub fn read_task_system(
         }
         let Some(tech) = aq.current.knowledge_tech() else {
             // Misconfigured task — clear it.
-            ai.state = AiState::Idle;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
         if find_readable_slot(agent, tech).is_none() {
             // Lost the tablet (dropped, traded). End task.
-            ai.state = AiState::Idle;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         }
 
@@ -214,9 +212,7 @@ pub fn read_task_system(
             }
         }
         if session_done || learned {
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
-            aq.advance();
+            aq.finish_task(&mut ai);
             // Release the player-imposed `Drafted` marker so autonomous goal
             // dispatch can pick the agent back up.
             if let Some(mut ec) = commands.get_entity(entity) {
@@ -314,9 +310,10 @@ pub fn teach_task_system(
         } else {
             // Pin the teacher to "Working" so movement doesn't drift them.
             if let Ok((_, mut ai, mut aq, _)) = teachers.get_mut(teacher_e) {
-                ai.state = AiState::Working;
-                ai.work_progress = ai.work_progress.saturating_add(1);
+                let prev_progress = ai.work_progress.saturating_add(1);
                 aq.current = crate::simulation::typed_task::Task::Teach { tech };
+                aq.begin_working(&mut ai);
+                ai.work_progress = prev_progress;
             }
         }
     }
@@ -468,13 +465,12 @@ pub fn lecture_tick_system(
                 ec.remove::<Attending>();
                 ec.remove::<Drafted>();
             }
-            ai.state = AiState::Idle;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         }
 
         // Pin task each tick.
-        ai.state = AiState::Working;
+        aq.begin_working(&mut ai);
         aq.current = crate::simulation::typed_task::Task::AttendLecture { tech: att.tech };
 
         let amount = study_amount(stats, 2.0);
@@ -502,8 +498,7 @@ pub fn lecture_tick_system(
                 ec.remove::<Attending>();
                 ec.remove::<Drafted>();
             }
-            ai.state = AiState::Idle;
-            aq.advance();
+            aq.finish_task(&mut ai);
         }
     }
 
@@ -514,11 +509,10 @@ pub fn lecture_tick_system(
                 ec.remove::<Lecturing>();
                 ec.remove::<Drafted>();
             }
-            ai.state = AiState::Idle;
-            aq.advance();
+            aq.finish_task(&mut ai);
         } else {
             // Pin lecturer in HoldLecture state.
-            ai.state = AiState::Working;
+            aq.begin_working(&mut ai);
             aq.current = crate::simulation::typed_task::Task::HoldLecture { tech: lec.tech };
         }
     }

@@ -186,4 +186,5 @@ Helpers: `stone_yield_count`, `soil_fertility_mult`. No `Farmland` variant — G
 - **No new crates** without explicit permission.
 - **Error handling:** avoid `unwrap()` in core systems; use `match` / `if let`.
 - **Mutable aliasing:** be careful with Bevy query aliasing; test empirically.
+- **`PersonAI.state` is encapsulated:** never assign it directly — use the `ActionQueue` transition methods (`begin_working` / `begin_seeking` / `begin_routing` / `begin_sleeping` / `begin_attacking` / `finish_task` / `cancel_chain`). Direct `ai.state = AiState::X` writes outside `src/simulation/` are a compile error. See `src/simulation/CLAUDE.md` → "ActionQueue and typed Task variants" for the rationale.
 - **Doc updates:** when behaviour changes, update the matching `CLAUDE.md`. Subsystem-local changes go in `src/<dir>/CLAUDE.md`; cross-cutting in this file. Keep entries terse.

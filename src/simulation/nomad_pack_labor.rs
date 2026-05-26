@@ -136,8 +136,7 @@ pub fn stamp_pack_duty(world: &mut World, fids: &[u32]) {
                 release_claimant(&mut board, claim.job_id, entity);
             }
 
-            aq.cancel();
-            ai.state = AiState::Idle;
+            aq.cancel_chain(&mut ai);
             ai.target_entity = None;
             ai.target_tile = tile;
             ai.dest_tile = tile;
@@ -432,6 +431,7 @@ pub fn dispatch_unpitch_tasks(world: &mut World, packs: &[(u32, (i32, i32), i32)
             a.worker_chunk,
             a.structure_tile,
             TaskKind::UnpitchStructure,
+            None,
             Some(a.structure),
             &chunk_graph,
             &chunk_router,
@@ -440,8 +440,7 @@ pub fn dispatch_unpitch_tasks(world: &mut World, packs: &[(u32, (i32, i32), i32)
             &spatial_index,
             &stand_reservations,
             a.worker,
-            now,
-        );
+            now,);
         if routed {
             aq.cancel();
             aq.dispatch(Task::UnpitchStructure {
@@ -488,16 +487,12 @@ pub fn unpitch_structure_task_system(
             continue;
         }
         let Some(structure) = aq.current.as_unpitch_structure() else {
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
         // Structure gone (raced or already despawned): clean exit.
         let Ok((transform, deploy, is_bed, is_campfire)) = structure_q.get(structure) else {
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
         if (ai.work_progress as u32) < UNPITCH_WORK_TICKS {
@@ -551,9 +546,7 @@ pub fn unpitch_structure_task_system(
             ty: tile.1,
         });
 
-        ai.state = AiState::Idle;
-        ai.work_progress = 0;
-        aq.advance();
+        aq.finish_task(&mut ai);
     }
 }
 
@@ -584,18 +577,14 @@ pub fn unload_camp_cargo_task_system(
             continue;
         }
         let Some((rid, qty, tile)) = aq.current.as_unload_camp_cargo() else {
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
         let removed = agent.remove_resource(rid, qty as u32);
         if removed > 0 {
             spawn_ground_drop(&mut commands, tile.0, tile.1, rid, removed);
         }
-        ai.state = AiState::Idle;
-        ai.work_progress = 0;
-        aq.advance();
+        aq.finish_task(&mut ai);
     }
 }
 
@@ -622,9 +611,7 @@ pub fn pitch_structure_at_task_system(
             continue;
         }
         let Some((kind, anchor)) = aq.current.as_pitch_structure_at() else {
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
         if (ai.work_progress as u32) < PITCH_WORK_TICKS {
@@ -722,9 +709,7 @@ pub fn pitch_structure_at_task_system(
 }
 
 fn finish_pitch_worker(ai: &mut PersonAI, aq: &mut ActionQueue) {
-    ai.state = AiState::Idle;
-    ai.work_progress = 0;
-    aq.advance();
+    aq.finish_task(ai);
 }
 
 fn consume_ground_resource_near(

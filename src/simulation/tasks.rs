@@ -750,12 +750,22 @@ pub fn pick_adjacent_stand_tile(
     best.map(|(tile, z, _)| (tile, z))
 }
 
+/// `resource_z_override`: pass `Some(z)` when the target is an **impassable**
+/// column (well shaft, deep wall, sealed-floor tile) whose
+/// `nearest_standable_z` would descend into the column and reject every
+/// viable surface bank stand tile via the `|nz - resource_z| ≤ 1` filter.
+/// `None` uses the default `nearest_standable_z(target, agent.z)` derivation.
+///
+/// Wells should pass `Some(well.surf_z)` (the dug top, not the basin floor);
+/// water/marsh targets should pass `Some(agent.current_z)` (rivers expose
+/// their waterline at the bank's surface, not at the wet column floor).
 pub fn assign_task_with_routing(
     ai: &mut PersonAI,
     cur_tile: (i32, i32),
     cur_chunk: ChunkCoord,
     target: (i32, i32),
     task: TaskKind,
+    resource_z_override: Option<i8>,
     target_entity: Option<Entity>,
     chunk_graph: &ChunkGraph,
     chunk_router: &ChunkRouter,
@@ -770,8 +780,15 @@ pub fn assign_task_with_routing(
     // reach the work tile. The agent's `target_z` is set below to the route
     // tile's Z (where they'll stand), not this — otherwise flow-field seeds
     // and Working-transition checks fire at the wrong Z on sloped ground.
-    let resource_z =
-        chunk_map.nearest_standable_z(target.0 as i32, target.1 as i32, ai.current_z as i32) as i8;
+    //
+    // `resource_z_override` lets callers bypass the default when the target is
+    // an impassable column (well shaft, deep wall). Without the override,
+    // `nearest_standable_z` descends the shaft to the basin floor and the
+    // `|nz - resource_z| ≤ 1` filter in `pick_adjacent_stand_tile` rejects
+    // every surface bank tile.
+    let resource_z = resource_z_override.unwrap_or_else(|| {
+        chunk_map.nearest_standable_z(target.0 as i32, target.1 as i32, ai.current_z as i32) as i8
+    });
 
     // Release any prior stand-tile reservation for this worker; we may stake a
     // fresh one below. Releasing first keeps the bookkeeping clean across
@@ -904,6 +921,7 @@ pub fn dispatch_autonomous_task_with_routing(
         cur_chunk,
         target,
         task_kind,
+        None,
         target_entity,
         chunk_graph,
         chunk_router,
@@ -913,7 +931,7 @@ pub fn dispatch_autonomous_task_with_routing(
         stand_reservations,
         worker,
         now,
-    ) {
+                ) {
         return false;
     }
 
@@ -1512,13 +1530,13 @@ pub fn goal_dispatch_system(
                     // A pending gather claim must release here too: a goal
                     // flip preempts the chain before `finish_gather` runs.
                     release_gather_claim(&gather_claims, &mut ai, actor);
-                    ai.state = AiState::Idle;
                     // Phase 4b-ii: a goal flip is an external preempt — any
-                    // prefetched tasks belong to the abandoned plan. `cancel()`
-                    // drops both `current` and the queue so executors with the
+                    // prefetched tasks belong to the abandoned plan.
+                    // `cancel_chain` drops both `current` and the queue while
+                    // clearing `state` atomically so executors with the
                     // inconsistent-state guard see clean state and chained
                     // follow-ups don't outlive their plan.
-                    aq.cancel();
+                    aq.cancel_chain(&mut ai);
                 }
             }
 
@@ -1546,8 +1564,7 @@ pub fn goal_dispatch_system(
                 && aq.current_task_kind() == TaskKind::Explore as u16
                 && ai.state == AiState::Working
             {
-                ai.state = AiState::Idle;
-                aq.cancel();
+                aq.cancel_chain(&mut ai);
             }
         });
 }
@@ -1713,13 +1730,11 @@ pub fn play_system(
         ai.work_progress = ai.work_progress.saturating_add(1);
         if ai.work_progress as u32 >= PLAY_DURATION_TICKS || needs.willpower >= PLAY_FULL_WILLPOWER
         {
-            ai.state = AiState::Idle;
             ai.target_entity = None;
-            ai.work_progress = 0;
             // Phase 5e-xii-a: drain the typed channel so HTN-driven Play
-            // chains complete cleanly. Legacy plan-driven flows leave
-            // `aq.current = Idle`, so this is a benign no-op there.
-            aq.advance();
+            // chains complete cleanly. `finish_task` clears state +
+            // work_progress and advances any prefetched chain.
+            aq.finish_task(&mut ai);
         }
     }
 
@@ -1795,6 +1810,7 @@ mod tests {
             (10, 10),
             TaskKind::Idle,
             None,
+            None,
             &graph,
             &router,
             &map,
@@ -1803,7 +1819,7 @@ mod tests {
             &stand,
             Entity::PLACEHOLDER,
             0,
-        );
+                );
 
         // target_z must follow the agent's Z (the tunnel floor at z=0),
         // not the surface above (z=5). Without the fix, this would be 5

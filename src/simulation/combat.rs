@@ -324,16 +324,23 @@ pub fn combat_system(
                 && !body_query.contains(target)
                 && !vehicle_query.contains(target))
         {
-            if let Ok(mut ai) = ai_query.get_mut(attacker) {
-                ai.state = AiState::Idle;
-            }
             // Phase 5e-vii: drain the typed channel after a kill so a stale
             // `Task::Hunt { prey: <dead> }` doesn't linger in `aq.current`.
             // For non-hunt combat (Defend / brawl) `aq.current` is unrelated
             // and `advance()` is a no-op transition out of whatever else was
             // there — the next dispatcher tick re-establishes the right task.
+            // Atomic ai + aq mutation via `finish_task` when both available;
+            // otherwise the orphan invariant still holds because the attacker
+            // can't both have a current task AND no PersonAI (Person spawns
+            // attach both).
             if let Some(ref mut aq) = attacker_aq {
-                aq.advance();
+                if let Ok(mut ai) = ai_query.get_mut(attacker) {
+                    aq.finish_task(&mut ai);
+                } else {
+                    aq.advance();
+                }
+            } else if let Ok(mut ai) = ai_query.get_mut(attacker) {
+                ai.state = AiState::Idle;
             }
             if let Ok((mut animal_ai, _)) = animal_ai_query.get_mut(attacker) {
                 animal_ai.state = AnimalState::Wander;
@@ -382,6 +389,10 @@ pub fn combat_system(
 
         if found {
             if let Ok(mut ai) = ai_query.get_mut(attacker) {
+                // Combat overrides the action FSM without clearing the
+                // current task — the retaliation cleanup system restores
+                // it. Direct field write (no `aq` in this sub-query)
+                // because we want the attacker's task to survive intact.
                 ai.state = AiState::Attacking;
             }
 
@@ -505,9 +516,10 @@ pub fn combat_system(
         } else {
             if let Ok(mut ai) = ai_query.get_mut(attacker) {
                 if ai.state == AiState::Attacking {
-                    ai.state = AiState::Idle;
                     if let Some(ref mut aq) = attacker_aq {
-                        aq.advance();
+                        aq.finish_task(&mut ai);
+                    } else {
+                        ai.state = AiState::Idle;
                     }
                 }
             }
@@ -838,8 +850,7 @@ pub fn hunt_chase_system(
             // Despawned. Cancel cleanly so dispatcher re-evaluates next tick.
             crate::simulation::htn::record_target_failure(&mut history, &mut ai, now);
             combat_target.0 = None;
-            ai.state = AiState::Idle;
-            aq.cancel();
+            aq.cancel_chain(&mut ai);
             continue;
         };
         if prey_health.is_dead() {
@@ -866,8 +877,7 @@ pub fn hunt_chase_system(
         if cheb > HUNT_LEASH_RADIUS {
             crate::simulation::htn::record_target_failure(&mut history, &mut ai, now);
             combat_target.0 = None;
-            ai.state = AiState::Idle;
-            aq.cancel();
+            aq.cancel_chain(&mut ai);
             continue;
         }
 
@@ -883,8 +893,9 @@ pub fn hunt_chase_system(
             // movement loop actually re-routes instead of accumulating
             // work_progress while the prey runs free.
             if ai.state == AiState::Working {
-                ai.state = AiState::Seeking;
-                ai.work_progress = 0;
+                let new_target = (prey_tx, prey_ty);
+                let new_z = chunk_map.surface_z_at(prey_tx, prey_ty) as i8;
+                aq.begin_seeking(&mut ai, new_target, new_z);
             }
             // Force a fresh path plan next tick. Mirror movement_system's
             // stuck-tick clear (lines 280-287) so the path worker rebuilds

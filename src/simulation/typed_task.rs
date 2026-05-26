@@ -193,7 +193,7 @@ pub enum Task {
     /// `SOCIAL_RADIUS`, and `needs.rs`'s table+chair bonus reads
     /// `task_id == TaskKind::Socialize` for furniture-assisted recovery.
     /// There is no dedicated executor — the dispatcher routes via
-    /// `assign_task_with_routing(... TaskKind::Socialize, Some(partner) ...)`
+    /// `assign_task_with_routing(... TaskKind::Socialize, Some(partner) ...,)`
     /// and the agent simply sits in the task until `goal_update_system`
     /// flips them off `AgentGoal::Socialize`. Produced by HTN
     /// `SocializeWithPartnerMethod` (replaces legacy `Socialize` plan
@@ -243,7 +243,7 @@ pub enum Task {
     HuntPartyMuster { hearth: (i32, i32) },
     /// Hunt down the named prey entity. There is no dedicated executor — the
     /// dispatcher routes the agent to the prey via
-    /// `assign_task_with_routing(... TaskKind::Hunter, Some(prey) ...)` and
+    /// `assign_task_with_routing(... TaskKind::Hunter, Some(prey) ...,)` and
     /// sets `CombatTarget`, then `combat_system` engages the moment the
     /// agent is adjacent. The variant carries the prey entity for chain
     /// inspection (the future HTN `EngagePreyMethod` will read it; the
@@ -871,6 +871,103 @@ impl ActionQueue {
         ai.state = AiState::Idle;
         ai.work_progress = 0;
         self.cancel();
+    }
+
+    // -----------------------------------------------------------------------
+    // Atomic state-transition methods.
+    //
+    // `PersonAI.state` is encapsulated (private field, `state()` getter); the
+    // only legal way to mutate it is through one of these methods on the
+    // typed queue. This makes orphan state (`current != Idle && state == Idle`)
+    // unrepresentable: every transition mutates both fields atomically with a
+    // `debug_assert!` precondition on the queue.
+    //
+    // Use in dispatchers and executors:
+    //   - `begin_working` after `dispatch(Task::X)` for in-place work
+    //   - `begin_seeking` / `begin_routing` inside routing helpers
+    //   - `begin_sleeping` on arrival in `sleep_task_system`
+    //   - `begin_attacking` in combat dispatch
+    //   - `finish_task` / `cancel_chain` for exits (already above)
+    // -----------------------------------------------------------------------
+
+    /// Promote agent to `AiState::Working` and zero `work_progress`. Asserts
+    /// that a task is current — Working with `current == Idle` is the dual
+    /// orphan shape this whole module exists to prevent.
+    pub fn begin_working(&self, ai: &mut PersonAI) {
+        debug_assert!(
+            self.current != Task::Idle,
+            "begin_working requires a current task; got Task::Idle"
+        );
+        ai.state = AiState::Working;
+        ai.work_progress = 0;
+    }
+
+    /// Promote agent to `AiState::Seeking` toward `(tile, z)`. Asserts that a
+    /// task is current.
+    pub fn begin_seeking(&self, ai: &mut PersonAI, tile: (i32, i32), z: i8) {
+        debug_assert!(
+            self.current != Task::Idle,
+            "begin_seeking requires a current task; got Task::Idle"
+        );
+        ai.state = AiState::Seeking;
+        ai.target_tile = tile;
+        ai.target_z = z;
+    }
+
+    /// Promote agent to `AiState::Routing` toward `(waypoint, z)` (cross-chunk
+    /// route). Asserts that a task is current.
+    pub fn begin_routing(&self, ai: &mut PersonAI, waypoint: (i32, i32), z: i8) {
+        debug_assert!(
+            self.current != Task::Idle,
+            "begin_routing requires a current task; got Task::Idle"
+        );
+        ai.state = AiState::Routing;
+        ai.target_tile = waypoint;
+        ai.target_z = z;
+    }
+
+    /// Flip arrived sleeper into `AiState::Sleeping`. Asserts that the current
+    /// task is a `Task::Sleep` variant.
+    pub fn begin_sleeping(&self, ai: &mut PersonAI) {
+        debug_assert!(
+            self.current.as_sleep().is_some(),
+            "begin_sleeping requires current == Task::Sleep"
+        );
+        ai.state = AiState::Sleeping;
+    }
+
+    /// Promote agent to `AiState::Attacking`. Asserts that a task is current
+    /// (combat-task discrimination is checked at the caller — combat dispatch
+    /// sets this for both ranged and melee on a variety of typed tasks).
+    pub fn begin_attacking(&self, ai: &mut PersonAI) {
+        debug_assert!(
+            self.current != Task::Idle,
+            "begin_attacking requires a current task; got Task::Idle"
+        );
+        ai.state = AiState::Attacking;
+    }
+
+    /// Re-assert `state = Idle` at a site where `current` is already `Idle`
+    /// (player Move arrivals, sites that drop a task-less agent into rest).
+    /// Asserts the precondition so a real orphan can't be created here.
+    pub fn assert_idle(&self, ai: &mut PersonAI) {
+        debug_assert!(
+            self.current == Task::Idle,
+            "assert_idle requires current == Task::Idle; got {:?}",
+            self.current
+        );
+        ai.state = AiState::Idle;
+    }
+
+    /// Direct state-invariant probe used by debug assertion systems. Holds
+    /// `!(current != Idle && state == Idle)` — the canonical no-orphan
+    /// shape.
+    pub fn assert_state_invariant(&self, ai: &PersonAI) {
+        debug_assert!(
+            !(self.current != Task::Idle && ai.state == AiState::Idle),
+            "task-state desync: current = {:?}, state = Idle",
+            self.current
+        );
     }
 }
 

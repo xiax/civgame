@@ -3166,6 +3166,7 @@ pub fn htn_vehicle_haul_dispatch_system(
             vehicle_tile,
             TaskKind::VehicleCargoHaul,
             None,
+            None,
             &chunk_graph,
             &chunk_router,
             &chunk_map,
@@ -3173,8 +3174,7 @@ pub fn htn_vehicle_haul_dispatch_system(
             &spatial_index,
             &stand_reservations,
             actor,
-            now,
-        );
+            now,);
         if !routed {
             continue;
         }

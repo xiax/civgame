@@ -656,6 +656,7 @@ pub fn raid_prep_dispatch_system(
             storage_tile,
             TaskKind::WithdrawMaterial,
             None,
+            None,
             &chunk_graph,
             &chunk_router,
             &chunk_map,
@@ -664,7 +665,7 @@ pub fn raid_prep_dispatch_system(
             &stand_reservations,
             actor,
             now,
-        );
+                );
         if !dispatched {
             continue;
         }
@@ -785,6 +786,9 @@ pub fn raid_execution_system(
                                     continue;
                                 }
                                 combat_target.0 = Some(other);
+                                // Combat overrides the FSM without
+                                // touching the task — retaliation cleanup
+                                // restores it. No `aq` in this query.
                                 ai.state = AiState::Attacking;
                                 break 'find;
                             }

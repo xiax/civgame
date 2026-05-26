@@ -52,10 +52,8 @@ pub fn clear_obstacle_task_system(
         }
 
         let Some((obstacle_entity, bp_entity)) = aq.current.as_clear_obstacle() else {
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
             ai.target_entity = None;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
 
@@ -65,10 +63,8 @@ pub fn clear_obstacle_task_system(
             if let Ok(mut bp) = blueprints.get_mut(bp_entity) {
                 bp.pending_clear.retain(|&e| e != obstacle_entity);
             }
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
             ai.target_entity = None;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
 
@@ -83,10 +79,8 @@ pub fn clear_obstacle_task_system(
             if let Ok(mut bp) = blueprints.get_mut(bp_entity) {
                 bp.pending_clear.retain(|&e| e != obstacle_entity);
             }
-            ai.state = AiState::Idle;
-            ai.work_progress = 0;
             ai.target_entity = None;
-            aq.advance();
+            aq.finish_task(&mut ai);
             continue;
         };
 
@@ -117,10 +111,8 @@ pub fn clear_obstacle_task_system(
         }
 
         skills.gain_xp(skill, skill_xp);
-        ai.state = AiState::Idle;
-        ai.work_progress = 0;
         ai.target_entity = None;
-        aq.advance();
+        aq.finish_task(&mut ai);
     }
 }
 

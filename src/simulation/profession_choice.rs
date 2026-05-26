@@ -140,16 +140,28 @@ pub fn demote_profession_state(
     reservations: &StorageReservations,
     commands: &mut Commands,
 ) {
-    if let Some(ai) = ai {
-        if ai.reserved_resource.is_some() {
-            release_reservation(reservations, ai);
+    // Atomic teardown when both are present (`cancel_chain` handles both
+    // fields). Otherwise fall back to whichever was available.
+    match (ai, aq) {
+        (Some(ai), Some(aq)) => {
+            if ai.reserved_resource.is_some() {
+                release_reservation(reservations, ai);
+            }
+            ai.target_entity = None;
+            aq.cancel_chain(ai);
         }
-        ai.state = AiState::Idle;
-        ai.target_entity = None;
-        ai.work_progress = 0;
-    }
-    if let Some(aq) = aq {
-        aq.cancel();
+        (Some(ai), None) => {
+            if ai.reserved_resource.is_some() {
+                release_reservation(reservations, ai);
+            }
+            ai.state = AiState::Idle;
+            ai.target_entity = None;
+            ai.work_progress = 0;
+        }
+        (None, Some(aq)) => {
+            aq.cancel();
+        }
+        (None, None) => {}
     }
     commands
         .entity(entity)
