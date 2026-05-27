@@ -697,6 +697,8 @@ pub fn raid_execution_system(
     clock: Res<SimClock>,
     mut registry: ResMut<FactionRegistry>,
     mut ledger: ResMut<crate::simulation::diplomacy::DiplomacyLedger>,
+    mut federation_map: ResMut<crate::simulation::federation::FederationMap>,
+    mut activity_log: EventWriter<crate::ui::activity_log::ActivityLogEvent>,
     mut agents: Query<(
         Entity,
         &mut PersonAI,
@@ -840,6 +842,53 @@ pub fn raid_execution_system(
             target_faction,
             clock.tick,
         );
+        // Intra-fed hostility → auto-expel the aggressor. The sync
+        // system tears their Alliance treaties down next tick.
+        if let Some((fid, _former)) =
+            crate::simulation::federation::expel_on_intra_fed_hostility(
+                &mut federation_map,
+                &mut ledger,
+                attacker_faction,
+                target_faction,
+                clock.tick,
+            )
+        {
+            activity_log.send(crate::ui::activity_log::ActivityLogEvent {
+                tick: clock.tick,
+                actor: Entity::PLACEHOLDER,
+                faction_id: attacker_faction,
+                kind: crate::ui::activity_log::ActivityEntryKind::FederationExpelled {
+                    federation_id: fid,
+                    expelled: attacker_faction,
+                    reason: crate::simulation::federation::ExpulsionReason::IntraFedAttack,
+                },
+            });
+        }
+        // Federation defensive propagation — every co-member of the
+        // victim declares war on the raider (idempotent). Defensive-only:
+        // attacker's federation does NOT bandwagon. (Returns empty when
+        // attacker just expelled — no longer in a federation.)
+        let bandwagoners =
+            crate::simulation::federation::propagate_federation_defense_on_war(
+                &federation_map,
+                &mut ledger,
+                attacker_faction,
+                target_faction,
+                clock.tick,
+            );
+        if let Some(fid) = federation_map.federation_of(target_faction).map(|f| f.id) {
+            for _ in &bandwagoners {
+                activity_log.send(crate::ui::activity_log::ActivityLogEvent {
+                    tick: clock.tick,
+                    actor: Entity::PLACEHOLDER,
+                    faction_id: target_faction,
+                    kind: crate::ui::activity_log::ActivityEntryKind::FederationDefenseTriggered {
+                        federation_id: fid,
+                        attacker: attacker_faction,
+                    },
+                });
+            }
+        }
     }
 }
 

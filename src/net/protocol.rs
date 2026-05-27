@@ -23,7 +23,7 @@ use crate::world::water_runtime::RuntimeWaterCell;
 /// Wire protocol version negotiated at connect time. Bump whenever the
 /// shape of any wire message in this module changes; mismatched clients
 /// are rejected by `accept_connections_system` before any state transfer.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// One UI- (or remote-client-)issued command, scoped to the faction that
 /// claims to be sending it. The loopback validates `sender_faction_id`
@@ -313,6 +313,21 @@ pub struct BootstrapSnapshot {
     pub controlled_factions: Vec<u32>,
     pub overlay_tiles: OverlayTileSnapshot,
     pub interest_chunks: Vec<(i32, i32)>,
+    /// Federation roster — late-joining clients need this to render the
+    /// diplomacy panel. Bumped `PROTOCOL_VERSION` to 7.
+    pub federations: Vec<WireFederationEntry>,
+}
+
+/// Wire-shaped mirror of `simulation::federation::Federation`. Charter
+/// elided in v1 — every federation uses defaults; if charters become
+/// customisable, extend this struct and re-bump `PROTOCOL_VERSION`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireFederationEntry {
+    pub federation_id: u32,
+    pub name: String,
+    pub members: Vec<u32>,
+    pub founder: u32,
+    pub founded_tick: u64,
 }
 
 /// Wire-shaped mirror of `world::seasons::Calendar` (it's not serde-
@@ -920,6 +935,13 @@ mod tests {
                 ..Default::default()
             },
             interest_chunks: vec![(-4, 1), (-4, 2), (-3, 1)],
+            federations: vec![super::WireFederationEntry {
+                federation_id: 9,
+                name: "Test Bloc".into(),
+                members: vec![2, 3],
+                founder: 2,
+                founded_tick: 100,
+            }],
         };
         let bytes = bincode::serialize(&snap).expect("serialize");
         let restored: BootstrapSnapshot = bincode::deserialize(&bytes).expect("deserialize");
@@ -929,6 +951,9 @@ mod tests {
         assert_eq!(restored.settlements[0].name, "Founders' Camp");
         assert_eq!(restored.overlay_tiles.walls.len(), 1);
         assert_eq!(restored.interest_chunks.len(), 3);
+        assert_eq!(restored.federations.len(), 1);
+        assert_eq!(restored.federations[0].name, "Test Bloc");
+        assert_eq!(restored.federations[0].members, vec![2, 3]);
     }
 
     #[test]
@@ -1233,6 +1258,95 @@ mod tests {
                 assert_eq!(response, ProposalResponse::Accept);
             }
             other => panic!("expected RespondDiplomacyDealPackage, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Federation player commands
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn propose_federation_round_trips() {
+        let original = PlayerCommand::ProposeFederation {
+            faction_id: 1,
+            name: "Hanseatic League".into(),
+            invitees: vec![2, 3, 4],
+        };
+        let restored = round_trip(&original);
+        match restored {
+            PlayerCommand::ProposeFederation {
+                faction_id,
+                name,
+                invitees,
+            } => {
+                assert_eq!(faction_id, 1);
+                assert_eq!(name, "Hanseatic League");
+                assert_eq!(invitees, vec![2, 3, 4]);
+            }
+            other => panic!("expected ProposeFederation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn accept_federation_invite_round_trips() {
+        use crate::simulation::federation::FederationId;
+        let original = PlayerCommand::AcceptFederationInvite {
+            faction_id: 5,
+            federation_id: FederationId(11),
+        };
+        let restored = round_trip(&original);
+        match restored {
+            PlayerCommand::AcceptFederationInvite {
+                faction_id,
+                federation_id,
+            } => {
+                assert_eq!(faction_id, 5);
+                assert_eq!(federation_id, FederationId(11));
+            }
+            other => panic!("expected AcceptFederationInvite, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn leave_federation_round_trips() {
+        use crate::simulation::federation::FederationId;
+        let original = PlayerCommand::LeaveFederation {
+            faction_id: 5,
+            federation_id: FederationId(11),
+        };
+        let restored = round_trip(&original);
+        match restored {
+            PlayerCommand::LeaveFederation {
+                faction_id,
+                federation_id,
+            } => {
+                assert_eq!(faction_id, 5);
+                assert_eq!(federation_id, FederationId(11));
+            }
+            other => panic!("expected LeaveFederation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expel_from_federation_round_trips() {
+        use crate::simulation::federation::FederationId;
+        let original = PlayerCommand::ExpelFromFederation {
+            faction_id: 5,
+            federation_id: FederationId(11),
+            target_faction_id: 7,
+        };
+        let restored = round_trip(&original);
+        match restored {
+            PlayerCommand::ExpelFromFederation {
+                faction_id,
+                federation_id,
+                target_faction_id,
+            } => {
+                assert_eq!(faction_id, 5);
+                assert_eq!(federation_id, FederationId(11));
+                assert_eq!(target_faction_id, 7);
+            }
+            other => panic!("expected ExpelFromFederation, got {:?}", other),
         }
     }
 

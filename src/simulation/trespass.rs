@@ -285,6 +285,7 @@ pub fn trespass_handling_system(
     mut state: ResMut<TrespassRegistry>,
     mut queue: ResMut<TerritoryDefenseQueue>,
     registry: Res<FactionRegistry>,
+    mut federation_map: ResMut<crate::simulation::federation::FederationMap>,
     mut log: EventWriter<crate::ui::activity_log::ActivityLogEvent>,
 ) {
     let now = clock.tick;
@@ -320,6 +321,54 @@ pub fn trespass_handling_system(
                     },
                 );
                 queue_defense = true;
+                // Intra-fed hostile attack auto-expels aggressor.
+                if let Some((fid, _former)) =
+                    crate::simulation::federation::expel_on_intra_fed_hostility(
+                        &mut federation_map,
+                        &mut ledger,
+                        ev.intruder_faction,
+                        ev.owner_faction,
+                        now,
+                    )
+                {
+                    log.send(crate::ui::activity_log::ActivityLogEvent {
+                        tick: now,
+                        actor: Entity::PLACEHOLDER,
+                        faction_id: ev.intruder_faction,
+                        kind: crate::ui::activity_log::ActivityEntryKind::FederationExpelled {
+                            federation_id: fid,
+                            expelled: ev.intruder_faction,
+                            reason: crate::simulation::federation::ExpulsionReason::IntraFedAttack,
+                        },
+                    });
+                }
+                // Federation defensive propagation — co-members of the
+                // owner declare war on the intruder. Defensive-only.
+                let bandwagoners =
+                    crate::simulation::federation::propagate_federation_defense_on_war(
+                        &federation_map,
+                        &mut ledger,
+                        ev.intruder_faction,
+                        ev.owner_faction,
+                        now,
+                    );
+                if let Some(fid) = federation_map
+                    .federation_of(ev.owner_faction)
+                    .map(|f| f.id)
+                {
+                    for _ in &bandwagoners {
+                        log.send(crate::ui::activity_log::ActivityLogEvent {
+                            tick: now,
+                            actor: Entity::PLACEHOLDER,
+                            faction_id: ev.owner_faction,
+                            kind:
+                                crate::ui::activity_log::ActivityEntryKind::FederationDefenseTriggered {
+                                    federation_id: fid,
+                                    attacker: ev.intruder_faction,
+                                },
+                        });
+                    }
+                }
             }
             TrespassClassification::Neutral => {
                 // Smart-diplomacy P2 — personality-aware grace.

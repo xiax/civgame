@@ -18,10 +18,20 @@ use crate::simulation::diplomatic_evaluator::{
 };
 use crate::simulation::diplomatic_personality::DiplomaticPersonality;
 use crate::simulation::faction::{FactionRegistry, PlayerFaction, SOLO};
+use crate::simulation::federation::{FederationMap, FEDERATION_MEMBER_CAP};
 use crate::simulation::player_command::{CommandSender, PlayerCommand};
 
 #[derive(Resource, Default)]
 pub struct DiplomacyPanelOpen(pub bool);
+
+/// UI state for the Propose-Federation modal — name entry + invitee
+/// checklist persisted across frames.
+#[derive(Resource, Default)]
+pub struct DiplomacyPanelFederationState {
+    pub propose_modal_open: bool,
+    pub proposed_name: String,
+    pub proposed_invitees: Vec<u32>,
+}
 
 /// Persistent selection between renders so the right pane stays on
 /// one faction across frames.
@@ -38,6 +48,8 @@ pub fn diplomacy_panel_system(
     registry: Res<FactionRegistry>,
     contact_book: Res<DiplomaticContactBook>,
     grants: Res<AccessGrantTable>,
+    federation_map: Res<FederationMap>,
+    mut panel_state: ResMut<DiplomacyPanelFederationState>,
     player_faction: Res<PlayerFaction>,
     mut sender: CommandSender,
 ) {
@@ -95,6 +107,134 @@ pub fn diplomacy_panel_system(
                 }
             });
             ui.separator();
+            // ── Federation section (above the columns) ─────────────
+            {
+                let player_fed = federation_map.federation_of(self_root);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Federation:").strong());
+                    if let Some(fed) = player_fed {
+                        ui.label(format!(
+                            "{} — {}/{} members ({})",
+                            fed.name,
+                            fed.members.len(),
+                            FEDERATION_MEMBER_CAP,
+                            fed.members
+                                .iter()
+                                .map(|m| m.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ));
+                        if ui.button("Leave").clicked() {
+                            sender.send(
+                                Vec::new(),
+                                PlayerCommand::LeaveFederation {
+                                    faction_id: self_fid,
+                                    federation_id: fed.id,
+                                },
+                            );
+                        }
+                    } else {
+                        ui.label(egui::RichText::new("(not in a federation)").italics());
+                        if ui.button("Propose Federation").clicked() {
+                            panel_state.propose_modal_open = true;
+                            panel_state.proposed_name = format!("Faction {} Bloc", self_fid);
+                            panel_state.proposed_invitees.clear();
+                        }
+                    }
+                });
+                if panel_state.propose_modal_open {
+                    ui.indent("propose_fed_modal", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Name:");
+                            ui.text_edit_singleline(&mut panel_state.proposed_name);
+                        });
+                        ui.label("Invitees (current Alliance partners):");
+                        let candidates: Vec<u32> = foreign
+                            .iter()
+                            .copied()
+                            .filter(|target| {
+                                ledger
+                                    .relation(self_fid, *target)
+                                    .map(|r| r.treaties.has(TreatyKind::Alliance))
+                                    .unwrap_or(false)
+                                    && !federation_map
+                                        .by_root_faction
+                                        .contains_key(&registry.root_faction(*target))
+                            })
+                            .collect();
+                        if candidates.is_empty() {
+                            ui.label(
+                                egui::RichText::new(
+                                    "  (no eligible Alliance partners — form an alliance first)",
+                                )
+                                .italics(),
+                            );
+                        }
+                        for cand in candidates {
+                            let mut on = panel_state.proposed_invitees.contains(&cand);
+                            if ui
+                                .checkbox(&mut on, format!("Faction {}", cand))
+                                .changed()
+                            {
+                                if on {
+                                    panel_state.proposed_invitees.push(cand);
+                                } else {
+                                    panel_state.proposed_invitees.retain(|&x| x != cand);
+                                }
+                            }
+                        }
+                        ui.horizontal(|ui| {
+                            let can_submit = !panel_state.proposed_invitees.is_empty()
+                                && !panel_state.proposed_name.trim().is_empty();
+                            if ui
+                                .add_enabled(can_submit, egui::Button::new("Submit"))
+                                .clicked()
+                            {
+                                sender.send(
+                                    Vec::new(),
+                                    PlayerCommand::ProposeFederation {
+                                        faction_id: self_fid,
+                                        name: panel_state.proposed_name.clone(),
+                                        invitees: panel_state.proposed_invitees.clone(),
+                                    },
+                                );
+                                panel_state.propose_modal_open = false;
+                                panel_state.proposed_invitees.clear();
+                            }
+                            if ui.button("Cancel").clicked() {
+                                panel_state.propose_modal_open = false;
+                                panel_state.proposed_invitees.clear();
+                            }
+                        });
+                    });
+                }
+                // Pending invites to me — accept/reject row per invite.
+                let my_invites: Vec<(crate::simulation::federation::FederationId, String, u32)> =
+                    federation_map
+                        .invites
+                        .iter()
+                        .filter(|((_fid, to), _)| *to == self_root)
+                        .map(|((fid, _), inv)| (*fid, inv.name.clone(), inv.from_faction))
+                        .collect();
+                if !my_invites.is_empty() {
+                    ui.label(egui::RichText::new("Pending federation invites:").italics());
+                }
+                for (fid, name, from) in my_invites {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("  {} (from faction {})", name, from));
+                        if ui.button("Accept").clicked() {
+                            sender.send(
+                                Vec::new(),
+                                PlayerCommand::AcceptFederationInvite {
+                                    faction_id: self_fid,
+                                    federation_id: fid,
+                                },
+                            );
+                        }
+                    });
+                }
+                ui.separator();
+            }
             ui.columns(2, |cols| {
                 // ── Left: faction list ───────────────────────────
                 cols[0].label(egui::RichText::new("Known factions").strong());

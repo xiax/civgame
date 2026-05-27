@@ -62,7 +62,7 @@ Agent AI, factions, knowledge, hunting, typed-task pipeline, pluralist economy. 
 
 - **Drain:** movement per tile (scaled by terrain effort + mounted ×0.15), labor (`energy_tick_system`, ParallelA after `tick_needs_system`, while `AiState::Working`), combat per swing (tired attacker cooldown ×1.3).
 - **Recovery:** sleep (`sleep_task_system`, same bed ×2 multiplier), idle (`energy_tick_system`, `AiState::Idle`).
-- **Effects:** movement speed and work-progress accrual both ×`energy_factor()` (alongside sickness factor). **Exhaustion goal gate:** `GoalScoringContext.is_exhausted` (set from `energy_q` in `ScorerInputs`); `GoalScorerRegistry::best_with_incumbent` drops every non-`Survival`/`Safety` candidate while it holds. Eat/drink/sleep/heal/flee/defend stay ungated.
+- **Effects:** movement speed and work-progress accrual both ×`energy_factor()` (alongside sickness factor). Scaled accrual routes through `PersonAI::add_work_progress(amount: f32)` which carries a sub-tick `work_progress_fraction` across ticks — without the fraction a `factor < 1.0` would truncate `(base * factor) as u8` to 0 every tick and stall the worker forever. **Exhaustion goal gate:** `GoalScoringContext.is_exhausted` (set from `energy_q` in `ScorerInputs`); `GoalScorerRegistry::best_with_incumbent` drops every non-`Survival`/`Safety` candidate while it holds. Eat/drink/sleep/heal/flee/defend stay ungated.
 
 ### Swimming (`swimming.rs`)
 
@@ -117,7 +117,7 @@ UI emits `PlayerCommandEvent`. Sim drains in `SimulationSet::Input` (exclusive),
 
 - **Producers** (HTN dispatchers, `ui/orders.rs`, `teaching.rs::ReadItem`, legacy-only `building_upgrade_system` / `terraform_dispatch_system` / `military_task_system` reroute) route through `aq.dispatch(task)` — enqueues then promotes head into `current` if `current == Idle`. Returns `DispatchOutcome::{Promoted, Queued, Rejected}`. `Rejected` (queue full) fires `debug_assert!` inside `dispatch`.
 - **Autonomous direct dispatch** that bypasses a registry `Method` (job-driven single-leg tasks like field preparation) must use `tasks::dispatch_autonomous_task_with_routing`. Wraps `assign_task_with_routing` + `aq.dispatch(...)` and stamps `AutonomousTaskLifecycle { owner_goal, task_kind, job_id, preserve_across_goal_dispatch }`. `goal_dispatch_system` consumes that before legacy preserve-arm list, so tasks survive stale-reset ticks only while owning goal/task matches.
-- **Consumers** (executor exits in `gather.rs`, `dig.rs`, `corpse.rs`, `construction.rs`, `items.rs`, `production.rs`, `teaching.rs`, `sleep.rs`, plus `MilitaryMove` arrival) call `aq.advance()` instead of `current = Idle`. `sleep::sleep_task_system` owns `Task::Sleep` end-to-end: arrival `Working`→`Sleeping`, recovery, `finish_task` retirement, **orphan self-heal** (`cancel_chain` when `current == Sleep` but state is `Idle`/`Attacking`). Canonical exit helpers: `aq.finish_task(&mut ai)` (success — `state = Idle` + `work_progress = 0` + advance), `aq.cancel_chain(&mut ai)` (abort — same + cancel). Long non-cargo work uses `goals::yield_for_maintenance_boundary` at safe boundaries; clears `active_method` before dropping current chain so HTN history records neither success nor failure.
+- **Consumers** (executor exits in `gather.rs`, `dig.rs`, `corpse.rs`, `construction.rs`, `items.rs`, `production.rs`, `teaching.rs`, `sleep.rs`, plus `MilitaryMove` arrival) call `aq.advance()` instead of `current = Idle`. `sleep::sleep_task_system` owns `Task::Sleep` end-to-end: arrival `Working`→`Sleeping`, recovery, `finish_task` retirement, **orphan self-heal** (`cancel_chain` when `current == Sleep` but state is `Idle`/`Attacking`). Canonical exit helpers: `aq.finish_task(&mut ai)` (success — `state = Idle` + `work_progress = 0` + `work_progress_fraction = 0.0` + advance), `aq.cancel_chain(&mut ai)` (abort — same + cancel). `begin_working` zeroes the fraction too. Long non-cargo work uses `goals::yield_for_maintenance_boundary` at safe boundaries; clears `active_method` before dropping current chain so HTN history records neither success nor failure.
 - **External preempts** (`dispatch_player_command_system`, hunter demote, stale reset, `movement::release_to_idle`, `combat::combat_retaliation_cleanup_system` draining `CombatRetaliationStartedEvent`) call `aq.cancel()` / `aq.cancel_chain(&mut ai)`. Retaliation cleanup runs in `Sequential` right after `combat_system` because `combat_system`'s `attacker_query` holds `Option<&mut ActionQueue>` mutably across iteration. **A *Sleeping* victim emits `CombatRetaliationStartedEvent` on every damaging hit** so multi-attacker swarms can't skip the deferred cancel. `goal_update_system` overrides (Lead/Defend/Raid/Rescue/Scout/Migrate chief / commanded force-flip / earnincome override) must also call `aq.cancel()`. **Debug-time enforcement:** `aq.dispatch` fires `debug_assert!` when incoming task shares `TaskKind` with `current` and queue is empty.
 - Per-tick pin sites (lecture/teach pin writes) stay as direct `aq.current = X` writes — idempotent re-assertions.
 
@@ -460,6 +460,32 @@ All Serialize/Deserialize via bincode (4 round-trip tests in `net/protocol.rs`).
 - `ui/diplomacy_panel.rs` — two-column window. Left: known foreign factions sorted by id with one-word attitude + treaty badges. Right: selected faction's reputation tracks, recent incidents (last 8), pending proposals (Accept / Reject), action row (Offer Trade / Alliance / Non-Aggression, Declare War, Break ... when extant).
 - `ui/activity_log.rs` — four new `ActivityEntryKind` variants: `TreatyFormed`, `TreatyBroken`, `TrespassWarning`, `DiplomacyProposalReceived`.
 - `ui/world_map.rs` — `WorldMapView.show_territory` toggle. Mega-chunk tint by dominant `TerritoryMap` owner; deterministic per-faction palette (`territory_tint_for_faction` hashes id into a lifted RGB band).
+
+### Federations (`federation.rs`)
+
+Thin overlay on the pairwise ledger. A `Federation` is `{ id, name, members: Vec<u32>, founder, founded_tick, charter }` keyed on **root** faction ids; `FederationMap` holds `by_id` + `by_root_faction` + `invites`. `FEDERATION_MEMBER_CAP = 5`. Households resolved via `FactionRegistry::root_faction` at every command boundary.
+
+The only durable mechanical effect is **`federation_alliance_sync_system`** (Economy daily, before `access_grant::treaty_to_grant_sync_system`): for every co-member pair, calls `form_treaty(Alliance)` (idempotent); for pairs that **were** co-members (tracked via `RememberedFederationAlliance.pairs`) and no longer are, calls `break_treaty(Alliance)`. Pairwise Alliance already drives `access_grant::reconcile_pair_grants` (`FullTerritory` both ways), `raid::pick_raid_target` (allies unraidable), and `trespass::classify_trespass` (allies pass through territory) — federation gets all three for free.
+
+**Defensive propagation** (`propagate_federation_defense_on_war`): outsider attacks a member → every other co-member declares war on the attacker. Called from `raid::raid_execution_system` and `trespass::trespass_handling_system` Hostile-classification path. Defensive-only — attacker's federation does NOT bandwagon offensive wars.
+
+**Intra-fed auto-expulsion** (`expel_on_intra_fed_hostility`): co-member attacks co-member → aggressor drops from `FederationMap`, `federation_alliance_sync_system` tears their Alliance treaties down next tick. Penalty: `FEDERATION_LEAVE_TRUST_PENALTY=10` / `FEDERATION_LEAVE_GRIEVANCE_PENALTY=4` per former co-member pair. Called from same two sites.
+
+**Trade-trust spread** (`record_trade_incident_with_propagation`): records `IncidentKind::TradeCompleted` on the originating pair, then on every bystander co-member pair (`originating_party, bystander`) at `charter.trade_propagation_pct = 0.20` of the original value. Capacity ≤ 4 bystanders × 1 write = ≤4 pair-writes per trade. No new incident enum — `TradeCompleted` is reused.
+
+**Player commands** (faction-level; `drain_player_command_events_system`):
+- `ProposeFederation { faction_id, name, invitees }` — allocates fresh `FederationId`, seats founder implicitly, seeds one `PendingFederationInvite` per invitee. De-duped + filtered against existing membership + cap.
+- `AcceptFederationInvite { faction_id, federation_id }` — drains invite, inserts caller into the roster. On second-accept (`members.len() == 2`) emits `ActivityEntryKind::FederationFormed`; later joins emit `FederationJoined`.
+- `LeaveFederation { faction_id, federation_id }` — voluntary; applies penalty to every former co-member pair.
+- `ExpelFromFederation { faction_id, federation_id, target_faction_id }` — founder-only; same per-pair penalty as Leave.
+
+**AI proposer** (`ai_federation_proposal_system`, Economy daily, staggered `(day + faction_id) % 7`): for each AI faction not in a federation, walks `DiplomaticContactBook` for two allies that share a current war target; allocates federation + seeds invites. `ai_federation_response_system` accepts an invite when any existing member already holds Alliance with the receiver. Invite expiry (`FEDERATION_INVITE_EXPIRY_TICKS = 7 days`) by `federation_invite_expiry_system`.
+
+**Wire** (`PROTOCOL_VERSION = 7`): 4 new `PlayerCommand` variants (bincode round-trip tested). `BootstrapSnapshot.federations: Vec<WireFederationEntry>` ships full roster to late-joining clients; `apply_bootstrap_snapshot` rebuilds `FederationMap.by_id` + `by_root_faction`.
+
+**Activity log** (`ui/activity_log.rs`): five new `ActivityEntryKind` variants — `FederationFormed`, `FederationJoined`, `FederationLeft`, `FederationExpelled { reason: ExpulsionReason::{Voluntary, IntraFedAttack} }`, `FederationDefenseTriggered`.
+
+**UI** (`ui/diplomacy_panel.rs`): top-of-window Federation section shows name + roster + Leave button when membership exists; otherwise `Propose Federation` opens an inline modal with name field + Alliance-partner checklist. Pending invites surface as Accept rows beneath. `DiplomacyPanelFederationState` persists modal entry across frames.
 
 ## Raids (`raid.rs`)
 

@@ -59,6 +59,7 @@ impl Plugin for UiPlugin {
             .insert_resource(vehicle_designer::VehicleDesignerState::default())
             .insert_resource(diplomacy_panel::DiplomacyPanelOpen::default())
             .insert_resource(diplomacy_panel::DiplomacyPanelSelection::default())
+            .insert_resource(diplomacy_panel::DiplomacyPanelFederationState::default())
             .add_event::<activity_log::ActivityLogEvent>()
             .add_systems(
                 Update,

@@ -900,6 +900,73 @@ mod smoke {
         assert!(drained.is_exhausted());
     }
 
+    #[test]
+    fn tired_worker_still_accumulates_work_progress() {
+        // Regression for the fractional-work stall: pre-fix, a worker with
+        // `energy_factor() < 1.0` would see `(base * factor) as u8` truncate
+        // to 0 every tick and never advance `work_progress`. With the
+        // fractional accumulator, slowdown averages out over multiple ticks.
+        use crate::simulation::person::{AiState, PersonAI};
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        // Spawn a Drafted person with low Energy (50 < ENERGY_TIRED=90 →
+        // energy_factor ≈ 0.61).
+        let person = sim.spawn_person(sim.player_faction_id, (4, 4), |b| {
+            b.energy(50.0).drafted();
+        });
+        // Force the labor state at the agent's own tile so movement_system
+        // routes through the in-place Working arm and calls
+        // `ai.add_work_progress(base * factor)`.
+        {
+            let mut ai = sim.app.world_mut().get_mut::<PersonAI>(person).unwrap();
+            ai.state = AiState::Working;
+            ai.target_tile = (4, 4);
+            ai.dest_tile = (4, 4);
+            ai.work_progress = 0;
+            ai.work_progress_fraction = 0.0;
+        }
+        sim.tick_n(30);
+        let ai = person_ai(&sim.app, person);
+        assert!(
+            ai.work_progress > 0,
+            "tired worker should accumulate progress over 30 ticks; got {} (fraction {})",
+            ai.work_progress,
+            ai.work_progress_fraction
+        );
+    }
+
+    #[test]
+    fn sick_worker_still_accumulates_work_progress() {
+        // Mirror of the energy slowdown case via `Sickness`.
+        use crate::simulation::medicine::Sickness;
+        use crate::simulation::person::{AiState, PersonAI};
+        let mut sim = TestSim::new(0xC0FFEE);
+        sim.flat_world(1, 0, TileKind::Grass);
+        let person = sim.spawn_person(sim.player_faction_id, (4, 4), |b| {
+            b.drafted();
+        });
+        sim.app.world_mut().entity_mut(person).insert(Sickness {
+            severity: 200,
+            applied_tick: 0,
+        });
+        {
+            let mut ai = sim.app.world_mut().get_mut::<PersonAI>(person).unwrap();
+            ai.state = AiState::Working;
+            ai.target_tile = (4, 4);
+            ai.dest_tile = (4, 4);
+            ai.work_progress = 0;
+            ai.work_progress_fraction = 0.0;
+        }
+        sim.tick_n(30);
+        let ai = person_ai(&sim.app, person);
+        assert!(
+            ai.work_progress > 0,
+            "sick worker should accumulate progress over 30 ticks; got {} (fraction {})",
+            ai.work_progress,
+            ai.work_progress_fraction
+        );
+    }
+
     // ─── Pluralist Economy rewrite — R0 currency-helper unit tests ───
 
     #[test]

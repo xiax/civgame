@@ -24,6 +24,7 @@ use bevy::prelude::*;
 
 use crate::net::protocol::{
     BootstrapSnapshot, CalendarWire, FactionSummary, OverlayTileSnapshot, SettlementSummary,
+    WireFederationEntry,
     WireBridgeEntry, WireDamEntry, WireDoorEntry, WireWallEntry, WireWaterEntry,
 };
 use crate::net_id::{NetIdMap, Networked};
@@ -67,6 +68,7 @@ pub fn build_bootstrap_snapshot(
     runtime_water: &RuntimeWater,
     networked_q: &Query<&Networked>,
     wall_q: &Query<&crate::simulation::construction::Wall>,
+    federation_map: &crate::simulation::federation::FederationMap,
 ) -> BootstrapSnapshot {
     let calendar_wire = CalendarWire {
         season: calendar.season as u8,
@@ -121,6 +123,19 @@ pub fn build_bootstrap_snapshot(
     let interest_chunks =
         compute_interest_chunks(controlled, factions, INTEREST_RADIUS_CHUNKS);
 
+    let mut federation_list: Vec<WireFederationEntry> = federation_map
+        .by_id
+        .values()
+        .map(|f| WireFederationEntry {
+            federation_id: f.id.0,
+            name: f.name.clone(),
+            members: f.members.clone(),
+            founder: f.founder,
+            founded_tick: f.founded_tick,
+        })
+        .collect();
+    federation_list.sort_by_key(|f| f.federation_id);
+
     BootstrapSnapshot {
         server_tick,
         calendar: calendar_wire,
@@ -129,6 +144,7 @@ pub fn build_bootstrap_snapshot(
         controlled_factions: controlled.to_vec(),
         overlay_tiles,
         interest_chunks,
+        federations: federation_list,
     }
 }
 
@@ -257,6 +273,7 @@ pub fn apply_bootstrap_snapshot(
     dam_map: &mut DamMap,
     runtime_water: &mut RuntimeWater,
     ids: &NetIdMap,
+    federation_map: &mut crate::simulation::federation::FederationMap,
 ) {
     calendar.season = Season::from_index(snap.calendar.season);
     calendar.day = snap.calendar.day;
@@ -305,6 +322,27 @@ pub fn apply_bootstrap_snapshot(
     runtime_water.cells.clear();
     for entry in &snap.overlay_tiles.runtime_water {
         runtime_water.cells.insert(entry.tile, entry.cell);
+    }
+
+    federation_map.by_id.clear();
+    federation_map.by_root_faction.clear();
+    federation_map.invites.clear();
+    federation_map.next_id = 0;
+    for entry in &snap.federations {
+        let fid = crate::simulation::federation::FederationId(entry.federation_id);
+        let fed = crate::simulation::federation::Federation {
+            id: fid,
+            name: entry.name.clone(),
+            members: entry.members.clone(),
+            founder: entry.founder,
+            founded_tick: entry.founded_tick,
+            charter: crate::simulation::federation::FederationCharter::default(),
+        };
+        for &m in &fed.members {
+            federation_map.by_root_faction.insert(m, fid);
+        }
+        federation_map.by_id.insert(fid, fed);
+        federation_map.next_id = federation_map.next_id.max(entry.federation_id);
     }
 }
 
@@ -388,6 +426,7 @@ mod tests {
             controlled_factions: vec![3, 4],
             overlay_tiles: OverlayTileSnapshot::default(),
             interest_chunks: Vec::new(),
+            federations: Vec::new(),
         };
 
         let mut calendar = Calendar::default();
@@ -398,6 +437,7 @@ mod tests {
         let mut dam = DamMap::default();
         let mut water = RuntimeWater::default();
         let ids = NetIdMap::default();
+        let mut fed_map = crate::simulation::federation::FederationMap::default();
 
         apply_bootstrap_snapshot(
             &snap,
@@ -409,6 +449,7 @@ mod tests {
             &mut dam,
             &mut water,
             &ids,
+            &mut fed_map,
         );
 
         assert!(matches!(calendar.season, Season::Autumn));

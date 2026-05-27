@@ -203,6 +203,7 @@ pub fn handle_client_hello_system(
     world_seed: Res<WorldSeed>,
     calendar: Res<Calendar>,
     factions: Res<FactionRegistry>,
+    federation_map: Res<crate::simulation::federation::FederationMap>,
     settlement_map: Res<SettlementMap>,
     settlement_q: Query<&Settlement>,
     bootstrap: BootstrapParams,
@@ -274,6 +275,7 @@ pub fn handle_client_hello_system(
             &bootstrap.runtime_water,
             &bootstrap.networked_q,
             &bootstrap.wall_component_q,
+            &federation_map,
         );
         if let Err(err) = conn_mgr.send_message_to_target::<OrderedReliableChannel, _>(
             &snapshot,

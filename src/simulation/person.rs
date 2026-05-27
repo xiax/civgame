@@ -219,6 +219,13 @@ pub struct PersonAI {
     pub(in crate::simulation) state: AiState,
     /// Progress ticks toward the next production event.
     pub work_progress: u8,
+    /// Sub-tick remainder of slowdown-scaled work accrual. `movement_system`
+    /// accumulates `base * factor` here; whole units roll into `work_progress`
+    /// and the fraction persists across ticks so a 0.45-factor worker still
+    /// makes 1 progress every ~2.22 ticks instead of stalling at 0 forever.
+    /// Zeroed at task entry/exit by `ActionQueue::{begin_working, finish_task,
+    /// cancel_chain}`.
+    pub(in crate::simulation) work_progress_fraction: f32,
     pub target_tile: (i32, i32),
     pub dest_tile: (i32, i32),
     pub ticks_idle: u8,
@@ -281,6 +288,7 @@ impl Default for PersonAI {
         Self {
             state: AiState::default(),
             work_progress: 0,
+            work_progress_fraction: 0.0,
             target_tile: (0, 0),
             dest_tile: (0, 0),
             ticks_idle: 0,
@@ -308,6 +316,23 @@ impl PersonAI {
     #[inline]
     pub fn state(&self) -> AiState {
         self.state
+    }
+
+    /// Accumulate slowdown-scaled work progress, preserving the sub-tick
+    /// remainder across ticks. Drops non-positive / NaN inputs silently.
+    /// Whole units roll into `work_progress` (saturating at `u8::MAX`); the
+    /// fractional part stays in `work_progress_fraction` until the next call
+    /// pushes it past 1.0.
+    #[inline]
+    pub fn add_work_progress(&mut self, amount: f32) {
+        if !(amount > 0.0) {
+            return;
+        }
+        let total = self.work_progress_fraction + amount;
+        let whole = total.floor();
+        self.work_progress_fraction = total - whole;
+        let whole_u8 = whole.min(u8::MAX as f32) as u8;
+        self.work_progress = self.work_progress.saturating_add(whole_u8);
     }
 
     /// Constructor for placement-time spawn sites outside the simulation
@@ -1178,5 +1203,57 @@ mod tests {
                 assert!(d > 200.0, "homes {i} and {j} too close: {d}");
             }
         }
+    }
+
+    use super::PersonAI;
+
+    #[test]
+    fn add_work_progress_accumulates_sub_unit_fractions() {
+        let mut ai = PersonAI::default();
+        ai.add_work_progress(0.4);
+        ai.add_work_progress(0.4);
+        // Two 0.4s = 0.8, still below 1 whole unit.
+        assert_eq!(ai.work_progress, 0);
+        assert!((ai.work_progress_fraction - 0.8).abs() < 1e-5);
+
+        ai.add_work_progress(0.4);
+        // Third 0.4 pushes total to 1.2 → one whole unit, fraction 0.2.
+        assert_eq!(ai.work_progress, 1);
+        assert!((ai.work_progress_fraction - 0.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn add_work_progress_saturates_at_u8_max() {
+        let mut ai = PersonAI::default();
+        ai.add_work_progress(300.0);
+        assert_eq!(ai.work_progress, u8::MAX);
+        // Saturation pushes the leftover whole units out — fraction is < 1.
+        assert!(ai.work_progress_fraction < 1.0);
+    }
+
+    #[test]
+    fn add_work_progress_ignores_nonpositive_inputs() {
+        let mut ai = PersonAI::default();
+        ai.work_progress_fraction = 0.3;
+        ai.add_work_progress(0.0);
+        ai.add_work_progress(-1.0);
+        ai.add_work_progress(f32::NAN);
+        // No changes.
+        assert_eq!(ai.work_progress, 0);
+        assert!((ai.work_progress_fraction - 0.3).abs() < 1e-5);
+    }
+
+    #[test]
+    fn add_work_progress_slow_factor_eventually_advances() {
+        // factor = 0.45 (between energy-tired floor 0.45 and 1.0). At
+        // base = 1.0 per tick, the legacy `(base * factor) as u8` cast
+        // truncated to 0 and stalled. Now we should accrue ~1 unit per
+        // ~2.22 ticks.
+        let mut ai = PersonAI::default();
+        for _ in 0..3 {
+            ai.add_work_progress(0.45);
+        }
+        // 3 * 0.45 = 1.35 → 1 whole unit.
+        assert_eq!(ai.work_progress, 1);
     }
 }

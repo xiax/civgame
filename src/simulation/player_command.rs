@@ -281,6 +281,36 @@ pub enum PlayerCommand {
         deal_id: crate::simulation::diplomacy::DealId,
         response: crate::simulation::diplomacy::ProposalResponse,
     },
+    /// Federations — propose a new federation. Allocates a fresh
+    /// `FederationId` and seeds one pending invite per `invitees` entry;
+    /// the founder's seat is implicit and only commits on the founder's
+    /// own `AcceptFederationInvite`. Invitees must be **root** factions
+    /// (caller resolves via `FactionRegistry::root_faction`).
+    ProposeFederation {
+        faction_id: u32,
+        name: String,
+        invitees: Vec<u32>,
+    },
+    /// Federations — accept an outstanding invite. Founding-accept
+    /// (founder is first to accept) materialises the `Federation`;
+    /// every later accept inserts the caller into the existing roster.
+    AcceptFederationInvite {
+        faction_id: u32,
+        federation_id: crate::simulation::federation::FederationId,
+    },
+    /// Federations — voluntary leave. Applies trust/grievance penalty
+    /// per former co-member pair.
+    LeaveFederation {
+        faction_id: u32,
+        federation_id: crate::simulation::federation::FederationId,
+    },
+    /// Federations — founder-only expulsion. Same per-pair penalty as
+    /// `LeaveFederation`.
+    ExpelFromFederation {
+        faction_id: u32,
+        federation_id: crate::simulation::federation::FederationId,
+        target_faction_id: u32,
+    },
 }
 
 /// Per-actor authority marker. Replaces `PlayerOrder` once Commit 3 lands.
@@ -382,6 +412,8 @@ pub fn drain_player_command_events_system(
     let mut grants = &mut *diplo.grants;
     let settlement_map_q = &diplo.settlement_map;
     let settlements_q = &diplo.settlements;
+    let federation_map = &mut *diplo.federation_map;
+    let activity_log = &mut diplo.activity_log;
     let now = clock.tick as u32;
     for ev in reader.read() {
         // Faction-level applies (no actors needed).
@@ -399,7 +431,11 @@ pub fn drain_player_command_events_system(
                 | PlayerCommand::BreakTreaty { faction_id, .. }
                 | PlayerCommand::RevokeAccessGrant { faction_id, .. }
                 | PlayerCommand::SendDiplomacyDealPackage { faction_id, .. }
-                | PlayerCommand::RespondDiplomacyDealPackage { faction_id, .. } => Some(*faction_id),
+                | PlayerCommand::RespondDiplomacyDealPackage { faction_id, .. }
+                | PlayerCommand::ProposeFederation { faction_id, .. }
+                | PlayerCommand::AcceptFederationInvite { faction_id, .. }
+                | PlayerCommand::LeaveFederation { faction_id, .. }
+                | PlayerCommand::ExpelFromFederation { faction_id, .. } => Some(*faction_id),
                 _ => None,
             };
             if let Some(fid) = payload_faction {
@@ -757,6 +793,212 @@ pub fn drain_player_command_events_system(
                         }
                     }
                 }
+                PlayerCommand::ProposeFederation {
+                    faction_id,
+                    name,
+                    invitees,
+                } => {
+                    use crate::simulation::federation::{
+                        Federation, FederationCharter, PendingFederationInvite,
+                        FEDERATION_MEMBER_CAP,
+                    };
+                    let founder_root = factions.root_faction(faction_id);
+                    if federation_map.by_root_faction.contains_key(&founder_root) {
+                        continue;
+                    }
+                    // De-dup invitees against founder + each other +
+                    // existing federation members.
+                    let mut unique: Vec<u32> = Vec::new();
+                    for inv in &invitees {
+                        let root = factions.root_faction(*inv);
+                        if root == founder_root
+                            || unique.contains(&root)
+                            || federation_map.by_root_faction.contains_key(&root)
+                        {
+                            continue;
+                        }
+                        if !factions.factions.contains_key(&root) {
+                            continue;
+                        }
+                        unique.push(root);
+                        if unique.len() + 1 >= FEDERATION_MEMBER_CAP {
+                            break;
+                        }
+                    }
+                    if unique.is_empty() {
+                        continue;
+                    }
+                    let fed_id = federation_map.alloc_id();
+                    federation_map.by_id.insert(
+                        fed_id,
+                        Federation {
+                            id: fed_id,
+                            name: name.clone(),
+                            members: Vec::new(),
+                            founder: founder_root,
+                            founded_tick: clock.tick,
+                            charter: FederationCharter::default(),
+                        },
+                    );
+                    // Founder is implicit invitee — auto-seats them so
+                    // the first acceptor (another invitee) finds the
+                    // federation already populated. We treat the proposer's
+                    // accept as already given.
+                    if let Some(fed) = federation_map.by_id.get_mut(&fed_id) {
+                        fed.insert(founder_root);
+                    }
+                    federation_map
+                        .by_root_faction
+                        .insert(founder_root, fed_id);
+                    for inv_root in unique {
+                        federation_map.invites.insert(
+                            (fed_id, inv_root),
+                            PendingFederationInvite {
+                                federation_id: fed_id,
+                                from_faction: founder_root,
+                                to_faction: inv_root,
+                                name: name.clone(),
+                                posted_tick: clock.tick,
+                            },
+                        );
+                    }
+                }
+                PlayerCommand::AcceptFederationInvite {
+                    faction_id,
+                    federation_id,
+                } => {
+                    use crate::simulation::federation::validate_accept_invite;
+                    let root = factions.root_faction(faction_id);
+                    if validate_accept_invite(&federation_map, federation_id, root).is_err() {
+                        continue;
+                    }
+                    // Drain the invite.
+                    federation_map.invites.remove(&(federation_id, root));
+                    let members_after: Vec<u32> = if let Some(fed) =
+                        federation_map.by_id.get_mut(&federation_id)
+                    {
+                        if fed.members.len() >= crate::simulation::federation::FEDERATION_MEMBER_CAP
+                        {
+                            continue;
+                        }
+                        fed.insert(root);
+                        fed.members.clone()
+                    } else {
+                        continue;
+                    };
+                    federation_map
+                        .by_root_faction
+                        .insert(root, federation_id);
+                    // Founding-accept = "we now have ≥ 2 members for the
+                    // first time". Emit FederationFormed; otherwise the
+                    // join is incremental.
+                    if members_after.len() == 2 {
+                        let name = federation_map
+                            .by_id
+                            .get(&federation_id)
+                            .map(|f| f.name.clone())
+                            .unwrap_or_default();
+                        activity_log.send(crate::ui::activity_log::ActivityLogEvent {
+                            tick: clock.tick,
+                            actor: Entity::PLACEHOLDER,
+                            faction_id: root,
+                            kind: crate::ui::activity_log::ActivityEntryKind::FederationFormed {
+                                federation_id,
+                                name,
+                                members: members_after,
+                            },
+                        });
+                    } else {
+                        activity_log.send(crate::ui::activity_log::ActivityLogEvent {
+                            tick: clock.tick,
+                            actor: Entity::PLACEHOLDER,
+                            faction_id: root,
+                            kind: crate::ui::activity_log::ActivityEntryKind::FederationJoined {
+                                federation_id,
+                                joiner: root,
+                            },
+                        });
+                    }
+                }
+                PlayerCommand::LeaveFederation {
+                    faction_id,
+                    federation_id,
+                } => {
+                    use crate::simulation::federation::{
+                        ExpulsionReason, FEDERATION_LEAVE_GRIEVANCE_PENALTY,
+                        FEDERATION_LEAVE_TRUST_PENALTY,
+                    };
+                    let root = factions.root_faction(faction_id);
+                    if federation_map.by_root_faction.get(&root) != Some(&federation_id) {
+                        continue;
+                    }
+                    let former = federation_map.co_members_of(root);
+                    federation_map.remove_member(root);
+                    for other in &former {
+                        let r = ledger.relation_mut(root, *other);
+                        r.reputation.trust = r
+                            .reputation
+                            .trust
+                            .saturating_sub(FEDERATION_LEAVE_TRUST_PENALTY);
+                        r.reputation.grievance = r
+                            .reputation
+                            .grievance
+                            .saturating_add(FEDERATION_LEAVE_GRIEVANCE_PENALTY);
+                        r.reputation.clamp();
+                    }
+                    activity_log.send(crate::ui::activity_log::ActivityLogEvent {
+                        tick: clock.tick,
+                        actor: Entity::PLACEHOLDER,
+                        faction_id: root,
+                        kind: crate::ui::activity_log::ActivityEntryKind::FederationLeft {
+                            federation_id,
+                            leaver: root,
+                        },
+                    });
+                    let _ = ExpulsionReason::Voluntary;
+                }
+                PlayerCommand::ExpelFromFederation {
+                    faction_id,
+                    federation_id,
+                    target_faction_id,
+                } => {
+                    use crate::simulation::federation::{
+                        ExpulsionReason, FEDERATION_LEAVE_GRIEVANCE_PENALTY,
+                        FEDERATION_LEAVE_TRUST_PENALTY,
+                    };
+                    let caller_root = factions.root_faction(faction_id);
+                    let target_root = factions.root_faction(target_faction_id);
+                    let Some(fed) = federation_map.by_id.get(&federation_id) else {
+                        continue;
+                    };
+                    if fed.founder != caller_root || !fed.contains(target_root) {
+                        continue;
+                    }
+                    let former = federation_map.co_members_of(target_root);
+                    federation_map.remove_member(target_root);
+                    for other in &former {
+                        let r = ledger.relation_mut(target_root, *other);
+                        r.reputation.trust = r
+                            .reputation
+                            .trust
+                            .saturating_sub(FEDERATION_LEAVE_TRUST_PENALTY);
+                        r.reputation.grievance = r
+                            .reputation
+                            .grievance
+                            .saturating_add(FEDERATION_LEAVE_GRIEVANCE_PENALTY);
+                        r.reputation.clamp();
+                    }
+                    activity_log.send(crate::ui::activity_log::ActivityLogEvent {
+                        tick: clock.tick,
+                        actor: Entity::PLACEHOLDER,
+                        faction_id: target_root,
+                        kind: crate::ui::activity_log::ActivityEntryKind::FederationExpelled {
+                            federation_id,
+                            expelled: target_root,
+                            reason: ExpulsionReason::Voluntary,
+                        },
+                    });
+                }
                 _ => {
                     // Other commands need actors; skip a malformed event.
                 }
@@ -985,7 +1227,11 @@ pub fn player_command_lifecycle_system(
             | PlayerCommand::BreakTreaty { .. }
             | PlayerCommand::RevokeAccessGrant { .. }
             | PlayerCommand::SendDiplomacyDealPackage { .. }
-            | PlayerCommand::RespondDiplomacyDealPackage { .. } => Some(CommandStatus::Completed),
+            | PlayerCommand::RespondDiplomacyDealPackage { .. }
+            | PlayerCommand::ProposeFederation { .. }
+            | PlayerCommand::AcceptFederationInvite { .. }
+            | PlayerCommand::LeaveFederation { .. }
+            | PlayerCommand::ExpelFromFederation { .. } => Some(CommandStatus::Completed),
             // Lookout never auto-completes — the worker holds the anchor
             // until the player supersedes the command or `aq.cancel`
             // drops the chain via another dispatch.
@@ -1059,6 +1305,8 @@ pub struct DiplomacyDrainParams<'w, 's> {
     pub grants: ResMut<'w, crate::simulation::access_grant::AccessGrantTable>,
     pub settlement_map: Res<'w, crate::simulation::settlement::SettlementMap>,
     pub settlements: Query<'w, 's, &'static crate::simulation::settlement::Settlement>,
+    pub federation_map: ResMut<'w, crate::simulation::federation::FederationMap>,
+    pub activity_log: EventWriter<'w, crate::ui::activity_log::ActivityLogEvent>,
 }
 
 /// UI-side bundle for emitting commands. Wraps the network-boundary
@@ -1881,7 +2129,11 @@ fn dispatch_one(
         | BreakTreaty { .. }
         | RevokeAccessGrant { .. }
         | SendDiplomacyDealPackage { .. }
-        | RespondDiplomacyDealPackage { .. } => {
+        | RespondDiplomacyDealPackage { .. }
+        | ProposeFederation { .. }
+        | AcceptFederationInvite { .. }
+        | LeaveFederation { .. }
+        | ExpelFromFederation { .. } => {
             // Faction-level — applied directly in
             // `drain_player_command_events_system` (empty `actors`). If an
             // event ever arrives carrying actors, the dispatch is a no-op.

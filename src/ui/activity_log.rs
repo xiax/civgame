@@ -125,6 +125,36 @@ pub enum ActivityEntryKind {
         child: Entity,
         child_name: String,
     },
+    /// Federations — a federation was formed (founder + first member
+    /// accepted). One entry posted per founding member.
+    FederationFormed {
+        federation_id: crate::simulation::federation::FederationId,
+        name: String,
+        members: Vec<u32>,
+    },
+    /// Federations — a faction joined an existing federation.
+    FederationJoined {
+        federation_id: crate::simulation::federation::FederationId,
+        joiner: u32,
+    },
+    /// Federations — voluntary leave.
+    FederationLeft {
+        federation_id: crate::simulation::federation::FederationId,
+        leaver: u32,
+    },
+    /// Federations — expelled, either by founder or by intra-fed attack.
+    FederationExpelled {
+        federation_id: crate::simulation::federation::FederationId,
+        expelled: u32,
+        reason: crate::simulation::federation::ExpulsionReason,
+    },
+    /// Federations — outsider attacked a member; co-members entered
+    /// defensive war. `attacker` is the outsider; one entry per
+    /// bandwagoning co-member.
+    FederationDefenseTriggered {
+        federation_id: crate::simulation::federation::FederationId,
+        attacker: u32,
+    },
 }
 
 #[derive(Clone)]
@@ -313,6 +343,48 @@ pub fn activity_log_ingest_system(
                     },
                 )
             }
+            ActivityEntryKind::FederationFormed {
+                federation_id,
+                name,
+                members,
+            } => (
+                "founded federation",
+                format!("{} (fed {}, members: {:?})", name, federation_id.0, members),
+                ResultLink::NoTarget,
+            ),
+            &ActivityEntryKind::FederationJoined {
+                federation_id,
+                joiner,
+            } => (
+                "joined federation",
+                format!("fed {} (faction {})", federation_id.0, joiner),
+                ResultLink::NoTarget,
+            ),
+            &ActivityEntryKind::FederationLeft {
+                federation_id,
+                leaver,
+            } => (
+                "left federation",
+                format!("fed {} (faction {})", federation_id.0, leaver),
+                ResultLink::NoTarget,
+            ),
+            &ActivityEntryKind::FederationExpelled {
+                federation_id,
+                expelled,
+                reason,
+            } => (
+                "expelled from federation",
+                format!("fed {} (faction {}, {:?})", federation_id.0, expelled, reason),
+                ResultLink::NoTarget,
+            ),
+            &ActivityEntryKind::FederationDefenseTriggered {
+                federation_id,
+                attacker,
+            } => (
+                "federation defense triggered",
+                format!("fed {} vs faction {}", federation_id.0, attacker),
+                ResultLink::NoTarget,
+            ),
         };
 
         log.entries.push_back(ActivityLogEntry {

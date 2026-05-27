@@ -31,6 +31,7 @@ pub mod drink;
 pub mod energy;
 pub mod faction;
 pub mod farm;
+pub mod federation;
 pub mod fishing;
 pub mod gather;
 pub mod gather_claims;
@@ -318,6 +319,8 @@ impl Plugin for SimulationPlugin {
             .insert_resource(diplomacy::DiplomacyLedger::default())
             .insert_resource(diplomatic_contact::DiplomaticContactBook::default())
             .insert_resource(access_grant::AccessGrantTable::default())
+            .insert_resource(federation::FederationMap::default())
+            .insert_resource(federation::RememberedFederationAlliance::default())
             .insert_resource(trespass::TrespassRegistry::default())
             .insert_resource(trespass::TerritoryDefenseQueue::default())
             .add_event::<trespass::TrespassEvent>()
@@ -1764,8 +1767,17 @@ impl Plugin for SimulationPlugin {
                     diplomacy::ai_diplomacy_proposal_system,
                     diplomacy::ai_diplomacy_package_response_system
                         .after(diplomacy::ai_diplomacy_response_system),
-                    access_grant::treaty_to_grant_sync_system
+                    federation::federation_alliance_sync_system
                         .after(diplomacy::ai_diplomacy_response_system),
+                    federation::federation_invite_expiry_system
+                        .after(diplomacy::proposal_expiry_system),
+                    federation::ai_federation_proposal_system
+                        .after(diplomacy::ai_diplomacy_response_system),
+                    federation::ai_federation_response_system
+                        .after(federation::ai_federation_proposal_system),
+                    access_grant::treaty_to_grant_sync_system
+                        .after(diplomacy::ai_diplomacy_response_system)
+                        .after(federation::federation_alliance_sync_system),
                     access_grant::ai_auto_revoke_grants_system
                         .after(access_grant::treaty_to_grant_sync_system),
                     deal_obligation::deal_obligation_step_system

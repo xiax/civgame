@@ -850,6 +850,12 @@ impl ActionQueue {
     /// task-completion transitions (current done → advance), keep using a
     /// plain `current = Task::Idle` so the prefetched queue can advance into
     /// `current` on the next tick.
+    ///
+    /// Asymmetry vs. `cancel_chain`: this doesn't take `&mut ai` and therefore
+    /// doesn't zero `work_progress_fraction`. The internal callers (`dispatch`
+    /// queue-overflow, `advance` overflow path) run before any fraction has
+    /// been accrued for the new task; per-task fraction zeroing is owned by
+    /// `begin_working` / `finish_task` / `cancel_chain`.
     pub fn cancel(&mut self) {
         self.autonomous_lifecycle = None;
         self.current = Task::Idle;
@@ -857,10 +863,12 @@ impl ActionQueue {
     }
 
     /// Canonical executor-success exit: reset `PersonAI.state` to `Idle`,
-    /// zero `work_progress`, and `advance()` to the next prefetched task.
+    /// zero `work_progress` (+ fractional remainder), and `advance()` to the
+    /// next prefetched task.
     pub fn finish_task(&mut self, ai: &mut PersonAI) {
         ai.state = AiState::Idle;
         ai.work_progress = 0;
+        ai.work_progress_fraction = 0.0;
         self.advance();
     }
 
@@ -870,6 +878,7 @@ impl ActionQueue {
     pub fn cancel_chain(&mut self, ai: &mut PersonAI) {
         ai.state = AiState::Idle;
         ai.work_progress = 0;
+        ai.work_progress_fraction = 0.0;
         self.cancel();
     }
 
@@ -900,6 +909,7 @@ impl ActionQueue {
         );
         ai.state = AiState::Working;
         ai.work_progress = 0;
+        ai.work_progress_fraction = 0.0;
     }
 
     /// Promote agent to `AiState::Seeking` toward `(tile, z)`. Asserts that a

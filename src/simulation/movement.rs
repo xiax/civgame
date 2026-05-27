@@ -233,8 +233,7 @@ pub fn movement_system(
                             .as_deref()
                             .map(|e| e.energy_factor())
                             .unwrap_or(1.0);
-                    let progress = (base * factor) as u8;
-                    ai.work_progress = ai.work_progress.saturating_add(progress);
+                    ai.add_work_progress(base * factor);
                 }
                 continue;
             }
@@ -826,8 +825,7 @@ pub fn movement_system(
                             .as_deref()
                             .map(|e| e.energy_factor())
                             .unwrap_or(1.0);
-                    let progress = (base * factor) as u8;
-                    ai.work_progress = ai.work_progress.saturating_add(progress);
+                    ai.add_work_progress(base * factor);
                 }
             }
             AiState::Idle => {

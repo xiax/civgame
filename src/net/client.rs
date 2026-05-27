@@ -151,6 +151,7 @@ pub fn apply_bootstrap_snapshot_system(
     mut maps: OverlayApplyMaps,
     mut net_ids: ResMut<NetIdMap>,
     mut start: BootstrapStartParams,
+    mut federation_map: ResMut<crate::simulation::federation::FederationMap>,
     mut commands: Commands,
 ) {
     for ev in assignments.read() {
@@ -205,6 +206,7 @@ pub fn apply_bootstrap_snapshot_system(
             &mut maps.dam_map,
             &mut maps.runtime_water,
             &net_ids,
+            &mut federation_map,
         );
         info!(
             "bootstrap applied: tick {}, {} factions, {} settlements, {} walls",
