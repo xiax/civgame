@@ -31,3 +31,9 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1"
 ron = "0.8"
 lightyear = { version = "0.19", default-features = false }
+
+[dev-dependencies]
+# Used only by the `gen_form_fallback_pngs` test in
+# `src/rendering/plant_sprites.rs` to write PNG files to disk. Already a
+# transitive Bevy dep — this just makes it directly addressable from tests.
+image = "0.25"
