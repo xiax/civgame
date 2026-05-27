@@ -6,6 +6,8 @@ Agent AI, factions, knowledge, hunting, typed-task pipeline, pluralist economy. 
 
 `GameSpeed { current, last_unpaused }` is player-facing; `SpeedPreset::{Paused, Normal, Fast (2×), VeryFast (5×)}`. `sync_game_speed_to_virtual_time` (PreUpdate, change-detected) mirrors onto `Time<Virtual>`. Higher presets fire FixedUpdate more often per real second — per-tick decay, cooldown, calendar, and `tick % CADENCE == 0` Economy systems scale naturally. `SimClock.scale_factor()` carries bucket compensation only. `handle_speed_keybinds_system` maps `Space` → pause toggle, `1/2/3` → presets (egui-focus-gated). Per-preset CPU budgets via `SpeedPreset::budget_ms_per_tick()`.
 
+**`BucketSlot` lifetime.** Slots are assigned monotonically at spawn (`person::spawn_faction_band` increments `clock.population`, never reused on death); only `combat::death_system` decrements `clock.population`. So a live entity can carry a raw `BucketSlot` value `>=` the current `clock.population` after any death-driven dip below a prior peak. `SimClock::is_active(slot)` normalizes `slot % population` before window-checking, so stale slots rotate back into liveness and don't permanently miss every `is_active`-gated task executor (`prepare_field`, `plow`, `fish`, `gather`, `dig`, `craft`, `terraform`, `production`, movement-Working progress accumulation). `population == 0` short-circuit preserves the headless/test-fixture fallthrough.
+
 ## Background work budgets (`perf.rs`, `world_sim.rs`)
 
 `PerfWorkBudget` centralises main-thread apply caps: chunk data loads 24/tick, camera sprite loads 8/tick, chunk unloads 32/tick, graph classify 16/task, tile refreshes 512/tick, faction plan applies 4/tick, settlement plan applies 2/tick. `BackgroundWorkDiagnostics` is the shared debug surface.

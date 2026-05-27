@@ -6592,6 +6592,186 @@ mod smoke {
         assert_eq!(aq.autonomous_lifecycle(), None);
     }
 
+    /// Regression: a live worker may carry a `BucketSlot` whose raw value
+    /// exceeds `SimClock.population` after a death-driven population dip
+    /// (slots are assigned monotonically at spawn; population only
+    /// decrements on death). Before the fix in `SimClock::is_active`, the
+    /// rotating active window `[current_start, current_end)` never reached
+    /// the stale slot, so `movement_system`'s `Working` arm and
+    /// `prepare_field_task_system` both skipped the worker forever — the
+    /// agent arrived at the field and sat in `AiState::Working` with
+    /// `work_progress` pinned at zero.
+    ///
+    /// After the fix, `is_active` normalizes `slot % population`, so the
+    /// stale slot rotates back into a live window. The real schedule then
+    /// drives the prepare task to completion.
+    #[test]
+    fn prepare_field_completes_with_stale_bucket_slot() {
+        use crate::simulation::farm::{FarmWorkPhase, FieldTileIndex, FIELD_PREP_WORK_TICKS};
+        use crate::simulation::jobs::{
+            JobBoard, JobClaim, JobKind, JobPosting, JobProgress, JobSource, PosterClass, TileAabb,
+        };
+        use crate::simulation::land::{Plot, PlotIndex, Tenure, TenureHolder};
+        use crate::simulation::settlement::{TileRect, ZoneKind};
+        use crate::simulation::tasks::TaskKind;
+        use crate::simulation::typed_task::{ActionQueue, AutonomousTaskLifecycle, Task};
+
+        let mut sim = TestSim::new(0xFADED);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        let tile = (1, 0);
+        let area = TileAabb {
+            min: tile,
+            max: tile,
+        };
+        let pid = {
+            let world = sim.app.world_mut();
+            let pid = world.resource_mut::<PlotIndex>().alloc_id();
+            let plot_entity = world
+                .spawn(Plot {
+                    id: pid,
+                    settlement_id: 0,
+                    faction_id: fid,
+                    rect: TileRect::new(tile.0, tile.1, 1, 1),
+                    z: 0,
+                    zone_kind: ZoneKind::Agricultural,
+                    tenure: Tenure::StateOwned,
+                    holder: TenureHolder::State { faction_id: fid },
+                    base_value: 0.0,
+                    last_valued_tick: 0,
+                    missed_payments: 0,
+                    frontage_edge: None,
+                    access_tile: None,
+                    parent_plot: None,
+                    plowed_year: None,
+                })
+                .id();
+            world
+                .resource_mut::<PlotIndex>()
+                .by_id
+                .insert(pid, plot_entity);
+            world.resource_mut::<PlotIndex>().by_tile.insert(tile, pid);
+            world.resource_mut::<PlotIndex>().ag_tiles.insert(tile);
+            world
+                .resource_mut::<FieldTileIndex>()
+                .ensure_entry(tile, pid, 150);
+            pid
+        };
+
+        // Stale slot: spawn_person bumps population to 1 and sets the
+        // active window to [0, 1). A raw slot of 5 fails the pre-fix gate
+        // (5 < 1 is false), but post-fix `5 % 1 = 0` lands in the window.
+        let stale_slot: u32 = 5;
+        let worker = sim.spawn_person(fid, tile, |b| {
+            b.goal(AgentGoal::Farm);
+            b.profession(Profession::Farmer);
+            b.bucket(stale_slot);
+        });
+
+        let job_id = {
+            let mut board = sim.app.world_mut().resource_mut::<JobBoard>();
+            let id = board.alloc_id();
+            board.faction_postings_mut(fid).push(JobPosting {
+                id,
+                faction_id: fid,
+                kind: JobKind::Farm,
+                progress: JobProgress::FieldWork {
+                    phase: FarmWorkPhase::Prepare,
+                    completed: 0,
+                    target: 1,
+                    area,
+                    plot_id: Some(pid),
+                    assigned_farmer: None,
+                },
+                claimants: vec![worker],
+                priority: 200,
+                source: JobSource::Chief,
+                posted_tick: 0,
+                expiry_tick: None,
+                poster_class: PosterClass::Chief,
+                reward: 0.0,
+                settlement_id: None,
+            });
+            id
+        };
+
+        {
+            let world = sim.app.world_mut();
+            world.entity_mut(worker).insert(JobClaim {
+                job_id,
+                faction_id: fid,
+                kind: JobKind::Farm,
+                posted_tick: 0,
+                fail_count: 0,
+            });
+            let mut ai = world.get_mut::<PersonAI>(worker).unwrap();
+            ai.state = AiState::Working;
+            ai.work_progress = 0;
+            let mut aq = world.get_mut::<ActionQueue>(worker).unwrap();
+            aq.current = Task::PrepareField { tile };
+            // Lifecycle metadata so `goal_dispatch_system` doesn't clear
+            // the manually-installed task on the next tick.
+            aq.set_autonomous_lifecycle(AutonomousTaskLifecycle {
+                owner_goal: AgentGoal::Farm,
+                task_kind: TaskKind::PrepareField,
+                job_id: Some(job_id),
+                preserve_across_goal_dispatch: true,
+            });
+        }
+
+        // Sanity: pre-fix `is_active` would reject this slot. The clock
+        // window after one spawn is [0, 1); slot=5 only lands in it via
+        // the modulo normalization we're testing.
+        {
+            let clock = sim.app.world().resource::<SimClock>();
+            assert!(
+                clock.is_active(stale_slot),
+                "fix invariant: stale slot {stale_slot} must normalize into the active \
+                 window [{}, {}) with population {}",
+                clock.current_start,
+                clock.current_end,
+                clock.population,
+            );
+        }
+
+        // Tick the real schedule. `movement_system`'s Working arm advances
+        // `work_progress` by ~1/tick; `prepare_field_task_system`
+        // finalizes once it crosses `FIELD_PREP_WORK_TICKS`. Allow slack
+        // for the energy/sickness factor and downstream completion.
+        sim.tick_n((FIELD_PREP_WORK_TICKS as u32) + 40);
+
+        let kind = sim
+            .app
+            .world()
+            .resource::<ChunkMap>()
+            .tile_kind_at(tile.0, tile.1);
+        assert_eq!(
+            kind,
+            Some(TileKind::Cropland),
+            "stale-bucket worker must complete PrepareField and stamp Cropland"
+        );
+        let board = sim.app.world().resource::<JobBoard>();
+        assert!(
+            board.faction_postings(fid).iter().all(|p| p.id != job_id),
+            "completed FieldWork posting must be removed"
+        );
+        assert!(
+            sim.app.world().get::<JobClaim>(worker).is_none(),
+            "worker JobClaim released on prepare completion"
+        );
+        // After `aq.finish_task`, downstream systems may dispatch a
+        // follow-on task this same tick (e.g. trader/bureaucrat/idle
+        // wander). Don't assert `Task::Idle` here — the prepare task
+        // completing (Cropland stamp + posting + claim release above) is
+        // the regression signal.
+        let aq = sim.app.world().get::<ActionQueue>(worker).unwrap();
+        assert_ne!(
+            aq.current_task_kind(),
+            TaskKind::PrepareField as u16,
+            "PrepareField must have retired (not still pinned on the worker)"
+        );
+    }
+
     /// Draftwork v2: with `ARD_PLOW` Aware + an `ard_plow` implement in
     /// storage + a state-owned Agricultural plot with `plowed_year == None`,
     /// chief posts exactly one `JobKind::Plow` per plot in Spring. Sibling

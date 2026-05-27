@@ -37,7 +37,8 @@ impl SimClock {
         if self.population == 0 {
             return true;
         }
-        slot >= self.current_start && slot < self.current_end
+        let normalized = slot % self.population;
+        normalized >= self.current_start && normalized < self.current_end
     }
 
     /// Bucket compensation: how many ticks pass between updates for any
@@ -64,4 +65,58 @@ pub fn advance_sim_clock(mut clock: ResMut<SimClock>) {
     clock.current_start = next_start;
     clock.current_end = next_end;
     clock.tick = clock.tick.wrapping_add(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_clock(population: u32, current_start: u32, current_end: u32) -> SimClock {
+        SimClock {
+            tick: 0,
+            bucket_size: current_end - current_start,
+            population,
+            current_start,
+            current_end,
+        }
+    }
+
+    #[test]
+    fn is_active_population_zero_passthrough() {
+        let clock = make_clock(0, 0, 0);
+        assert!(clock.is_active(0));
+        assert!(clock.is_active(7));
+        assert!(clock.is_active(u32::MAX));
+    }
+
+    #[test]
+    fn is_active_in_range_slot() {
+        let clock = make_clock(4, 0, 2);
+        assert!(clock.is_active(0));
+        assert!(clock.is_active(1));
+        assert!(!clock.is_active(2));
+        assert!(!clock.is_active(3));
+    }
+
+    #[test]
+    fn is_active_normalizes_stale_slot() {
+        // population shrank from a previous peak; live agents may hold slots >= population
+        let clock = make_clock(4, 0, 2);
+        // slot=5 → 5 % 4 = 1, in [0,2) → active
+        assert!(clock.is_active(5));
+        // slot=6 → 6 % 4 = 2, NOT in [0,2) → inactive
+        assert!(!clock.is_active(6));
+        // slot=7 → 7 % 4 = 3, NOT in [0,2) → inactive
+        assert!(!clock.is_active(7));
+    }
+
+    #[test]
+    fn is_active_stale_slot_rotates_into_liveness() {
+        // Same stale slot is inactive in one window but reachable in another
+        let early = make_clock(4, 0, 2);
+        let later = make_clock(4, 2, 4);
+        // slot=6 → 6 % 4 = 2: inactive in [0,2), active in [2,4)
+        assert!(!early.is_active(6));
+        assert!(later.is_active(6));
+    }
 }

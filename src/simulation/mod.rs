@@ -1338,7 +1338,9 @@ impl Plugin for SimulationPlugin {
                 // gather (mutually exclusive task). Split into its own block
                 // because the main Sequential tuple is at Bevy's 21-element
                 // ceiling.
-                (farm::prepare_field_task_system.before(gather::gather_system),)
+                (farm::prepare_field_task_system
+                    .after(movement::movement_system)
+                    .before(gather::gather_system),)
                     .in_set(SimulationSet::Sequential),
             )
             .add_systems(
@@ -1347,7 +1349,9 @@ impl Plugin for SimulationPlugin {
                 // the gather harvest path doesn't race a freshly-stamped
                 // `Plot.plowed_year`) + animal training tick.
                 (
-                    draftwork::plow_task_system.before(gather::gather_system),
+                    draftwork::plow_task_system
+                        .after(movement::movement_system)
+                        .before(gather::gather_system),
                     draftwork::animal_training_progress_system,
                 )
                     .in_set(SimulationSet::Sequential),
@@ -1366,7 +1370,9 @@ impl Plugin for SimulationPlugin {
             // and dispatched by the `AcquireFood` / `StockpileFood` systems.
             .add_systems(
                 FixedUpdate,
-                (fishing::fish_task_system.before(gather::gather_system),)
+                (fishing::fish_task_system
+                    .after(movement::movement_system)
+                    .before(gather::gather_system),)
                     .in_set(SimulationSet::Sequential),
             )
             .add_systems(
