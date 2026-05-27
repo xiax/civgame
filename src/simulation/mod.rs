@@ -329,7 +329,8 @@ impl Plugin for SimulationPlugin {
                     SimulationSet::ParallelB.after(SimulationSet::ParallelA),
                     SimulationSet::Sequential.after(SimulationSet::ParallelB),
                     SimulationSet::Economy.after(SimulationSet::Sequential),
-                ),
+                )
+                    .run_if(crate::net::net_mode_runs_sim),
             )
             // Speed/pause: mirror `GameSpeed` onto `Time<Virtual>` every
             // PreUpdate. Per-frame tick counter lives on Update so it ticks

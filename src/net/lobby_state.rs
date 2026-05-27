@@ -151,12 +151,32 @@ impl LobbyState {
 
     pub fn bump(&mut self) {
         self.version = self.version.wrapping_add(1);
-        // Auto-advance phase based on slot occupancy.
+        // Auto-advance phase based on slot occupancy + readiness.
+        let all_ready_with_starts = !self.slots.is_empty()
+            && self
+                .slots
+                .iter()
+                .all(|s| s.ready && s.megachunk.is_some());
         self.phase = match self.phase {
             LobbyPhase::Hosting if !self.slots.is_empty() => LobbyPhase::SelectingStarts,
             LobbyPhase::SelectingStarts if self.slots.is_empty() => LobbyPhase::Hosting,
+            LobbyPhase::SelectingStarts if all_ready_with_starts => LobbyPhase::Starting,
             other => other,
         };
+    }
+
+    /// True iff this candidate megachunk is far enough from every other
+    /// slot's chosen megachunk to satisfy `MIN_HUMAN_MEGACHUNK_DISTANCE`.
+    /// Pure — globe habitability is checked separately at the call site.
+    pub fn is_select_acceptable(&self, candidate: (i32, i32), self_client_id: u64) -> bool {
+        use crate::net::protocol::is_start_megachunk_acceptable;
+        let others: Vec<(i32, i32)> = self
+            .slots
+            .iter()
+            .filter(|s| s.client_id != self_client_id)
+            .filter_map(|s| s.megachunk)
+            .collect();
+        is_start_megachunk_acceptable(candidate, &others)
     }
 }
 
@@ -210,6 +230,66 @@ mod tests {
             faction_id: None,
         });
         assert_eq!(lobby.next_slot_id(), 1, "fills slot id gap");
+    }
+
+    #[test]
+    fn bump_advances_to_starting_when_all_ready() {
+        let mut lobby = LobbyState::default();
+        lobby.slots.push(ServerLobbySlot {
+            slot_id: 0,
+            player_name: "alice".into(),
+            client_id: 1,
+            megachunk: Some((5, 5)),
+            lifestyle: Lifestyle::Settled,
+            ready: true,
+            faction_id: None,
+        });
+        lobby.bump();
+        // First bump promotes Hosting → SelectingStarts.
+        assert_eq!(lobby.phase, LobbyPhase::SelectingStarts);
+        lobby.bump();
+        // With all-ready-with-starts, second bump promotes to Starting.
+        assert_eq!(lobby.phase, LobbyPhase::Starting);
+    }
+
+    #[test]
+    fn bump_holds_in_selecting_starts_until_ready() {
+        let mut lobby = LobbyState::default();
+        lobby.slots.push(ServerLobbySlot {
+            slot_id: 0,
+            player_name: "alice".into(),
+            client_id: 1,
+            megachunk: Some((5, 5)),
+            lifestyle: Lifestyle::Settled,
+            ready: false, // not ready
+            faction_id: None,
+        });
+        lobby.bump();
+        assert_eq!(lobby.phase, LobbyPhase::SelectingStarts);
+        lobby.bump();
+        assert_eq!(lobby.phase, LobbyPhase::SelectingStarts);
+    }
+
+    #[test]
+    fn select_acceptable_rejects_too_close() {
+        let mut lobby = LobbyState::default();
+        lobby.slots.push(ServerLobbySlot {
+            slot_id: 0,
+            player_name: "alice".into(),
+            client_id: 1,
+            megachunk: Some((0, 0)),
+            lifestyle: Lifestyle::Settled,
+            ready: false,
+            faction_id: None,
+        });
+        // Same megachunk → reject.
+        assert!(!lobby.is_select_acceptable((0, 0), 2));
+        // 2 mega-chunks away → reject (< MIN_HUMAN_MEGACHUNK_DISTANCE=3).
+        assert!(!lobby.is_select_acceptable((2, 0), 2));
+        // 3 → accept.
+        assert!(lobby.is_select_acceptable((3, 0), 2));
+        // Picking the same chunk as your own existing pick → fine (self).
+        assert!(lobby.is_select_acceptable((0, 0), 1));
     }
 
     #[test]

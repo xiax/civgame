@@ -310,3 +310,127 @@ shared `build_globe_image` consumed by lobby).
 - **Inspector summary as subscribe-on-focus** (vs. request/response):
   keyed on `ClientCameraFocus`, would auto-stream the snapshot for
   the entity in view.
+
+## Phase 8 — wire-up completion
+
+Phases 1–7 landed shapes; this phase drains them. Closes: lobby
+message handlers, client appliers, `apply_bootstrap_snapshot_system`
+state transition, sim-plugin gating on client, plant/structure
+delta emission, and the host+2-client integration test.
+
+### 8.1 Server lobby handlers (`src/net/server.rs`, `lobby_state.rs`)
+
+Four drain systems gated on `NetMode::{ListenServer, DedicatedServer}`:
+- `handle_lobby_join_system` — validate `protocol_version`; reclaim
+  via `lobby.accepts_join(&name)` else append via `next_slot_id()`;
+  `bump()`; `LobbyReject` on failure.
+- `handle_lobby_select_start_system` — new pure validator
+  `is_start_megachunk_acceptable(&lobby, client_id, megachunk,
+  &globe)` in `lobby_state.rs` (habitability via
+  `region::pick_player_home_in_megachunk`'s checks +
+  `MIN_HUMAN_MEGACHUNK_DISTANCE = 3`); write `slot.megachunk` or
+  reject.
+- `handle_lobby_set_ready_system` — write `slot.ready`; `bump()`.
+  Extend `LobbyState::bump()` so `SelectingStarts → Starting` fires
+  when every slot has `megachunk.is_some() && ready`.
+- `handle_lobby_leave_system` — drain `LobbyLeave` +
+  `ServerDisconnectEvent` while pre-`InGame`; remove slot (no
+  reconnect stash in lobby).
+
+Plus:
+- `broadcast_lobby_snapshot_system` — when `lobby.version` differs
+  from `last_sent_version`, ship `LobbySnapshot` to every connected
+  client on `OrderedReliableChannel`.
+- `start_game_transition_system` — on phase entering `Starting`,
+  allocate `faction_id` per slot (monotonic by `slot_id`), broadcast
+  `LobbyStartGame { slot_assignments }`, populate
+  `PendingStarts.{slots, primary_start}`, `NextState(Playing)`,
+  phase → `InGame`.
+
+### 8.2 Client lobby appliers (`src/net/client.rs`, `src/ui/lobby.rs`)
+
+- `apply_lobby_snapshot_system` (NetMode::Client) — mirror snapshot
+  into `LobbyUiState`; add `remote_slots: Vec<LobbySlotPublic>`
+  (client doesn't write `PendingStarts.slots` until
+  `LobbyStartGame`). Lobby UI reads `remote_slots` for the roster.
+- `apply_lobby_start_game_system` — drain `LobbyStartGame`, build
+  `PendingStarts { primary_start: megachunk→camera tile for local
+  client, slots: from slot_assignments }`, `NextState(Playing)`.
+  Don't spawn — sim is gated off on Client.
+- UI sends `LobbySelectStart / LobbySetReady / LobbyLeave` via a new
+  `LobbyCommandSender` SystemParam. ListenServer host bypasses the
+  wire via a `LocalLobbyCommand` event drained by the same 8.1
+  handlers under `HOST_SERVER_LOCAL_CLIENT_ID`.
+
+### 8.3 Bootstrap extension (`apply_bootstrap_snapshot_system`)
+
+After draining `BootstrapSnapshot`:
+- Set `WorldSeed(snapshot.world_seed)` (client has no seed today).
+- Fire `RegenerateWorldRequest` so `spawn_world_system` builds the
+  windows around assigned home.
+- Resolve assigned faction's `home_tile` from
+  `snapshot.factions`; write `PendingStarts.primary_start`.
+- `NextState(Playing)` if in `MultiplayerLobby` (canonical path on
+  reconnect, where lobby was skipped).
+
+### 8.4 Client gating (`simulation/mod.rs`, `economy/mod.rs`, `pathfinding/mod.rs`)
+
+Add `pub fn net_mode_runs_sim(mode: Res<NetMode>) -> bool` in
+`net/mod.rs`. Wrap mutating system *sets*
+(`SimulationSet::{ParallelA, ParallelB, Sequential, Economy}` and
+`Input`, plus equivalents in the other two plugins) with
+`.run_if(net_mode_runs_sim)`. Render / fog / camera / world streaming
+/ UI keep running. `spawn_world_system` stays ungated — clients
+regen terrain from the replicated seed.
+
+### 8.5 Plant + structure replication
+
+Server (`replicate_tile_overlays_system::push_ops_for_tile`):
+- Probe `PlantMap` → emit `TileOverlayOp::AddPlant { tile,
+  entity_net_id, kind, stage }`; `RemovePlant` from a
+  `RemovedComponents<Plant>` reader.
+- Probe a new `StructureMap` resource (mirrors `PlantMap`, populated
+  by `Added<StructureLabel>` observer + `on_remove` hook) → emit
+  `TileOverlayOp::AddStructure { tile, entity_net_id, kind,
+  owner_faction, label_id }`.
+
+Client (`apply_overlay_delta`): for both ops, in addition to existing
+stub spawn, write a `ReplicatedPlantMap` / `ReplicatedStructureMap`
+resource entry so renderer/inspector can resolve tile → entity. Walls
+already do this; same pattern.
+
+Verify spawn/stage/despawn sites in `simulation/plants.rs` and the
+structure spawners emit `TileChangedEvent` (the existing replicator
+cadence drives the per-tick emit; no new schedule).
+
+### 8.6 Headless host+2-client integration test
+
+`src/net/integration_tests.rs` (new, `#[cfg(test)]`). Build
+`MultiAppHarness { server: App, clients: Vec<App> }` with
+in-memory transport (preferred) or localhost UDP fallback.
+
+Scenario: server `ListenServer` + 2 `Client`s; each client
+`LobbyJoin → LobbySelectStart (non-conflicting megachunks) →
+LobbySetReady`; host slot injected via `LocalLobbyCommand`. After
+auto-transition to `Starting`, step 200 ticks. Assert:
+- All three Apps in `GameState::Playing`.
+- Each client's `ControlledFactions` contains exactly its assigned
+  faction.
+- `ReplicationStats` shows nonzero entity + tile-overlay deltas.
+- Cross-faction command from client 0 → client 1's home returns
+  `OwnershipRejected`.
+- Plant spawned on host at tick 50 visible on both clients by ~T+5.
+- `ConnectedRemotes.count == 2`; speed lock active.
+
+### Verification
+
+- `cargo test --bin civgame net` green; new unit tests:
+  `lobby_select_start_rejects_too_close`,
+  `lobby_bump_advances_to_starting_when_all_ready`,
+  `apply_bootstrap_sets_pending_starts_primary`,
+  `replicate_tile_overlays_emits_add_plant`.
+- Phase 8.6 integration test green.
+- Two-terminal manual: `cargo run -- --listen --bind 0.0.0.0:5000
+  --player host` + `cargo run -- --connect 127.0.0.1:5000 --player
+  joiner`; both see lobby, pick starts, ready, host starts; both
+  transition into `Playing` rendering the same seed.

@@ -1,5 +1,33 @@
 # TaskOutcome Feedback Contract (skeleton — follow-up to gather-fail-loops fix)
 
+## Status — CLOSED 2026-05-26 (no implementation)
+
+Evaluation against shipped code found the central `TaskFailure` enum +
+dispatcher was unnecessary. Three findings:
+
+- **Phase A (scavenge symmetric invalidation): no-op.** Scavenge targets
+  source from live `CurrentVision` / `SpatialIndex` only — `SharedKnowledge`
+  clusters are tile-anchored and don't hold ground-item entities. Vision
+  refresh + `record_target_failure` bias already handle stale picks.
+- **Phase B (inspector ring): already shipped.** `inspector.rs:1250-1293`
+  renders `MethodHistory` with method name + outcome + tick-age, colour-coded
+  (red for `FailedTarget`/`FailedRouting`).
+- **Phase C (documentation): shipped.** New "Task failure protocol" section
+  in `src/simulation/CLAUDE.md` enumerates the four primitives
+  (`SharedKnowledge::invalidate_*`, `MethodHistory` bias, `aq.cancel_chain`,
+  goal-level cooldown via `chronic_failure_release_system` /
+  `JOB_CLAIM_BACKOFF_TICKS`) and the per-site composition table.
+
+The original sketch's `TaskFailure { TargetGone, Unreachable, JobCapped }`
+collapsed distinctions the existing channels already handle separately —
+`Unreachable` duplicates `record_routing_failure`, `JobCapped` duplicates
+`chronic_failure_release_system`. Per-(goal, ResolvedTarget) cooldown
+granularity is overkill because symmetric memory invalidation already
+removes the offending target from future picks.
+
+See `~/.claude/plans/evaluate-the-task-outcome-feedback-contr-effervescent-bumblebee.md`
+for the full evaluation.
+
 ## Why
 
 Once the gather-only fix lands ([fix-repeating-gather-fail-loops.md](fix-repeating-gather-fail-loops.md)),

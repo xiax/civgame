@@ -54,6 +54,7 @@ impl Plugin for UiPlugin {
                 Update,
                 lobby::lobby_system.run_if(in_state(crate::GameState::MultiplayerLobby)),
             )
+            .add_systems(OnEnter(crate::GameState::MultiplayerLobby), lobby::auto_join_lobby_on_enter)
             .insert_resource(migration_panel::MigrationPanelOpen::default())
             .insert_resource(vehicle_designer::VehicleDesignerState::default())
             .insert_resource(diplomacy_panel::DiplomacyPanelOpen::default())

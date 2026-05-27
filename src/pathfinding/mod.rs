@@ -56,7 +56,8 @@ impl Plugin for PathfindingPlugin {
                     chunk_graph::poll_rebuild_task_system,
                     connectivity::poll_connectivity_rebuild_task_system
                         .after(chunk_graph::poll_rebuild_task_system),
-                ),
+                )
+                    .run_if(crate::net::net_mode_runs_sim),
             )
             // Path drain lives on FixedUpdate so its budget scales with
             // sim speed (more `Time<Virtual>` ticks per real second at
@@ -66,7 +67,8 @@ impl Plugin for PathfindingPlugin {
             .add_systems(
                 FixedUpdate,
                 worker::drain_path_requests_system
-                    .before(crate::simulation::SimulationSet::Sequential),
+                    .before(crate::simulation::SimulationSet::Sequential)
+                    .run_if(crate::net::net_mode_runs_sim),
             )
             .add_systems(
                 PostUpdate,
@@ -81,7 +83,8 @@ impl Plugin for PathfindingPlugin {
                         .after(chunk_graph::spawn_rebuild_task_system),
                     hotspots::rebuild_dirty_hotspots_system
                         .after(invalidate_pathing_on_tile_change_system),
-                ),
+                )
+                    .run_if(crate::net::net_mode_runs_sim),
             );
     }
 }

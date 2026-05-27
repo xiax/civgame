@@ -35,9 +35,28 @@ pub mod protocol_plugin;
 pub mod server;
 pub mod snapshot;
 
+#[cfg(test)]
+mod integration_tests;
+
 #[allow(unused_imports)]
 pub use cli::{parse_from_env, CliError, NetConfig};
 pub use protocol::{NetMode, NetPlayerCommandEvent};
+
+/// Run-condition predicate: true on every mode except `Client`. Wraps
+/// the mutating sim/economy/pathfinding system sets so the client App
+/// can co-exist with replication-driven state without locally
+/// authoring the world. `NetMode::runs_sim()` mirrors this for
+/// non-system call sites.
+///
+/// Returns `true` when `NetMode` isn't installed (headless test
+/// fixtures, sandbox harnesses) so existing tests that never touch
+/// `NetPlugin` keep their sim running.
+pub fn net_mode_runs_sim(mode: Option<Res<NetMode>>) -> bool {
+    match mode.as_deref() {
+        Some(NetMode::Client) => false,
+        _ => true,
+    }
+}
 
 /// Stable protocol id for the Lightyear netcode handshake. Bump if the
 /// on-the-wire protocol changes in a way that requires hard rejection
@@ -160,6 +179,7 @@ impl Plugin for NetPlugin {
         // never overwrites.
         app.init_resource::<NetMode>()
             .add_event::<NetPlayerCommandEvent>()
+            .add_event::<server::LocalLobbyCommand>()
             .init_resource::<DisconnectPolicy>()
             .init_resource::<ConnectedRemotes>()
             // Loopback runs in `PreUpdate` so the sim's `Input`
@@ -394,6 +414,7 @@ fn install_server_systems(app: &mut App) {
         .init_resource::<server::ReplicationStats>()
         .init_resource::<server::LastKnownChunkMap>()
         .init_resource::<server::PendingReconnect>()
+        .init_resource::<lobby_state::LobbyState>()
         .add_systems(
             Update,
             (
@@ -408,6 +429,23 @@ fn install_server_systems(app: &mut App) {
                 server::replicate_entity_state_system,
                 server::replicate_entity_removals_system,
                 server::report_replication_stats_system,
+                server::emit_tile_changed_for_replicated_entities_system,
+            ),
+        )
+        .add_systems(
+            Update,
+            (
+                server::handle_lobby_join_system,
+                server::handle_lobby_select_start_system,
+                server::handle_lobby_set_ready_system,
+                server::handle_lobby_leave_system,
+                server::broadcast_lobby_snapshot_system
+                    .after(server::handle_lobby_join_system)
+                    .after(server::handle_lobby_select_start_system)
+                    .after(server::handle_lobby_set_ready_system)
+                    .after(server::handle_lobby_leave_system),
+                server::start_game_transition_system
+                    .after(server::broadcast_lobby_snapshot_system),
             ),
         );
 }
@@ -415,6 +453,8 @@ fn install_server_systems(app: &mut App) {
 fn install_client_systems(app: &mut App) {
     app.init_resource::<client::ClientCommandSequencer>()
         .init_resource::<client::ClientAckLog>()
+        .init_resource::<client::ReplicatedPlantMap>()
+        .init_resource::<client::ReplicatedStructureMap>()
         .add_systems(
             Update,
             (
@@ -425,6 +465,14 @@ fn install_client_systems(app: &mut App) {
                 client::send_camera_focus_system,
                 client::send_command_frames_system,
                 client::observe_disconnect_system,
+            ),
+        )
+        .add_systems(
+            Update,
+            (
+                client::apply_lobby_snapshot_system,
+                client::apply_lobby_start_game_system,
+                client::apply_lobby_reject_system,
             ),
         );
 }

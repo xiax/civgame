@@ -487,19 +487,38 @@ pub fn receive_command_frames_system(
 /// Naive v1: broadcasts to every connected client. Phase 3 will gate on
 /// per-connection interest rooms.
 #[allow(clippy::too_many_arguments)]
+/// Bundle the tile-overlay maps + queries `push_ops_for_tile` needs.
+/// Folded into a single SystemParam to stay under Bevy's 16-arg ceiling
+/// once plant + structure indexes joined the cast.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct TileOverlayParams<'w, 's> {
+    pub wall_map: Res<'w, WallMap>,
+    pub door_map: Res<'w, DoorMap>,
+    pub bridge_map: Res<'w, BridgeMap>,
+    pub dam_map: Res<'w, DamMap>,
+    pub runtime_water: Res<'w, RuntimeWater>,
+    pub plant_map: Res<'w, crate::simulation::plants::PlantMap>,
+    pub structure_index: Res<'w, crate::simulation::construction::StructureIndex>,
+    pub networked_q: Query<'w, 's, &'static Networked>,
+    pub door_q: Query<'w, 's, &'static Door>,
+    pub wall_q: Query<'w, 's, &'static crate::simulation::construction::Wall>,
+    pub plant_q: Query<'w, 's, &'static crate::simulation::plants::Plant>,
+    pub structure_q: Query<
+        'w,
+        's,
+        (
+            &'static crate::simulation::construction::StructureLabel,
+            Option<&'static crate::simulation::faction::FactionMember>,
+        ),
+    >,
+}
+
 pub fn replicate_tile_overlays_system(
     mut changes: EventReader<TileChangedEvent>,
     mut conn_mgr: ResMut<ServerConnectionManager>,
     server_conns: Res<ServerConnections>,
     mut stats: ResMut<ReplicationStats>,
-    wall_map: Res<WallMap>,
-    door_map: Res<DoorMap>,
-    bridge_map: Res<BridgeMap>,
-    dam_map: Res<DamMap>,
-    runtime_water: Res<RuntimeWater>,
-    networked_q: Query<&Networked>,
-    door_q: Query<&Door>,
-    wall_q: Query<&crate::simulation::construction::Wall>,
+    overlay: TileOverlayParams,
 ) {
     // Group ops by chunk to keep ChunkOverlayDelta tight.
     let mut by_chunk: ahash::AHashMap<(i32, i32), Vec<TileOverlayOp>> = ahash::AHashMap::new();
@@ -512,18 +531,7 @@ pub fn replicate_tile_overlays_system(
         }
         let chunk = tile_to_chunk_coord(tile);
         let bucket = by_chunk.entry(chunk).or_default();
-        push_ops_for_tile(
-            tile,
-            bucket,
-            &wall_map,
-            &door_map,
-            &bridge_map,
-            &dam_map,
-            &runtime_water,
-            &networked_q,
-            &door_q,
-            &wall_q,
-        );
+        push_ops_for_tile(tile, bucket, &overlay);
     }
 
     for (chunk, ops) in by_chunk.into_iter() {
@@ -545,19 +553,19 @@ pub fn replicate_tile_overlays_system(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_ops_for_tile(
     tile: (i32, i32),
     out: &mut Vec<TileOverlayOp>,
-    wall_map: &WallMap,
-    door_map: &DoorMap,
-    bridge_map: &BridgeMap,
-    dam_map: &DamMap,
-    runtime_water: &RuntimeWater,
-    networked_q: &Query<&Networked>,
-    door_q: &Query<&Door>,
-    wall_q: &Query<&crate::simulation::construction::Wall>,
+    overlay: &TileOverlayParams,
 ) {
+    let wall_map = &overlay.wall_map;
+    let door_map = &overlay.door_map;
+    let bridge_map = &overlay.bridge_map;
+    let dam_map = &overlay.dam_map;
+    let runtime_water = &overlay.runtime_water;
+    let networked_q = &overlay.networked_q;
+    let door_q = &overlay.door_q;
+    let wall_q = &overlay.wall_q;
     // Walls
     match wall_map.0.get(&tile) {
         Some(&entity) => {
@@ -638,7 +646,161 @@ fn push_ops_for_tile(
         out.push(TileOverlayOp::ClearRuntimeWater { tile });
     }
 
+    // Plants
+    match overlay.plant_map.0.get(&tile) {
+        Some(&entity) => {
+            if let (Ok(n), Ok(plant)) = (networked_q.get(entity), overlay.plant_q.get(entity)) {
+                out.push(TileOverlayOp::AddPlant {
+                    tile,
+                    entity_net_id: n.0,
+                    kind: plant_kind_to_wire(plant.kind),
+                    stage: plant_stage_to_wire(plant.stage),
+                });
+            }
+        }
+        None => {
+            out.push(TileOverlayOp::RemovePlant { tile });
+        }
+    }
+
+    // Structures (Bed / Workshop / Campfire / Storage / civic anchors).
+    // Wall/Door/Bridge/Dam already covered above; only Person-style
+    // structure entities live in `StructureIndex`.
+    match overlay.structure_index.0.get(&tile) {
+        Some(&entity) => {
+            if let (Ok(n), Ok((label, faction))) =
+                (networked_q.get(entity), overlay.structure_q.get(entity))
+            {
+                out.push(TileOverlayOp::AddStructure {
+                    tile,
+                    entity_net_id: n.0,
+                    kind: structure_kind_wire_from_label(label.0),
+                    owner_faction: faction.map(|f| f.faction_id).unwrap_or(0),
+                    label_id: label_hash_u16(label.0),
+                });
+            }
+        }
+        None => {
+            out.push(TileOverlayOp::RemoveStructure { tile });
+        }
+    }
+
     let _ = door_q; // suppresses unused-binding when Door query isn't sampled per-op
+}
+
+/// Translate plant + structure spawn/despawn into `TileChangedEvent` so
+/// the existing `replicate_tile_overlays_system` picks them up. Without
+/// this, plants and structures only replicate when something else
+/// (chunk reload, wall change) happens on the same tile.
+#[allow(clippy::type_complexity)]
+pub fn emit_tile_changed_for_replicated_entities_system(
+    added_plants: Query<
+        (&Transform, ()),
+        bevy::prelude::Added<crate::simulation::plants::Plant>,
+    >,
+    added_structures: Query<
+        (&Transform, ()),
+        bevy::prelude::Added<crate::simulation::construction::StructureLabel>,
+    >,
+    mut removed_plants: RemovedComponents<crate::simulation::plants::Plant>,
+    mut removed_structures: RemovedComponents<crate::simulation::construction::StructureLabel>,
+    last_known: Res<LastKnownChunkMap>,
+    networked_q: Query<&Networked>,
+    mut events: EventWriter<TileChangedEvent>,
+) {
+    for (tf, _) in &added_plants {
+        let tile = translation_to_tile(tf.translation.truncate());
+        events.send(TileChangedEvent { tx: tile.0, ty: tile.1 });
+    }
+    for (tf, _) in &added_structures {
+        let tile = translation_to_tile(tf.translation.truncate());
+        events.send(TileChangedEvent { tx: tile.0, ty: tile.1 });
+    }
+    // Removals: we no longer have a Transform; fall back to the
+    // `LastKnownChunkMap` to recover an approximate tile (every replicated
+    // entity passes through `replicate_entity_state_system`, which keys
+    // the map by `NetId`). If the entity was never replicated yet, the
+    // remove falls through — the client never saw the add either.
+    for e in removed_plants.read() {
+        if let Ok(n) = networked_q.get(e) {
+            if let Some(&(cx, cy)) = last_known.0.get(&n.0) {
+                // chunk coord → emit one event for the chunk centre so
+                // `replicate_tile_overlays_system` re-runs `push_ops_for_tile`
+                // for a representative tile (it'll emit RemovePlant
+                // for the actual ex-tile too if the plant map already
+                // dropped it).
+                let tx = cx * crate::world::chunk::CHUNK_SIZE as i32;
+                let ty = cy * crate::world::chunk::CHUNK_SIZE as i32;
+                events.send(TileChangedEvent { tx, ty });
+            }
+        }
+    }
+    for e in removed_structures.read() {
+        if let Ok(n) = networked_q.get(e) {
+            if let Some(&(cx, cy)) = last_known.0.get(&n.0) {
+                let tx = cx * crate::world::chunk::CHUNK_SIZE as i32;
+                let ty = cy * crate::world::chunk::CHUNK_SIZE as i32;
+                events.send(TileChangedEvent { tx, ty });
+            }
+        }
+    }
+}
+
+fn plant_kind_to_wire(
+    kind: crate::simulation::plants::PlantKind,
+) -> crate::net::protocol::PlantKindWire {
+    use crate::net::protocol::PlantKindWire;
+    use crate::simulation::plants::PlantKind;
+    match kind {
+        PlantKind::Grain => PlantKindWire::Grain,
+        PlantKind::BerryBush => PlantKindWire::BerryBush,
+        PlantKind::Tree => PlantKindWire::Tree,
+    }
+}
+
+fn plant_stage_to_wire(
+    stage: crate::simulation::plants::GrowthStage,
+) -> crate::net::protocol::PlantStageWire {
+    use crate::net::protocol::PlantStageWire;
+    use crate::simulation::plants::GrowthStage;
+    match stage {
+        GrowthStage::Seed => PlantStageWire::Seed,
+        GrowthStage::Seedling => PlantStageWire::Seedling,
+        GrowthStage::Mature => PlantStageWire::Mature,
+        GrowthStage::Overripe => PlantStageWire::Overripe,
+        GrowthStage::Harvested => PlantStageWire::Harvested,
+    }
+}
+
+/// Bucket the &'static label string into one of five wire categories the
+/// client uses to pick rendering. Falls back to `CivicAnchor` for
+/// monument-class anchors the client doesn't need a distinct sprite for.
+fn structure_kind_wire_from_label(label: &'static str) -> crate::net::protocol::StructureKindWire {
+    use crate::net::protocol::StructureKindWire;
+    match label {
+        "Bed" | "Bedroll" | "Tent" | "Yurt" => StructureKindWire::Bed,
+        "Campfire" => StructureKindWire::Campfire,
+        "Granary" => StructureKindWire::Storage,
+        "Workbench" | "Loom" | "Table" | "Chair" | "Pen" | "Stable"
+        | "Feed Trough" | "Hitching Post" | "Vehicle Yard" => StructureKindWire::Workshop,
+        _ => StructureKindWire::CivicAnchor,
+    }
+}
+
+/// Hash the structure label into a stable `u16` so the client can match
+/// `label_id` to a specific variant without sending the &'static str
+/// over the wire.
+fn label_hash_u16(label: &'static str) -> u16 {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let state = ahash::RandomState::with_seeds(
+        0x4356_4944_5f4c_414e,
+        0x5354_5255_4354_5552,
+        0x0000_0000_0000_0001,
+        0x0000_0000_0000_0002,
+    );
+    let mut h = state.build_hasher();
+    label.hash(&mut h);
+    (h.finish() & 0xFFFF) as u16
 }
 
 // ============================================================================
@@ -1233,6 +1395,411 @@ pub fn replicate_entity_removals_system(
     }
 }
 
+// ============================================================================
+// Phase 8.1 — Server lobby handlers
+// ============================================================================
+//
+// Server-side drains for `LobbyJoin / LobbySelectStart / LobbySetReady /
+// LobbyLeave`, the snapshot broadcaster, and the start-game transition.
+// Mounted only in `ListenServer` / `DedicatedServer`. The host's own UI
+// emits commands through `LocalLobbyCommand` to bypass the wire while
+// reusing the same handlers.
+
+use crate::game_state::{
+    EconomyPreset, GameStartOptions, GameState, PendingStarts, PlayerStartSlot,
+    StartSettlementMaturity,
+};
+use crate::net::lobby_state::{LobbyPhase, LobbyState, ServerLobbySlot};
+use crate::net::protocol::{
+    LobbyJoin, LobbyLeave, LobbyReject, LobbyRejectReason, LobbySelectStart, LobbySetReady,
+    LobbySlotAssignment, LobbySnapshot, LobbyStartGame,
+};
+use crate::simulation::faction::Lifestyle;
+use crate::simulation::technology::Era;
+
+/// Locally-issued lobby command for the `ListenServer` host (its own UI
+/// edits the lobby without going through Lightyear). One event per command
+/// kind keeps the wire/local path symmetric: the host UI writes
+/// `LocalLobbyCommand`, the handler drains it the same way it drains the
+/// `ServerReceiveMessage<_>` variant.
+#[derive(bevy::ecs::event::Event, Debug, Clone)]
+pub enum LocalLobbyCommand {
+    Join { player_name: String, client_id: u64 },
+    SelectStart { client_id: u64, megachunk: (i32, i32) },
+    SetReady { client_id: u64, ready: bool },
+    Leave { client_id: u64 },
+}
+
+/// Drain `LobbyJoin` (wire + local). Validates `protocol_version`, then
+/// either reclaims an existing slot by `player_name` or appends a fresh
+/// one. Always calls `lobby.bump()` so the snapshot broadcaster ships
+/// next tick.
+pub fn handle_lobby_join_system(
+    mut wire: EventReader<lightyear::prelude::ServerReceiveMessage<LobbyJoin>>,
+    mut local: EventReader<LocalLobbyCommand>,
+    mut lobby: ResMut<LobbyState>,
+    mut conn_mgr: ResMut<ServerConnectionManager>,
+) {
+    // Wire joins.
+    for ev in wire.read() {
+        let msg = ev.message();
+        let client = ev.from;
+        let client_id_u64 = client_id_to_u64(client);
+        if msg.protocol_version != crate::net::protocol::PROTOCOL_VERSION {
+            let _ = conn_mgr.send_message_to_target::<OrderedReliableChannel, _>(
+                &LobbyReject {
+                    reason: LobbyRejectReason::ProtocolMismatch,
+                    detail: None,
+                },
+                NetworkTarget::Single(client),
+            );
+            continue;
+        }
+        if !lobby.accepts_join(&msg.player_name) {
+            let _ = conn_mgr.send_message_to_target::<OrderedReliableChannel, _>(
+                &LobbyReject {
+                    reason: LobbyRejectReason::LobbyFull,
+                    detail: None,
+                },
+                NetworkTarget::Single(client),
+            );
+            continue;
+        }
+        apply_lobby_join(&mut lobby, &msg.player_name, client_id_u64);
+    }
+
+    // Local joins (host UI).
+    for ev in local.read() {
+        if let LocalLobbyCommand::Join { player_name, client_id } = ev {
+            if !lobby.accepts_join(player_name) {
+                continue;
+            }
+            apply_lobby_join(&mut lobby, player_name, *client_id);
+        }
+    }
+}
+
+fn apply_lobby_join(lobby: &mut LobbyState, player_name: &str, client_id: u64) {
+    if let Some(slot) = lobby
+        .slots
+        .iter_mut()
+        .find(|s| s.player_name == player_name)
+    {
+        slot.client_id = client_id;
+    } else {
+        let slot_id = lobby.next_slot_id();
+        lobby.slots.push(ServerLobbySlot {
+            slot_id,
+            player_name: player_name.to_string(),
+            client_id,
+            megachunk: None,
+            lifestyle: Lifestyle::Settled,
+            ready: false,
+            faction_id: None,
+        });
+    }
+    lobby.bump();
+}
+
+/// Drain `LobbySelectStart`. Validates megachunk distance against
+/// `MIN_HUMAN_MEGACHUNK_DISTANCE`; globe habitability is checked here
+/// too via `region::is_megachunk_habitable`. On accept writes the
+/// slot's megachunk; on reject ships `LobbyReject::StartInvalid`.
+pub fn handle_lobby_select_start_system(
+    mut wire: EventReader<lightyear::prelude::ServerReceiveMessage<LobbySelectStart>>,
+    mut local: EventReader<LocalLobbyCommand>,
+    mut lobby: ResMut<LobbyState>,
+    mut conn_mgr: ResMut<ServerConnectionManager>,
+    globe: Option<Res<crate::world::globe::Globe>>,
+) {
+    for ev in wire.read() {
+        let msg = ev.message();
+        let client = ev.from;
+        let client_id_u64 = client_id_to_u64(client);
+        if !megachunk_acceptable(&lobby, client_id_u64, msg.megachunk, globe.as_deref()) {
+            let _ = conn_mgr.send_message_to_target::<OrderedReliableChannel, _>(
+                &LobbyReject {
+                    reason: LobbyRejectReason::StartInvalid,
+                    detail: None,
+                },
+                NetworkTarget::Single(client),
+            );
+            continue;
+        }
+        if let Some(slot) = lobby.slot_for_client_mut(client_id_u64) {
+            slot.megachunk = Some(msg.megachunk);
+        }
+        lobby.bump();
+    }
+
+    for ev in local.read() {
+        if let LocalLobbyCommand::SelectStart {
+            client_id,
+            megachunk,
+        } = ev
+        {
+            if !megachunk_acceptable(&lobby, *client_id, *megachunk, globe.as_deref()) {
+                continue;
+            }
+            if let Some(slot) = lobby.slot_for_client_mut(*client_id) {
+                slot.megachunk = Some(*megachunk);
+            }
+            lobby.bump();
+        }
+    }
+}
+
+fn megachunk_acceptable(
+    lobby: &LobbyState,
+    client_id: u64,
+    megachunk: (i32, i32),
+    globe: Option<&crate::world::globe::Globe>,
+) -> bool {
+    if !lobby.is_select_acceptable(megachunk, client_id) {
+        return false;
+    }
+    // Habitability check (when globe loaded). Mirror the relief filter
+    // `region::pick_player_home_in_megachunk` uses — centre tile of the
+    // mega-chunk must not be mountain / ocean.
+    if let Some(globe) = globe {
+        let (cx, cy) = crate::simulation::region::MegaChunkCoord::center_tile(megachunk.0, megachunk.1);
+        if globe.sample_relief(cx, cy).class.rejects_settlement() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Drain `LobbySetReady`. Writes the slot's `ready` flag and bumps; the
+/// `bump()` path may auto-advance into `Starting`.
+pub fn handle_lobby_set_ready_system(
+    mut wire: EventReader<lightyear::prelude::ServerReceiveMessage<LobbySetReady>>,
+    mut local: EventReader<LocalLobbyCommand>,
+    mut lobby: ResMut<LobbyState>,
+) {
+    for ev in wire.read() {
+        let msg = ev.message();
+        let client_id_u64 = client_id_to_u64(ev.from);
+        if let Some(slot) = lobby.slot_for_client_mut(client_id_u64) {
+            slot.ready = msg.ready;
+        }
+        lobby.bump();
+    }
+    for ev in local.read() {
+        if let LocalLobbyCommand::SetReady { client_id, ready } = ev {
+            if let Some(slot) = lobby.slot_for_client_mut(*client_id) {
+                slot.ready = *ready;
+            }
+            lobby.bump();
+        }
+    }
+}
+
+/// Drain `LobbyLeave` (wire + local) plus `ServerDisconnectEvent` while
+/// the phase is pre-`InGame`. Removes the slot. Mid-game reconnect-by-
+/// name is handled by `record_disconnections_system` + `PendingReconnect`
+/// — lobby slots aren't stashed (the player can rejoin from a clean slot).
+pub fn handle_lobby_leave_system(
+    mut wire: EventReader<lightyear::prelude::ServerReceiveMessage<LobbyLeave>>,
+    mut local: EventReader<LocalLobbyCommand>,
+    mut disconnects: EventReader<ServerDisconnectEvent>,
+    mut lobby: ResMut<LobbyState>,
+) {
+    if lobby.phase == LobbyPhase::InGame {
+        return;
+    }
+    let mut changed = false;
+    for ev in wire.read() {
+        let client_id_u64 = client_id_to_u64(ev.from);
+        if remove_slot(&mut lobby, client_id_u64) {
+            changed = true;
+        }
+    }
+    for ev in local.read() {
+        if let LocalLobbyCommand::Leave { client_id } = ev {
+            if remove_slot(&mut lobby, *client_id) {
+                changed = true;
+            }
+        }
+    }
+    for ev in disconnects.read() {
+        let client_id_u64 = client_id_to_u64(ev.client_id);
+        if remove_slot(&mut lobby, client_id_u64) {
+            changed = true;
+        }
+    }
+    if changed {
+        lobby.bump();
+    }
+}
+
+fn remove_slot(lobby: &mut LobbyState, client_id: u64) -> bool {
+    let before = lobby.slots.len();
+    lobby.slots.retain(|s| s.client_id != client_id);
+    lobby.slots.len() != before
+}
+
+/// Broadcast the current `LobbyState` to every connected client whenever
+/// the version bumps past the last sent version. Lobby payload is small
+/// (slot count bounded by `max_players`) so we always ship the whole
+/// snapshot rather than diffing.
+pub fn broadcast_lobby_snapshot_system(
+    mut last_sent_version: Local<u32>,
+    lobby: Res<LobbyState>,
+    mut conn_mgr: ResMut<ServerConnectionManager>,
+    server_conns: Res<ServerConnections>,
+) {
+    if lobby.version == *last_sent_version {
+        return;
+    }
+    let snapshot = LobbySnapshot {
+        game_name: lobby.config.game_name.clone(),
+        world_seed: lobby.config.world_seed,
+        era_index: lobby.config.era as u8,
+        economy_index: economy_preset_to_index(lobby.config.economy),
+        maturity_index: maturity_to_index(lobby.config.maturity),
+        max_players: lobby.config.max_players,
+        slots: lobby.public_snapshot(),
+    };
+    // Ship to every connected client.
+    for &client in server_conns.by_client.keys() {
+        let _ = conn_mgr.send_message_to_target::<OrderedReliableChannel, _>(
+            &snapshot,
+            NetworkTarget::Single(client),
+        );
+    }
+    *last_sent_version = lobby.version;
+}
+
+/// When the lobby's auto-bump pushes phase into `Starting`, allocate a
+/// `faction_id` per slot, broadcast `LobbyStartGame`, populate
+/// `PendingStarts` + `GameStartOptions` from the lobby config, then flip
+/// `GameState` into `Playing`. After this the lobby phase is `InGame`
+/// and new joins are rejected (`PendingReconnect` is the only re-entry).
+#[allow(clippy::too_many_arguments)]
+pub fn start_game_transition_system(
+    mut lobby: ResMut<LobbyState>,
+    mut conn_mgr: ResMut<ServerConnectionManager>,
+    server_conns: Res<ServerConnections>,
+    mut pending_starts: ResMut<PendingStarts>,
+    mut options: ResMut<GameStartOptions>,
+    mut next_state: ResMut<NextState<GameState>>,
+    mut world_seed: ResMut<WorldSeed>,
+) {
+    if lobby.phase != LobbyPhase::Starting {
+        return;
+    }
+    // Allocate faction ids monotonically by slot_id; first slot wins
+    // faction 0, next slot 1, etc. Faction 0 historically maps to the
+    // player faction in single-player; this preserves that contract for
+    // the host's own slot when it's the first ready slot.
+    let mut assignments: Vec<LobbySlotAssignment> = Vec::with_capacity(lobby.slots.len());
+    let mut player_slots: Vec<PlayerStartSlot> = Vec::with_capacity(lobby.slots.len());
+    let mut primary_start: Option<(i32, i32)> = None;
+    // Sort by slot_id for deterministic faction allocation.
+    let mut slots_sorted: Vec<usize> = (0..lobby.slots.len()).collect();
+    slots_sorted.sort_by_key(|&i| lobby.slots[i].slot_id);
+    for (faction_idx, &slot_idx) in slots_sorted.iter().enumerate() {
+        let slot = &mut lobby.slots[slot_idx];
+        let Some(mega) = slot.megachunk else {
+            continue;
+        };
+        let faction_id = faction_idx as u32;
+        slot.faction_id = Some(faction_id);
+        assignments.push(LobbySlotAssignment {
+            slot_id: slot.slot_id,
+            client_id: slot.client_id,
+            faction_id,
+            megachunk: mega,
+        });
+        let center_tile = megachunk_center_tile(mega);
+        if primary_start.is_none()
+            && slot.client_id == crate::net::HOST_SERVER_LOCAL_CLIENT_ID
+        {
+            primary_start = Some(center_tile);
+        }
+        player_slots.push(PlayerStartSlot {
+            slot_id: slot.slot_id,
+            player_name: slot.player_name.clone(),
+            client_id: slot.client_id,
+            megachunk: Some(mega),
+            lifestyle: slot.lifestyle,
+            ready: slot.ready,
+            faction_id: Some(faction_id),
+        });
+    }
+    // Fall back to first slot's start as the camera anchor when the host
+    // wasn't itself in the lobby (pure dedicated server case).
+    let primary_start = primary_start.or_else(|| {
+        assignments
+            .first()
+            .map(|a| megachunk_center_tile(a.megachunk))
+    });
+
+    let start_msg = LobbyStartGame {
+        slot_assignments: assignments,
+        world_seed: lobby.config.world_seed,
+    };
+    for &client in server_conns.by_client.keys() {
+        let _ = conn_mgr.send_message_to_target::<OrderedReliableChannel, _>(
+            &start_msg,
+            NetworkTarget::Single(client),
+        );
+    }
+
+    // Server-side `PendingStarts` + `GameStartOptions` so the OnEnter
+    // chain spawns every slot's faction in the right megachunk.
+    pending_starts.primary_start = primary_start;
+    pending_starts.slots = player_slots;
+    options.era = lobby.config.era;
+    options.economy = lobby.config.economy;
+    options.maturity = lobby.config.maturity;
+    world_seed.0 = lobby.config.world_seed;
+
+    lobby.phase = LobbyPhase::InGame;
+    next_state.set(GameState::Playing);
+    info!(
+        "lobby → Playing: {} slots, world_seed {:#x}",
+        lobby.slots.len(),
+        lobby.config.world_seed
+    );
+}
+
+fn megachunk_center_tile(megachunk: (i32, i32)) -> (i32, i32) {
+    crate::simulation::region::MegaChunkCoord::center_tile(megachunk.0, megachunk.1)
+}
+
+fn economy_preset_to_index(preset: EconomyPreset) -> u8 {
+    match preset {
+        EconomyPreset::Subsistence => 0,
+        EconomyPreset::Mixed => 1,
+        EconomyPreset::Market => 2,
+    }
+}
+
+fn maturity_to_index(maturity: StartSettlementMaturity) -> u8 {
+    match maturity {
+        StartSettlementMaturity::Founder => 0,
+        StartSettlementMaturity::Established => 1,
+        StartSettlementMaturity::Developed => 2,
+    }
+}
+
+/// `ClientId` decomposes into a `u64` for our `ServerLobbySlot.client_id`
+/// keying. Lightyear's `ClientId` is an enum (`Netcode(u64)` /
+/// `Local(u64)` etc.) — we only ever care about the raw inner id. The
+/// host's local-transport id is `HOST_SERVER_LOCAL_CLIENT_ID`, derived
+/// at `install_host_client` time.
+fn client_id_to_u64(client: ClientId) -> u64 {
+    match client {
+        ClientId::Netcode(id) => id,
+        ClientId::Steam(id) => id,
+        ClientId::Local(id) => id,
+        _ => 0,
+    }
+}
+
+#[allow(dead_code)]
 fn heading_to_facing(heading: u8) -> u8 {
     // `Vehicle.heading` is `0..=3` (back/right/front/left). Map onto the
     // 8-way `FacingDirection` u8 (South/SE/E/NE/N/NW/W/SW). For now the

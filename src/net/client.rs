@@ -20,13 +20,20 @@ use lightyear::prelude::client::{
 };
 use lightyear::prelude::ClientReceiveMessage;
 
+use crate::game_state::{
+    EconomyPreset, GameStartOptions, GameState, PendingStarts, PlayerStartSlot,
+    RegenerateWorldRequest, StartSettlementMaturity, WorldSeed,
+};
 use crate::net::bootstrap::apply_bootstrap_snapshot;
 use crate::net::cli::NetConfig;
 use crate::net::protocol::{
     BootstrapSnapshot, ChunkOverlayDelta, ClientCameraFocus, ClientHello, CommandId,
     EntityKindWire, EntityRemoved, EntityStateDelta, EntityStateEntry, FactionAssignment,
-    NetCommandAck, NetCommandFrame, NetPlayerCommandEvent, TileOverlayOp, PROTOCOL_VERSION,
+    LobbyReject, LobbySnapshot, LobbyStartGame, NetCommandAck, NetCommandFrame,
+    NetPlayerCommandEvent, TileOverlayOp, PROTOCOL_VERSION,
 };
+use crate::simulation::faction::Lifestyle;
+use crate::simulation::technology::Era;
 use crate::net::protocol_plugin::OrderedReliableChannel;
 use crate::net_id::{NetId, NetIdMap, Networked};
 use crate::simulation::construction::{
@@ -101,6 +108,33 @@ pub fn send_client_hello_system(
     }
 }
 
+/// Bundle the lobby-transition resources `apply_bootstrap_snapshot_system`
+/// touches when it promotes the client into `Playing`. Bevy caps a system
+/// at 16 parameters; folding these into one `SystemParam` keeps room for
+/// the overlay-map mut-resources the snapshot apply path also needs.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct BootstrapStartParams<'w> {
+    pub world_seed: ResMut<'w, WorldSeed>,
+    pub regen: EventWriter<'w, RegenerateWorldRequest>,
+    pub pending_starts: ResMut<'w, PendingStarts>,
+    pub state: Res<'w, State<GameState>>,
+    pub next_state: ResMut<'w, NextState<GameState>>,
+}
+
+/// Bundle the client-side tile-overlay maps mutated by
+/// `apply_overlay_delta`. Folded into one SystemParam so callers stay
+/// under Bevy's 16-arg ceiling.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct OverlayApplyMaps<'w> {
+    pub wall_map: ResMut<'w, WallMap>,
+    pub door_map: ResMut<'w, DoorMap>,
+    pub bridge_map: ResMut<'w, BridgeMap>,
+    pub dam_map: ResMut<'w, DamMap>,
+    pub runtime_water: ResMut<'w, RuntimeWater>,
+    pub plant_map: ResMut<'w, ReplicatedPlantMap>,
+    pub structure_map: ResMut<'w, ReplicatedStructureMap>,
+}
+
 /// Drain `FactionAssignment` first (sets `PlayerFaction`), then any
 /// `BootstrapSnapshot` (overwrites Calendar/maps), then `ChunkOverlayDelta`s.
 /// `ClientDisconnectEvent` is a placeholder for reconnect handling.
@@ -114,12 +148,9 @@ pub fn apply_bootstrap_snapshot_system(
     mut calendar: ResMut<Calendar>,
     mut player_faction: ResMut<PlayerFaction>,
     mut controlled: ResMut<ControlledFactions>,
-    mut wall_map: ResMut<WallMap>,
-    mut door_map: ResMut<DoorMap>,
-    mut bridge_map: ResMut<BridgeMap>,
-    mut dam_map: ResMut<DamMap>,
-    mut runtime_water: ResMut<RuntimeWater>,
+    mut maps: OverlayApplyMaps,
     mut net_ids: ResMut<NetIdMap>,
+    mut start: BootstrapStartParams,
     mut commands: Commands,
 ) {
     for ev in assignments.read() {
@@ -130,6 +161,13 @@ pub fn apply_bootstrap_snapshot_system(
         );
         player_faction.faction_id = m.faction_id;
         controlled.add(m.faction_id);
+        // World seed must match the server's so locally-regenerated
+        // terrain / globe is deterministic. Fire `RegenerateWorldRequest`
+        // so `spawn_world_system` rebuilds against the new seed.
+        if start.world_seed.0 != m.world_seed {
+            start.world_seed.0 = m.world_seed;
+            start.regen.send(RegenerateWorldRequest);
+        }
     }
 
     for ev in snapshots.read() {
@@ -161,11 +199,11 @@ pub fn apply_bootstrap_snapshot_system(
             snap,
             &mut calendar,
             &mut controlled,
-            &mut wall_map,
-            &mut door_map,
-            &mut bridge_map,
-            &mut dam_map,
-            &mut runtime_water,
+            &mut maps.wall_map,
+            &mut maps.door_map,
+            &mut maps.bridge_map,
+            &mut maps.dam_map,
+            &mut maps.runtime_water,
             &net_ids,
         );
         info!(
@@ -175,20 +213,32 @@ pub fn apply_bootstrap_snapshot_system(
             snap.settlements.len(),
             snap.overlay_tiles.walls.len()
         );
+
+        // Anchor `PendingStarts.primary_start` on the assigned faction's
+        // home tile so the camera centres on the right place. This is the
+        // canonical write path — `apply_lobby_start_game_system` ALSO sets
+        // it from the lobby `slot_assignments`, but a reconnecting client
+        // skips the lobby entirely and only sees `BootstrapSnapshot`.
+        if let Some(faction) = snap
+            .factions
+            .iter()
+            .find(|f| f.faction_id == player_faction.faction_id)
+        {
+            start.pending_starts.primary_start = Some(faction.home_tile);
+        }
+
+        // Transition the client into `Playing` if it's still showing the
+        // lobby (i.e. lobby was bypassed via mid-game reconnect, or this
+        // is the first bootstrap after `LobbyStartGame`). A repeat
+        // bootstrap (resync) on an already-`Playing` client is a no-op.
+        if !matches!(start.state.get(), GameState::Playing) {
+            start.next_state.set(GameState::Playing);
+        }
     }
 
     for ev in deltas.read() {
         let delta = ev.message();
-        apply_overlay_delta(
-            delta,
-            &mut commands,
-            &mut net_ids,
-            &mut wall_map,
-            &mut door_map,
-            &mut bridge_map,
-            &mut dam_map,
-            &mut runtime_water,
-        );
+        apply_overlay_delta(delta, &mut commands, &mut net_ids, &mut maps);
     }
 
     for ev in acks.read() {
@@ -232,12 +282,15 @@ fn apply_overlay_delta(
     delta: &ChunkOverlayDelta,
     commands: &mut Commands,
     ids: &mut NetIdMap,
-    wall_map: &mut WallMap,
-    door_map: &mut DoorMap,
-    bridge_map: &mut BridgeMap,
-    dam_map: &mut DamMap,
-    runtime_water: &mut RuntimeWater,
+    maps: &mut OverlayApplyMaps,
 ) {
+    let wall_map = &mut maps.wall_map;
+    let door_map = &mut maps.door_map;
+    let bridge_map = &mut maps.bridge_map;
+    let dam_map = &mut maps.dam_map;
+    let runtime_water = &mut maps.runtime_water;
+    let plant_map = &mut maps.plant_map;
+    let structure_map = &mut maps.structure_map;
     for op in &delta.ops {
         match op {
             TileOverlayOp::AddWall {
@@ -316,31 +369,38 @@ fn apply_overlay_delta(
             // index off the wire. Once those indexes land, populate
             // them here the same way wall/door already do.
             TileOverlayOp::AddPlant {
-                tile: _,
+                tile,
                 entity_net_id,
                 kind: _,
                 stage: _,
             } => {
                 ensure_stub(commands, ids, *entity_net_id);
+                if let Some(entity) = ids.entity_of(*entity_net_id) {
+                    plant_map.0.insert(*tile, entity);
+                }
             }
-            TileOverlayOp::RemovePlant { tile: _ } => {
-                // No client-side PlantMap yet — the matching stub will
-                // GC via `EntityRemoved` separately.
+            TileOverlayOp::RemovePlant { tile } => {
+                plant_map.0.remove(tile);
             }
             TileOverlayOp::PlantStageChange { tile: _, stage: _ } => {
                 // Stage flips: stub already exists; rendering picks up
-                // when stage replication lands.
+                // when per-stage replication lands.
             }
             TileOverlayOp::AddStructure {
-                tile: _,
+                tile,
                 entity_net_id,
                 kind: _,
                 owner_faction: _,
                 label_id: _,
             } => {
                 ensure_stub(commands, ids, *entity_net_id);
+                if let Some(entity) = ids.entity_of(*entity_net_id) {
+                    structure_map.0.insert(*tile, entity);
+                }
             }
-            TileOverlayOp::RemoveStructure { tile: _ } => {}
+            TileOverlayOp::RemoveStructure { tile } => {
+                structure_map.0.remove(tile);
+            }
         }
     }
 }
@@ -434,6 +494,17 @@ pub enum ReplicatedEntityKind {
     Animal,
     Vehicle,
 }
+
+/// Client-side tile→`Entity` index for replicated plants. Mirrors the
+/// server's `PlantMap` over the wire. Populated by
+/// `apply_overlay_delta`'s `AddPlant` branch and torn down by
+/// `RemovePlant`.
+#[derive(bevy::prelude::Resource, Default, Debug)]
+pub struct ReplicatedPlantMap(pub ahash::AHashMap<(i32, i32), bevy::prelude::Entity>);
+
+/// Client-side tile→`Entity` index for replicated structures.
+#[derive(bevy::prelude::Resource, Default, Debug)]
+pub struct ReplicatedStructureMap(pub ahash::AHashMap<(i32, i32), bevy::prelude::Entity>);
 
 /// Replicated-entity bookkeeping carried on every stub. Stores the latest
 /// server tick that touched the stub so a future LOD-aware draw can age
@@ -560,5 +631,118 @@ fn replicated_entity_kind(wire: EntityKindWire) -> ReplicatedEntityKind {
         EntityKindWire::Person => ReplicatedEntityKind::Person,
         EntityKindWire::Animal(_) => ReplicatedEntityKind::Animal,
         EntityKindWire::Vehicle => ReplicatedEntityKind::Vehicle,
+    }
+}
+
+// ============================================================================
+// Phase 8.2 — Client lobby appliers
+// ============================================================================
+
+/// Drain `LobbySnapshot` and mirror onto `LobbyUiState` so the lobby UI
+/// renders the live server-side player roster. Also reads back the
+/// host-side config (world seed / era / economy / maturity) into the
+/// client's `WorldSeed` + `GameStartOptions` so the right values show up
+/// in the panel even when the host is mid-edit.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_lobby_snapshot_system(
+    mut snapshots: EventReader<ClientReceiveMessage<LobbySnapshot>>,
+    mut ui_state: Option<ResMut<crate::ui::lobby::LobbyUiState>>,
+    mut world_seed: ResMut<WorldSeed>,
+    mut options: ResMut<GameStartOptions>,
+) {
+    for ev in snapshots.read() {
+        let snap = ev.message();
+        if let Some(ui) = ui_state.as_deref_mut() {
+            ui.remote_slots = snap.slots.clone();
+        }
+        world_seed.0 = snap.world_seed;
+        options.era = match snap.era_index {
+            0 => Era::Paleolithic,
+            1 => Era::Mesolithic,
+            2 => Era::Neolithic,
+            3 => Era::Chalcolithic,
+            _ => Era::BronzeAge,
+        };
+        options.economy = match snap.economy_index {
+            0 => EconomyPreset::Subsistence,
+            1 => EconomyPreset::Mixed,
+            _ => EconomyPreset::Market,
+        };
+        options.maturity = match snap.maturity_index {
+            0 => StartSettlementMaturity::Founder,
+            1 => StartSettlementMaturity::Established,
+            _ => StartSettlementMaturity::Developed,
+        };
+    }
+}
+
+/// Drain `LobbyStartGame`. Build `PendingStarts` from the slot
+/// assignments — the slot whose `client_id` matches our derived id
+/// becomes the camera anchor (`primary_start`). Then flip into
+/// `GameState::Playing`. World terrain comes up via the existing
+/// `BootstrapSnapshot` path (Phase 8.3 sets seed / fires
+/// `RegenerateWorldRequest`).
+pub fn apply_lobby_start_game_system(
+    mut events: EventReader<ClientReceiveMessage<LobbyStartGame>>,
+    net_config: Res<NetConfig>,
+    mut pending_starts: ResMut<PendingStarts>,
+    mut world_seed: ResMut<WorldSeed>,
+    state: Res<State<GameState>>,
+    mut next_state: ResMut<NextState<GameState>>,
+) {
+    for ev in events.read() {
+        let msg = ev.message();
+        world_seed.0 = msg.world_seed;
+
+        // Compute our local client id the same way `install_client` did
+        // (`derive_client_id(player_name)`) so the matching slot lands as
+        // `primary_start`. If the host UI emitted us through `LocalLobbyCommand`,
+        // our client id is `HOST_SERVER_LOCAL_CLIENT_ID` instead.
+        let local_name = net_config
+            .player_name
+            .clone()
+            .unwrap_or_else(|| "Player".into());
+        let local_client_id = crate::net::derive_client_id(&local_name);
+
+        let slots: Vec<PlayerStartSlot> = msg
+            .slot_assignments
+            .iter()
+            .map(|a| PlayerStartSlot {
+                slot_id: a.slot_id,
+                player_name: String::new(),
+                client_id: a.client_id,
+                megachunk: Some(a.megachunk),
+                lifestyle: Lifestyle::Settled,
+                ready: true,
+                faction_id: Some(a.faction_id),
+            })
+            .collect();
+        let primary_start = slots
+            .iter()
+            .find(|s| s.client_id == local_client_id)
+            .and_then(|s| s.megachunk.map(megachunk_center_tile_client));
+        pending_starts.slots = slots;
+        if primary_start.is_some() {
+            pending_starts.primary_start = primary_start;
+        }
+
+        if !matches!(state.get(), GameState::Playing) {
+            next_state.set(GameState::Playing);
+        }
+    }
+}
+
+fn megachunk_center_tile_client(megachunk: (i32, i32)) -> (i32, i32) {
+    crate::simulation::region::MegaChunkCoord::center_tile(megachunk.0, megachunk.1)
+}
+
+/// Drain `LobbyReject` and log it. Future-Phase: surface to the UI as a
+/// transient toast.
+pub fn apply_lobby_reject_system(
+    mut events: EventReader<ClientReceiveMessage<LobbyReject>>,
+) {
+    for ev in events.read() {
+        let r = ev.message();
+        warn!("lobby reject: {:?} ({:?})", r.reason, r.detail);
     }
 }

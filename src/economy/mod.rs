@@ -31,7 +31,8 @@ impl Plugin for EconomyPlugin {
                     market::settlement_price_update_system,
                     market::camp_price_update_system,
                 )
-                    .in_set(SimulationSet::Economy),
+                    .in_set(SimulationSet::Economy)
+                    .run_if(crate::net::net_mode_runs_sim),
             );
     }
 }
