@@ -309,6 +309,38 @@ fn apply_overlay_delta(
             TileOverlayOp::ClearRuntimeWater { tile } => {
                 runtime_water.cells.remove(tile);
             }
+            // Phase 7 — plant + structure ops. v1 stub-only: bind a
+            // `Networked` entity for the new server-side id so future
+            // requests (inspector summary, etc.) can resolve it; the
+            // client doesn't yet maintain a `PlantMap` / structure
+            // index off the wire. Once those indexes land, populate
+            // them here the same way wall/door already do.
+            TileOverlayOp::AddPlant {
+                tile: _,
+                entity_net_id,
+                kind: _,
+                stage: _,
+            } => {
+                ensure_stub(commands, ids, *entity_net_id);
+            }
+            TileOverlayOp::RemovePlant { tile: _ } => {
+                // No client-side PlantMap yet — the matching stub will
+                // GC via `EntityRemoved` separately.
+            }
+            TileOverlayOp::PlantStageChange { tile: _, stage: _ } => {
+                // Stage flips: stub already exists; rendering picks up
+                // when stage replication lands.
+            }
+            TileOverlayOp::AddStructure {
+                tile: _,
+                entity_net_id,
+                kind: _,
+                owner_faction: _,
+                label_id: _,
+            } => {
+                ensure_stub(commands, ids, *entity_net_id);
+            }
+            TileOverlayOp::RemoveStructure { tile: _ } => {}
         }
     }
 }

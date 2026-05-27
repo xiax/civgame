@@ -27,9 +27,9 @@ use lightyear::prelude::*;
 
 use crate::net::protocol::{
     BootstrapSnapshot, ChunkOverlayDelta, ClientCameraFocus, ClientHello, EntityRemoved,
-    EntityStateDelta, FactionAssignment, LobbyJoin, LobbyLeave, LobbyReject,
-    LobbySelectStart, LobbySetReady, LobbySnapshot, LobbyStartGame, NetCommandAck,
-    NetCommandFrame,
+    EntityStateDelta, FactionAssignment, InspectorSummaryRequest, InspectorSummaryResponse,
+    LobbyJoin, LobbyLeave, LobbyReject, LobbySelectStart, LobbySetReady, LobbySnapshot,
+    LobbyStartGame, NetCommandAck, NetCommandFrame,
 };
 
 /// The single reliable channel every Phase 2 control message rides.
@@ -68,5 +68,10 @@ impl Plugin for ProtocolPlugin {
         app.register_message::<LobbySnapshot>(ChannelDirection::ServerToClient);
         app.register_message::<LobbyReject>(ChannelDirection::ServerToClient);
         app.register_message::<LobbyStartGame>(ChannelDirection::ServerToClient);
+
+        // Phase 7 inspector summary — request/response on the same
+        // reliable channel (sparse, one-shot, ordered).
+        app.register_message::<InspectorSummaryRequest>(ChannelDirection::ClientToServer);
+        app.register_message::<InspectorSummaryResponse>(ChannelDirection::ServerToClient);
     }
 }

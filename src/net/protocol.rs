@@ -184,6 +184,74 @@ pub enum TileOverlayOp {
     ClearRuntimeWater {
         tile: (i32, i32),
     },
+    // ---------------------------------------------------------------
+    // Phase 7 — replication completeness (plants + structures).
+    // ---------------------------------------------------------------
+    /// Plant appeared on `tile` at `stage`. `kind` covers Grain /
+    /// BerryBush / Tree variants; the client renders the matching
+    /// sprite from `kind + stage`.
+    AddPlant {
+        tile: (i32, i32),
+        entity_net_id: NetId,
+        kind: PlantKindWire,
+        stage: PlantStageWire,
+    },
+    RemovePlant {
+        tile: (i32, i32),
+    },
+    /// Existing plant on `tile` advanced to a new stage (seedling →
+    /// mature → harvested). Carried separately from `RemovePlant` so
+    /// the client doesn't need to despawn+respawn the stub.
+    PlantStageChange {
+        tile: (i32, i32),
+        stage: PlantStageWire,
+    },
+    /// Tile-resident built structure (Workshop / Bed / Campfire /
+    /// civic anchor). `label_id` is a short opaque slug the client
+    /// renders into the inspector header (`StructureLabel`).
+    AddStructure {
+        tile: (i32, i32),
+        entity_net_id: NetId,
+        kind: StructureKindWire,
+        owner_faction: u32,
+        label_id: u16,
+    },
+    RemoveStructure {
+        tile: (i32, i32),
+    },
+}
+
+/// Wire projection of `PlantKind`. Adding a new kind = a new variant
+/// here AND a protocol bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlantKindWire {
+    Grain,
+    BerryBush,
+    Tree,
+}
+
+/// Wire projection of `PlantStage`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlantStageWire {
+    Seed,
+    Seedling,
+    Mature,
+    Overripe,
+    Harvested,
+}
+
+/// Wire projection of `StructureLabel`'s class — covers Bed,
+/// Workshop (Workbench/Loom/Granary/Shrine/Market/Barracks/Monument),
+/// Campfire, and storage. The client uses `kind` to pick the right
+/// sprite category; the `label_id` carries the specific variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StructureKindWire {
+    Bed,
+    Workshop,
+    Campfire,
+    Storage,
+    /// Civic anchor (granary / shrine / market / barracks / monument).
+    CivicAnchor,
 }
 
 /// Batched ops for one chunk's worth of tile-overlay changes. The server
@@ -547,6 +615,36 @@ pub struct LobbySlotAssignment {
 /// inside `spawn_population::faction_spacing_score`'s saturation distance
 /// can collapse them into the same cluster.
 pub const MIN_HUMAN_MEGACHUNK_DISTANCE: i32 = 3;
+
+// ============================================================================
+// Phase 7 — inspector summary request/response
+// ============================================================================
+//
+// Replicating every inspector field every tick would dominate bandwidth.
+// Instead the client requests a focused snapshot when the player opens
+// the inspector for an entity; the server responds once. Refresh by
+// re-requesting (typically on a 500ms cadence while the inspector is
+// open).
+
+/// Client→Server. Asks the server to ship a focused inspector snapshot
+/// for `net_id`. No-op if `net_id` doesn't resolve.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct InspectorSummaryRequest {
+    pub net_id: NetId,
+}
+
+/// Server→Client. One inspector snapshot. Strings are short, capped at
+/// 64 chars on the server side. Lifetimes follow the Bevy-component
+/// fields these mirror (task display name, current goal, recent wage,
+/// short knowledge summary).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InspectorSummaryResponse {
+    pub net_id: NetId,
+    pub task: String,
+    pub goal: String,
+    pub wage_24h: f32,
+    pub knowledge_summary: String,
+}
 
 #[cfg(test)]
 mod tests {
@@ -1286,6 +1384,88 @@ mod tests {
         assert!(super::is_start_megachunk_acceptable((3, 0), other_slots));
         // Comfortable spread → accept.
         assert!(super::is_start_megachunk_acceptable((4, 4), other_slots));
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 7 replication completeness round-trips
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn tile_overlay_add_plant_round_trips() {
+        use super::{PlantKindWire, PlantStageWire, TileOverlayOp};
+        let op = TileOverlayOp::AddPlant {
+            tile: (4, -2),
+            entity_net_id: NetId(7),
+            kind: PlantKindWire::Grain,
+            stage: PlantStageWire::Mature,
+        };
+        let bytes = bincode::serialize(&op).unwrap();
+        let back: TileOverlayOp = bincode::deserialize(&bytes).unwrap();
+        match back {
+            TileOverlayOp::AddPlant { tile, entity_net_id, kind, stage } => {
+                assert_eq!(tile, (4, -2));
+                assert_eq!(entity_net_id, NetId(7));
+                assert_eq!(kind, PlantKindWire::Grain);
+                assert_eq!(stage, PlantStageWire::Mature);
+            }
+            other => panic!("expected AddPlant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tile_overlay_add_structure_round_trips() {
+        use super::{StructureKindWire, TileOverlayOp};
+        let op = TileOverlayOp::AddStructure {
+            tile: (1, 2),
+            entity_net_id: NetId(99),
+            kind: StructureKindWire::CivicAnchor,
+            owner_faction: 3,
+            label_id: 42,
+        };
+        let bytes = bincode::serialize(&op).unwrap();
+        let back: TileOverlayOp = bincode::deserialize(&bytes).unwrap();
+        match back {
+            TileOverlayOp::AddStructure {
+                tile,
+                entity_net_id,
+                kind,
+                owner_faction,
+                label_id,
+            } => {
+                assert_eq!(tile, (1, 2));
+                assert_eq!(entity_net_id, NetId(99));
+                assert_eq!(kind, StructureKindWire::CivicAnchor);
+                assert_eq!(owner_faction, 3);
+                assert_eq!(label_id, 42);
+            }
+            other => panic!("expected AddStructure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn inspector_summary_request_round_trips() {
+        use super::InspectorSummaryRequest;
+        let msg = InspectorSummaryRequest { net_id: NetId(31) };
+        let bytes = bincode::serialize(&msg).unwrap();
+        let back: InspectorSummaryRequest = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.net_id, NetId(31));
+    }
+
+    #[test]
+    fn inspector_summary_response_round_trips() {
+        use super::InspectorSummaryResponse;
+        let msg = InspectorSummaryResponse {
+            net_id: NetId(31),
+            task: "Gather Wood".into(),
+            goal: "GatherWood".into(),
+            wage_24h: 12.5,
+            knowledge_summary: "Fire, Cordage, Pottery".into(),
+        };
+        let bytes = bincode::serialize(&msg).unwrap();
+        let back: InspectorSummaryResponse = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.net_id, NetId(31));
+        assert_eq!(back.task, "Gather Wood");
+        assert!((back.wage_24h - 12.5).abs() < f32::EPSILON);
     }
 
     #[test]
