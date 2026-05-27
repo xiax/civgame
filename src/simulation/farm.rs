@@ -148,6 +148,13 @@ pub enum FarmSeasonPhase {
     WinterDormant,
 }
 
+/// How long `goal_update_system`'s farm precompute may reuse a cached
+/// `households_with_seasonal_work` snapshot before rebuilding. Invalidated
+/// immediately on season transitions; otherwise the scan rebuilds at this
+/// cadence. 60 ticks ≈ 3 s at 1× speed — well under the 200-tick per-agent
+/// goal re-eval cadence so no FarmWorkScorer-driven agent observes staleness.
+pub const FARM_PRECOMPUTE_CADENCE_TICKS: u64 = 60;
+
 /// Map `Calendar.season` to a `FarmSeasonPhase`. Pure helper.
 #[inline]
 pub fn farm_season_phase(cal: &Calendar) -> FarmSeasonPhase {
