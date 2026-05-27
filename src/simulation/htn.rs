@@ -7876,6 +7876,7 @@ pub fn htn_prepare_field_dispatch_system(
     clock: Res<SimClock>,
     board: Res<crate::simulation::jobs::JobBoard>,
     field_tiles: Res<crate::simulation::farm::FieldTileIndex>,
+    mut reservations: ResMut<crate::simulation::farm::PrepareFieldReservations>,
     mut query: Query<
         (
             Entity,
@@ -7967,6 +7968,7 @@ pub fn htn_prepare_field_dispatch_system(
         let Some(tile) = crate::simulation::farm::find_nearest_unprepared_in_rect(
             &chunk_map,
             &field_tiles,
+            &reservations,
             (cur_tx, cur_ty),
             area.min,
             area.max,
@@ -7981,6 +7983,11 @@ pub fn htn_prepare_field_dispatch_system(
             );
             continue;
         };
+        // Reserve the work tile before routing so a sibling dispatcher
+        // iteration this same tick can't pick the same tile. `try_reserve`
+        // always succeeds here because `find_nearest_unprepared_in_rect`
+        // skipped any tile already in the map.
+        reservations.try_reserve(tile, actor, now);
         let dispatched = dispatch_autonomous_task_with_routing(
             &mut ai,
             &mut aq,
@@ -8003,6 +8010,10 @@ pub fn htn_prepare_field_dispatch_system(
             now,
         );
         if !dispatched {
+            // Routing failed — drop the reservation now so the next farmer
+            // can pick this tile up immediately. Without this, the slot
+            // stays held until the daily GC pass.
+            reservations.release(tile);
             continue;
         }
     }

@@ -4359,8 +4359,14 @@ pub fn posting_target_workers(p: &JobPosting) -> u32 {
         (JobKind::Haul, _) => 2,
         // Seasonal Farm postings: scale with target tile/plant count so
         // Spring prep (256-tile plot) gets up to 12 workers but a 1-tile
-        // caretaker run stays at 3.
-        (JobKind::Farm, JobProgress::FieldWork { target, .. }) => ((*target / 8).max(3)).min(12),
+        // caretaker run stays at 3. Also cap by remaining work so a posting
+        // with 15/16 completed doesn't admit three farmers fighting over the
+        // last tile.
+        (JobKind::Farm, JobProgress::FieldWork { target, completed, .. }) => {
+            let scaled = ((*target / 8).max(3)).min(12);
+            let remaining = target.saturating_sub(*completed).max(1);
+            scaled.min(remaining)
+        }
         (JobKind::Farm, _) => 3,
         (JobKind::Craft, _) => 1,
         // Plow is a single-farmer single-animal job — one worker pulls the

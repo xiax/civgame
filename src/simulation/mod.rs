@@ -306,6 +306,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(land::LandListings::default())
             .insert_resource(farm::FarmPlotAssignments::default())
             .insert_resource(farm::FieldTileIndex::default())
+            .insert_resource(farm::PrepareFieldReservations::default())
             .insert_resource(fishing::FishStock::default())
             .insert_resource(military::ActiveRallyPoints::default())
             .insert_resource(military::MilitaryFormationGroupGen::default())
@@ -1324,6 +1325,11 @@ impl Plugin for SimulationPlugin {
                     // stale entries (worker died / Dormant-demoted / goal
                     // flipped without releasing).
                     plants::planting_reservation_gc_system,
+                    // Daily GC for PrepareField tile reservations — same
+                    // shape as planting: catches goal-flip / Dormant /
+                    // > TICKS_PER_DAY leaks the dispatcher + executor
+                    // release paths missed.
+                    farm::prepare_field_reservation_gc_system,
                     // Daily GC for stand-tile reservations — same shape:
                     // worker despawned / Dormant / current task is no
                     // longer adjacent-interacting / age > TICKS_PER_DAY.

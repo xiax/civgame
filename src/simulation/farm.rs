@@ -242,6 +242,64 @@ impl FieldTileIndex {
     }
 }
 
+/// Per-tile reservation map for in-flight `Task::PrepareField` chains. Mirrors
+/// `plants::PlantingReservations`: dispatcher stakes the tile before routing,
+/// executor releases on every exit path, and a daily GC backstop drops
+/// reservations whose worker died / drifted / aged past one game day.
+///
+/// Without this map, multiple farmers claiming the same `FieldWork { phase:
+/// Prepare }` posting all dispatch onto the *same* nearest unprepared tile —
+/// wasted parallelism, plus a stale-credit race when the first worker
+/// finalises the tile to `Cropland` while a second is still ticking
+/// `work_progress` to the completion threshold.
+#[derive(Resource, Default, Debug)]
+pub struct PrepareFieldReservations {
+    pub by_tile: AHashMap<(i32, i32), PrepareFieldReservation>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PrepareFieldReservation {
+    pub worker: Entity,
+    pub reserved_tick: u64,
+}
+
+impl PrepareFieldReservations {
+    /// Returns `true` if `tile` already carries a live reservation.
+    #[inline]
+    pub fn is_reserved(&self, tile: (i32, i32)) -> bool {
+        self.by_tile.contains_key(&tile)
+    }
+
+    /// Attempts to reserve `tile` for `worker`. Returns `true` on success,
+    /// `false` if another worker already holds the slot.
+    pub fn try_reserve(&mut self, tile: (i32, i32), worker: Entity, now: u64) -> bool {
+        if self.by_tile.contains_key(&tile) {
+            return false;
+        }
+        self.by_tile.insert(
+            tile,
+            PrepareFieldReservation {
+                worker,
+                reserved_tick: now,
+            },
+        );
+        true
+    }
+
+    /// Drops the reservation at `tile`. No-op if `tile` isn't reserved.
+    /// Idempotent — every teardown path can call this without checking.
+    #[inline]
+    pub fn release(&mut self, tile: (i32, i32)) {
+        self.by_tile.remove(&tile);
+    }
+
+    /// Drops every reservation held by `worker`. Defensive: used on the
+    /// type-mismatch executor exit and by the daily GC pass.
+    pub fn release_for_worker(&mut self, worker: Entity) {
+        self.by_tile.retain(|_, r| r.worker != worker);
+    }
+}
+
 /// Per-plot tile classification used by the foreman pass in
 /// `chief_job_posting_system`. Counts mirror the predicates encoded in
 /// `find_nearest_plantable_in_rect` / `find_nearest_unprepared_in_rect` plus
@@ -385,10 +443,13 @@ pub fn find_nearest_plantable_in_rect(
 }
 
 /// Find the nearest tile in `rect` that needs Prepare work — either not yet
-/// `Cropland` OR `FieldTileIndex[tile].nutrients < EXHAUSTED_FLOOR`.
+/// `Cropland` OR `FieldTileIndex[tile].nutrients < EXHAUSTED_FLOOR`. Tiles
+/// held by a live `PrepareFieldReservations` slot are skipped so two farmers
+/// can't dispatch onto the same tile.
 pub fn find_nearest_unprepared_in_rect(
     chunk_map: &crate::world::chunk::ChunkMap,
     field_tiles: &FieldTileIndex,
+    reservations: &PrepareFieldReservations,
     from: (i32, i32),
     rect_min: (i32, i32),
     rect_max: (i32, i32),
@@ -397,6 +458,9 @@ pub fn find_nearest_unprepared_in_rect(
     let mut best_dist = i32::MAX;
     for ty in rect_min.1..=rect_max.1 {
         for tx in rect_min.0..=rect_max.0 {
+            if reservations.is_reserved((tx, ty)) {
+                continue;
+            }
             let is_cropland = matches!(
                 chunk_map.tile_kind_at(tx, ty),
                 Some(crate::world::tile::TileKind::Cropland)
@@ -859,6 +923,7 @@ pub fn prepare_field_task_system(
     mut chunk_map: ResMut<crate::world::chunk::ChunkMap>,
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
     mut field_tiles: ResMut<FieldTileIndex>,
+    mut reservations: ResMut<PrepareFieldReservations>,
     mut board: ResMut<crate::simulation::jobs::JobBoard>,
     mut completed_events: EventWriter<crate::simulation::jobs::JobCompletedEvent>,
     mut workers: Query<
@@ -886,8 +951,11 @@ pub fn prepare_field_task_system(
         if aq.current_task_kind() != TaskKind::PrepareField as u16 {
             continue;
         }
-        // Defence-in-depth: typed channel mismatch means a stale write.
+        // Defence-in-depth: typed channel mismatch means a stale write. Drop
+        // every reservation the worker might be holding before cancelling —
+        // the stale write could correspond to any prior dispatch.
         let Some(tile) = aq.current.as_prepare_field() else {
+            reservations.release_for_worker(actor);
             aq.cancel_chain(&mut ai);
             continue;
         };
@@ -897,12 +965,28 @@ pub fn prepare_field_task_system(
         if (ai.work_progress as u16) < FIELD_PREP_WORK_TICKS {
             continue;
         }
-        // Completion: stamp tile to Cropland (preserving elevation/fertility/
-        // flags/ore), emit a change event, bump nutrients up to the
-        // exhausted-floor minimum, credit the posting, grant XP, exit.
+        // Stale-completion guard. A sibling worker that finalised this tile
+        // one tick earlier could leave us here with `work_progress` already
+        // at the threshold. Exit cleanly without crediting the posting,
+        // granting XP, or re-emitting `TileChangedEvent` — the tile is
+        // already prepared.
         let (tx, ty) = tile;
         let z = chunk_map.surface_z_at(tx, ty);
         let cur = chunk_map.tile_at(tx, ty, z);
+        let already_prepared = cur.kind == TileKind::Cropland
+            && field_tiles
+                .by_tile
+                .get(&tile)
+                .map(|s| s.nutrients >= EXHAUSTED_FLOOR)
+                .unwrap_or(false);
+        if already_prepared {
+            reservations.release(tile);
+            aq.finish_task(&mut ai);
+            continue;
+        }
+        // Completion: stamp tile to Cropland (preserving elevation/fertility/
+        // flags/ore), emit a change event, bump nutrients up to the
+        // exhausted-floor minimum, credit the posting, grant XP, exit.
         if cur.kind != TileKind::Cropland {
             chunk_map.set_tile(
                 tx,
@@ -940,9 +1024,50 @@ pub fn prepare_field_task_system(
             }
         }
         skills.gain_xp(SkillKind::Farming, SKILL_XP_PER_PREP_TILE);
+        reservations.release(tile);
         let _ = actor;
         aq.finish_task(&mut ai);
     }
+}
+
+/// Daily GC for `PrepareFieldReservations`. Drops any reservation whose
+/// holder (a) no longer exists, (b) is no longer running or queueing a
+/// `Task::PrepareField { tile }` for the reserved tile, or (c) was reserved
+/// more than `RESERVATION_MAX_AGE_TICKS` ticks ago (catches goal-flip cancels,
+/// Dormant LOD demotions, and any other release path the executor /
+/// dispatcher didn't cover). Mirrors `plants::planting_reservation_gc_system`.
+pub fn prepare_field_reservation_gc_system(
+    clock: Res<SimClock>,
+    mut reservations: ResMut<PrepareFieldReservations>,
+    aq_q: Query<&crate::simulation::typed_task::ActionQueue>,
+) {
+    const RESERVATION_MAX_AGE_TICKS: u64 = TICKS_PER_DAY as u64;
+    let now = clock.tick;
+    if now % RESERVATION_MAX_AGE_TICKS != 0 {
+        return;
+    }
+    reservations.by_tile.retain(|tile, r| {
+        if now.saturating_sub(r.reserved_tick) > RESERVATION_MAX_AGE_TICKS {
+            return false;
+        }
+        let Ok(aq) = aq_q.get(r.worker) else {
+            // Worker entity gone.
+            return false;
+        };
+        // Live iff the worker's current task or any queued task targets
+        // *this* tile via `Task::PrepareField`. Walk the prefetch ring so a
+        // worker that chain-handed to a different PrepareField tile drops
+        // the stale slot.
+        if aq.current.as_prepare_field() == Some(*tile) {
+            return true;
+        }
+        for slot in aq.queued_iter() {
+            if slot.as_prepare_field() == Some(*tile) {
+                return true;
+            }
+        }
+        false
+    });
 }
 
 /// Per-season-edge Economy system. Walks every entry in `FieldTileIndex`; for
@@ -1633,5 +1758,103 @@ mod tests {
             bumped,
             crate::simulation::projects::PRIORITY_PLAYER
         );
+    }
+
+    // --- PrepareFieldReservations -----------------------------------------
+
+    #[test]
+    fn prepare_field_reservation_basic() {
+        let mut r = PrepareFieldReservations::default();
+        let worker_a = Entity::from_raw(1);
+        let worker_b = Entity::from_raw(2);
+        let tile = (5, 7);
+        assert!(!r.is_reserved(tile));
+        assert!(r.try_reserve(tile, worker_a, 100));
+        assert!(r.is_reserved(tile));
+        // Second reserve fails — slot held by worker_a.
+        assert!(!r.try_reserve(tile, worker_b, 101));
+        // release clears the slot; subsequent reserve succeeds.
+        r.release(tile);
+        assert!(!r.is_reserved(tile));
+        assert!(r.try_reserve(tile, worker_b, 102));
+        // release_for_worker drops only worker_b's entries.
+        r.try_reserve((9, 9), worker_a, 103);
+        r.release_for_worker(worker_b);
+        assert!(!r.is_reserved(tile));
+        assert!(r.is_reserved((9, 9)));
+    }
+
+    #[test]
+    fn find_nearest_unprepared_in_rect_skips_reserved() {
+        // Empty ChunkMap → every tile reads kind=None, so every tile in rect
+        // counts as unprepared. Reservation gating is the only filter.
+        let chunk_map = crate::world::chunk::ChunkMap::default();
+        let field_tiles = FieldTileIndex::default();
+        let mut reservations = PrepareFieldReservations::default();
+        let from = (0, 0);
+        let rect_min = (0, 0);
+        let rect_max = (2, 0);
+        // Nearest is (0,0). Reserve it, expect (1,0) next.
+        let worker = Entity::from_raw(1);
+        assert!(reservations.try_reserve((0, 0), worker, 0));
+        let pick = find_nearest_unprepared_in_rect(
+            &chunk_map,
+            &field_tiles,
+            &reservations,
+            from,
+            rect_min,
+            rect_max,
+        );
+        assert_eq!(pick, Some((1, 0)));
+        // Reserve every tile → helper returns None.
+        assert!(reservations.try_reserve((1, 0), worker, 0));
+        assert!(reservations.try_reserve((2, 0), worker, 0));
+        assert_eq!(
+            find_nearest_unprepared_in_rect(
+                &chunk_map,
+                &field_tiles,
+                &reservations,
+                from,
+                rect_min,
+                rect_max,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn posting_target_workers_field_work_caps_remaining_work() {
+        use crate::simulation::jobs::{
+            posting_target_workers, JobKind, JobPosting, JobProgress, TileAabb,
+        };
+        fn posting(target: u32, completed: u32) -> JobPosting {
+            JobPosting {
+                id: 0,
+                faction_id: 0,
+                kind: JobKind::Farm,
+                progress: JobProgress::FieldWork {
+                    phase: FarmWorkPhase::Prepare,
+                    completed,
+                    target,
+                    area: TileAabb {
+                        min: (0, 0),
+                        max: (0, 0),
+                    },
+                    plot_id: None,
+                    assigned_farmer: None,
+                },
+                ..JobPosting::chief_defaults()
+            }
+        }
+        // 1-tile posting: 1 worker.
+        assert_eq!(posting_target_workers(&posting(1, 0)), 1);
+        // 16-tile posting: scaled floor is 3.
+        assert_eq!(posting_target_workers(&posting(16, 0)), 3);
+        // 256-tile posting: scaled ceiling is 12.
+        assert_eq!(posting_target_workers(&posting(256, 0)), 12);
+        // Almost-complete posting caps to remaining tiles.
+        assert_eq!(posting_target_workers(&posting(16, 15)), 1);
+        // Saturating-sub floor: completed == target → 1, never 0.
+        assert_eq!(posting_target_workers(&posting(8, 8)), 1);
     }
 }
