@@ -23,7 +23,8 @@ use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::chunk_router::ChunkRouter;
 use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::simulation::construction::{
-    Bed, BedMap, BuildSiteKind, Campfire, CampfireMap, ShelterTier, StructureLabel, TentShelter,
+    Bed, BedMap, BedTier, BuildSiteKind, Campfire, CampfireMap, ShelterTier, StructureLabel,
+    TentShelter,
 };
 use crate::simulation::faction::{
     release_reservation, FactionMember, FactionRegistry, StorageReservations,
@@ -599,9 +600,18 @@ pub fn pitch_structure_at_task_system(
     mut campfire_map: ResMut<CampfireMap>,
     mut tile_changed: EventWriter<TileChangedEvent>,
     mut ground_q: Query<(Entity, &Transform, &mut GroundItem)>,
-    mut workers: Query<(&mut PersonAI, &mut ActionQueue, &BucketSlot, &LodLevel), With<Person>>,
+    mut workers: Query<
+        (
+            &mut PersonAI,
+            &mut ActionQueue,
+            &BucketSlot,
+            &LodLevel,
+            &crate::simulation::faction::FactionMember,
+        ),
+        With<Person>,
+    >,
 ) {
-    for (mut ai, mut aq, slot, lod) in workers.iter_mut() {
+    for (mut ai, mut aq, slot, lod, member) in workers.iter_mut() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -648,7 +658,11 @@ pub fn pitch_structure_at_task_system(
             BuildSiteKind::Bedroll => {
                 let e = commands
                     .spawn((
-                        Bed::default(),
+                        Bed {
+                            owner: None,
+                            tier: BedTier::Crude,
+                            owning_faction: Some(member.faction_id),
+                        },
                         Deployable::fully_packable(crate::economy::core_ids::bedroll()),
                         StructureLabel("Bedroll"),
                         Transform::from_xyz(world_pos.x, world_pos.y, 0.35),

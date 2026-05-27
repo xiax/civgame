@@ -366,11 +366,15 @@ impl BedTier {
 
 /// Placed on completed bed entities. `owner` is the person who has claimed
 /// this bed as theirs; cleared when the owner dies (`death_system`) and
-/// reassigned by `assign_beds_system`.
+/// reassigned by `assign_beds_system`. `owning_faction` is the faction that
+/// built/seeded the bed (root or sub-faction id); `None` flags a legacy or
+/// pre-tag spawn and is resolved at assignment time via `PlotIndex` lookup
+/// then the settlement-tile-union backstop in `bed_eligible_for_faction`.
 #[derive(Component, Default)]
 pub struct Bed {
     pub owner: Option<Entity>,
     pub tier: BedTier,
+    pub owning_faction: Option<u32>,
 }
 
 /// Persistent bed claim on a person. Inserted/updated by `assign_beds_system`.
@@ -5104,6 +5108,7 @@ pub fn construction_system(
                     let bed = Bed {
                         owner: None,
                         tier: best_bed_for(&build_techs),
+                        owning_faction: Some(bp.faction_id),
                     };
                     let label = bed.tier.label();
                     let bed_entity = commands
@@ -5128,7 +5133,11 @@ pub fn construction_system(
                     // unchanged; the `Deployable` marker lets Phase 8's
                     // `pack_deployable` convert it back into a `bedroll`
                     // good when the camp moves.
-                    let bed = Bed::default();
+                    let bed = Bed {
+                        owner: None,
+                        tier: BedTier::Crude,
+                        owning_faction: Some(bp.faction_id),
+                    };
                     let bed_entity = commands
                         .spawn((
                             bed,
@@ -5795,6 +5804,55 @@ pub fn construction_system(
 /// Affinity threshold above which a homeless woman gets a "discount" toward
 /// beds close to her partner's bed.
 const PARTNER_AFFINITY_THRESHOLD: i8 = 60;
+
+/// Chebyshev radius for the home-tile / settlement-market-tile backstop used
+/// when a legacy untagged bed has no `PlotIndex` entry. Same magnitude as the
+/// pre-fix box but chebyshev (matches the rest of the codebase) and only the
+/// legacy safety net, not the primary filter.
+pub(crate) const BED_FALLBACK_RADIUS: i32 = 30;
+
+/// Pure predicate: is a bed with `bed_owning_faction` at `bed_tile` claimable
+/// by a worker rooted at `viewer_root`?
+///
+/// Pure-fn shape so tests can drive it without an `App`. The system caller
+/// wraps `PlotIndex` + `Query<&Plot>` into the `plot_faction_at` closure and
+/// `FactionRegistry::root_faction` into `root_of`.
+///
+/// Resolution order:
+/// 1. `bed_owning_faction == Some(fid)` → eligible iff `root_of(fid) == viewer_root`.
+/// 2. Untagged (legacy / pre-tag spawn): `plot_faction_at(bed_tile)` returns the
+///    plot's `Plot.faction_id` (if any). Compare `root_of(plot_faction)` to
+///    `viewer_root` — that decision is final when the bed sits in a plot.
+/// 3. Untagged and not in any plot → accept if the bed tile sits within
+///    chebyshev `BED_FALLBACK_RADIUS` of any tile in `anchor_tiles` (the
+///    viewer-faction's home + every owned `Settlement.market_tile`).
+///
+/// Households (`HouseholdMember`) consult the parent village's root via
+/// `root_of`, so a household member can claim a bed inside the parent
+/// village's residential plot.
+pub(crate) fn bed_eligible_for_faction(
+    bed_owning_faction: Option<u32>,
+    bed_tile: (i32, i32),
+    viewer_root: u32,
+    root_of: &impl Fn(u32) -> u32,
+    plot_faction_at: &impl Fn((i32, i32)) -> Option<u32>,
+    anchor_tiles: &[(i32, i32)],
+) -> bool {
+    // 1. Tagged beds: rooted-faction equality.
+    if let Some(bed_faction) = bed_owning_faction {
+        return root_of(bed_faction) == viewer_root;
+    }
+    // 2. Untagged: plot-derived ownership is authoritative when present.
+    if let Some(plot_faction) = plot_faction_at(bed_tile) {
+        return root_of(plot_faction) == viewer_root;
+    }
+    // 3. Untagged + no plot: settlement-anchor chebyshev backstop.
+    anchor_tiles.iter().any(|&(ax, ay)| {
+        let dx = (bed_tile.0 - ax).abs();
+        let dy = (bed_tile.1 - ay).abs();
+        dx.max(dy) <= BED_FALLBACK_RADIUS
+    })
+}
 /// Higher bar for an *already-housed* woman to abandon her bed for one closer
 /// to her partner (hysteresis vs PARTNER_AFFINITY_THRESHOLD prevents flapping).
 const REASSIGN_AFFINITY_THRESHOLD: i8 = 80;
@@ -5819,7 +5877,7 @@ const PARTNER_PROXIMITY_BONUS: i32 = 50;
 pub fn assign_beds_system(
     mut commands: Commands,
     mut bed_query: Query<&mut Bed>,
-    person_query: Query<
+    mut person_query: Query<
         (
             Entity,
             &FactionMember,
@@ -5828,6 +5886,8 @@ pub fn assign_beds_system(
             Option<&crate::simulation::memory::RelationshipMemory>,
             Option<&crate::simulation::reproduction::BiologicalSex>,
             Option<&crate::simulation::reproduction::HouseholdMember>,
+            Option<&mut PersonAI>,
+            Option<&mut crate::simulation::typed_task::ActionQueue>,
         ),
         With<Person>,
     >,
@@ -5837,6 +5897,10 @@ pub fn assign_beds_system(
     faction_registry: Res<FactionRegistry>,
     clock: Res<SimClock>,
     chunk_map: Res<ChunkMap>,
+    plot_index: Res<crate::simulation::land::PlotIndex>,
+    plot_q: Query<&crate::simulation::land::Plot>,
+    settlement_map: Res<crate::simulation::settlement::SettlementMap>,
+    settlement_q: Query<&crate::simulation::settlement::Settlement>,
 ) {
     use crate::simulation::reproduction::BiologicalSex;
     use crate::simulation::settlement_bootstrap::SPOUSE_AFFINITY;
@@ -5846,6 +5910,12 @@ pub fn assign_beds_system(
     }
 
     let mut claimed_this_pass: AHashSet<Entity> = AHashSet::new();
+    // Workers freshly assigned a `HomeBed` this pass — drained after every
+    // assignment loop to cancel any in-flight `Task::Sleep { bed: None }` so the
+    // next `htn_sleep_dispatch_system` tick re-routes them to the new bed
+    // instead of finishing the night outside. See `bed_eligible_for_faction`
+    // header for the wider fix.
+    let mut cancel_bedless_sleep: Vec<Entity> = Vec::new();
 
     // Reverse lookup: bed entity → tile position. BedMap is sparse so the
     // collect is cheap.
@@ -5864,7 +5934,7 @@ pub fn assign_beds_system(
     }
     let partner_info: AHashMap<Entity, PartnerInfo> = person_query
         .iter()
-        .map(|(e, fm, tr, hb, _, sex, hh)| {
+        .map(|(e, fm, tr, hb, _, sex, hh, _, _)| {
             let tx = (tr.translation.x / crate::world::terrain::TILE_SIZE).floor() as i32;
             let ty = (tr.translation.y / crate::world::terrain::TILE_SIZE).floor() as i32;
             (
@@ -5932,7 +6002,7 @@ pub fn assign_beds_system(
     // time Pass A and the homeless faction pass run, seeded spouses are
     // already paired into adjacent beds inside their dwelling footprint.
     let mut paired_this_pass: AHashSet<Entity> = AHashSet::new();
-    for (person, member, _transform, home_bed_opt, rel_opt, _sex_opt, household_opt) in
+    for (person, member, _transform, home_bed_opt, rel_opt, _sex_opt, household_opt, _, _) in
         &person_query
     {
         if member.faction_id == SOLO {
@@ -6057,6 +6127,8 @@ pub fn assign_beds_system(
         }
         commands.entity(person).insert(HomeBed(Some(first_e)));
         commands.entity(partner).insert(HomeBed(Some(second_e)));
+        cancel_bedless_sleep.push(person);
+        cancel_bedless_sleep.push(partner);
         claimed_this_pass.insert(first_e);
         claimed_this_pass.insert(second_e);
         paired_this_pass.insert(person);
@@ -6064,7 +6136,7 @@ pub fn assign_beds_system(
     }
 
     // ── Pass A: re-evaluate already-housed women whose partner lives far away.
-    for (person, member, _transform, home_bed_opt, rel_opt, sex_opt, household_opt) in
+    for (person, member, _transform, home_bed_opt, rel_opt, sex_opt, household_opt, _, _) in
         &person_query
     {
         if member.faction_id == SOLO {
@@ -6189,7 +6261,7 @@ pub fn assign_beds_system(
     // spouse's bed — never queues a blueprint. Closes the loop for the rare
     // case where Pass 0 couldn't pair them in a single pass (mid-game
     // household formation, mid-game spawn, abstract-faction materialisation).
-    for (person, _member, _transform, home_bed_opt, rel_opt, _sex_opt, household_opt) in
+    for (person, _member, _transform, home_bed_opt, rel_opt, _sex_opt, household_opt, _, _) in
         &person_query
     {
         let Some(my_hh) = household_opt else { continue };
@@ -6284,14 +6356,41 @@ pub fn assign_beds_system(
         }
     }
 
+    // ── Anchor tiles per root faction ────────────────────────────────────────
+    // Backstop anchors for legacy untagged beds in `bed_eligible_for_faction`:
+    // every faction's `home_tile` (households contribute their own home so a
+    // member-local fallback still works) plus every owned `Settlement.market_tile`.
+    // Keyed by `root_faction` so household members share the parent village's
+    // anchors.
+    let mut anchors_by_root: AHashMap<u32, Vec<(i32, i32)>> = AHashMap::new();
+    for (faction_id, data) in faction_registry.factions.iter() {
+        let root = faction_registry.root_faction(*faction_id);
+        anchors_by_root.entry(root).or_default().push(data.home_tile);
+    }
+    for (faction_id, ids) in settlement_map.by_faction.iter() {
+        let root = faction_registry.root_faction(*faction_id);
+        let bucket = anchors_by_root.entry(root).or_default();
+        for sid in ids {
+            if let Some(&se) = settlement_map.by_id.get(sid) {
+                if let Ok(s) = settlement_q.get(se) {
+                    bucket.push(s.market_tile);
+                }
+            }
+        }
+    }
+    let empty_anchors: Vec<(i32, i32)> = Vec::new();
+
     // ── Faction pass ─────────────────────────────────────────────────────────
     struct Homeless {
         person: Entity,
         pos: (i32, i32),
         partner_bed: Option<(i32, i32)>,
     }
-    let mut homeless_by_faction: AHashMap<u32, Vec<Homeless>> = AHashMap::new();
-    for (person, member, transform, home_bed, rel_opt, sex_opt, _household_opt) in &person_query {
+    // Bucket by root_faction so households share the village's bed pool.
+    let mut homeless_by_root: AHashMap<u32, Vec<Homeless>> = AHashMap::new();
+    for (person, member, transform, home_bed, rel_opt, sex_opt, _household_opt, _, _) in
+        &person_query
+    {
         if member.faction_id == SOLO {
             continue;
         }
@@ -6314,8 +6413,9 @@ pub fn assign_beds_system(
             ),
             _ => None,
         };
-        homeless_by_faction
-            .entry(member.faction_id)
+        let root = faction_registry.root_faction(member.faction_id);
+        homeless_by_root
+            .entry(root)
             .or_default()
             .push(Homeless {
                 person,
@@ -6324,26 +6424,38 @@ pub fn assign_beds_system(
             });
     }
 
-    for (faction_id, homeless) in homeless_by_faction {
-        let Some(fd) = faction_registry.factions.get(&faction_id) else {
-            continue;
-        };
-        let home = fd.home_tile;
+    let root_of = |fid: u32| faction_registry.root_faction(fid);
+    let plot_faction_at = |tile: (i32, i32)| -> Option<u32> {
+        let plot_id = plot_index.plot_at(tile.0, tile.1)?;
+        let plot_entity = *plot_index.by_id.get(&plot_id)?;
+        let plot = plot_q.get(plot_entity).ok()?;
+        Some(plot.faction_id)
+    };
+
+    for (root, homeless) in homeless_by_root {
+        let anchors = anchors_by_root.get(&root).unwrap_or(&empty_anchors);
         let mut available: Vec<(Entity, (i32, i32))> = bed_map
             .0
             .iter()
-            .filter(|(pos, _)| {
-                (pos.0 as i32 - home.0 as i32).abs() <= 30
-                    && (pos.1 as i32 - home.1 as i32).abs() <= 30
-            })
             .filter_map(|(pos, &bed_entity)| {
                 if claimed_this_pass.contains(&bed_entity) {
                     return None;
                 }
-                match bed_query.get(bed_entity) {
-                    Ok(b) if b.owner.is_none() => Some((bed_entity, *pos)),
-                    _ => None,
+                let bed = bed_query.get(bed_entity).ok()?;
+                if bed.owner.is_some() {
+                    return None;
                 }
+                if !bed_eligible_for_faction(
+                    bed.owning_faction,
+                    *pos,
+                    root,
+                    &root_of,
+                    &plot_faction_at,
+                    anchors,
+                ) {
+                    return None;
+                }
+                Some((bed_entity, *pos))
             })
             .collect();
 
@@ -6377,6 +6489,7 @@ pub fn assign_beds_system(
             let (bed_e, _) = available.swap_remove(best_idx);
             claimed_this_pass.insert(bed_e);
             commands.entity(h.person).insert(HomeBed(Some(bed_e)));
+            cancel_bedless_sleep.push(h.person);
             if let Ok(mut bed_comp) = bed_query.get_mut(bed_e) {
                 bed_comp.owner = Some(h.person);
             }
@@ -6385,7 +6498,8 @@ pub fn assign_beds_system(
 
     // ── Solo pass ─────────────────────────────────────────────────────────────
     // Solo agents claim any nearby unclaimed bed, or place a personal blueprint.
-    for (person, member, transform, home_bed, _, _, _) in &person_query {
+    let solo_anchors = anchors_by_root.get(&SOLO).unwrap_or(&empty_anchors);
+    for (person, member, transform, home_bed, _, _, _, _, _) in &person_query {
         if member.faction_id != SOLO {
             continue;
         }
@@ -6399,21 +6513,32 @@ pub fn assign_beds_system(
         let tx = (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / crate::world::terrain::TILE_SIZE).floor() as i32;
 
-        // Try to claim the nearest unclaimed bed within 30 tiles.
+        // Claim the nearest unclaimed eligible bed (eligibility per the helper:
+        // SOLO-tagged or untagged-with-no-other-faction's-plot — `solo_anchors`
+        // backstops the legacy radius case).
         let mut best_bed: Option<(Entity, i32)> = None;
         for (&bpos, &bed_entity) in &bed_map.0 {
             if claimed_this_pass.contains(&bed_entity) {
                 continue;
             }
-            if bed_query
-                .get(bed_entity)
-                .map(|b| b.owner.is_some())
-                .unwrap_or(true)
-            {
+            let Ok(bed) = bed_query.get(bed_entity) else {
+                continue;
+            };
+            if bed.owner.is_some() {
                 continue;
             }
-            let d = (bpos.0 as i32 - tx as i32).abs() + (bpos.1 as i32 - ty as i32).abs();
-            if d <= 30 && best_bed.map(|(_, bd)| d < bd).unwrap_or(true) {
+            if !bed_eligible_for_faction(
+                bed.owning_faction,
+                bpos,
+                SOLO,
+                &root_of,
+                &plot_faction_at,
+                solo_anchors,
+            ) {
+                continue;
+            }
+            let d = (bpos.0 - tx).abs() + (bpos.1 - ty).abs();
+            if best_bed.map(|(_, bd)| d < bd).unwrap_or(true) {
                 best_bed = Some((bed_entity, d));
             }
         }
@@ -6421,6 +6546,7 @@ pub fn assign_beds_system(
         if let Some((bed_e, _)) = best_bed {
             claimed_this_pass.insert(bed_e);
             commands.entity(person).insert(HomeBed(Some(bed_e)));
+            cancel_bedless_sleep.push(person);
             if let Ok(mut bed_comp) = bed_query.get_mut(bed_e) {
                 bed_comp.owner = Some(person);
             }
@@ -6445,6 +6571,21 @@ pub fn assign_beds_system(
                     ))
                     .id();
                 bp_map.0.insert((tx, ty), bp_e);
+            }
+        }
+    }
+
+    // ── Cancel any in-flight bedless Sleep on freshly-bedded workers ─────────
+    // Workers that were dispatched `Task::Sleep { bed: None }` (in-place /
+    // home-tile fallback) need their chain cancelled now that they have a
+    // `HomeBed`, otherwise they finish the night outside and only re-route on
+    // the next dispatch. `htn_sleep_dispatch_system` re-evaluates next tick.
+    for person in cancel_bedless_sleep {
+        if let Ok((_, _, _, _, _, _, _, Some(mut ai), Some(mut aq))) =
+            person_query.get_mut(person)
+        {
+            if aq.current.as_sleep() == Some(None) {
+                aq.cancel_chain(&mut ai);
             }
         }
     }
@@ -6847,6 +6988,7 @@ fn spawn_seeded_structure_at_tile(
             let bed = Bed {
                 owner: None,
                 tier: best_bed_for(seed_techs),
+                owning_faction: Some(faction_id),
             };
             let label = bed.tier.label();
             let e = commands
@@ -6863,7 +7005,11 @@ fn spawn_seeded_structure_at_tile(
             maps.bed_map.0.insert(tile, e);
         }
         BuildSiteKind::Bedroll => {
-            let bed = Bed::default();
+            let bed = Bed {
+                owner: None,
+                tier: BedTier::Crude,
+                owning_faction: Some(faction_id),
+            };
             let e = commands
                 .spawn((
                     bed,
@@ -7285,6 +7431,7 @@ pub fn seed_starting_buildings_system(
                     &mut used,
                     hearth_tile,
                     beds_per_hearth,
+                    faction_id,
                 );
             }
             continue;
@@ -7638,6 +7785,7 @@ fn seed_walled_house_at(
                 let bed = Bed {
                     owner: None,
                     tier: best_bed_for(seed_techs),
+                    owning_faction: Some(faction_id),
                 };
                 let label = bed.tier.label();
                 let e = commands
@@ -7799,6 +7947,7 @@ pub(crate) fn seed_nomadic_camp(
             used,
             hearth_tile,
             bedrolls_per_hearth,
+            faction_id,
         );
 
         // Tents — outer ring shelter (sticks-and-leaves; 50% wood refund on
@@ -7838,6 +7987,7 @@ fn seed_bedrolls_around_hearth(
     used: &mut AHashSet<(i32, i32)>,
     hearth: (i32, i32),
     count: u32,
+    faction_id: u32,
 ) {
     let bedroll_id = crate::economy::core_ids::bedroll();
     let mut placed = 0u32;
@@ -7864,7 +8014,11 @@ fn seed_bedrolls_around_hearth(
                     continue;
                 }
                 let world_pos = tile_to_world(tile.0, tile.1);
-                let bed = Bed::default();
+                let bed = Bed {
+                    owner: None,
+                    tier: BedTier::Crude,
+                    owning_faction: Some(faction_id),
+                };
                 let e = commands
                     .spawn((
                         bed,
@@ -8015,6 +8169,7 @@ fn seed_paleo_beds_around_hearth(
     used: &mut AHashSet<(i32, i32)>,
     hearth: (i32, i32),
     count: u32,
+    faction_id: u32,
 ) {
     let mut placed = 0u32;
     'outer: for radius in 2i32..=5 {
@@ -8040,7 +8195,11 @@ fn seed_paleo_beds_around_hearth(
                     continue;
                 }
                 let world_pos = tile_to_world(tile.0, tile.1);
-                let bed = Bed::default();
+                let bed = Bed {
+                    owner: None,
+                    tier: BedTier::default(),
+                    owning_faction: Some(faction_id),
+                };
                 let label = bed.tier.label();
                 let e = commands
                     .spawn((
@@ -8797,5 +8956,179 @@ mod tests {
             "tile in an unloaded chunk must not be restamped"
         );
         assert!(drain_wall_changed(&mut app).is_empty());
+    }
+
+    // ── Bed eligibility predicate (plans/workers-sleeping-outside.md) ────────
+
+    /// Identity root for tests with no parent-faction graph.
+    fn root_identity(fid: u32) -> u32 {
+        fid
+    }
+    fn no_plot(_tile: (i32, i32)) -> Option<u32> {
+        None
+    }
+
+    #[test]
+    fn same_faction_tagged_bed_beyond_30_tiles_is_eligible() {
+        // Pre-fix: any bed >30 chebyshev from home_tile was rejected. Now the
+        // faction tag short-circuits the radius gate so a satellite Hamlet bed
+        // 40 tiles away is claimable by its own faction.
+        let anchors = vec![(0, 0)];
+        assert!(bed_eligible_for_faction(
+            Some(7),
+            (40, 0),
+            7,
+            &root_identity,
+            &no_plot,
+            &anchors,
+        ));
+    }
+
+    #[test]
+    fn other_faction_tagged_bed_is_rejected() {
+        // Tagged-bed mismatch wins over any radius proximity.
+        let anchors = vec![(0, 0)];
+        assert!(!bed_eligible_for_faction(
+            Some(9),
+            (5, 5),
+            7,
+            &root_identity,
+            &no_plot,
+            &anchors,
+        ));
+    }
+
+    #[test]
+    fn legacy_untagged_bed_in_same_faction_plot_is_eligible() {
+        // No tag, but plot lookup returns viewer's own faction → claim.
+        let anchors = vec![(0, 0)];
+        let plot_of = |tile: (i32, i32)| if tile == (50, 50) { Some(7) } else { None };
+        assert!(bed_eligible_for_faction(
+            None,
+            (50, 50),
+            7,
+            &root_identity,
+            &plot_of,
+            &anchors,
+        ));
+    }
+
+    #[test]
+    fn legacy_untagged_bed_in_other_faction_plot_is_rejected() {
+        // Plot ownership trumps the radius backstop — a foreign plot blocks the
+        // claim even if the bed sits inside `BED_FALLBACK_RADIUS` of home.
+        let anchors = vec![(0, 0)];
+        let plot_of = |tile: (i32, i32)| if tile == (10, 10) { Some(9) } else { None };
+        assert!(!bed_eligible_for_faction(
+            None,
+            (10, 10),
+            7,
+            &root_identity,
+            &plot_of,
+            &anchors,
+        ));
+    }
+
+    #[test]
+    fn legacy_untagged_bed_without_plot_uses_anchor_radius() {
+        // No tag, no plot — fall through to the chebyshev radius backstop.
+        // Inside radius around any anchor → eligible.
+        let anchors = vec![(0, 0), (200, 200)];
+        assert!(bed_eligible_for_faction(
+            None,
+            (15, 25),
+            7,
+            &root_identity,
+            &no_plot,
+            &anchors,
+        ));
+        // Settlement-anchor backstop catches beds near a satellite market_tile.
+        assert!(bed_eligible_for_faction(
+            None,
+            (220, 215),
+            7,
+            &root_identity,
+            &no_plot,
+            &anchors,
+        ));
+    }
+
+    #[test]
+    fn legacy_untagged_bed_outside_all_anchors_is_rejected() {
+        let anchors = vec![(0, 0), (200, 200)];
+        assert!(!bed_eligible_for_faction(
+            None,
+            (1000, 1000),
+            7,
+            &root_identity,
+            &no_plot,
+            &anchors,
+        ));
+    }
+
+    #[test]
+    fn household_member_claims_parent_village_bed_via_root() {
+        // Household 12 is a sub-faction of village 7. Bed is tagged for the
+        // village; household member's viewer_root resolves to 7 → eligible.
+        let anchors = vec![(0, 0)];
+        let root_of = |fid: u32| match fid {
+            12 => 7,
+            other => other,
+        };
+        // Worker is in household 12 (viewer_root = root_of(12) = 7).
+        let viewer_root = root_of(12);
+        assert!(bed_eligible_for_faction(
+            Some(7),
+            (5, 5),
+            viewer_root,
+            &root_of,
+            &no_plot,
+            &anchors,
+        ));
+        // Bed tagged for sibling household 13 (also rooted at 7) still claimable.
+        let root_of2 = |fid: u32| match fid {
+            12 | 13 => 7,
+            other => other,
+        };
+        assert!(bed_eligible_for_faction(
+            Some(13),
+            (5, 5),
+            viewer_root,
+            &root_of2,
+            &no_plot,
+            &anchors,
+        ));
+    }
+
+    #[test]
+    fn chebyshev_backstop_uses_30_tile_radius() {
+        // Boundary check on `BED_FALLBACK_RADIUS = 30`.
+        let anchors = vec![(0, 0)];
+        // Exactly 30 chebyshev → eligible.
+        assert!(bed_eligible_for_faction(
+            None,
+            (30, 0),
+            7,
+            &root_identity,
+            &no_plot,
+            &anchors,
+        ));
+        assert!(bed_eligible_for_faction(
+            None,
+            (30, 30),
+            7,
+            &root_identity,
+            &no_plot,
+            &anchors,
+        ));
+        // 31 chebyshev → rejected.
+        assert!(!bed_eligible_for_faction(
+            None,
+            (31, 0),
+            7,
+            &root_identity,
+            &no_plot,
+            &anchors,
+        ));
     }
 }
