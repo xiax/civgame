@@ -49,6 +49,50 @@ pub struct Plant {
     pub tile_pos: (i32, i32),
 }
 
+/// Catalog species attached as a sibling component alongside `Plant`. Drives
+/// per-species behaviour (harvest profile, sowing window, native realms,
+/// sprite palette). Spawn helpers (`spawn_plant_at`, scatter, chunk-gen)
+/// attach this automatically; legacy test fixtures that spawn raw `Plant`
+/// fall back to `PlantCatalog::default_for_kind(plant.kind)` when reading.
+#[derive(Component, Copy, Clone, Debug)]
+pub struct PlantSpecies(pub crate::simulation::plant_catalog::PlantSpeciesId);
+
+impl PlantSpecies {
+    pub fn id(self) -> crate::simulation::plant_catalog::PlantSpeciesId {
+        self.0
+    }
+}
+
+/// Phase 6: deterministic per-entity variant index `0..=2`. Stamped at
+/// spawn from `(species, tile)` via splitmix64. Held by every Plant so
+/// stage transitions (Seedling → Mature → Overripe → Harvested) keep the
+/// same silhouette pick across the plant's lifetime.
+#[derive(Component, Copy, Clone, Debug)]
+pub struct PlantSpriteVariant(pub u8);
+
+#[inline]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// Pick a stable variant index for `(species, tile)`. Caller mods by the
+/// species' actual variant count via `ResolvedPlantDef::sprite_variants()`
+/// at sprite-resolve time — the raw byte stored on the component is the
+/// upper bound (3-way) so a species that expands from 1 → 3 variants
+/// later still gets deterministic dispersion without reroll.
+pub fn plant_sprite_variant_for(
+    species: crate::simulation::plant_catalog::PlantSpeciesId,
+    tile_x: i32,
+    tile_y: i32,
+) -> u8 {
+    let mixed = (species.0 as u64) ^ ((tile_x as i64 as u64) << 32) ^ (tile_y as i64 as u64);
+    (splitmix64(mixed) % 3) as u8
+}
+
 /// Marks a plant that was deliberately sown by a farmer via `Task::Planter`,
 /// as opposed to wild scatter (`try_scatter_seed`) or recreational
 /// `PlayPlant`. A cultivated crop skips the 20% wild sprout roll in
@@ -132,6 +176,26 @@ impl PlantKind {
             .copied()
             .find(|k| k.seed_resource() == Some(rid))
     }
+}
+
+/// Resolve a seed `ResourceId` to its catalog species (when registered) and
+/// the legacy `PlantKind` bucket. Catalog match wins; falls back to the
+/// hand-rolled `PlantKind::from_seed_resource` for fixtures that bypass the
+/// catalog (grain_seed / berry_seed). Returns `None` when the resource is
+/// not a registered plantable seed.
+pub fn resolve_seed_resource(
+    rid: crate::economy::resource_catalog::ResourceId,
+) -> Option<(Option<crate::simulation::plant_catalog::PlantSpeciesId>, PlantKind)> {
+    let cat = crate::simulation::plant_catalog::catalog();
+    if let Some(sid) = cat.species_of_seed(rid) {
+        if let Some(def) = cat.def(sid) {
+            return Some((Some(sid), def.legacy_kind()));
+        }
+    }
+    PlantKind::from_seed_resource(rid).map(|kind| (None, kind))
+}
+
+impl PlantKind {
 
     /// `true` when this plant kind can be deliberately sown via the farm
     /// pipeline — i.e. it has a registered seed resource. Used by farm
@@ -304,6 +368,70 @@ impl PlantKind {
             _ => MemoryKind::Resource(id),
         }
     }
+}
+
+/// Per-species memory tagging. Walks every harvest profile and returns
+/// every `MemoryKind` the plant should be sighted under. Lets a multi-
+/// profile species (oak: fruit + wood) seed both `AnyEdible` and
+/// `Resource(wood)` clusters in one vision sweep so independent HTN gather
+/// methods can find it through whichever lens applies.
+///
+/// Returns a small inline `Vec` (typically 1-2 entries). Foods canonicalise
+/// to `AnyEdible`; every distinct non-food primary yield gets a
+/// `Resource(rid)` entry. Stops collecting after 4 entries — pathological
+/// catalogs notwithstanding, a real species shouldn't tag more channels.
+pub fn plant_memory_kinds(
+    species: Option<crate::simulation::plant_catalog::PlantSpeciesId>,
+    fallback_kind: PlantKind,
+) -> Vec<MemoryKind> {
+    use crate::economy::resource_catalog::ResourceClass;
+    let mut out: Vec<MemoryKind> = Vec::with_capacity(2);
+    let mut push = |mk: MemoryKind| {
+        if out.len() >= 4 {
+            return;
+        }
+        if !out.contains(&mk) {
+            out.push(mk);
+        }
+    };
+
+    if let Some(sid) = species {
+        let cat = crate::simulation::plant_catalog::catalog();
+        if let Some(def) = cat.def(sid) {
+            for profile in &def.harvests {
+                for &(rid, _qty) in &profile.yields {
+                    let cls = crate::economy::core_ids::catalog()
+                        .get(rid)
+                        .map(|d| d.class);
+                    match cls {
+                        Some(ResourceClass::Food) => push(MemoryKind::AnyEdible),
+                        _ => push(MemoryKind::Resource(rid)),
+                    }
+                }
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+    }
+    // Legacy fallback (test fixtures, raw `spawn_plant_at` callers).
+    out.push(fallback_kind.harvest_memory_kind());
+    out
+}
+
+/// True iff this species has ANY harvest profile that yields `rid`. Mirrors
+/// `plant_memory_kinds` — both walk the same `def.harvests[*].yields` list —
+/// so memory tagging and the gather-dispatch validator stay synchronised
+/// through one accessor. Returns `false` for an unregistered species id.
+pub fn species_yields_resource(
+    species: crate::simulation::plant_catalog::PlantSpeciesId,
+    rid: crate::economy::resource_catalog::ResourceId,
+) -> bool {
+    let cat = crate::simulation::plant_catalog::catalog();
+    let Some(def) = cat.def(species) else { return false };
+    def.harvests
+        .iter()
+        .any(|p| p.yields.iter().any(|(y, _)| *y == rid))
 }
 
 /// P6a: live `PlantMap` fast path. Probes for a mature plant of a
@@ -787,6 +915,62 @@ pub fn despawn_plant_internals(
     commands.entity(entity).despawn_recursive();
 }
 
+/// Spawn a plant entity at the given tile using a specific species. The
+/// derived `PlantKind` bucket is set from `species.form.legacy_kind()`.
+/// Returns `None` if the tile is occupied or the species id is invalid.
+pub fn spawn_plant_at_species(
+    commands: &mut Commands,
+    plant_map: &mut PlantMap,
+    plant_sprite_index: &mut PlantSpriteIndex,
+    tile_x: i32,
+    tile_y: i32,
+    species: crate::simulation::plant_catalog::PlantSpeciesId,
+    stage: GrowthStage,
+) -> Option<Entity> {
+    if plant_map.0.contains_key(&(tile_x, tile_y)) {
+        return None;
+    }
+    let catalog = crate::simulation::plant_catalog::catalog();
+    let def = catalog.def(species)?;
+    let kind = def.legacy_kind();
+    let world_pos = tile_to_world(tile_x, tile_y);
+    let (clear_skill, clear_xp) = kind.harvest_skill_xp(false);
+    let entity = commands
+        .spawn((
+            Plant {
+                kind,
+                stage,
+                growth: 0,
+                tile_pos: (tile_x as i32, tile_y as i32),
+            },
+            PlantSpecies(species),
+            PlantSpriteVariant(plant_sprite_variant_for(species, tile_x, tile_y)),
+            Transform::from_xyz(world_pos.x, world_pos.y, 0.5),
+            GlobalTransform::default(),
+            Visibility::Visible,
+            InheritedVisibility::default(),
+            crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Plant),
+            crate::simulation::obstacle::ConstructionObstacle {
+                resolution: crate::simulation::obstacle::ObstacleResolution::WorkerClear {
+                    work_ticks: def.clear_work_ticks,
+                    skill: clear_skill,
+                    skill_xp: clear_xp,
+                },
+            },
+        ))
+        .id();
+    plant_map.0.insert((tile_x, tile_y), entity);
+    let chunk_x = tile_x.div_euclid(CHUNK_SIZE as i32);
+    let chunk_y = tile_y.div_euclid(CHUNK_SIZE as i32);
+    let coord = ChunkCoord(chunk_x, chunk_y);
+    plant_sprite_index
+        .by_chunk
+        .entry(coord)
+        .or_default()
+        .push((entity, (tile_x, tile_y)));
+    Some(entity)
+}
+
 /// Spawn a plant entity at the given tile. Returns `None` if the tile is
 /// already occupied. Callers that need to attach an ownership marker
 /// (`LandClaim`) read the returned entity.
@@ -806,6 +990,7 @@ pub fn spawn_plant_at(
     let world_pos = tile_to_world(tile_x, tile_y);
 
     let (clear_skill, clear_xp) = kind.harvest_skill_xp(false);
+    let species = crate::simulation::plant_catalog::catalog().default_for_kind(kind);
     let entity = commands
         .spawn((
             Plant {
@@ -814,6 +999,8 @@ pub fn spawn_plant_at(
                 growth: 0,
                 tile_pos: (tile_x as i32, tile_y as i32),
             },
+            PlantSpecies(species),
+            PlantSpriteVariant(plant_sprite_variant_for(species, tile_x, tile_y)),
             Transform::from_xyz(world_pos.x, world_pos.y, 0.5),
             GlobalTransform::default(),
             Visibility::Visible,
@@ -846,12 +1033,19 @@ pub fn spawn_plant_at(
 /// bootstrap pipeline reserved (footprints, doormats, planned roads) and
 /// tiles inside any Agricultural plot (wild scatter has no business sprouting
 /// in a worked field).
+///
+/// When `species` is `Some(_)`, the surface filter walks the species's
+/// `spawn.surface_tiles` so a desert/marsh species doesn't wrong-spawn on
+/// generic grass. Without a species the legacy Grass/soil-like predicate
+/// applies (test fixtures, legacy spawn helpers).
 fn seed_target_tile_ok(
     chunk_map: &ChunkMap,
+    globe: Option<&crate::world::globe::Globe>,
     reservation: &crate::simulation::seed_reservation::SeedReservation,
     plot_index: &crate::simulation::land::PlotIndex,
     x: i32,
     y: i32,
+    species: Option<crate::simulation::plant_catalog::PlantSpeciesId>,
 ) -> bool {
     use crate::world::tile::TileKind as TK;
     if reservation.is_reserved((x, y)) {
@@ -860,9 +1054,75 @@ fn seed_target_tile_ok(
     if plot_index.ag_tiles.contains(&(x, y)) {
         return false;
     }
-    match chunk_map.tile_kind_at(x, y) {
-        Some(TK::Grass) => true,
-        Some(k) if k.is_soil_like() => true,
+    let Some(kind) = chunk_map.tile_kind_at(x, y) else {
+        return false;
+    };
+    if let Some(sid) = species {
+        let cat = crate::simulation::plant_catalog::catalog();
+        if let Some(def) = cat.def(sid) {
+            // Surface tile gate: catalog declares which TileKinds a species
+            // can occupy.
+            if !def.spawn.surface_tiles.iter().any(|s| s.matches(kind)) {
+                return false;
+            }
+            // Riparian band: willow / date palm / papyrus declare
+            // `river_distance`. `river_distance_at` returns `u8::MAX` for
+            // far/unloaded which falls outside any declared range, so an
+            // unloaded chunk correctly suppresses scatter rather than
+            // over-spawning.
+            if !def
+                .spawn
+                .river_distance
+                .contains(chunk_map.river_distance_at(x, y))
+            {
+                return false;
+            }
+            // Coastal + native-realm gates need a `Globe`. Headless test
+            // fixtures don't insert one — fall back to surface+river-only
+            // checks when `None`.
+            if let Some(globe) = globe {
+                if def.spawn.requires_coastal {
+                    let mut coastal = false;
+                    'outer: for dy in -1..=1 {
+                        for dx in -1..=1 {
+                            if dx == 0 && dy == 0 {
+                                continue;
+                            }
+                            let nb =
+                                crate::world::biome::classify_at_tile(globe, x + dx, y + dy);
+                            if matches!(nb, crate::world::globe::Biome::Ocean) {
+                                coastal = true;
+                                break 'outer;
+                            }
+                        }
+                    }
+                    if !coastal {
+                        return false;
+                    }
+                }
+                // Floristic-realm gate: scatter must stay inside the
+                // species's native (realm, biome) pool. Reuses the
+                // precomputed `native_pools` cache so a Crabapple-from-
+                // Mediterranoid parent can't naturalise in a Boreal cell.
+                if let Some(region) =
+                    crate::world::flora_regions::floristic_region_at_tile(globe, x, y)
+                {
+                    let realm = region.realm.to_kind();
+                    let biome = crate::world::biome::classify_at_tile(globe, x, y);
+                    if !cat.native_pool_for(realm, biome).contains(&sid) {
+                        return false;
+                    }
+                } else {
+                    // Ocean / no realm — scatter rejects.
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+    match kind {
+        TK::Grass => true,
+        k if k.is_soil_like() => true,
         _ => false,
     }
 }
@@ -870,15 +1130,24 @@ fn seed_target_tile_ok(
 /// Roll once: with probability `chance`, drop one fresh `Seed` plant of
 /// `parent_kind` somewhere in chebyshev `radius` of the parent. No-op on
 /// miss or on collision; never spawns at the parent's own tile.
+///
+/// When `parent_species` is `Some(_)`, the spawned child carries the same
+/// species id (so a Crabapple parent scatters Crabapple seeds), and the
+/// candidate tile is validated against that species's `spawn.surface_tiles`
+/// instead of the generic Grass/soil-like predicate. A `None` species path
+/// preserves the legacy 3-kind behaviour for raw `spawn_plant_at` callers.
 fn try_scatter_seed(
     commands: &mut Commands,
     plant_map: &mut PlantMap,
     plant_sprite_index: &mut PlantSpriteIndex,
     chunk_map: &ChunkMap,
+    globe: Option<&crate::world::globe::Globe>,
     reservation: &crate::simulation::seed_reservation::SeedReservation,
     plot_index: &crate::simulation::land::PlotIndex,
     parent_tile: (i32, i32),
     parent_kind: PlantKind,
+    parent_species: Option<crate::simulation::plant_catalog::PlantSpeciesId>,
+    _cultivated_parent: bool,
     chance: f32,
     radius: i32,
 ) {
@@ -891,18 +1160,36 @@ fn try_scatter_seed(
         return;
     }
     let (nx, ny) = (parent_tile.0 + dx, parent_tile.1 + dy);
-    if !seed_target_tile_ok(chunk_map, reservation, plot_index, nx, ny) {
+    // `seed_target_tile_ok` enforces native realm/biome/river/coastal when a
+    // species is supplied — applies symmetrically to wild and cultivated
+    // scatter so cultivated imports can't naturalise outside their range and
+    // wild drift never crosses a realm border. `_cultivated_parent` stays in
+    // the signature for future hooks (e.g. tighter wild yield bias) but is
+    // unused today; the realm gate is the load-bearing constraint.
+    if !seed_target_tile_ok(chunk_map, globe, reservation, plot_index, nx, ny, parent_species) {
         return;
     }
-    spawn_plant_at(
-        commands,
-        plant_map,
-        plant_sprite_index,
-        nx,
-        ny,
-        parent_kind,
-        GrowthStage::Seed,
-    );
+    if let Some(sid) = parent_species {
+        spawn_plant_at_species(
+            commands,
+            plant_map,
+            plant_sprite_index,
+            nx,
+            ny,
+            sid,
+            GrowthStage::Seed,
+        );
+    } else {
+        spawn_plant_at(
+            commands,
+            plant_map,
+            plant_sprite_index,
+            nx,
+            ny,
+            parent_kind,
+            GrowthStage::Seed,
+        );
+    }
 }
 
 /// Calendar-driven plant lifecycle. Replaces the legacy `plant_growth_system` +
@@ -920,12 +1207,16 @@ pub fn plant_lifecycle_system(
     mut commands: Commands,
     calendar: Res<Calendar>,
     chunk_map: Res<ChunkMap>,
+    // Optional so headless test fixtures (which don't build a `Globe`) keep
+    // running. When `None`, scatter falls back to legacy surface-only gates;
+    // when `Some`, scatter enforces native realm/biome/river/coastal.
+    globe: Option<Res<crate::world::globe::Globe>>,
     reservation: Res<crate::simulation::seed_reservation::SeedReservation>,
     plot_index: Res<crate::simulation::land::PlotIndex>,
     mut last_season: Local<Option<Season>>,
     mut plant_map: ResMut<PlantMap>,
     mut plant_sprite_index: ResMut<PlantSpriteIndex>,
-    mut query: Query<(Entity, &mut Plant, Option<&Cultivated>)>,
+    mut query: Query<(Entity, &mut Plant, Option<&Cultivated>, Option<&PlantSpecies>)>,
 ) {
     let prev = match *last_season {
         Some(s) if s == calendar.season => return,
@@ -939,38 +1230,83 @@ pub fn plant_lifecycle_system(
 
     // Snapshot per-entity work to keep the borrow on `query` short while we
     // mutate `plant_map` / spawn new plants below.
-    let mut to_kill: Vec<(Entity, (i32, i32), bool)> = Vec::new();
-    let mut scatter_jobs: Vec<((i32, i32), PlantKind, f32, i32)> = Vec::new();
+    let mut to_kill: Vec<(
+        Entity,
+        (i32, i32),
+        bool,
+        Option<crate::simulation::plant_catalog::PlantSpeciesId>,
+        bool,
+    )> = Vec::new();
+    let mut scatter_jobs: Vec<(
+        (i32, i32),
+        PlantKind,
+        Option<crate::simulation::plant_catalog::PlantSpeciesId>,
+        bool,
+        f32,
+        i32,
+    )> = Vec::new();
 
-    for (entity, mut plant, cultivated) in query.iter_mut() {
-        // ── Winter mortality for grain ────────────────────────────────────
-        if calendar.season == Season::Winter && plant.kind == PlantKind::Grain {
+    let cat = crate::simulation::plant_catalog::catalog();
+
+    for (entity, mut plant, cultivated, species_opt) in query.iter_mut() {
+        let species_id = species_opt.map(|s| s.id());
+        // Resolve the per-species lifecycle profile when available. Legacy
+        // path (no `PlantSpecies`) keeps the hardcoded `season_growth` /
+        // `stage_threshold` numbers.
+        let profile = species_id.and_then(|sid| cat.def(sid)).map(|d| &d.lifecycle);
+
+        // ── Winter mortality for annuals ──────────────────────────────────
+        // Catalog-driven for species_present: `lifecycle.annual` flag.
+        // Legacy: only Grain dies in Winter.
+        let is_annual = profile.map(|p| p.annual).unwrap_or(plant.kind == PlantKind::Grain);
+        if calendar.season == Season::Winter && is_annual {
             let scatter_now = plant.stage == GrowthStage::Mature;
-            to_kill.push((entity, plant.tile_pos, scatter_now));
+            to_kill.push((
+                entity,
+                plant.tile_pos,
+                scatter_now,
+                species_id,
+                cultivated.is_some(),
+            ));
             continue;
         }
 
         // ── Accumulate growth from the season that just ended ────────────
-        let gain = season_growth(plant.kind, prev) as u16;
+        // Profile carries `season_growth: [Spring, Summer, Autumn, Winter]`
+        // indexed by `prev as u8`. Legacy fallback uses the closed-form
+        // `season_growth(kind, prev)` for the 3 legacy kinds.
+        let gain = profile
+            .and_then(|p| p.season_growth.get(prev as usize).copied())
+            .map(|v| v as u16)
+            .unwrap_or_else(|| season_growth(plant.kind, prev) as u16);
         plant.growth = plant.growth.saturating_add(gain);
 
-        // ── Stage advance — at most one transition per season tick ──────
-        // `growth` tracks time spent in the current stage; on transition
-        // we reset to zero so each stage gets its full duration regardless
-        // of carry-over from the previous one. (E.g. grain Mature has a
-        // small threshold; carry-over would blast through Mature→Overripe
-        // in the same tick that Seedling→Mature fires.)
-        let threshold = stage_threshold(plant.kind, plant.stage);
+        // Per-species `stage_thresholds: [Seed, Seedling, Harvested, Mature, Overripe]`
+        // indexed by the stage discriminant. Legacy table for fallback.
+        let stage_idx = plant.stage as usize;
+        let threshold = profile
+            .and_then(|p| p.stage_thresholds.get(stage_idx).copied())
+            .unwrap_or_else(|| stage_threshold(plant.kind, plant.stage));
+
         if threshold > 0 && plant.growth >= threshold {
             match plant.stage {
                 GrowthStage::Seed => {
-                    // Deliberately-sown crops (`Cultivated`) sprout reliably;
-                    // only wild scatter / PlayPlant rolls the 20% odds.
-                    if cultivated.is_some() || fastrand::f32() < 0.20 {
+                    // Cultivated crops always sprout; wild rolls per-species
+                    // `wild_sprout_chance` (legacy 20%) before despawning.
+                    let sprout_chance_pct = profile.map(|p| p.wild_sprout_chance).unwrap_or(20);
+                    let sprouts = cultivated.is_some()
+                        || fastrand::u8(0..100) < sprout_chance_pct;
+                    if sprouts {
                         plant.growth = 0;
                         plant.stage = GrowthStage::Seedling;
                     } else {
-                        to_kill.push((entity, plant.tile_pos, false));
+                        to_kill.push((
+                            entity,
+                            plant.tile_pos,
+                            false,
+                            species_id,
+                            cultivated.is_some(),
+                        ));
                     }
                 }
                 GrowthStage::Seedling | GrowthStage::Harvested => {
@@ -978,18 +1314,46 @@ pub fn plant_lifecycle_system(
                     plant.stage = GrowthStage::Mature;
                 }
                 GrowthStage::Mature => {
-                    let (chance, radius) = match plant.kind {
-                        PlantKind::Grain => (0.20_f32, 2_i32),
-                        PlantKind::BerryBush => (0.10, 2),
-                        PlantKind::Tree => (0.05, 3),
+                    // Per-species scatter parameters; legacy fallback per kind.
+                    let (chance, radius) = if let Some(p) = profile {
+                        (
+                            p.scatter_chance as f32 / 100.0,
+                            p.scatter_radius as i32,
+                        )
+                    } else {
+                        match plant.kind {
+                            PlantKind::Grain => (0.20_f32, 2_i32),
+                            PlantKind::BerryBush => (0.10, 2),
+                            PlantKind::Tree => (0.05, 3),
+                        }
                     };
-                    scatter_jobs.push((plant.tile_pos, plant.kind, chance, radius));
+                    scatter_jobs.push((
+                        plant.tile_pos,
+                        plant.kind,
+                        species_id,
+                        cultivated.is_some(),
+                        chance,
+                        radius,
+                    ));
 
                     plant.growth = 0;
-                    plant.stage = match plant.kind {
-                        PlantKind::Grain => GrowthStage::Overripe,
-                        PlantKind::BerryBush => GrowthStage::Harvested,
-                        PlantKind::Tree => GrowthStage::Mature,
+                    // Post-fruiting transition: regrow_after_harvest → Harvested
+                    // (BerryBush-like); annual → Overripe; perennial woody
+                    // → Mature (tree).
+                    plant.stage = if let Some(p) = profile {
+                        if p.regrow_after_harvest {
+                            GrowthStage::Harvested
+                        } else if p.annual {
+                            GrowthStage::Overripe
+                        } else {
+                            GrowthStage::Mature
+                        }
+                    } else {
+                        match plant.kind {
+                            PlantKind::Grain => GrowthStage::Overripe,
+                            PlantKind::BerryBush => GrowthStage::Harvested,
+                            PlantKind::Tree => GrowthStage::Mature,
+                        }
                     };
                 }
                 GrowthStage::Overripe => {}
@@ -998,33 +1362,39 @@ pub fn plant_lifecycle_system(
     }
 
     // ── Apply scatter jobs ───────────────────────────────────────────────
-    for (parent_tile, kind, chance, radius) in scatter_jobs {
+    for (parent_tile, kind, species, cultivated_parent, chance, radius) in scatter_jobs {
         try_scatter_seed(
             &mut commands,
             &mut plant_map,
             &mut plant_sprite_index,
             &chunk_map,
+            globe.as_deref(),
             &reservation,
             &plot_index,
             parent_tile,
             kind,
+            species,
+            cultivated_parent,
             chance,
             radius,
         );
     }
 
     // ── Apply death pass (after scatter so winter-mature grain seeds first) ─
-    for (entity, tile, scatter_first) in to_kill {
+    for (entity, tile, scatter_first, species, cultivated_parent) in to_kill {
         if scatter_first {
             try_scatter_seed(
                 &mut commands,
                 &mut plant_map,
                 &mut plant_sprite_index,
                 &chunk_map,
+                globe.as_deref(),
                 &reservation,
                 &plot_index,
                 tile,
                 PlantKind::Grain,
+                species,
+                cultivated_parent,
                 0.20,
                 2,
             );

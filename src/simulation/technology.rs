@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 pub type TechId = u16;
-pub const TECH_COUNT: usize = 86;
+pub const TECH_COUNT: usize = 91;
 pub const ACTIVITY_COUNT: usize = 14;
 
 // ── Tech ID constants ─────────────────────────────────────────────────────────
@@ -135,6 +135,15 @@ pub const SPIRIT_ILLNESS: TechId = 82;
 pub const MIASMA_THEORY: TechId = 83;
 pub const ECLIPSE_OMENS: TechId = 84;
 pub const WEATHER_OMENS: TechId = 85;
+
+// ── Biome-native plant ecology (Phase BN) ─────────────────────────────────
+// Five techs gating the plant-derived recipes added alongside the species
+// catalog. Placed at the tail so `TECH_COUNT` extension stays append-only.
+pub const PLANT_LORE: TechId = 86;
+pub const HERBAL_MEDICINE: TechId = 87;
+pub const FIBER_PROCESSING: TechId = 88;
+pub const ORCHARD_CULTIVATION: TechId = 89;
+pub const OIL_PRESSING: TechId = 90;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -1668,6 +1677,68 @@ pub static TECH_TREE: [TechDef; TECH_COUNT] = [
         triggers: &[],
         bonus: TechBonus::ZERO,
     },
+    // ── Phase BN: biome-native plant ecology techs ─────────────────────
+    TechDef {
+        id: PLANT_LORE,
+        era: Era::Mesolithic,
+        name: "Plant Lore",
+        description: "Recognising useful plants — which fibres, fruits, barks, and roots reward harvest.",
+        prerequisites: &[],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::Foraging,
+            per_unit_chance: 0.004,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: HERBAL_MEDICINE,
+        era: Era::Neolithic,
+        name: "Herbal Medicine",
+        description: "Compounding leaves, barks, and roots into bundles that speed healing and \
+             blunt sickness.",
+        prerequisites: &[PLANT_LORE],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::Foraging,
+            per_unit_chance: 0.002,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: FIBER_PROCESSING,
+        era: Era::Neolithic,
+        name: "Fibre Processing",
+        description: "Retting and combing plant fibres — flax, hemp, nettle, and agave — into spinnable strands.",
+        prerequisites: &[PLANT_LORE],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::Foraging,
+            per_unit_chance: 0.003,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: ORCHARD_CULTIVATION,
+        era: Era::Neolithic,
+        name: "Orchard Cultivation",
+        description: "Planting and tending fruit trees and vines — perennial orchards that yield year after year.",
+        prerequisites: &[CROP_CULTIVATION],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::Farming,
+            per_unit_chance: 0.002,
+        }],
+        bonus: TechBonus::ZERO,
+    },
+    TechDef {
+        id: OIL_PRESSING,
+        era: Era::Chalcolithic,
+        name: "Oil Pressing",
+        description: "Pressing oil from oilseed crops and palm fruit — fuel, food, and luxury.",
+        prerequisites: &[FIRED_POTTERY],
+        triggers: &[TechTrigger {
+            activity: ActivityKind::Farming,
+            per_unit_chance: 0.002,
+        }],
+        bonus: TechBonus::ZERO,
+    },
 ];
 
 // Discovery is now per-person and per-action; see
@@ -1714,8 +1785,9 @@ mod tests {
         }
         // Phase E added 14 building-technique entries (50..=63);
         // Phase G added 16 foundational knowledge entries (64..=79);
-        // Phase H added 6 belief entries (80..=85).
-        assert_eq!(TECH_COUNT, 86);
+        // Phase H added 6 belief entries (80..=85);
+        // Phase BN added 5 biome-native plant techs (86..=90).
+        assert_eq!(TECH_COUNT, 91);
         // POWERED_TRACTION caps the line — its prereqs precede it.
         assert!(tech_def(POWERED_TRACTION)
             .prerequisites

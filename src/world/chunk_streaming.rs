@@ -814,6 +814,7 @@ pub fn spawn_chunk_plants(
     let Some(chunk) = chunk_map.0.get(&coord) else {
         return;
     };
+    let catalog = crate::simulation::plant_catalog::catalog();
 
     for ty in 0..CHUNK_SIZE {
         for tx in 0..CHUNK_SIZE {
@@ -828,92 +829,135 @@ pub fn spawn_chunk_plants(
             let surf_z = chunk.surface_z[ty][tx] as i32;
             let tile = tile_at_3d(chunk_map, gen, globe, global_tx, global_ty, surf_z);
 
+            // Hash drives the candidate lottery + initial stage.
             let h = (global_tx.wrapping_mul(2_654_435_761_u32 as i32)
                 ^ global_ty.wrapping_mul(2_246_822_519_u32 as i32)
                 ^ PLANT_HASH_SEED as i32) as u32;
 
-            match tile.kind {
-                // High-fertility grassland — replaces the old Farmland branch.
-                // Wild Grain (wheat) and BerryBush spawn on the most fertile
-                // patches of grass. Effectively the natural prairie / meadow.
-                TileKind::Grass if tile.fertility > 180 => {
-                    let pct = h % 100;
-                    let (kind, stage) = if pct < 4 {
-                        (PlantKind::BerryBush, initial_stage(h))
-                    } else if pct < 12 {
-                        (PlantKind::Grain, initial_stage(h))
-                    } else {
+            // Resolve flora region for this tile (None = ocean / no realm
+            // — wild plants skip; cultivated still works via Plot path).
+            let region = crate::world::flora_regions::floristic_region_at_tile(
+                globe, global_tx, global_ty,
+            );
+            let Some(region) = region else { continue };
+            let realm = region.realm.to_kind();
+
+            // Cell biome (canonical, unwarped) for native filtering.
+            let biome = crate::world::biome::classify_at_tile(globe, global_tx, global_ty);
+            // Coastal predicate: passable tile adjacent to Ocean within one
+            // chebyshev step. Cheap per-tile via climate-cell biome lookup
+            // on the four neighbour tiles (sampled at tile granularity).
+            let mut coastal = false;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dy == 0 {
                         continue;
-                    };
-                    spawn_plant_at(
-                        commands,
-                        plant_map,
-                        plant_sprite_index,
+                    }
+                    let nb = crate::world::biome::classify_at_tile(
+                        globe,
+                        global_tx + dx,
+                        global_ty + dy,
+                    );
+                    if matches!(nb, crate::world::globe::Biome::Ocean) {
+                        coastal = true;
+                        break;
+                    }
+                }
+                if coastal {
+                    break;
+                }
+            }
+
+            // Phase 8: pre-cached per-(realm, biome) native pool — typical
+            // tiles touch 0-12 candidates instead of all ~50 species.
+            // Per-tile gates (surface, fertility, coastal, patch-noise)
+            // still apply.
+            let pool = catalog.native_pool_for(realm, biome);
+            let mut candidates: Vec<(
+                crate::simulation::plant_catalog::PlantSpeciesId,
+                u32,
+            )> = Vec::with_capacity(8);
+            let mut total_weight: u32 = 0;
+            for &sid in pool {
+                let Some(def) = catalog.def(sid) else { continue };
+                if !def
+                    .spawn
+                    .surface_tiles
+                    .iter()
+                    .any(|s| s.matches(tile.kind))
+                {
+                    continue;
+                }
+                if !def.spawn.fertility.contains(tile.fertility) {
+                    continue;
+                }
+                if def.spawn.requires_coastal && !coastal {
+                    continue;
+                }
+                // Riparian-only species (willow/date/papyrus etc.) declare a
+                // `river_distance` band. `river_distance_at` returns u8::MAX
+                // for far/unloaded, which falls outside any species range, so
+                // unloaded neighbours correctly suppress riparian spawns.
+                if !def
+                    .spawn
+                    .river_distance
+                    .contains(chunk_map.river_distance_at(global_tx, global_ty))
+                {
+                    continue;
+                }
+                let mut w = def.spawn.base_weight as u32;
+                // Patch-noise gate. Wavelength 0 disables.
+                if def.spawn.patch_noise.wavelength_tiles > 0 {
+                    let cell = (def.spawn.patch_noise.wavelength_tiles as i32).max(1);
+                    let ph = patch_hash(
                         global_tx,
                         global_ty,
-                        kind,
-                        stage,
+                        cell,
+                        PLANT_HASH_SEED.wrapping_add(def.id.raw() as u32),
                     );
-                }
-                // Wetland-edge berries (no grain — too wet for cereal).
-                TileKind::Marsh => {
-                    if h % 100 < 5 {
-                        spawn_plant_at(
-                            commands,
-                            plant_map,
-                            plant_sprite_index,
-                            global_tx,
-                            global_ty,
-                            PlantKind::BerryBush,
-                            initial_stage(h),
-                        );
+                    if (ph % 100) as u8 >= def.spawn.patch_noise.threshold {
+                        continue;
                     }
                 }
-                TileKind::Grass if tile.fertility > 100 => {
-                    let pct = h % 100;
-                    let berry_patch =
-                        patch_hash(global_tx, global_ty, PATCH_CELL_SIZE, BERRY_PATCH_SEED) % 100
-                            < 6;
-                    let tree_patch =
-                        patch_hash(global_tx, global_ty, PATCH_CELL_SIZE, TREE_PATCH_SEED) % 100
-                            < 12;
-                    if berry_patch && pct < 40 {
-                        spawn_plant_at(
-                            commands,
-                            plant_map,
-                            plant_sprite_index,
-                            global_tx,
-                            global_ty,
-                            PlantKind::BerryBush,
-                            initial_stage(h),
-                        );
-                    } else if tree_patch && pct < 50 {
-                        spawn_plant_at(
-                            commands,
-                            plant_map,
-                            plant_sprite_index,
-                            global_tx,
-                            global_ty,
-                            PlantKind::Tree,
-                            initial_stage(h),
-                        );
-                    }
+                if w == 0 {
+                    continue;
                 }
-                TileKind::Forest => {
-                    if h % 100 < 40 {
-                        spawn_plant_at(
-                            commands,
-                            plant_map,
-                            plant_sprite_index,
-                            global_tx,
-                            global_ty,
-                            PlantKind::Tree,
-                            initial_stage(h),
-                        );
-                    }
-                }
-                _ => {}
+                total_weight = total_weight.saturating_add(w);
+                candidates.push((def.id, total_weight));
             }
+            if candidates.is_empty() {
+                continue;
+            }
+            // EMPTY_BIAS keeps the tile undecided on most rolls so density
+            // tracks legacy chunk-gen — bumped up so every grass tile
+            // isn't blanketed in plants.
+            const EMPTY_BIAS_GRASS: u32 = 1200;
+            const EMPTY_BIAS_FOREST: u32 = 220;
+            const EMPTY_BIAS_OTHER: u32 = 320;
+            let empty_bias = match tile.kind {
+                TileKind::Forest => EMPTY_BIAS_FOREST,
+                TileKind::Grass => EMPTY_BIAS_GRASS,
+                _ => EMPTY_BIAS_OTHER,
+            };
+            let denom = total_weight + empty_bias;
+            let r = h % denom.max(1);
+            if r >= total_weight {
+                continue;
+            }
+            let pick = candidates
+                .iter()
+                .find(|(_, cum)| r < *cum)
+                .map(|(id, _)| *id);
+            let Some(species) = pick else { continue };
+            crate::simulation::plants::spawn_plant_at_species(
+                commands,
+                plant_map,
+                plant_sprite_index,
+                global_tx,
+                global_ty,
+                species,
+                initial_stage(h),
+            );
         }
     }
 }

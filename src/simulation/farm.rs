@@ -735,6 +735,7 @@ pub fn seed_starting_farms_system(
     mut ground_items: Query<&mut crate::simulation::items::GroundItem>,
     mut commands: Commands,
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    globe: Res<crate::world::globe::Globe>,
 ) {
     use crate::simulation::settlement::TileRect;
 
@@ -884,6 +885,47 @@ pub fn seed_starting_farms_system(
                 crate::economy::core_ids::grain(),
                 food_buffer,
             );
+        }
+
+        // Phase 5 (biome-native plants): in addition to the legacy emmer
+        // grain bundle, founders born into a non-temperate realm get a
+        // small bundle of every native plantable species. A tundra
+        // founding gets cloudberry / arctic willow seeds; a tropical
+        // founding gets banana / cassava / cacao seeds — so the early
+        // game's first farming attempts aren't locked to a single global
+        // staple.
+        if let Some(region) =
+            crate::world::flora_regions::floristic_region_at_tile(&globe, home.0, home.1)
+        {
+            let realm = region.realm.to_kind();
+            let plant_cat = crate::simulation::plant_catalog::catalog();
+            const NATIVE_SEED_BUNDLE_PER_SPECIES: u32 = 4;
+            const MAX_NATIVE_SEED_SPECIES_GRANTED: usize = 4;
+            let mut granted = 0usize;
+            for def in plant_cat.iter() {
+                if granted >= MAX_NATIVE_SEED_SPECIES_GRANTED {
+                    break;
+                }
+                let Some(seed_id) = def.seed else { continue };
+                if !def.native_realms.contains(&realm) {
+                    continue;
+                }
+                // Skip the legacy emmer wheat (already seeded above) so
+                // founding villages don't double-stock grain_seed.
+                if seed_id == crate::economy::core_ids::grain_seed() {
+                    continue;
+                }
+                crate::simulation::items::spawn_or_merge_ground_item(
+                    &mut commands,
+                    &spatial,
+                    &mut ground_items,
+                    storage_tile.0,
+                    storage_tile.1,
+                    seed_id,
+                    NATIVE_SEED_BUNDLE_PER_SPECIES,
+                );
+                granted += 1;
+            }
         }
     }
 }

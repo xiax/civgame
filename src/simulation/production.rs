@@ -18,7 +18,7 @@ use crate::economy::agent::EconomicAgent;
 use crate::economy::goods::Bulk;
 use crate::economy::item::Item;
 use crate::simulation::plants::{
-    spawn_plant_at, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
+    spawn_plant_at, spawn_plant_at_species, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
 };
 use crate::simulation::technology::{
     ActivityKind, ANIMAL_HUSBANDRY, DOG_DOMESTICATION, HORSE_TAMING,
@@ -154,24 +154,45 @@ pub fn production_system(
                 } else {
                     aq.current.as_planter_full().map(|(_, s)| s)
                 };
+                // Walk the catalog first so any registered species (flax,
+                // millet, quinoa, …) resolves to its canonical
+                // `PlantSpeciesId` + legacy `PlantKind`. Fall back to the
+                // hand-rolled `PlantKind::from_seed_resource` for fixtures
+                // that bypass the catalog (grain_seed / berry_seed).
                 let seed_and_plant = typed_seed.and_then(|seed_id| {
-                    let plant_kind = PlantKind::from_seed_resource(seed_id)?;
+                    let (species_opt, plant_kind) =
+                        crate::simulation::plants::resolve_seed_resource(seed_id)?;
                     let held =
                         agent.quantity_of_resource(seed_id) + carrier.quantity_of_resource(seed_id);
-                    (held > 0).then_some((seed_id, plant_kind))
+                    (held > 0).then_some((seed_id, species_opt, plant_kind))
                 });
                 if !plant_map.0.contains_key(&(tx, ty)) {
-                    if let Some((seed_id, plant_kind)) = seed_and_plant {
+                    if let Some((seed_id, species_opt, plant_kind)) = seed_and_plant {
                         consume_one_resource(&mut agent, &mut carrier, seed_id);
-                        let spawned = spawn_plant_at(
-                            &mut commands,
-                            &mut plant_map,
-                            &mut plant_sprite_index,
-                            tx,
-                            ty,
-                            plant_kind,
-                            GrowthStage::Seed,
-                        );
+                        // Catalog match → spawn with the species id so the
+                        // sprite, harvest profiles, and lifecycle all key on
+                        // it. Legacy fallback → default species per kind.
+                        let spawned = if let Some(sid) = species_opt {
+                            spawn_plant_at_species(
+                                &mut commands,
+                                &mut plant_map,
+                                &mut plant_sprite_index,
+                                tx,
+                                ty,
+                                sid,
+                                GrowthStage::Seed,
+                            )
+                        } else {
+                            spawn_plant_at(
+                                &mut commands,
+                                &mut plant_map,
+                                &mut plant_sprite_index,
+                                tx,
+                                ty,
+                                plant_kind,
+                                GrowthStage::Seed,
+                            )
+                        };
                         // Draftwork v2: if the tile sits inside a plot whose
                         // `plowed_year == Some(current_year)`, mark the freshly
                         // spawned plant as `Tilled` so the harvest path applies

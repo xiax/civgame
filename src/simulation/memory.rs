@@ -360,6 +360,7 @@ pub fn vision_system(
     plant_query: Query<(
         &crate::simulation::plants::Plant,
         Option<&crate::simulation::shared_knowledge::LandClaim>,
+        Option<&crate::simulation::plants::PlantSpecies>,
     )>,
     item_query: Query<&crate::simulation::items::GroundItem>,
     prey_query: Query<
@@ -445,23 +446,38 @@ pub fn vision_system(
                 }
 
                 if let Some(&entity) = plant_map.0.get(&(ntx, nty)) {
-                    if let Ok((plant, land_claim)) = plant_query.get(entity) {
-                        let kind = match plant.kind {
-                            crate::simulation::plants::PlantKind::BerryBush
-                            | crate::simulation::plants::PlantKind::Grain => MemoryKind::AnyEdible,
-                            crate::simulation::plants::PlantKind::Tree => MemoryKind::wood(),
-                        };
+                    if let Ok((plant, land_claim, species_opt)) = plant_query.get(entity) {
                         if plant.stage == crate::simulation::plants::GrowthStage::Mature {
                             let owner = land_claim
                                 .map(|lc| lc.owner)
                                 .unwrap_or(ResourceOwner::Public);
-                            shared.report_sighting(write_tier, (ntx, nty), kind, owner, now);
-                            current_vision.entries.push(VisionEntry {
-                                kind,
-                                tile: (ntx, nty),
-                                entity: None,
-                                owner,
-                            });
+                            // Phase 3 (biome-native plants): seed every
+                            // memory channel the plant's harvest profiles
+                            // produce — fiber/medicine/dye/resin/latex/
+                            // oilseed in addition to the legacy
+                            // AnyEdible/wood lenses. Multi-profile species
+                            // (e.g. oak: fruit + wood) tag both channels in
+                            // one sweep so independent HTN gather methods
+                            // can find the same plant.
+                            let kinds = crate::simulation::plants::plant_memory_kinds(
+                                species_opt.map(|s| s.id()),
+                                plant.kind,
+                            );
+                            for k in kinds {
+                                shared.report_sighting(
+                                    write_tier,
+                                    (ntx, nty),
+                                    k,
+                                    owner,
+                                    now,
+                                );
+                                current_vision.entries.push(VisionEntry {
+                                    kind: k,
+                                    tile: (ntx, nty),
+                                    entity: None,
+                                    owner,
+                                });
+                            }
                         }
                     }
                 }

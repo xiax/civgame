@@ -504,7 +504,14 @@ pub struct TileOverlayParams<'w, 's> {
     pub networked_q: Query<'w, 's, &'static Networked>,
     pub door_q: Query<'w, 's, &'static Door>,
     pub wall_q: Query<'w, 's, &'static crate::simulation::construction::Wall>,
-    pub plant_q: Query<'w, 's, &'static crate::simulation::plants::Plant>,
+    pub plant_q: Query<
+        'w,
+        's,
+        (
+            &'static crate::simulation::plants::Plant,
+            Option<&'static crate::simulation::plants::PlantSpecies>,
+        ),
+    >,
     pub structure_q: Query<
         'w,
         's,
@@ -651,10 +658,22 @@ fn push_ops_for_tile(
     // Plants
     match overlay.plant_map.0.get(&tile) {
         Some(&entity) => {
-            if let (Ok(n), Ok(plant)) = (networked_q.get(entity), overlay.plant_q.get(entity)) {
+            if let (Ok(n), Ok((plant, species_opt))) =
+                (networked_q.get(entity), overlay.plant_q.get(entity))
+            {
+                let species_id = species_opt
+                    .map(|s| s.0.raw())
+                    .unwrap_or_else(|| {
+                        // Legacy plants without a PlantSpecies marker fall
+                        // back to the catalog default for their kind.
+                        crate::simulation::plant_catalog::catalog()
+                            .default_for_kind(plant.kind)
+                            .raw()
+                    });
                 out.push(TileOverlayOp::AddPlant {
                     tile,
                     entity_net_id: n.0,
+                    species: species_id,
                     kind: plant_kind_to_wire(plant.kind),
                     stage: plant_stage_to_wire(plant.stage),
                 });

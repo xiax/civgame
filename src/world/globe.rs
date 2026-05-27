@@ -7,7 +7,7 @@ const SAVE_PATH: &str = "world.bin";
 /// On-disk schema version for `world.bin`. Bump whenever `Globe`, `WorldCell`,
 /// or any serialized geo-data layout changes — `load_or_generate` will discard
 /// older caches and regenerate.
-pub const GLOBE_FILE_VERSION: u32 = 10;
+pub const GLOBE_FILE_VERSION: u32 = 11;
 
 /// Climate-sample grid resolution. Each cell holds elevation/climate/biome
 /// samples; per-tile values are bilinearly interpolated. Resolution is
@@ -27,7 +27,7 @@ pub const GLOBE_CELL_CHUNKS: i32 = 2;
 pub const MEGACHUNK_SIZE_CHUNKS: i32 = 16;
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum Biome {
     Ocean = 0,
     Tundra = 1,
@@ -360,6 +360,13 @@ pub struct Globe {
     /// caches deserialize empty and trigger the version-bump regenerate path.
     #[serde(default)]
     pub relief: super::geomorph::ReliefMap,
+    /// Procedural floristic regions. Built once after `build_hydrology`
+    /// in `generate_globe`; serialised on `world.bin`. Consumers gate wild
+    /// plant spawn on `floristic_region_at_tile` + `PlantCatalog::is_native_to`.
+    /// `#[serde(default)]` makes v10 caches deserialize empty so the
+    /// version-bump regenerate path can rebuild it.
+    #[serde(default)]
+    pub flora_regions: super::flora_regions::FloraRegionMap,
 }
 
 impl Globe {
@@ -371,6 +378,7 @@ impl Globe {
             lakes: LakeMap::default(),
             hydrology: HydrologyMap::default(),
             relief: super::geomorph::ReliefMap::default(),
+            flora_regions: super::flora_regions::FloraRegionMap::default(),
         }
     }
 
@@ -1005,12 +1013,18 @@ pub fn generate_globe(seed: u64) -> Globe {
         );
     }
 
+    // ── Floristic regions ──────────────────────────────────────────────
+    // Run after relief so future region-scoring can consult mountain/
+    // coastal classifications.
+    globe.flora_regions = super::flora_regions::build_flora_regions(&globe);
+
     info!(
-        "Globe generated: {}×{} cells, {} river edges, {} lakes",
+        "Globe generated: {}×{} cells, {} river edges, {} lakes, {} flora regions",
         GLOBE_WIDTH,
         GLOBE_HEIGHT,
         globe.rivers.edges.len(),
-        globe.lakes.lakes.len()
+        globe.lakes.lakes.len(),
+        globe.flora_regions.regions.len(),
     );
 
     globe

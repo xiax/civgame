@@ -23,7 +23,7 @@ use crate::world::water_runtime::RuntimeWaterCell;
 /// Wire protocol version negotiated at connect time. Bump whenever the
 /// shape of any wire message in this module changes; mismatched clients
 /// are rejected by `accept_connections_system` before any state transfer.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// One UI- (or remote-client-)issued command, scoped to the faction that
 /// claims to be sending it. The loopback validates `sender_faction_id`
@@ -187,12 +187,15 @@ pub enum TileOverlayOp {
     // ---------------------------------------------------------------
     // Phase 7 — replication completeness (plants + structures).
     // ---------------------------------------------------------------
-    /// Plant appeared on `tile` at `stage`. `kind` covers Grain /
-    /// BerryBush / Tree variants; the client renders the matching
-    /// sprite from `kind + stage`.
+    /// Plant appeared on `tile` at `stage`. `species` is the catalog
+    /// `PlantSpeciesId.0`; the client resolves to a sprite via its
+    /// local PlantCatalog. `kind` retains the coarse legacy form bucket
+    /// (Grain/BerryBush/Tree) so clients that haven't loaded a catalog
+    /// (e.g. the bootstrap window) can still render a placeholder.
     AddPlant {
         tile: (i32, i32),
         entity_net_id: NetId,
+        species: u16,
         kind: PlantKindWire,
         stage: PlantStageWire,
     },
@@ -1510,15 +1513,17 @@ mod tests {
         let op = TileOverlayOp::AddPlant {
             tile: (4, -2),
             entity_net_id: NetId(7),
+            species: 42,
             kind: PlantKindWire::Grain,
             stage: PlantStageWire::Mature,
         };
         let bytes = bincode::serialize(&op).unwrap();
         let back: TileOverlayOp = bincode::deserialize(&bytes).unwrap();
         match back {
-            TileOverlayOp::AddPlant { tile, entity_net_id, kind, stage } => {
+            TileOverlayOp::AddPlant { tile, entity_net_id, species, kind, stage } => {
                 assert_eq!(tile, (4, -2));
                 assert_eq!(entity_net_id, NetId(7));
+                assert_eq!(species, 42);
                 assert_eq!(kind, PlantKindWire::Grain);
                 assert_eq!(stage, PlantStageWire::Mature);
             }

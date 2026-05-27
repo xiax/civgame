@@ -79,8 +79,10 @@ pub fn quality_rank(q: ItemQuality) -> u8 {
 
 use crate::simulation::technology::{
     ANIMAL_HUSBANDRY, ARD_PLOW, BONE_TOOLS, BOW_AND_ARROW, BRONZE_CASTING, BRONZE_TOOLS,
-    BRONZE_WEAPONS, COPPER_TOOLS, CROP_CULTIVATION, CUNEIFORM_WRITING, FIRED_POTTERY, FIRE_MAKING,
-    FISHING, FLINT_KNAPPING, FOOD_SMOKING, HUNTING_SPEAR, LOOM_WEAVING, MICROLITHIC_TOOLS, OX_CART,
+    BRONZE_WEAPONS, COPPER_TOOLS, CROP_CULTIVATION, CUNEIFORM_WRITING, FIBER_PROCESSING,
+    FIRED_POTTERY, FIRE_MAKING, FISHING, FLINT_KNAPPING, FOOD_SMOKING, HERBAL_MEDICINE,
+    HUNTING_SPEAR, LOOM_WEAVING, MICROLITHIC_TOOLS, OIL_PRESSING, ORCHARD_CULTIVATION, OX_CART,
+    PLANT_LORE,
 };
 use crate::simulation::construction::WorkbenchTier;
 use crate::simulation::tools::{
@@ -195,6 +197,26 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
     let fishing_kit = core_ids::fishing_kit();
     let limestone = core_ids::limestone();
     let lime = core_ids::lime();
+    // Phase BN: biome-native plant ecology. Resolved through the
+    // resource_catalog `id_of` since these resources don't have legacy
+    // `core_ids::*` accessors — adding new resources is a RON-only change.
+    let cat = core_ids::catalog();
+    let fiber = cat.id_of("fiber").expect("catalog missing fiber");
+    let medicinal_herb = cat
+        .id_of("medicinal_herb")
+        .expect("catalog missing medicinal_herb");
+    let medicine_bundle = cat
+        .id_of("medicine_bundle")
+        .expect("catalog missing medicine_bundle");
+    let dye_plant = cat.id_of("dye_plant").expect("catalog missing dye_plant");
+    let oilseed = cat.id_of("oilseed").expect("catalog missing oilseed");
+    let plant_oil = cat.id_of("plant_oil").expect("catalog missing plant_oil");
+    let latex = cat.id_of("latex").expect("catalog missing latex");
+    let rubber = cat.id_of("rubber").expect("catalog missing rubber");
+    let papyrus_stalk = cat
+        .id_of("papyrus_stalk")
+        .expect("catalog missing papyrus_stalk");
+    let paper = cat.id_of("paper").expect("catalog missing paper");
     // Realistic Tool Overhaul tool-requirement shorthands.
     let cut = ToolRequirement::any(ToolUseKind::Cut);
     let chop = ToolRequirement::any(ToolUseKind::Chop);
@@ -652,6 +674,106 @@ fn build_craft_recipes() -> Vec<CraftRecipe> {
             work_ticks: 60,
             crafting_xp: 4,
             tech_gate: Some(FIRED_POTTERY),
+            requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![],
+            quality_floor: None,
+            min_station_tier: None,
+        },
+        // ── Phase BN: biome-native plant ecology recipes ────────────
+        // 47 — Retting and combing plant fibre into spinnable cloth.
+        // `FIBER_PROCESSING`-gated; Loom-bound to share the existing
+        // Woven Cloth pipeline.
+        CraftRecipe {
+            name: "Cloth from Fibre",
+            inputs: vec![(fiber, 3)],
+            output_resource: cloth,
+            output_qty: 1,
+            output_material: None,
+            work_ticks: 60,
+            crafting_xp: 6,
+            tech_gate: Some(FIBER_PROCESSING),
+            requires_station: Some(StationKind::Loom),
+            tool_requirements: vec![],
+            quality_floor: None,
+            min_station_tier: None,
+        },
+        // 48 — Compounding herbs into healing bundles. `HERBAL_MEDICINE`-
+        // gated; Workbench-bound. Consumed by `heal_task_system` as an
+        // accelerant — without it, healing still works (pure activity),
+        // with it severity drops twice as fast.
+        CraftRecipe {
+            name: "Medicine Bundle",
+            inputs: vec![(medicinal_herb, 3), (clean_water, 1)],
+            output_resource: medicine_bundle,
+            output_qty: 1,
+            output_material: None,
+            work_ticks: 60,
+            crafting_xp: 6,
+            tech_gate: Some(HERBAL_MEDICINE),
+            requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![],
+            quality_floor: None,
+            min_station_tier: None,
+        },
+        // 49 — Press oilseeds into plant oil. `OIL_PRESSING`-gated;
+        // Workbench-bound. Output flagged as Fuel as well as luxury input.
+        CraftRecipe {
+            name: "Press Plant Oil",
+            inputs: vec![(oilseed, 4), (wood, 1)],
+            output_resource: plant_oil,
+            output_qty: 1,
+            output_material: None,
+            work_ticks: 50,
+            crafting_xp: 5,
+            tech_gate: Some(OIL_PRESSING),
+            requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![],
+            quality_floor: None,
+            min_station_tier: None,
+        },
+        // 50 — Lay papyrus into paper sheets. `PLANT_LORE`-gated; the
+        // simplest knowledge-class output.
+        CraftRecipe {
+            name: "Paper from Papyrus",
+            inputs: vec![(papyrus_stalk, 3)],
+            output_resource: paper,
+            output_qty: 2,
+            output_material: None,
+            work_ticks: 40,
+            crafting_xp: 4,
+            tech_gate: Some(PLANT_LORE),
+            requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![],
+            quality_floor: None,
+            min_station_tier: None,
+        },
+        // 51 — Coagulate latex into rubber. `ORCHARD_CULTIVATION`-gated
+        // (rubber trees need orchard-scale husbandry).
+        CraftRecipe {
+            name: "Cure Rubber",
+            inputs: vec![(latex, 3), (wood, 1)],
+            output_resource: rubber,
+            output_qty: 1,
+            output_material: None,
+            work_ticks: 40,
+            crafting_xp: 5,
+            tech_gate: Some(ORCHARD_CULTIVATION),
+            requires_station: Some(StationKind::Workbench),
+            tool_requirements: vec![],
+            quality_floor: None,
+            min_station_tier: None,
+        },
+        // 52 — Boil dye plants into luxury dyes. `HERBAL_MEDICINE`-
+        // gated (same skillset for plant extraction).
+        CraftRecipe {
+            name: "Extract Dye",
+            inputs: vec![(dye_plant, 5)],
+            output_resource: luxury,
+            output_qty: 1,
+            output_material: None,
+            work_ticks: 50,
+            crafting_xp: 4,
+            tech_gate: Some(HERBAL_MEDICINE),
             requires_station: Some(StationKind::Workbench),
             tool_requirements: vec![],
             quality_floor: None,
@@ -1451,9 +1573,9 @@ mod tests {
         let recipes = craft_recipes();
         assert_eq!(
             recipes.len(),
-            47,
-            "expected 47 recipes (21 legacy + 25 Realistic Tool Overhaul + 1 Phase F Burn Lime); \
-             counts feed CraftOrder.recipe_id wire format"
+            53,
+            "expected 53 recipes (21 legacy + 25 Realistic Tool Overhaul + 1 Phase F Burn Lime + \
+             6 Phase BN biome-native plant recipes); counts feed CraftOrder.recipe_id wire format"
         );
 
         // Stone Tools (recipe 0): Stone×2 + Wood×1 → Tools×1

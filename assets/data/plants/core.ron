@@ -1,0 +1,1743 @@
+// Biome-native plant species catalog.
+//
+// Each entry is one species; ID is assigned at load by `PlantCatalog::from_defs`
+// from alphabetical sort of `key`. `native_realms` gate wild spawn to a
+// procedural floristic realm (see src/world/flora_regions.rs).
+//
+// Three legacy keys are pinned as `PlantKind::{Grain,BerryBush,Tree}` defaults:
+//   - emmer_wheat        -> PlantKind::Grain
+//   - generic_berry_bush -> PlantKind::BerryBush
+//   - oak_tree           -> PlantKind::Tree
+// All test_fixture.rs / sandbox.rs spawn paths route through these defaults.
+//
+// Per-form lifecycle defaults (matches legacy `season_growth` / `stage_thresholds`):
+//   Annual grass/forb:  season_growth=(4,5,2,0), thresholds=(3,5,0,2,0)
+//   Perennial shrub:    season_growth=(5,4,2,0), thresholds=(5,30,30,4,0)
+//   Tree:               season_growth=(4,5,3,0), thresholds=(12,48,48,18,0)
+//
+// `harvests` carries one or more profiles; the executor picks the first one
+// matching (stage, season, tool). Trees with `OnFruitSeason` + `OnFell`
+// give a non-felling fruit harvest in season alongside the always-available
+// wood-on-fell.
+PlantFile(
+    plants: [
+        // ═════════════════════════════════════════════════════════════════
+        // TEMPERATE — TempForest realm
+        // ═════════════════════════════════════════════════════════════════
+        PlantDef(
+            key: "emmer_wheat",
+            display_name: "Emmer Wheat",
+            form: grass,
+            uses: [grain, food],
+            native_realms: [temp_forest, grassland_temp, mediterranoid],
+            spawn: PlantSpawnRule(
+                biomes: [Grassland, Temperate, Steppe],
+                surface_tiles: [grass, cropland],
+                fertility: RangeU8(min: 100, max: 255),
+                base_weight: 80,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: true,
+                sowing_seasons: [spring],
+                stage_thresholds: [3, 5, 0, 2, 0],
+                season_growth: [4, 5, 2, 0],
+                wild_sprout_chance: 20,
+                scatter_chance: 20,
+                scatter_radius: 2,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature,
+                    tool: Some(sickle),
+                    work_ticks: 0,
+                    yields: [("grain", 5), ("grain_seed", 2), ("thatch", 1)],
+                    despawn: true,
+                    activity: farming,
+                    skill: farming,
+                    skill_xp: 5,
+                ),
+            ],
+            seed: Some("grain_seed"),
+            farm_tile_class: Some(cropland),
+            clear_work_ticks: 10,
+        ),
+        PlantDef(
+            key: "generic_berry_bush",
+            display_name: "Berry Bush",
+            form: shrub,
+            uses: [food],
+            native_realms: [temp_forest, taiga, boreal],
+            spawn: PlantSpawnRule(
+                biomes: [Grassland, Temperate, Taiga, Wetland],
+                surface_tiles: [grass, marsh],
+                base_weight: 40,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false,
+                sowing_seasons: [spring, autumn],
+                stage_thresholds: [5, 30, 30, 4, 0],
+                season_growth: [5, 4, 2, 0],
+                wild_sprout_chance: 20,
+                scatter_chance: 10,
+                scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature,
+                    tool: None,
+                    work_ticks: 0,
+                    yields: [("fruit", 3), ("berry_seed", 1)],
+                    despawn: false,
+                    stage_after: harvested,
+                    activity: foraging,
+                    skill: building,
+                    skill_xp: 3,
+                ),
+            ],
+            seed: Some("berry_seed"),
+            farm_tile_class: Some(cropland),
+            clear_work_ticks: 15,
+        ),
+        PlantDef(
+            key: "oak_tree",
+            display_name: "Oak Tree",
+            form: tree,
+            uses: [wood, food],
+            native_realms: [temp_forest, mediterranoid],
+            spawn: PlantSpawnRule(
+                biomes: [Temperate, Grassland],
+                surface_tiles: [grass, forest],
+                fertility: RangeU8(min: 80, max: 255),
+                base_weight: 60,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false,
+                sowing_seasons: [spring, autumn],
+                stage_thresholds: [12, 48, 48, 18, 0],
+                season_growth: [4, 5, 3, 0],
+                wild_sprout_chance: 20,
+                scatter_chance: 5,
+                scatter_radius: 3,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                // Autumn acorn drop — bare hands, plant remains.
+                PlantHarvestProfile(
+                    trigger: on_fruit_season(autumn),
+                    tool: None,
+                    work_ticks: 0,
+                    yields: [("acorn", 2)],
+                    despawn: false,
+                    stage_after: mature,
+                    activity: foraging,
+                    skill: foraging,
+                    skill_xp: 3,
+                ),
+                // Fell — axe-gated, despawns.
+                PlantHarvestProfile(
+                    trigger: on_fell,
+                    tool: Some(axe),
+                    work_ticks: 0,
+                    yields: [("wood", 3)],
+                    despawn: true,
+                    activity: wood_gathering,
+                    skill: building,
+                    skill_xp: 10,
+                ),
+            ],
+            seed: None,
+            farm_tile_class: None,
+            clear_work_ticks: 60,
+        ),
+        PlantDef(
+            key: "hazel",
+            display_name: "Hazel",
+            form: shrub,
+            uses: [food, wood],
+            native_realms: [temp_forest],
+            spawn: PlantSpawnRule(
+                biomes: [Temperate],
+                surface_tiles: [grass, forest],
+                base_weight: 25,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring, autumn],
+                stage_thresholds: [8, 32, 32, 12, 0],
+                season_growth: [4, 5, 3, 0],
+                wild_sprout_chance: 20, scatter_chance: 8, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_fruit_season(autumn), tool: None, work_ticks: 0,
+                    yields: [("hazelnut", 2)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 20,
+        ),
+        PlantDef(
+            key: "crabapple",
+            display_name: "Crabapple",
+            form: tree,
+            uses: [food, wood],
+            native_realms: [temp_forest, mediterranoid],
+            spawn: PlantSpawnRule(
+                biomes: [Temperate, Grassland],
+                surface_tiles: [grass],
+                base_weight: 15,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring, autumn],
+                stage_thresholds: [12, 48, 48, 18, 0],
+                season_growth: [4, 5, 3, 0],
+                wild_sprout_chance: 20, scatter_chance: 6, scatter_radius: 3,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_fruit_season(autumn), tool: None, work_ticks: 0,
+                    yields: [("crabapple", 3)],
+                    despawn: false, stage_after: mature,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+                PlantHarvestProfile(
+                    trigger: on_fell, tool: Some(axe), work_ticks: 0,
+                    yields: [("wood", 2)],
+                    despawn: true,
+                    activity: wood_gathering, skill: building, skill_xp: 8,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 50,
+        ),
+        PlantDef(
+            key: "flax",
+            display_name: "Flax",
+            form: forb,
+            uses: [fiber, oil],
+            native_realms: [temp_forest, mediterranoid, grassland_temp],
+            spawn: PlantSpawnRule(
+                biomes: [Temperate, Grassland],
+                surface_tiles: [grass, cropland],
+                base_weight: 20,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: true, sowing_seasons: [spring],
+                stage_thresholds: [3, 5, 0, 2, 0],
+                season_growth: [4, 5, 2, 0],
+                wild_sprout_chance: 20, scatter_chance: 15, scatter_radius: 2,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(knife), work_ticks: 0,
+                    yields: [("fiber", 2), ("oilseed", 1), ("flax_seed", 1)],
+                    despawn: true,
+                    activity: farming, skill: farming, skill_xp: 5,
+                ),
+            ],
+            seed: Some("flax_seed"),
+            farm_tile_class: Some(cropland),
+            clear_work_ticks: 8,
+        ),
+        PlantDef(
+            key: "hemp",
+            display_name: "Hemp",
+            form: forb,
+            uses: [fiber],
+            native_realms: [temp_forest, grassland_temp],
+            spawn: PlantSpawnRule(
+                biomes: [Temperate, Grassland],
+                surface_tiles: [grass, cropland],
+                base_weight: 15,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: true, sowing_seasons: [spring],
+                stage_thresholds: [3, 5, 0, 2, 0],
+                season_growth: [4, 5, 2, 0],
+                wild_sprout_chance: 20, scatter_chance: 15, scatter_radius: 2,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(knife), work_ticks: 0,
+                    yields: [("fiber", 3), ("hemp_seed", 1)],
+                    despawn: true,
+                    activity: farming, skill: farming, skill_xp: 5,
+                ),
+            ],
+            seed: Some("hemp_seed"),
+            farm_tile_class: Some(cropland),
+            clear_work_ticks: 8,
+        ),
+        PlantDef(
+            key: "grape",
+            display_name: "Grape Vine",
+            form: vine,
+            uses: [food, luxury],
+            native_realms: [temp_forest, mediterranoid],
+            spawn: PlantSpawnRule(
+                biomes: [Temperate],
+                surface_tiles: [grass, forest],
+                base_weight: 10,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [5, 30, 30, 4, 0],
+                season_growth: [5, 4, 2, 0],
+                wild_sprout_chance: 20, scatter_chance: 8, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_fruit_season(autumn), tool: None, work_ticks: 0,
+                    yields: [("grape", 4)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 4,
+                ),
+            ],
+            seed: None, farm_tile_class: Some(orchard), clear_work_ticks: 12,
+        ),
+        PlantDef(
+            key: "willow",
+            display_name: "Willow",
+            form: tree,
+            uses: [wood, medicine],
+            native_realms: [temp_forest, taiga, coastal_wetland],
+            spawn: PlantSpawnRule(
+                biomes: [Temperate, Wetland, Taiga],
+                surface_tiles: [grass, marsh],
+                river_distance: RangeU8(min: 0, max: 3),
+                base_weight: 30,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring, autumn],
+                stage_thresholds: [10, 40, 40, 16, 0],
+                season_growth: [4, 5, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 6, scatter_radius: 3,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(knife), work_ticks: 0,
+                    yields: [("medicinal_herb", 1)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+                PlantHarvestProfile(
+                    trigger: on_fell, tool: Some(axe), work_ticks: 0,
+                    yields: [("wood", 3)],
+                    despawn: true,
+                    activity: wood_gathering, skill: building, skill_xp: 10,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 50,
+        ),
+
+        // ═════════════════════════════════════════════════════════════════
+        // TUNDRA — Boreal realm
+        // ═════════════════════════════════════════════════════════════════
+        PlantDef(
+            key: "cloudberry",
+            display_name: "Cloudberry",
+            form: shrub,
+            uses: [food],
+            native_realms: [boreal, taiga],
+            spawn: PlantSpawnRule(
+                biomes: [Tundra],
+                surface_tiles: [grass, marsh, snow],
+                base_weight: 30,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [5, 30, 30, 4, 0],
+                season_growth: [3, 5, 3, 0],
+                wild_sprout_chance: 20, scatter_chance: 12, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_fruit_season(summer), tool: None, work_ticks: 0,
+                    yields: [("cloudberry", 3)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 12,
+        ),
+        PlantDef(
+            key: "crowberry",
+            display_name: "Crowberry",
+            form: shrub,
+            uses: [food],
+            native_realms: [boreal],
+            spawn: PlantSpawnRule(
+                biomes: [Tundra],
+                surface_tiles: [grass, scrub],
+                base_weight: 25,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [5, 30, 30, 4, 0],
+                season_growth: [3, 5, 3, 0],
+                wild_sprout_chance: 20, scatter_chance: 12, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_fruit_season(autumn), tool: None, work_ticks: 0,
+                    yields: [("crowberry", 3)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 10,
+        ),
+        PlantDef(
+            key: "dwarf_birch",
+            display_name: "Dwarf Birch",
+            form: shrub,
+            uses: [wood, bark],
+            native_realms: [boreal],
+            spawn: PlantSpawnRule(
+                biomes: [Tundra, Taiga],
+                surface_tiles: [grass, scrub, snow],
+                base_weight: 20,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [8, 36, 36, 12, 0],
+                season_growth: [3, 5, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 6, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(axe), work_ticks: 0,
+                    yields: [("wood", 1), ("birch_bark", 1)],
+                    despawn: false, stage_after: harvested,
+                    activity: wood_gathering, skill: building, skill_xp: 5,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 20,
+        ),
+        PlantDef(
+            key: "arctic_willow",
+            display_name: "Arctic Willow",
+            form: shrub,
+            uses: [wood, medicine],
+            native_realms: [boreal],
+            spawn: PlantSpawnRule(
+                biomes: [Tundra],
+                surface_tiles: [grass, scrub, snow],
+                base_weight: 20,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [8, 36, 36, 12, 0],
+                season_growth: [3, 5, 2, 0],
+                wild_sprout_chance: 25, scatter_chance: 6, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(knife), work_ticks: 0,
+                    yields: [("medicinal_herb", 1)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 18,
+        ),
+        PlantDef(
+            key: "labrador_tea",
+            display_name: "Labrador Tea",
+            form: shrub,
+            uses: [medicine, luxury],
+            native_realms: [boreal, taiga],
+            spawn: PlantSpawnRule(
+                biomes: [Tundra, Taiga],
+                surface_tiles: [marsh, grass],
+                base_weight: 15,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [5, 30, 30, 4, 0],
+                season_growth: [4, 5, 2, 0],
+                wild_sprout_chance: 25, scatter_chance: 12, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: None, work_ticks: 0,
+                    yields: [("medicinal_herb", 2)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 10,
+        ),
+
+        // ═════════════════════════════════════════════════════════════════
+        // TAIGA realm
+        // ═════════════════════════════════════════════════════════════════
+        PlantDef(
+            key: "paper_birch",
+            display_name: "Paper Birch",
+            form: tree,
+            uses: [wood, bark],
+            native_realms: [taiga, boreal],
+            spawn: PlantSpawnRule(
+                biomes: [Taiga, Tundra],
+                surface_tiles: [grass, forest],
+                base_weight: 45,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring, autumn],
+                stage_thresholds: [12, 48, 48, 18, 0],
+                season_growth: [4, 5, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 5, scatter_radius: 3,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_fell, tool: Some(axe), work_ticks: 0,
+                    yields: [("wood", 3), ("birch_bark", 2)],
+                    despawn: true,
+                    activity: wood_gathering, skill: building, skill_xp: 10,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 60,
+        ),
+        PlantDef(
+            key: "spruce",
+            display_name: "Spruce",
+            form: tree,
+            uses: [wood, resin],
+            native_realms: [taiga, boreal],
+            spawn: PlantSpawnRule(
+                biomes: [Taiga],
+                surface_tiles: [grass, forest, snow],
+                base_weight: 50,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring, autumn],
+                stage_thresholds: [12, 48, 48, 18, 0],
+                season_growth: [4, 5, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 5, scatter_radius: 3,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(knife), work_ticks: 0,
+                    yields: [("resin", 1)],
+                    despawn: false, stage_after: mature,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+                PlantHarvestProfile(
+                    trigger: on_fell, tool: Some(axe), work_ticks: 0,
+                    yields: [("wood", 3)],
+                    despawn: true,
+                    activity: wood_gathering, skill: building, skill_xp: 10,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 60,
+        ),
+        PlantDef(
+            key: "pine",
+            display_name: "Pine",
+            form: tree,
+            uses: [wood, resin],
+            native_realms: [taiga, temp_forest, montane_temp],
+            spawn: PlantSpawnRule(
+                biomes: [Taiga, Temperate],
+                surface_tiles: [grass, forest],
+                base_weight: 45,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring, autumn],
+                stage_thresholds: [12, 48, 48, 18, 0],
+                season_growth: [4, 5, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 5, scatter_radius: 3,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(knife), work_ticks: 0,
+                    yields: [("resin", 1)],
+                    despawn: false, stage_after: mature,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+                PlantHarvestProfile(
+                    trigger: on_fell, tool: Some(axe), work_ticks: 0,
+                    yields: [("wood", 3)],
+                    despawn: true,
+                    activity: wood_gathering, skill: building, skill_xp: 10,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 60,
+        ),
+        PlantDef(
+            key: "cranberry",
+            display_name: "Cranberry",
+            form: shrub,
+            uses: [food],
+            native_realms: [taiga, boreal, coastal_wetland],
+            spawn: PlantSpawnRule(
+                biomes: [Taiga, Wetland],
+                surface_tiles: [marsh, grass],
+                base_weight: 25,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [5, 30, 30, 4, 0],
+                season_growth: [4, 5, 2, 0],
+                wild_sprout_chance: 25, scatter_chance: 10, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_fruit_season(autumn), tool: None, work_ticks: 0,
+                    yields: [("cranberry", 3)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 10,
+        ),
+        PlantDef(
+            key: "stinging_nettle",
+            display_name: "Stinging Nettle",
+            form: forb,
+            uses: [fiber, medicine],
+            native_realms: [taiga, temp_forest, boreal],
+            spawn: PlantSpawnRule(
+                biomes: [Taiga, Temperate, Wetland],
+                surface_tiles: [grass, marsh],
+                base_weight: 25,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [3, 8, 8, 3, 0],
+                season_growth: [5, 5, 2, 0],
+                wild_sprout_chance: 30, scatter_chance: 15, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(knife), work_ticks: 0,
+                    yields: [("fiber", 1), ("medicinal_herb", 1)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 8,
+        ),
+
+        // ═════════════════════════════════════════════════════════════════
+        // GRASSLAND — GrasslandTemp realm
+        // ═════════════════════════════════════════════════════════════════
+        PlantDef(
+            key: "wild_barley",
+            display_name: "Wild Barley",
+            form: grass,
+            uses: [grain, food],
+            native_realms: [grassland_temp, mediterranoid],
+            spawn: PlantSpawnRule(
+                biomes: [Grassland, Steppe],
+                surface_tiles: [grass, cropland],
+                base_weight: 60,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: true, sowing_seasons: [spring],
+                stage_thresholds: [3, 5, 0, 2, 0],
+                season_growth: [4, 5, 2, 0],
+                wild_sprout_chance: 20, scatter_chance: 20, scatter_radius: 2,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(sickle), work_ticks: 0,
+                    yields: [("barley_grain", 5), ("barley_seed", 2), ("thatch", 1)],
+                    despawn: true,
+                    activity: farming, skill: farming, skill_xp: 5,
+                ),
+            ],
+            seed: Some("barley_seed"),
+            farm_tile_class: Some(cropland),
+            clear_work_ticks: 10,
+        ),
+        PlantDef(
+            key: "sunflower",
+            display_name: "Sunflower",
+            form: forb,
+            uses: [food, oil],
+            native_realms: [grassland_temp],
+            spawn: PlantSpawnRule(
+                biomes: [Grassland, Steppe],
+                surface_tiles: [grass, cropland],
+                base_weight: 25,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: true, sowing_seasons: [spring],
+                stage_thresholds: [3, 5, 0, 2, 0],
+                season_growth: [4, 5, 2, 0],
+                wild_sprout_chance: 20, scatter_chance: 12, scatter_radius: 2,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(knife), work_ticks: 0,
+                    yields: [("sunflower_seed", 3), ("oilseed", 2), ("sunflower_seed_seed", 1)],
+                    despawn: true,
+                    activity: farming, skill: farming, skill_xp: 5,
+                ),
+            ],
+            seed: Some("sunflower_seed_seed"),
+            farm_tile_class: Some(cropland),
+            clear_work_ticks: 10,
+        ),
+        PlantDef(
+            key: "prairie_turnip",
+            display_name: "Prairie Turnip",
+            form: tuber,
+            uses: [food],
+            native_realms: [grassland_temp],
+            spawn: PlantSpawnRule(
+                biomes: [Grassland, Steppe],
+                surface_tiles: [grass],
+                base_weight: 18,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: true, sowing_seasons: [spring],
+                stage_thresholds: [3, 5, 0, 2, 0],
+                season_growth: [4, 5, 2, 0],
+                wild_sprout_chance: 20, scatter_chance: 12, scatter_radius: 2,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: None, work_ticks: 0,
+                    yields: [("prairie_turnip", 3)],
+                    despawn: true,
+                    activity: foraging, skill: foraging, skill_xp: 4,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 8,
+        ),
+        PlantDef(
+            key: "camas",
+            display_name: "Camas",
+            form: tuber,
+            uses: [food],
+            native_realms: [grassland_temp, temp_forest],
+            spawn: PlantSpawnRule(
+                biomes: [Grassland, Temperate],
+                surface_tiles: [grass, marsh],
+                base_weight: 18,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [4, 12, 12, 6, 0],
+                season_growth: [4, 5, 2, 0],
+                wild_sprout_chance: 20, scatter_chance: 10, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: None, work_ticks: 0,
+                    yields: [("camas_root", 3)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 4,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 8,
+        ),
+        PlantDef(
+            key: "amaranth",
+            display_name: "Amaranth",
+            form: forb,
+            uses: [grain, food],
+            native_realms: [grassland_temp, grassland_trop],
+            spawn: PlantSpawnRule(
+                biomes: [Grassland, Steppe],
+                surface_tiles: [grass, cropland],
+                base_weight: 20,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: true, sowing_seasons: [spring],
+                stage_thresholds: [3, 5, 0, 2, 0],
+                season_growth: [4, 5, 2, 0],
+                wild_sprout_chance: 20, scatter_chance: 15, scatter_radius: 2,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(sickle), work_ticks: 0,
+                    yields: [("amaranth_grain", 4), ("amaranth_seed", 2), ("thatch", 1)],
+                    despawn: true,
+                    activity: farming, skill: farming, skill_xp: 5,
+                ),
+            ],
+            seed: Some("amaranth_seed"),
+            farm_tile_class: Some(cropland),
+            clear_work_ticks: 10,
+        ),
+
+        // ═════════════════════════════════════════════════════════════════
+        // TROPICAL — RainforestTrop realm
+        // ═════════════════════════════════════════════════════════════════
+        PlantDef(
+            key: "banana",
+            display_name: "Banana",
+            form: tree,
+            uses: [food],
+            native_realms: [rainforest_trop, grassland_trop],
+            spawn: PlantSpawnRule(
+                biomes: [Tropical, Wetland],
+                surface_tiles: [grass, marsh, forest],
+                base_weight: 30,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring, autumn],
+                stage_thresholds: [8, 20, 20, 8, 0],
+                season_growth: [5, 5, 4, 0],
+                wild_sprout_chance: 30, scatter_chance: 10, scatter_radius: 3,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_fruit_season(summer), tool: None, work_ticks: 0,
+                    yields: [("banana", 4)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 4,
+                ),
+            ],
+            seed: None, farm_tile_class: Some(orchard), clear_work_ticks: 30,
+        ),
+        PlantDef(
+            key: "taro",
+            display_name: "Taro",
+            form: tuber,
+            uses: [food],
+            native_realms: [rainforest_trop, coastal_wetland],
+            spawn: PlantSpawnRule(
+                biomes: [Tropical, Wetland],
+                surface_tiles: [marsh, grass],
+                base_weight: 20,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [4, 16, 16, 6, 0],
+                season_growth: [5, 5, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 10, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: None, work_ticks: 0,
+                    yields: [("taro_root", 3)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 4,
+                ),
+            ],
+            seed: None, farm_tile_class: Some(paddy), clear_work_ticks: 10,
+        ),
+        PlantDef(
+            key: "yam",
+            display_name: "Yam",
+            form: vine,
+            uses: [food],
+            native_realms: [rainforest_trop, grassland_trop],
+            spawn: PlantSpawnRule(
+                biomes: [Tropical],
+                surface_tiles: [grass, forest],
+                base_weight: 20,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [4, 16, 16, 6, 0],
+                season_growth: [5, 5, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 10, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: None, work_ticks: 0,
+                    yields: [("yam_tuber", 3)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 4,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 12,
+        ),
+        PlantDef(
+            key: "cacao",
+            display_name: "Cacao",
+            form: tree,
+            uses: [luxury, food],
+            native_realms: [rainforest_trop],
+            spawn: PlantSpawnRule(
+                biomes: [Tropical],
+                surface_tiles: [forest, grass],
+                base_weight: 15,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [12, 48, 48, 18, 0],
+                season_growth: [4, 5, 3, 0],
+                wild_sprout_chance: 30, scatter_chance: 6, scatter_radius: 3,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_fruit_season(autumn), tool: Some(knife), work_ticks: 0,
+                    yields: [("luxury", 1)],
+                    despawn: false, stage_after: mature,
+                    activity: foraging, skill: foraging, skill_xp: 5,
+                ),
+                PlantHarvestProfile(
+                    trigger: on_fell, tool: Some(axe), work_ticks: 0,
+                    yields: [("wood", 2)],
+                    despawn: true,
+                    activity: wood_gathering, skill: building, skill_xp: 8,
+                ),
+            ],
+            seed: None, farm_tile_class: Some(orchard), clear_work_ticks: 50,
+        ),
+        PlantDef(
+            key: "rubber_tree",
+            display_name: "Rubber Tree",
+            form: tree,
+            uses: [latex, wood],
+            native_realms: [rainforest_trop],
+            spawn: PlantSpawnRule(
+                biomes: [Tropical],
+                surface_tiles: [forest, grass],
+                base_weight: 20,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [12, 48, 48, 18, 0],
+                season_growth: [4, 5, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 5, scatter_radius: 3,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(knife), work_ticks: 0,
+                    yields: [("latex", 1)],
+                    despawn: false, stage_after: mature,
+                    activity: foraging, skill: foraging, skill_xp: 4,
+                ),
+                PlantHarvestProfile(
+                    trigger: on_fell, tool: Some(axe), work_ticks: 0,
+                    yields: [("wood", 3)],
+                    despawn: true,
+                    activity: wood_gathering, skill: building, skill_xp: 10,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 60,
+        ),
+        PlantDef(
+            key: "oil_palm",
+            display_name: "Oil Palm",
+            form: tree,
+            uses: [oil, food],
+            native_realms: [rainforest_trop, grassland_trop],
+            spawn: PlantSpawnRule(
+                biomes: [Tropical],
+                surface_tiles: [grass, forest],
+                base_weight: 15,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [12, 48, 48, 18, 0],
+                season_growth: [4, 5, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 5, scatter_radius: 3,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_fruit_season(autumn), tool: Some(knife), work_ticks: 0,
+                    yields: [("oilseed", 3)],
+                    despawn: false, stage_after: mature,
+                    activity: foraging, skill: foraging, skill_xp: 4,
+                ),
+                PlantHarvestProfile(
+                    trigger: on_fell, tool: Some(axe), work_ticks: 0,
+                    yields: [("wood", 2)],
+                    despawn: true,
+                    activity: wood_gathering, skill: building, skill_xp: 9,
+                ),
+            ],
+            seed: None, farm_tile_class: Some(orchard), clear_work_ticks: 55,
+        ),
+
+        // ═════════════════════════════════════════════════════════════════
+        // DESERT — DesertHot realm
+        // ═════════════════════════════════════════════════════════════════
+        PlantDef(
+            key: "date_palm",
+            display_name: "Date Palm",
+            form: tree,
+            uses: [food, wood],
+            native_realms: [desert_hot, mediterranoid],
+            spawn: PlantSpawnRule(
+                biomes: [Desert, Badlands],
+                surface_tiles: [sand, grass],
+                river_distance: RangeU8(min: 0, max: 5),
+                base_weight: 20,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [12, 48, 48, 18, 0],
+                season_growth: [4, 5, 3, 0],
+                wild_sprout_chance: 30, scatter_chance: 5, scatter_radius: 3,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_fruit_season(autumn), tool: None, work_ticks: 0,
+                    yields: [("date_fruit", 4)],
+                    despawn: false, stage_after: mature,
+                    activity: foraging, skill: foraging, skill_xp: 4,
+                ),
+                PlantHarvestProfile(
+                    trigger: on_fell, tool: Some(axe), work_ticks: 0,
+                    yields: [("wood", 2)],
+                    despawn: true,
+                    activity: wood_gathering, skill: building, skill_xp: 9,
+                ),
+            ],
+            seed: None, farm_tile_class: Some(orchard), clear_work_ticks: 55,
+        ),
+        PlantDef(
+            key: "agave",
+            display_name: "Agave",
+            form: cactus,
+            uses: [fiber, food],
+            native_realms: [desert_hot],
+            spawn: PlantSpawnRule(
+                biomes: [Desert, Badlands],
+                surface_tiles: [sand, scrub],
+                base_weight: 20,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [6, 32, 32, 12, 0],
+                season_growth: [3, 4, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 8, scatter_radius: 2,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(knife), work_ticks: 0,
+                    yields: [("fiber", 2)],
+                    despawn: true,
+                    activity: foraging, skill: foraging, skill_xp: 4,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 20,
+        ),
+        PlantDef(
+            key: "yucca",
+            display_name: "Yucca",
+            form: cactus,
+            uses: [fiber, food],
+            native_realms: [desert_hot, desert_cold],
+            spawn: PlantSpawnRule(
+                biomes: [Desert, Badlands],
+                surface_tiles: [sand, scrub],
+                base_weight: 20,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [6, 32, 32, 12, 0],
+                season_growth: [3, 4, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 8, scatter_radius: 2,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(knife), work_ticks: 0,
+                    yields: [("fiber", 2)],
+                    despawn: true,
+                    activity: foraging, skill: foraging, skill_xp: 4,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 18,
+        ),
+        PlantDef(
+            key: "prickly_pear",
+            display_name: "Prickly Pear",
+            form: cactus,
+            uses: [food],
+            native_realms: [desert_hot, desert_cold],
+            spawn: PlantSpawnRule(
+                biomes: [Desert, Badlands],
+                surface_tiles: [sand, scrub],
+                base_weight: 15,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [5, 20, 20, 6, 0],
+                season_growth: [3, 4, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 12, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_fruit_season(summer), tool: Some(knife), work_ticks: 0,
+                    yields: [("prickly_pear", 3)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 4,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 12,
+        ),
+        PlantDef(
+            key: "mesquite",
+            display_name: "Mesquite",
+            form: tree,
+            uses: [food, wood, medicine],
+            native_realms: [desert_hot],
+            spawn: PlantSpawnRule(
+                biomes: [Desert, Badlands],
+                surface_tiles: [sand, scrub, grass],
+                base_weight: 20,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [10, 40, 40, 16, 0],
+                season_growth: [3, 4, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 6, scatter_radius: 3,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_fruit_season(summer), tool: None, work_ticks: 0,
+                    yields: [("mesquite_pod", 3)],
+                    despawn: false, stage_after: mature,
+                    activity: foraging, skill: foraging, skill_xp: 4,
+                ),
+                PlantHarvestProfile(
+                    trigger: on_fell, tool: Some(axe), work_ticks: 0,
+                    yields: [("wood", 2)],
+                    despawn: true,
+                    activity: wood_gathering, skill: building, skill_xp: 8,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 45,
+        ),
+        PlantDef(
+            key: "aloe",
+            display_name: "Aloe",
+            form: forb,
+            uses: [medicine],
+            native_realms: [desert_hot, mediterranoid],
+            spawn: PlantSpawnRule(
+                biomes: [Desert, Badlands],
+                surface_tiles: [sand, scrub],
+                base_weight: 12,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [4, 16, 16, 6, 0],
+                season_growth: [4, 5, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 12, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(knife), work_ticks: 0,
+                    yields: [("medicinal_herb", 2)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 8,
+        ),
+
+        // ═════════════════════════════════════════════════════════════════
+        // MOUNTAIN — MontaneTemp / MontaneTrop realms
+        // ═════════════════════════════════════════════════════════════════
+        PlantDef(
+            key: "quinoa",
+            display_name: "Quinoa",
+            form: forb,
+            uses: [grain, food],
+            native_realms: [montane_temp, montane_trop],
+            spawn: PlantSpawnRule(
+                biomes: [Mountain, Steppe],
+                surface_tiles: [grass, cropland],
+                base_weight: 20,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: true, sowing_seasons: [spring],
+                stage_thresholds: [3, 5, 0, 2, 0],
+                season_growth: [4, 5, 2, 0],
+                wild_sprout_chance: 20, scatter_chance: 15, scatter_radius: 2,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(sickle), work_ticks: 0,
+                    yields: [("quinoa_grain", 4), ("quinoa_seed", 2), ("thatch", 1)],
+                    despawn: true,
+                    activity: farming, skill: farming, skill_xp: 5,
+                ),
+            ],
+            seed: Some("quinoa_seed"),
+            farm_tile_class: Some(cropland),
+            clear_work_ticks: 10,
+        ),
+        PlantDef(
+            key: "potato",
+            display_name: "Potato",
+            form: tuber,
+            uses: [food],
+            native_realms: [montane_temp, montane_trop],
+            spawn: PlantSpawnRule(
+                biomes: [Mountain, Temperate],
+                surface_tiles: [grass, cropland],
+                base_weight: 20,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: true, sowing_seasons: [spring],
+                stage_thresholds: [3, 5, 0, 2, 0],
+                season_growth: [4, 5, 2, 0],
+                wild_sprout_chance: 25, scatter_chance: 12, scatter_radius: 2,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: None, work_ticks: 0,
+                    yields: [("potato_tuber", 4), ("potato_seed", 1)],
+                    despawn: true,
+                    activity: farming, skill: farming, skill_xp: 5,
+                ),
+            ],
+            seed: Some("potato_seed"),
+            farm_tile_class: Some(cropland),
+            clear_work_ticks: 10,
+        ),
+        PlantDef(
+            key: "buckwheat",
+            display_name: "Buckwheat",
+            form: forb,
+            uses: [grain, food],
+            native_realms: [montane_temp],
+            spawn: PlantSpawnRule(
+                biomes: [Mountain, Temperate, Steppe],
+                surface_tiles: [grass, cropland],
+                base_weight: 20,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: true, sowing_seasons: [spring, summer],
+                stage_thresholds: [3, 5, 0, 2, 0],
+                season_growth: [4, 5, 2, 0],
+                wild_sprout_chance: 25, scatter_chance: 15, scatter_radius: 2,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(sickle), work_ticks: 0,
+                    yields: [("buckwheat_grain", 4), ("buckwheat_seed", 2), ("thatch", 1)],
+                    despawn: true,
+                    activity: farming, skill: farming, skill_xp: 5,
+                ),
+            ],
+            seed: Some("buckwheat_seed"),
+            farm_tile_class: Some(cropland),
+            clear_work_ticks: 10,
+        ),
+        PlantDef(
+            key: "juniper",
+            display_name: "Juniper",
+            form: shrub,
+            uses: [wood, medicine, resin],
+            native_realms: [montane_temp, desert_cold, mediterranoid],
+            spawn: PlantSpawnRule(
+                biomes: [Mountain, Steppe, Badlands],
+                surface_tiles: [grass, scrub],
+                base_weight: 20,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [10, 40, 40, 16, 0],
+                season_growth: [3, 5, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 6, scatter_radius: 2,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(knife), work_ticks: 0,
+                    yields: [("medicinal_herb", 1), ("resin", 1)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 30,
+        ),
+        PlantDef(
+            key: "alpine_willow",
+            display_name: "Alpine Willow",
+            form: shrub,
+            uses: [wood, medicine],
+            native_realms: [montane_temp, boreal],
+            spawn: PlantSpawnRule(
+                biomes: [Mountain, Tundra],
+                surface_tiles: [grass, scrub, snow],
+                base_weight: 15,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [8, 36, 36, 12, 0],
+                season_growth: [3, 5, 2, 0],
+                wild_sprout_chance: 25, scatter_chance: 6, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(knife), work_ticks: 0,
+                    yields: [("medicinal_herb", 1)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 18,
+        ),
+
+        // ═════════════════════════════════════════════════════════════════
+        // WETLAND — CoastalWetland realm
+        // ═════════════════════════════════════════════════════════════════
+        PlantDef(
+            key: "cattail",
+            display_name: "Cattail",
+            form: aquatic,
+            uses: [food, reed, fiber],
+            native_realms: [coastal_wetland, temp_forest],
+            spawn: PlantSpawnRule(
+                biomes: [Wetland],
+                surface_tiles: [marsh],
+                base_weight: 40,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [3, 12, 12, 4, 0],
+                season_growth: [5, 5, 3, 0],
+                wild_sprout_chance: 30, scatter_chance: 15, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: None, work_ticks: 0,
+                    yields: [("cattail_root", 2), ("reeds", 1)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 4,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 10,
+        ),
+        PlantDef(
+            key: "bulrush",
+            display_name: "Bulrush",
+            form: aquatic,
+            uses: [reed, fiber],
+            native_realms: [coastal_wetland],
+            spawn: PlantSpawnRule(
+                biomes: [Wetland],
+                surface_tiles: [marsh],
+                base_weight: 30,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [3, 12, 12, 4, 0],
+                season_growth: [5, 5, 3, 0],
+                wild_sprout_chance: 30, scatter_chance: 15, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: None, work_ticks: 0,
+                    yields: [("reeds", 2)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 10,
+        ),
+        PlantDef(
+            key: "papyrus",
+            display_name: "Papyrus",
+            form: aquatic,
+            uses: [reed, fiber],
+            native_realms: [coastal_wetland, grassland_trop],
+            spawn: PlantSpawnRule(
+                biomes: [Wetland, Tropical],
+                surface_tiles: [marsh],
+                base_weight: 20,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [3, 12, 12, 4, 0],
+                season_growth: [5, 5, 3, 0],
+                wild_sprout_chance: 30, scatter_chance: 15, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(knife), work_ticks: 0,
+                    yields: [("papyrus_stalk", 2)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 10,
+        ),
+        PlantDef(
+            key: "wild_rice",
+            display_name: "Wild Rice",
+            form: aquatic,
+            uses: [grain, food],
+            native_realms: [coastal_wetland, temp_forest],
+            spawn: PlantSpawnRule(
+                biomes: [Wetland],
+                surface_tiles: [marsh],
+                base_weight: 25,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: true, sowing_seasons: [spring],
+                stage_thresholds: [3, 5, 0, 2, 0],
+                season_growth: [4, 5, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 18, scatter_radius: 2,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(sickle), work_ticks: 0,
+                    yields: [("wild_rice", 4), ("rice_seed", 2)],
+                    despawn: true,
+                    activity: farming, skill: farming, skill_xp: 5,
+                ),
+            ],
+            seed: Some("rice_seed"),
+            farm_tile_class: Some(paddy),
+            clear_work_ticks: 10,
+        ),
+        PlantDef(
+            key: "lotus",
+            display_name: "Lotus",
+            form: aquatic,
+            uses: [food, luxury],
+            native_realms: [coastal_wetland, rainforest_trop],
+            spawn: PlantSpawnRule(
+                biomes: [Wetland, Tropical],
+                surface_tiles: [marsh],
+                base_weight: 15,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [4, 16, 16, 6, 0],
+                season_growth: [5, 5, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 10, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_fruit_season(summer), tool: None, work_ticks: 0,
+                    yields: [("lotus_root", 2)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 4,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 8,
+        ),
+
+        // ═════════════════════════════════════════════════════════════════
+        // STEPPE — GrasslandTemp / DesertCold realms
+        // ═════════════════════════════════════════════════════════════════
+        PlantDef(
+            key: "foxtail_millet",
+            display_name: "Foxtail Millet",
+            form: grass,
+            uses: [grain, food],
+            native_realms: [grassland_temp, desert_cold],
+            spawn: PlantSpawnRule(
+                biomes: [Steppe, Grassland],
+                surface_tiles: [grass, cropland, scrub],
+                base_weight: 25,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: true, sowing_seasons: [spring],
+                stage_thresholds: [3, 5, 0, 2, 0],
+                season_growth: [4, 5, 2, 0],
+                wild_sprout_chance: 20, scatter_chance: 18, scatter_radius: 2,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(sickle), work_ticks: 0,
+                    yields: [("millet_grain", 4), ("millet_seed", 2), ("thatch", 1)],
+                    despawn: true,
+                    activity: farming, skill: farming, skill_xp: 5,
+                ),
+            ],
+            seed: Some("millet_seed"),
+            farm_tile_class: Some(cropland),
+            clear_work_ticks: 10,
+        ),
+        PlantDef(
+            key: "sagebrush",
+            display_name: "Sagebrush",
+            form: shrub,
+            uses: [medicine, fodder],
+            native_realms: [desert_cold, grassland_temp],
+            spawn: PlantSpawnRule(
+                biomes: [Steppe, Badlands, Desert],
+                surface_tiles: [scrub, sand],
+                base_weight: 25,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [5, 20, 20, 8, 0],
+                season_growth: [3, 4, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 12, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: Some(knife), work_ticks: 0,
+                    yields: [("medicinal_herb", 1)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 10,
+        ),
+        PlantDef(
+            key: "wild_onion",
+            display_name: "Wild Onion",
+            form: forb,
+            uses: [food, medicine],
+            native_realms: [grassland_temp, desert_cold],
+            spawn: PlantSpawnRule(
+                biomes: [Steppe, Grassland, Badlands],
+                surface_tiles: [grass, scrub],
+                base_weight: 15,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [4, 12, 12, 4, 0],
+                season_growth: [4, 5, 2, 0],
+                wild_sprout_chance: 25, scatter_chance: 14, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: None, work_ticks: 0,
+                    yields: [("medicinal_herb", 1)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 8,
+        ),
+
+        // ═════════════════════════════════════════════════════════════════
+        // BADLANDS — DesertCold / DesertHot
+        // ═════════════════════════════════════════════════════════════════
+        PlantDef(
+            key: "pinyon_pine",
+            display_name: "Pinyon Pine",
+            form: tree,
+            uses: [food, wood, resin],
+            native_realms: [desert_cold, montane_temp],
+            spawn: PlantSpawnRule(
+                biomes: [Badlands, Mountain],
+                surface_tiles: [scrub, grass],
+                base_weight: 20,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [10, 40, 40, 16, 0],
+                season_growth: [3, 5, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 6, scatter_radius: 3,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_fruit_season(autumn), tool: None, work_ticks: 0,
+                    yields: [("pinyon_nut", 2)],
+                    despawn: false, stage_after: mature,
+                    activity: foraging, skill: foraging, skill_xp: 4,
+                ),
+                PlantHarvestProfile(
+                    trigger: on_fell, tool: Some(axe), work_ticks: 0,
+                    yields: [("wood", 2), ("resin", 1)],
+                    despawn: true,
+                    activity: wood_gathering, skill: building, skill_xp: 9,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 45,
+        ),
+        PlantDef(
+            key: "saltbush",
+            display_name: "Saltbush",
+            form: shrub,
+            uses: [fodder],
+            native_realms: [desert_cold, desert_hot],
+            spawn: PlantSpawnRule(
+                biomes: [Badlands, Desert, Steppe],
+                surface_tiles: [scrub, sand],
+                base_weight: 18,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [5, 20, 20, 8, 0],
+                season_growth: [3, 4, 3, 0],
+                wild_sprout_chance: 25, scatter_chance: 12, scatter_radius: 2,
+                regrow_after_harvest: true,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: None, work_ticks: 0,
+                    yields: [("fiber", 1)],
+                    despawn: false, stage_after: harvested,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 10,
+        ),
+
+        // ═════════════════════════════════════════════════════════════════
+        // OCEAN / COASTAL — CoastalWetland (requires_coastal)
+        // ═════════════════════════════════════════════════════════════════
+        PlantDef(
+            key: "kelp_wrack",
+            display_name: "Kelp Wrack",
+            form: aquatic,
+            uses: [food, fiber],
+            native_realms: [coastal_wetland],
+            spawn: PlantSpawnRule(
+                biomes: [Tundra, Temperate, Taiga, Tropical, Wetland],
+                surface_tiles: [sand],
+                requires_coastal: true,
+                base_weight: 25,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: true, sowing_seasons: [spring],
+                stage_thresholds: [3, 5, 0, 2, 0],
+                season_growth: [5, 5, 3, 0],
+                wild_sprout_chance: 35, scatter_chance: 18, scatter_radius: 2,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: None, work_ticks: 0,
+                    yields: [("fiber", 1), ("fruit", 1)],
+                    despawn: true,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 6,
+        ),
+        PlantDef(
+            key: "mangrove",
+            display_name: "Mangrove",
+            form: tree,
+            uses: [wood],
+            native_realms: [coastal_wetland, rainforest_trop],
+            spawn: PlantSpawnRule(
+                biomes: [Wetland, Tropical],
+                surface_tiles: [marsh],
+                requires_coastal: true,
+                base_weight: 25,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring, autumn],
+                stage_thresholds: [12, 48, 48, 18, 0],
+                season_growth: [5, 5, 4, 0],
+                wild_sprout_chance: 30, scatter_chance: 6, scatter_radius: 3,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_fell, tool: Some(axe), work_ticks: 0,
+                    yields: [("wood", 3)],
+                    despawn: true,
+                    activity: wood_gathering, skill: building, skill_xp: 10,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 55,
+        ),
+        PlantDef(
+            key: "coconut_palm",
+            display_name: "Coconut Palm",
+            form: tree,
+            uses: [food, oil, wood],
+            native_realms: [coastal_wetland, rainforest_trop],
+            spawn: PlantSpawnRule(
+                biomes: [Tropical, Wetland],
+                surface_tiles: [sand, grass],
+                requires_coastal: true,
+                base_weight: 20,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: false, sowing_seasons: [spring],
+                stage_thresholds: [12, 48, 48, 18, 0],
+                season_growth: [4, 5, 3, 0],
+                wild_sprout_chance: 30, scatter_chance: 5, scatter_radius: 3,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_fruit_season(summer), tool: None, work_ticks: 0,
+                    yields: [("coconut", 2)],
+                    despawn: false, stage_after: mature,
+                    activity: foraging, skill: foraging, skill_xp: 4,
+                ),
+                PlantHarvestProfile(
+                    trigger: on_fell, tool: Some(axe), work_ticks: 0,
+                    yields: [("wood", 2)],
+                    despawn: true,
+                    activity: wood_gathering, skill: building, skill_xp: 9,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 55,
+        ),
+        PlantDef(
+            key: "saltwort",
+            display_name: "Saltwort",
+            form: forb,
+            uses: [medicine],
+            native_realms: [coastal_wetland],
+            spawn: PlantSpawnRule(
+                biomes: [Wetland, Desert],
+                surface_tiles: [sand, marsh],
+                requires_coastal: true,
+                base_weight: 12,
+            ),
+            lifecycle: PlantLifecycleProfile(
+                annual: true, sowing_seasons: [spring],
+                stage_thresholds: [3, 5, 0, 2, 0],
+                season_growth: [4, 5, 2, 0],
+                wild_sprout_chance: 25, scatter_chance: 15, scatter_radius: 2,
+                regrow_after_harvest: false,
+            ),
+            harvests: [
+                PlantHarvestProfile(
+                    trigger: on_mature, tool: None, work_ticks: 0,
+                    yields: [("medicinal_herb", 1)],
+                    despawn: true,
+                    activity: foraging, skill: foraging, skill_xp: 3,
+                ),
+            ],
+            seed: None, farm_tile_class: None, clear_work_ticks: 5,
+        ),
+    ],
+)

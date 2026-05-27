@@ -9,6 +9,7 @@ pub mod entity_sprites;
 pub mod fog;
 pub mod path_debug;
 pub mod pixel_art;
+pub mod plant_sprites;
 pub mod projection;
 pub mod sprite_library;
 pub mod tile_render;
@@ -30,6 +31,7 @@ impl Plugin for RenderingPlugin {
             .insert_resource(fog::FogMap::default())
             .insert_resource(fog::FogTileMaterials::default())
             .insert_resource(pixel_art::AnimalTextures::default())
+            .insert_resource(plant_sprites::PlantSpriteSet::default())
             .insert_resource(water_current_render::CurrentStreakIndex::default())
             .add_systems(
                 Startup,
@@ -38,6 +40,7 @@ impl Plugin for RenderingPlugin {
                     day_night::spawn_day_night_overlay,
                     pixel_art::setup_pixel_art,
                     pixel_art::setup_animal_textures,
+                    plant_sprites::setup_plant_sprites,
                     sprite_library::setup_sprite_library,
                 ),
             )

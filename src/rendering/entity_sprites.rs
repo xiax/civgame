@@ -14,7 +14,9 @@ use crate::simulation::faction::{
 };
 use crate::simulation::items::{Equipment, EquipmentSlot, GroundItem};
 use crate::simulation::person::{HairColor, Person, PersonAI, SkinTone};
-use crate::simulation::plants::{GrowthStage, Plant, PlantKind};
+use crate::rendering::plant_sprites::PlantSpriteSet;
+use crate::simulation::plant_catalog::{PlantForm, PlantSpeciesId};
+use crate::simulation::plants::{GrowthStage, Plant, PlantKind, PlantSpecies, PlantSpriteVariant};
 use crate::simulation::reproduction::BiologicalSex;
 use crate::world::terrain::tile_to_world;
 use bevy::prelude::*;
@@ -1318,7 +1320,11 @@ pub fn spawn_person_sprites(
     }
 }
 
-pub fn get_plant_texture(
+/// Legacy ASCII fallback — the last-resort path when neither the
+/// per-species nor per-form PNG layer in `PlantSpriteSet` carries art for
+/// `(species, stage)`. Keyed on the coarse `PlantKind` bucket since the
+/// existing ASCII templates only cover Tree / BerryBush / Grain shapes.
+pub fn get_plant_texture_legacy(
     textures: &EntityTextures,
     kind: PlantKind,
     stage: GrowthStage,
@@ -1345,13 +1351,82 @@ pub fn get_plant_texture(
     }
 }
 
+/// Three-tier sprite resolution: species PNG → form PNG → legacy ASCII.
+pub fn resolve_plant_sprite(
+    plant_sprites: &PlantSpriteSet,
+    fallback: &EntityTextures,
+    species: PlantSpeciesId,
+    form: PlantForm,
+    kind: PlantKind,
+    stage: GrowthStage,
+    variant: u8,
+) -> Handle<Image> {
+    if species.is_valid() {
+        if let Some(slot) = plant_sprites.lookup_species(species, stage) {
+            if let Some(h) = slot.handle_for(variant) {
+                return h;
+            }
+        }
+    }
+    if let Some(slot) = plant_sprites.lookup_form(form, stage) {
+        if let Some(h) = slot.handle_for(variant) {
+            return h;
+        }
+    }
+    get_plant_texture_legacy(fallback, kind, stage)
+}
+
+/// Legacy entry kept as a thin shim for any out-of-tree caller.
+pub fn get_plant_texture(
+    textures: &EntityTextures,
+    kind: PlantKind,
+    stage: GrowthStage,
+) -> Handle<Image> {
+    get_plant_texture_legacy(textures, kind, stage)
+}
+
+fn form_of_species(species: PlantSpeciesId, kind: PlantKind) -> PlantForm {
+    if species.is_valid() {
+        if let Some(def) = crate::simulation::plant_catalog::catalog().def(species) {
+            return def.form;
+        }
+    }
+    // Test-fixture fallback: raw `Plant` with no `PlantSpecies`. Pick a
+    // form whose `legacy_kind()` matches so per-form PNGs still apply.
+    match kind {
+        PlantKind::Tree => PlantForm::Tree,
+        PlantKind::BerryBush => PlantForm::Shrub,
+        PlantKind::Grain => PlantForm::Grass,
+    }
+}
+
 pub fn spawn_plant_sprites(
     mut commands: Commands,
-    query: Query<(Entity, &Plant), Without<PlantVisual>>,
+    query: Query<
+        (
+            Entity,
+            &Plant,
+            Option<&PlantSpecies>,
+            Option<&PlantSpriteVariant>,
+        ),
+        Without<PlantVisual>,
+    >,
     textures: Res<EntityTextures>,
+    plant_sprites: Res<PlantSpriteSet>,
 ) {
-    for (entity, plant) in query.iter() {
-        let img = get_plant_texture(&textures, plant.kind, plant.stage);
+    for (entity, plant, species_opt, variant_opt) in query.iter() {
+        let species = species_opt.map(|s| s.0).unwrap_or(PlantSpeciesId::NONE);
+        let form = form_of_species(species, plant.kind);
+        let variant = variant_opt.map(|v| v.0).unwrap_or(0);
+        let img = resolve_plant_sprite(
+            &plant_sprites,
+            &textures,
+            species,
+            form,
+            plant.kind,
+            plant.stage,
+            variant,
+        );
         let mut sprite = Sprite::from_image(img);
         sprite.anchor = Anchor::BottomCenter;
 
@@ -1373,11 +1448,31 @@ pub fn spawn_plant_sprites(
 
 pub fn update_plant_sprites(
     textures: Res<EntityTextures>,
-    query: Query<(&Plant, &Children), (With<PlantVisual>, Changed<Plant>)>,
+    plant_sprites: Res<PlantSpriteSet>,
+    query: Query<
+        (
+            &Plant,
+            Option<&PlantSpecies>,
+            Option<&PlantSpriteVariant>,
+            &Children,
+        ),
+        (With<PlantVisual>, Changed<Plant>),
+    >,
     mut sprites: Query<&mut Sprite, With<VisualChild>>,
 ) {
-    for (plant, children) in query.iter() {
-        let img = get_plant_texture(&textures, plant.kind, plant.stage);
+    for (plant, species_opt, variant_opt, children) in query.iter() {
+        let species = species_opt.map(|s| s.0).unwrap_or(PlantSpeciesId::NONE);
+        let form = form_of_species(species, plant.kind);
+        let variant = variant_opt.map(|v| v.0).unwrap_or(0);
+        let img = resolve_plant_sprite(
+            &plant_sprites,
+            &textures,
+            species,
+            form,
+            plant.kind,
+            plant.stage,
+            variant,
+        );
         for &child in children.iter() {
             if let Ok(mut sprite) = sprites.get_mut(child) {
                 sprite.image = img.clone();

@@ -31,6 +31,8 @@ use super::technology::{
     ROUTE_MEMORY, SEASONAL_MEMORY, TOOLSTONE_RECOGNITION, WATER_SOURCE_MEMORY,
     // Phase H beliefs:
     ECLIPSE_OMENS, GEOCENTRIC_COSMOS, MIASMA_THEORY, SKY_DOME, SPIRIT_ILLNESS, WEATHER_OMENS,
+    // Phase BN biome-native plant ecology:
+    FIBER_PROCESSING, HERBAL_MEDICINE, OIL_PRESSING, ORCHARD_CULTIVATION, PLANT_LORE,
 };
 
 /// `KnowledgeId` is the long-term name for `TechId` once the catalog grows
@@ -396,6 +398,18 @@ pub static KNOWLEDGE_META: [KnowledgeMeta; TECH_COUNT] = {
     }
     // Cross-group `contradicts` links (only one belief can be accepted per
     // group; this slot is informational for UI / belief-swap heuristics).
+    //
+    // ── Phase BN: biome-native plant techs ────────────────────────────
+    arr[PLANT_LORE as usize].domain = KnowledgeDomain::Subsistence;
+    arr[PLANT_LORE as usize].kind = KnowledgeKind::PracticalSkill;
+    arr[HERBAL_MEDICINE as usize].domain = KnowledgeDomain::Medicine;
+    arr[HERBAL_MEDICINE as usize].kind = KnowledgeKind::PracticalSkill;
+    arr[FIBER_PROCESSING as usize].domain = KnowledgeDomain::Craft;
+    arr[FIBER_PROCESSING as usize].kind = KnowledgeKind::PracticalTechnique;
+    arr[ORCHARD_CULTIVATION as usize].domain = KnowledgeDomain::Subsistence;
+    arr[ORCHARD_CULTIVATION as usize].kind = KnowledgeKind::PracticalTechnique;
+    arr[OIL_PRESSING as usize].domain = KnowledgeDomain::Craft;
+    arr[OIL_PRESSING as usize].kind = KnowledgeKind::PracticalTechnique;
     arr
 };
 

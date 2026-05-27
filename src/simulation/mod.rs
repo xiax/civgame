@@ -67,6 +67,7 @@ pub mod pack_deploy;
 pub mod perf;
 pub mod person;
 pub mod placement_reachability;
+pub mod plant_catalog;
 pub mod plants;
 pub mod player_command;
 pub mod production;

@@ -7,6 +7,7 @@ pub mod chunk;
 pub mod chunk_streaming;
 pub mod climate;
 pub mod erosion;
+pub mod flora_regions;
 pub mod geomorph;
 pub mod globe;
 pub mod hydrology;
@@ -35,6 +36,12 @@ impl Plugin for WorldPlugin {
         // `ResourceId::*` accessors which can't take system params.
         let catalog = crate::economy::resource_catalog::load_resource_catalog();
         crate::economy::core_ids::install_catalog(catalog.clone());
+        // Biome-native plant ecology: load species catalog after the
+        // resource catalog is installed so seed/harvest yield keys resolve
+        // to `ResourceId`s. Process-global `plant_catalog::install_catalog`
+        // mirrors the resource-catalog accessor pattern.
+        let plant_cat = crate::simulation::plant_catalog::load_plant_catalog(&catalog);
+        crate::simulation::plant_catalog::install_catalog(plant_cat.clone());
         // P5: faction-archetype registry. Built at startup from the four
         // supported legacy archetypes (`derive_from_legacy` is the
         // current backing builder). Future RON loading replaces the
@@ -43,6 +50,7 @@ impl Plugin for WorldPlugin {
         // `derive_from_archetype_key`.
         let archetype_registry = crate::simulation::archetype::default_registry(&catalog);
         app.insert_resource(catalog);
+        app.insert_resource(plant_cat);
         app.insert_resource(archetype_registry);
 
         // World seed drives both the climate globe and the per-tile

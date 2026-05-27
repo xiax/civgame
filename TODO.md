@@ -177,7 +177,7 @@ Need UI overhaul to add commands for all actions players can take, in a way that
 
 Need debug menu overhaul that works with the current version of the game and contains all important tools a developer needs to debug and test the game like entity spawners and ways to give resources to factions, etc.
 
-Fix workers standing too far away from their work targets and interacting with them
+Fix workers standing too far away from their work targets when interacting with them.
 
 X - I want to add diplomacy and territory to the game. Each faction should exert influence over a certain amount of territory based on each of their settlements and era, and they should try and protect their territory. Factions can also form agreements with other factions, whether that is trade, alliance, or war. By default factions should not like strangers trespassing on their land, maybe they should even send a message to them. Diplomacy with players should be handled through some form of diplomacy screen.
 
@@ -190,6 +190,8 @@ X - Add volume to items and carrying capacity, remove hard number limit
 Debug toggle for how quickly workers learn new knowledge
 
 I want to add a lot more plant varieties to the game, plants that would be native to different biomes and were historically useful for human development. I want every biome to have at least a few unique native plants, so there is more incentive for exploration.
+
+I want to add a lot more animal varieties to the game, animals that would be native to different biomes and were historically useful for human development. I want every biome to have at least a few unique native animals, so there is more incentive for exploration.
 
 I want the plant and animal seeding to be more natural and realistic to real life.
 

@@ -23,8 +23,11 @@ use crate::simulation::knowledge::DiscoveryActionEvent;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::MemoryKind;
 use crate::simulation::person::{AiState, PersonAI};
+use crate::simulation::plant_catalog::{
+    HarvestTrigger, PlantSpeciesId, ResolvedHarvestProfile,
+};
 use crate::simulation::plants::{
-    despawn_plant_internals, GrowthStage, PlantKind, PlantMap, PlantSpriteIndex,
+    despawn_plant_internals, GrowthStage, PlantKind, PlantMap, PlantSpecies, PlantSpriteIndex,
 };
 use crate::simulation::schedule::{BucketSlot, SimClock};
 use crate::simulation::skills::{SkillKind, Skills};
@@ -84,6 +87,48 @@ fn mining_activity(id: ResourceId) -> Option<ActivityKind> {
     }
 }
 
+// ── Phase 2 (biome-native plants): multi-profile harvest selection ──────────
+//
+// When a plant carries a `PlantSpecies` (catalog id), its `ResolvedPlantDef`
+// may declare multiple harvest profiles — e.g. an oak with `OnFruitSeason(Autumn)`
+// (bare-hands → acorns, plant stays) AND `OnFell` (axe → wood, despawns). The
+// legacy `PlantKind::harvest_*` accessors only know the fell path, so without
+// this resolver the fruit profile is unreachable.
+//
+// `prefer_despawn` is the caller's intent: a worker chasing wood prefers the
+// destructive profile; a forager prefers the regrow path. Today we read it
+// from the agent's `active_gather_claim.kind` — `MemoryKind::wood()` ⇒ true.
+fn resolve_species_harvest_profile(
+    species: PlantSpeciesId,
+    stage: GrowthStage,
+    season: crate::world::seasons::Season,
+    toolkit: Option<&crate::simulation::tools::ToolKit>,
+    prefer_despawn: bool,
+) -> Option<ResolvedHarvestProfile> {
+    let cat = crate::simulation::plant_catalog::catalog();
+    let def = cat.def(species)?;
+    // Legacy default species (emmer_wheat / generic_berry_bush / oak_tree)
+    // ship a single profile each that's a strict re-encoding of the
+    // `PlantKind` defaults — leave the legacy path in charge so we don't
+    // shadow Grain's `harvest_extra_yields`/nutrient debit, Tree's no-Axe
+    // deadwood fallback, etc.
+    if def.harvests.len() <= 1
+        && (def.key == "emmer_wheat"
+            || def.key == "generic_berry_bush"
+            || def.key == "oak_tree")
+    {
+        return None;
+    }
+    use crate::simulation::tools::{ToolForm, ToolKit};
+    let has_tool = |form: ToolForm| -> bool {
+        toolkit
+            .map(|tk: &ToolKit| tk.has_form(form))
+            .unwrap_or(true)
+    };
+    cat.pick_harvest_profile(species, stage, season, has_tool, prefer_despawn)
+        .cloned()
+}
+
 // ── P6b: stale-target neighbor-scan retarget ─────────────────────────────────
 
 /// Cooldown between consecutive retargets on the same agent. Conservative:
@@ -124,7 +169,13 @@ pub fn is_target_still_valid(
     tile: (i32, i32),
     kind: MemoryKind,
     plant_map: &PlantMap,
-    plant_lookup: impl Fn(Entity) -> Option<(PlantKind, GrowthStage)>,
+    plant_lookup: impl Fn(
+        Entity,
+    ) -> Option<(
+        PlantKind,
+        GrowthStage,
+        Option<crate::simulation::plant_catalog::PlantSpeciesId>,
+    )>,
     chunk_map: &ChunkMap,
     spatial_index: &crate::world::spatial::SpatialIndex,
     ground_item_lookup: impl Fn(Entity) -> Option<(ResourceId, u32)>,
@@ -132,12 +183,39 @@ pub fn is_target_still_valid(
     let wood = MemoryKind::wood();
     let stone = MemoryKind::stone();
 
-    let plant_kind_ok = |pk: PlantKind, expected: MemoryKind| -> bool {
+    let plant_kind_ok = |pk: PlantKind,
+                         species: Option<crate::simulation::plant_catalog::PlantSpeciesId>,
+                         expected: MemoryKind|
+     -> bool {
         if expected == MemoryKind::AnyEdible {
+            // Catalog species: any harvest profile yielding a Food rid.
+            if let Some(sid) = species {
+                let cat = crate::simulation::plant_catalog::catalog();
+                if let Some(def) = cat.def(sid) {
+                    if def.yields_food() {
+                        return true;
+                    }
+                }
+            }
             matches!(pk, PlantKind::Grain | PlantKind::BerryBush)
         } else if expected == wood {
+            // Catalog species: explicit wood yield (oak fruit + wood, etc.).
+            if let Some(sid) = species {
+                if crate::simulation::plants::species_yields_resource(
+                    sid,
+                    crate::economy::core_ids::wood(),
+                ) {
+                    return true;
+                }
+            }
             matches!(pk, PlantKind::Tree)
         } else if let MemoryKind::Resource(rid) = expected {
+            // Catalog species: walk every harvest profile for this rid.
+            if let Some(sid) = species {
+                if crate::simulation::plants::species_yields_resource(sid, rid) {
+                    return true;
+                }
+            }
             let (yid, _) = pk.harvest_yield(false);
             yid == rid
         } else {
@@ -147,8 +225,8 @@ pub fn is_target_still_valid(
 
     // Plant slot.
     if let Some(&entity) = plant_map.0.get(&tile) {
-        if let Some((pk, stage)) = plant_lookup(entity) {
-            if plant_kind_ok(pk, kind) {
+        if let Some((pk, stage, species)) = plant_lookup(entity) {
+            if plant_kind_ok(pk, species, kind) {
                 // Tree-on-no-Axe still validates: we'd switch to deadwood,
                 // not bounce the chain.
                 if pk == PlantKind::Tree {
@@ -203,6 +281,7 @@ fn retarget_neighbor(
     plant_query: &Query<(
         &mut crate::simulation::plants::Plant,
         Option<&crate::simulation::shared_knowledge::LandClaim>,
+        Option<&PlantSpecies>,
     )>,
     kind: MemoryKind,
     from: (i32, i32),
@@ -233,7 +312,7 @@ fn retarget_neighbor(
                 continue;
             };
             // Read-only get — caller will mutate if and only if it commits.
-            let Ok((plant, _land_claim)) = plant_query.get(entity) else {
+            let Ok((plant, _land_claim, _species)) = plant_query.get(entity) else {
                 continue;
             };
             if plant.stage != GrowthStage::Mature {
@@ -528,6 +607,7 @@ pub fn gather_system(
     mut plant_query: Query<(
         &mut crate::simulation::plants::Plant,
         Option<&crate::simulation::shared_knowledge::LandClaim>,
+        Option<&PlantSpecies>,
     )>,
     mut agent_query: Query<(
         Entity,
@@ -616,7 +696,7 @@ pub fn gather_system(
             // (40-tick cooldown) so a depleted cluster doesn't loop forever.
             let stale = match plant_query.get(entity) {
                 Err(_) => true,
-                Ok((p, _)) if p.stage != GrowthStage::Mature => true,
+                Ok((p, _, _)) if p.stage != GrowthStage::Mature => true,
                 _ => false,
             };
             if stale {
@@ -712,7 +792,7 @@ pub fn gather_system(
                 //   2) No concrete id (live-world pick from underfoot /
                 //      vision): walk the agent's tier-set and clear the
                 //      tile via per-tier `invalidate_tile`.
-                let stale_plant_kind = plant_query.get(entity).ok().map(|(p, _)| p.kind);
+                let stale_plant_kind = plant_query.get(entity).ok().map(|(p, _, _)| p.kind);
                 let plant_gone = plant_query.get(entity).is_err();
                 if plant_gone {
                     plant_map.0.remove(&(tx, ty));
@@ -756,7 +836,8 @@ pub fn gather_system(
                 continue;
             }
             // Reborrow as &mut after the immutable peek above.
-            let (mut plant, land_claim) = plant_query.get_mut(entity).unwrap();
+            let (mut plant, land_claim, species_opt) = plant_query.get_mut(entity).unwrap();
+            let species_id = species_opt.map(|s| s.id());
 
             let kind = plant.kind;
             // Spill owner: if the harvested plant carries a Household
@@ -830,8 +911,45 @@ pub fn gather_system(
             }
             ai.work_progress = 0;
 
-            // Faction multipliers & activity log
-            let harvest_activity = kind.harvest_activity();
+            // ── Phase 2 (biome-native plants): catalog-driven multi-profile
+            // override. When the plant carries a `PlantSpecies` whose
+            // catalog def declares multiple harvest profiles (or any single
+            // non-legacy profile), resolve the active one. Caller intent —
+            // wood vs. fruit — comes from the agent's outstanding gather
+            // claim: a `MemoryKind::wood()` claim prefers the destructive
+            // (fell) profile so an axe-carrying agent doesn't pick acorns
+            // when assigned to a wood haul.
+            let prefer_despawn = ai
+                .active_gather_claim
+                .map(|t| t.kind == crate::simulation::memory::MemoryKind::wood())
+                .unwrap_or(false);
+            let species_profile = species_id.and_then(|sid| {
+                resolve_species_harvest_profile(
+                    sid,
+                    plant.stage,
+                    routing.calendar.season,
+                    toolkit,
+                    prefer_despawn,
+                )
+            });
+
+            // Faction multipliers & activity log. Activity comes from the
+            // resolved profile when present so a fruit-from-tree harvest
+            // logs as Foraging rather than WoodGathering.
+            let harvest_activity = species_profile
+                .as_ref()
+                .map(|p| match p.activity {
+                    crate::simulation::plant_catalog::HarvestActivityWire::Farming => {
+                        ActivityKind::Farming
+                    }
+                    crate::simulation::plant_catalog::HarvestActivityWire::Foraging => {
+                        ActivityKind::Foraging
+                    }
+                    crate::simulation::plant_catalog::HarvestActivityWire::WoodGathering => {
+                        ActivityKind::WoodGathering
+                    }
+                })
+                .unwrap_or_else(|| kind.harvest_activity());
             let (food_mul, wood_mul, _) =
                 faction_muls(&mut faction_registry, faction_id, harvest_activity);
             discovery_events.send(DiscoveryActionEvent {
@@ -839,7 +957,10 @@ pub fn gather_system(
                 activity: harvest_activity,
             });
 
-            let (yield_id, base_qty) = kind.harvest_yield(has_tool);
+            let (yield_id, base_qty) = species_profile
+                .as_ref()
+                .and_then(|p| p.yields.first().copied())
+                .unwrap_or_else(|| kind.harvest_yield(has_tool));
             let wood_id = core_ids::wood();
             let is_edible = core_ids::catalog()
                 .get(yield_id)
@@ -934,24 +1055,71 @@ pub fn gather_system(
                 );
             }
 
-            for (extra_id, extra_qty) in kind.harvest_extra_yields() {
-                route_yield(
-                    &mut commands,
-                    &mut carrier,
-                    &mut agent,
-                    extra_id,
-                    extra_qty,
-                    agent_tx,
-                    agent_ty,
-                    spill_owner_household,
-                );
+            // Extra yields: when species_profile is in charge, treat every
+            // yield past the first as an "extra" (the primary was routed
+            // above). Legacy path still calls `harvest_extra_yields` for
+            // grain seeds + thatch / berry seeds.
+            if let Some(profile) = species_profile.as_ref() {
+                for &(extra_id, extra_qty) in profile.yields.iter().skip(1) {
+                    route_yield(
+                        &mut commands,
+                        &mut carrier,
+                        &mut agent,
+                        extra_id,
+                        extra_qty,
+                        agent_tx,
+                        agent_ty,
+                        spill_owner_household,
+                    );
+                }
+            } else {
+                for (extra_id, extra_qty) in kind.harvest_extra_yields() {
+                    route_yield(
+                        &mut commands,
+                        &mut carrier,
+                        &mut agent,
+                        extra_id,
+                        extra_qty,
+                        agent_tx,
+                        agent_ty,
+                        spill_owner_household,
+                    );
+                }
             }
 
-            let (skill, xp) = kind.harvest_skill_xp(has_tool);
+            let (skill, xp) = match species_profile.as_ref() {
+                Some(p) => {
+                    let s = match p.skill {
+                        crate::simulation::plant_catalog::HarvestSkillWire::Farming => {
+                            SkillKind::Farming
+                        }
+                        crate::simulation::plant_catalog::HarvestSkillWire::Building => {
+                            SkillKind::Building
+                        }
+                        crate::simulation::plant_catalog::HarvestSkillWire::Foraging => {
+                            // No Foraging skill exists — credit Farming as
+                            // closest existing analogue (used by berry/grain
+                            // harvest activity already).
+                            SkillKind::Farming
+                        }
+                    };
+                    (s, p.skill_xp as u32)
+                }
+                None => kind.harvest_skill_xp(has_tool),
+            };
             skills.gain_xp(skill, xp);
 
-            for (drop_id, drop_qty) in kind.harvest_ground_drops(has_tool) {
-                spawn_ground_drop(&mut commands, tx, ty, drop_id, drop_qty);
+            // Ground drops stay on the legacy PlantKind path — the catalog
+            // doesn't model them yet. Skip when an OnFruitSeason profile
+            // fires for a Tree so a fruit harvest doesn't also drop wood.
+            let drop_kind_overridden = matches!(
+                species_profile.as_ref().map(|p| p.trigger),
+                Some(HarvestTrigger::OnFruitSeason(_))
+            );
+            if !drop_kind_overridden {
+                for (drop_id, drop_qty) in kind.harvest_ground_drops(has_tool) {
+                    spawn_ground_drop(&mut commands, tx, ty, drop_id, drop_qty);
+                }
             }
 
             // Realistic Tool Overhaul: felling a Tree requires an Axe. With
@@ -959,7 +1127,17 @@ pub fn gather_system(
             // tree is NOT despawned so it can be felled later with a real
             // axe. Berries / Grain keep their normal despawn rule.
             let tree_fell_blocked = matches!(kind, PlantKind::Tree) && !has_tool_for_plant;
-            if kind.harvest_despawns(has_tool) && !tree_fell_blocked {
+            // Phase 2: when species profile is in charge, its `despawn` flag
+            // drives the post-harvest state instead of `harvest_despawns`.
+            let despawn_now = species_profile
+                .as_ref()
+                .map(|p| p.despawn)
+                .unwrap_or_else(|| kind.harvest_despawns(has_tool));
+            let stage_after = species_profile
+                .as_ref()
+                .map(|p| p.stage_after)
+                .unwrap_or(GrowthStage::Harvested);
+            if despawn_now && !tree_fell_blocked {
                 despawn_plant_internals(
                     &mut commands,
                     entity,
@@ -981,7 +1159,7 @@ pub fn gather_system(
                 // Mature so it can be properly felled later. The cluster
                 // entry is NOT depleted (the wood is still there).
             } else {
-                plant.stage = GrowthStage::Harvested;
+                plant.stage = stage_after;
                 plant.growth = 0;
                 let depleted_kind = match plant.kind {
                     PlantKind::BerryBush | PlantKind::Grain => MemoryKind::AnyEdible,

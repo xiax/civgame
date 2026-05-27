@@ -4322,8 +4322,15 @@ pub fn htn_acquire_food_dispatch_system(
 
             // Dispatch preflight (`plans/fix-repeating-gather-fail-loops.md` §3):
             // gate the AnyEdible forage tile against live world state.
-            let plant_lookup_food = |e: Entity| -> Option<(PlantKind, GrowthStage)> {
-                plant_query.get(e).ok().map(|p| (p.kind, p.stage))
+            let plant_lookup_food = |e: Entity| -> Option<(
+                PlantKind,
+                GrowthStage,
+                Option<crate::simulation::plant_catalog::PlantSpeciesId>,
+            )> {
+                plant_query.get(e).ok().map(|p| {
+                    let species = gk.plant_species_q.get(e).ok().map(|s| s.id());
+                    (p.kind, p.stage, species)
+                })
             };
             let item_lookup_food = |e: Entity| -> Option<(crate::economy::resource_catalog::ResourceId, u32)> {
                 item_query.get(e).ok().map(|gi| (gi.item.resource_id, gi.qty))
@@ -5025,8 +5032,15 @@ pub fn htn_acquire_good_dispatch_system(
                 // win cleanly. (Cluster-side invalidation happens on the next
                 // gather attempt's failure path which holds `ResMut<SharedKnowledge>`;
                 // the precondition `false` short-circuits the dispatch this tick.)
-                let plant_lookup = |e: Entity| -> Option<(PlantKind, GrowthStage)> {
-                    gk.plant_q.get(e).ok().map(|p| (p.kind, p.stage))
+                let plant_lookup = |e: Entity| -> Option<(
+                    PlantKind,
+                    GrowthStage,
+                    Option<crate::simulation::plant_catalog::PlantSpeciesId>,
+                )> {
+                    gk.plant_q.get(e).ok().map(|p| {
+                        let species = gk.plant_species_q.get(e).ok().map(|s| s.id());
+                        (p.kind, p.stage, species)
+                    })
                 };
                 let item_lookup = |e: Entity| -> Option<(crate::economy::resource_catalog::ResourceId, u32)> {
                     item_query.get(e).ok().map(|gi| (gi.item.resource_id, gi.qty))
@@ -5874,8 +5888,15 @@ pub fn htn_stockpile_food_dispatch_system(
 
             // Dispatch preflight (`plans/fix-repeating-gather-fail-loops.md` §3):
             // re-validate the picked tile against live world state.
-            let plant_lookup_sf = |e: Entity| -> Option<(PlantKind, GrowthStage)> {
-                plant_query.get(e).ok().map(|p| (p.kind, p.stage))
+            let plant_lookup_sf = |e: Entity| -> Option<(
+                PlantKind,
+                GrowthStage,
+                Option<crate::simulation::plant_catalog::PlantSpeciesId>,
+            )> {
+                plant_query.get(e).ok().map(|p| {
+                    let species = gk.plant_species_q.get(e).ok().map(|s| s.id());
+                    (p.kind, p.stage, species)
+                })
             };
             let item_lookup_sf = |e: Entity| -> Option<(crate::economy::resource_catalog::ResourceId, u32)> {
                 item_query.get(e).ok().map(|gi| (gi.item.resource_id, gi.qty))
@@ -7605,17 +7626,48 @@ pub fn htn_plant_from_storage_dispatch_system(
             let Some(faction) = faction_registry.factions.get(&source_fid) else {
                 continue;
             };
+            // Phase 4 (biome-native plants): walk every catalog species that
+            // has a `seed` resource and is in-season; pick the one with the
+            // highest in-stock count, breaking ties by `id` for determinism.
+            // Covers the legacy `grain_seed`/`berry_seed` keys plus every
+            // new plantable seed (flax, hemp, foxtail millet, quinoa, etc.)
+            // without growing `PlantKind::ALL`.
+            //
+            // Future scoring axes (plot tile_class match, native realm fit,
+            // chief demand) slot in here; v1 = stock + in-season + id tiebreak.
+            let plant_cat = crate::simulation::plant_catalog::catalog();
+            let cur_season = farm_plot_params.calendar.season;
             let mut best_seed: Option<(crate::economy::resource_catalog::ResourceId, u32)> = None;
-            for kind in PlantKind::ALL.iter().copied() {
-                let Some(seed_id) = kind.seed_resource() else {
+            for def in plant_cat.iter() {
+                let Some(seed_id) = def.seed else { continue };
+                if !def.is_sowable_in(cur_season) {
                     continue;
-                };
+                }
                 let stock = faction.storage.totals.get(&seed_id).copied().unwrap_or(0);
                 if stock == 0 {
                     continue;
                 }
-                if best_seed.map_or(true, |(_, b)| stock > b) {
+                let take = match best_seed {
+                    None => true,
+                    Some((_, b)) => stock > b,
+                };
+                if take {
                     best_seed = Some((seed_id, stock));
+                }
+            }
+            // Legacy fallback (catalog might be missing the seed key for
+            // a test fixture). Keep the old `PlantKind::ALL` walk as a
+            // backstop so single-seed test rigs still work.
+            if best_seed.is_none() {
+                for kind in PlantKind::ALL.iter().copied() {
+                    let Some(seed_id) = kind.seed_resource() else { continue };
+                    let stock = faction.storage.totals.get(&seed_id).copied().unwrap_or(0);
+                    if stock == 0 {
+                        continue;
+                    }
+                    if best_seed.map_or(true, |(_, b)| stock > b) {
+                        best_seed = Some((seed_id, stock));
+                    }
                 }
             }
             let Some((seed_id, _)) = best_seed else {

@@ -18,7 +18,8 @@ use crate::simulation::technology::Era;
 use bevy::prelude::Component;
 
 /// The functional identity of a tool.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolForm {
     Knife,
     Axe,

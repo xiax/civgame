@@ -348,11 +348,21 @@ pub fn heal_task_system(
         &Transform,
         &mut Skills,
         Option<&crate::simulation::apprenticeship::ApprenticeOf>,
+        Option<&mut crate::economy::agent::EconomicAgent>,
+        Option<&mut crate::simulation::carry::Carrier>,
     )>,
     transform_query: Query<&Transform>,
     mut body_query: Query<&mut Body>,
 ) {
-    for (_healer, mut aq, mut ai, healer_t, mut skills, apprentice_opt) in healer_query.iter_mut() {
+    // Phase BN: `medicine_bundle` is a healing accelerant — when the
+    // healer carries one (inventory or hands), drain one unit at heal
+    // time and double the per-tick limb HP gain. Pure activity-based
+    // healing still works without the bundle (matches the
+    // `feedback_no_speculative_demand` rule — demand is bound to the
+    // real `Injury` consumer).
+    let medicine_bundle_id = crate::economy::core_ids::catalog()
+        .id_of("medicine_bundle");
+    for (_healer, mut aq, mut ai, healer_t, mut skills, apprentice_opt, mut agent_opt, mut carrier_opt) in healer_query.iter_mut() {
         let Task::Heal { patient } = aq.current else {
             continue;
         };
@@ -376,12 +386,38 @@ pub fn heal_task_system(
             aq.advance();
             continue;
         };
+        // Look up a medicine_bundle in inventory then hands; consume one
+        // unit on use (atomic) to enable accelerated healing.
+        let mut accelerator_active = false;
+        if let Some(mb_rid) = medicine_bundle_id {
+            if let Some(agent) = agent_opt.as_deref_mut() {
+                if agent.quantity_of_resource(mb_rid) > 0 {
+                    let removed = agent.remove_resource(mb_rid, 1);
+                    if removed > 0 {
+                        accelerator_active = true;
+                    }
+                }
+            }
+            if !accelerator_active {
+                if let Some(carrier) = carrier_opt.as_deref_mut() {
+                    let removed = carrier.remove_resource(mb_rid, 1);
+                    if removed > 0 {
+                        accelerator_active = true;
+                    }
+                }
+            }
+        }
+        let heal_gain = if accelerator_active {
+            HEAL_LIMB_HP_PER_TICK.saturating_mul(2)
+        } else {
+            HEAL_LIMB_HP_PER_TICK
+        };
         let mut healed_something = false;
         for limb in body.parts.iter_mut() {
             if limb.current < limb.max {
                 limb.current = limb
                     .current
-                    .saturating_add(HEAL_LIMB_HP_PER_TICK)
+                    .saturating_add(heal_gain)
                     .min(limb.max);
                 healed_something = true;
                 break;

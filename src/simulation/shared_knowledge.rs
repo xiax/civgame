@@ -818,6 +818,11 @@ pub struct GatherKnowledge<'w, 's> {
     /// large dispatchers don't bust Bevy's 16-param ceiling.
     pub plant_map: Res<'w, crate::simulation::plants::PlantMap>,
     pub plant_q: Query<'w, 's, &'static crate::simulation::plants::Plant>,
+    /// Sibling lookup for `is_target_still_valid` so the validator can read
+    /// a plant's catalog species id (multi-yield species like flax→fiber
+    /// and oak→fruit+wood are invisible through the legacy `PlantKind` enum).
+    pub plant_species_q:
+        Query<'w, 's, &'static crate::simulation::plants::PlantSpecies>,
 }
 
 impl<'w, 's> GatherKnowledge<'w, 's> {

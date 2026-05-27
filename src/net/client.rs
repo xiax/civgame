@@ -373,6 +373,7 @@ fn apply_overlay_delta(
             TileOverlayOp::AddPlant {
                 tile,
                 entity_net_id,
+                species: _,
                 kind: _,
                 stage: _,
             } => {
