@@ -18912,14 +18912,22 @@ mod onenter_era_seeding {
         check_invariant(&sim, "post-tick180");
     }
 
-    /// Regression for `plans/carve-plan-sync-followup.md`: a shifted
-    /// Agricultural zone rect with an *unchanged* `culture_hash` (the
-    /// position-blind `layout_hash` bug) must still be reconciled by
-    /// `carve_plots_system`. Unchanged plots keep their entity + durable
-    /// state (`plowed_year`); the shifted plot is torn down and re-carved;
-    /// the abandoned columns of the old rect leave `ag_tiles`.
+    /// Sticky-farm regression: a shifted Agricultural zone rect is NOT
+    /// torn down — the existing Ag plot keeps its identity and survives
+    /// per-tile reconciliation. The tiles that fell outside the new rect
+    /// are staged in `FarmRetirements` (their `ag_tiles` membership
+    /// persists until `drain_farm_retirements_system` finalises them).
+    /// The new tiles inside the shifted rect get extended onto the same
+    /// committed plot via the largest-overlap pick in `carve_plots_system`.
+    ///
+    /// Pre-sticky behaviour (rect-keyed identity) tore the whole plot
+    /// down on rect mismatch; the abandoned columns left `ag_tiles`
+    /// immediately and a fresh plot id replaced the kept one. The
+    /// rewrite enforces tile-level stickiness so a survey re-shoot
+    /// cannot relocate worked farmland.
     #[test]
     fn carve_plots_reconciles_shifted_agricultural_rect() {
+        use crate::simulation::farm::FarmRetirements;
         use crate::simulation::land::{carve_plots_system, Plot, PlotIndex};
         use crate::simulation::settlement::{SettlementPlans, TileRect, ZoneKind};
         use bevy::ecs::system::RunSystemOnce;
@@ -18931,11 +18939,22 @@ mod onenter_era_seeding {
         // 1. Find any faction with at least one Agricultural plot AND at
         //    least one other plot. Pick one Agricultural plot to shift and
         //    one other plot to keep — the kept plot's entity + plowed_year
-        //    stamp is the durability evidence (under legacy wholesale
-        //    teardown both would have been despawned).
-        let (target_fid, shift_rect, kept_pid, kept_entity, kept_rect): (
+        //    stamp is the durability evidence; the Ag plot's id + entity
+        //    are also captured so we can verify sticky identity survives
+        //    the shift.
+        let (
+            target_fid,
+            shift_rect,
+            shifted_pid,
+            shifted_entity,
+            kept_pid,
+            kept_entity,
+            kept_rect,
+        ): (
             u32,
             TileRect,
+            u32,
+            Entity,
             u32,
             Entity,
             TileRect,
@@ -18958,7 +18977,7 @@ mod onenter_era_seeding {
                         .push((pid, entity, plot.rect, plot.zone_kind));
                 }
             }
-            let mut chosen: Option<(u32, TileRect, u32, Entity, TileRect)> = None;
+            let mut chosen: Option<(u32, TileRect, u32, Entity, u32, Entity, TileRect)> = None;
             for (&fid, plots) in by_faction.iter() {
                 let Some(ag) = plots
                     .iter()
@@ -18966,16 +18985,17 @@ mod onenter_era_seeding {
                 else {
                     continue;
                 };
+                let (ag_pid, ag_entity, ag_rect, _) = *ag;
                 if let Some((kpid, kent, krect, _)) = plots
                     .iter()
-                    .find(|(_, _, r, _)| *r != ag.2)
+                    .find(|(_, _, r, _)| *r != ag_rect)
                     .cloned()
                 {
-                    chosen = Some((fid, ag.2, kpid, kent, krect));
+                    chosen = Some((fid, ag_rect, ag_pid, ag_entity, kpid, kent, krect));
                     break;
                 }
             }
-            let (fid, ag_rect, kpid, kent, krect) = chosen.expect(
+            let (fid, ag_rect, ag_pid, ag_entity, kpid, kent, krect) = chosen.expect(
                 "the seeded world should have at least one faction with an Agricultural \
                  plot + another plot (any kind)",
             );
@@ -18984,7 +19004,7 @@ mod onenter_era_seeding {
             if let Some(mut p) = sim.app.world_mut().get_mut::<Plot>(kent) {
                 p.plowed_year = Some(42);
             }
-            (fid, ag_rect, kpid, kent, krect)
+            (fid, ag_rect, ag_pid, ag_entity, kpid, kent, krect)
         };
 
         // 2. Shift the Agricultural zone by +2 in x, keeping `culture_hash`
@@ -19017,8 +19037,8 @@ mod onenter_era_seeding {
             .run_system_once(carve_plots_system)
             .expect("carve_plots_system run");
 
-        // 4. The kept plot survived as the *same* entity with its
-        //    plowed_year stamp intact.
+        // 4. The kept non-Ag plot survives unchanged (same entity, same
+        //    plowed_year). Identical behaviour to the pre-sticky world.
         let world = sim.app.world();
         let plot_index = world.resource::<PlotIndex>();
         assert_eq!(
@@ -19032,37 +19052,81 @@ mod onenter_era_seeding {
         assert_eq!(
             kept_plot.plowed_year,
             Some(42),
-            "durable Plot state must survive reconciliation (Option B vs Option A)"
+            "durable Plot state must survive reconciliation"
         );
         assert_eq!(kept_plot.rect, kept_rect);
 
-        // 5. The shifted-away columns left `ag_tiles`. The rect shifted by
-        //    +2 of width 16, so columns `[shift.x0, shift.x0+2)` are now
-        //    abandoned and the new columns `[shift.x0+16, shift.x0+18)` got
-        //    carved.
+        // 5. Sticky identity: the shifted Ag plot is the *same* entity +
+        //    plot id. Under the old rect-keyed teardown, the original Ag
+        //    plot would have been despawned and a fresh id allocated for
+        //    the new rect; the sticky carve keeps the existing plot and
+        //    extends/retires per tile.
+        assert_eq!(
+            plot_index.by_id.get(&shifted_pid).copied(),
+            Some(shifted_entity),
+            "shifted Ag plot must survive reconciliation with the same id"
+        );
+
+        // 6. The abandoned columns remain in `ag_tiles` (deferred
+        //    retirement). They sit in `FarmRetirements` waiting for any
+        //    standing crop / in-flight prep reservation to clear; only
+        //    `drain_farm_retirements_system` removes them from
+        //    `ag_tiles`. Carve alone must not strip Cropland out from
+        //    under work-in-flight.
+        let retirements = world.resource::<FarmRetirements>();
         let abandoned_cols = shift_rect.x0..shift_rect.x0 + 2;
         for x in abandoned_cols {
             for y in shift_rect.y0..shift_rect.y0 + shift_rect.h as i32 {
                 assert!(
-                    !plot_index.ag_tiles.contains(&(x, y)),
-                    "abandoned column ({x},{y}) should have left ag_tiles"
-                );
-            }
-        }
-        let new_only_cols = (new_rect.x0 + new_rect.w as i32 - 2)..(new_rect.x0 + new_rect.w as i32);
-        for x in new_only_cols {
-            for y in new_rect.y0..new_rect.y0 + new_rect.h as i32 {
-                assert!(
                     plot_index.ag_tiles.contains(&(x, y)),
-                    "freshly-carved column ({x},{y}) should be in ag_tiles"
+                    "abandoned column ({x},{y}) must remain in ag_tiles until \
+                     drain_farm_retirements_system finalises it"
+                );
+                assert!(
+                    retirements.is_retiring((x, y)),
+                    "abandoned column ({x},{y}) must be staged in FarmRetirements"
                 );
             }
         }
 
-        // 6. `SettlementPlans` and `PlotIndex.ag_tiles` agree on every tile
-        //    in the rectangle — the test's prime invariant. (The
-        //    `seeded_cropland_stays_inside_agricultural_plots` test checks
-        //    this on the seeded patch; we check it on the synthetic shift.)
+        // 7. Every tile inside the shifted rect is in `ag_tiles` owned by
+        //    *some* Ag plot of this settlement. When the shifted rect
+        //    grows into a neighbour's existing footprint, the neighbour
+        //    retains those tiles (sticky carve never reassigns owned
+        //    tiles); only previously-unowned tiles would attach to the
+        //    shifted plot. The invariant we care about is that no tile
+        //    inside any current Ag plan rect is orphaned.
+        let settlement_ag_plots: ahash::AHashSet<u32> = {
+            let mut s: ahash::AHashSet<u32> = ahash::AHashSet::new();
+            for (&pid, &entity) in plot_index.by_id.iter() {
+                let Some(p) = world.get::<Plot>(entity) else {
+                    continue;
+                };
+                if p.faction_id == target_fid && p.zone_kind == ZoneKind::Agricultural {
+                    s.insert(pid);
+                }
+            }
+            s
+        };
+        for x in new_rect.x0..new_rect.x0 + new_rect.w as i32 {
+            for y in new_rect.y0..new_rect.y0 + new_rect.h as i32 {
+                assert!(
+                    plot_index.ag_tiles.contains(&(x, y)),
+                    "tile ({x},{y}) inside the shifted plan should be in ag_tiles"
+                );
+                let owner = plot_index
+                    .by_tile
+                    .get(&(x, y))
+                    .copied()
+                    .expect("tile must have a plot owner");
+                assert!(
+                    settlement_ag_plots.contains(&owner),
+                    "tile ({x},{y}) must be owned by an Ag plot of this settlement (got pid={owner})"
+                );
+            }
+        }
+
+        // 8. `SettlementPlans` reflects the shifted plan write.
         let plans = world.resource::<SettlementPlans>();
         let plan_covers = |x: i32, y: i32| -> bool {
             plans.0.values().any(|p| {
@@ -19074,11 +19138,137 @@ mod onenter_era_seeding {
         for x in new_rect.x0..new_rect.x0 + new_rect.w as i32 {
             for y in new_rect.y0..new_rect.y0 + new_rect.h as i32 {
                 assert!(
-                    plot_index.ag_tiles.contains(&(x, y)) && plan_covers(x, y),
-                    "tile ({x},{y}) should be tracked by both PlotIndex.ag_tiles and SettlementPlans"
+                    plan_covers(x, y),
+                    "tile ({x},{y}) should be covered by SettlementPlans after the shift"
                 );
             }
         }
+        // Silence unused-binding warning when the test grows past the
+        // sticky-identity check.
+        let _ = shifted_entity;
+    }
+
+    /// Sticky-farm hard-conflict: when a non-Ag zone (Residential here)
+    /// is inserted overlapping a few tiles of an Ag plot, the carve must
+    /// stage just those overlap tiles in `FarmRetirements` and leave the
+    /// rest of the plot intact. The plot keeps its entity + id.
+    #[test]
+    fn hard_conflict_partial_retire() {
+        use crate::simulation::farm::{FarmRetirements, FieldTileIndex};
+        use crate::simulation::land::{carve_plots_system, Plot, PlotIndex};
+        use crate::simulation::settlement::{
+            SettlementPlans, TileRect, Zone, ZoneKind,
+        };
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        trigger_onenter(&mut sim);
+
+        // Find an Ag plot to overlap. Capture id + entity + rect.
+        let (target_fid, ag_pid, ag_entity, ag_rect): (u32, u32, Entity, TileRect) = {
+            let world = sim.app.world();
+            let plot_index = world.resource::<PlotIndex>();
+            let mut chosen: Option<(u32, u32, Entity, TileRect)> = None;
+            for (&pid, &entity) in plot_index.by_id.iter() {
+                let Some(plot) = world.get::<Plot>(entity) else {
+                    continue;
+                };
+                if plot.zone_kind == ZoneKind::Agricultural {
+                    chosen = Some((plot.faction_id, pid, entity, plot.rect));
+                    break;
+                }
+            }
+            chosen.expect("seeded world should have at least one Agricultural plot")
+        };
+
+        // Pick a 2×2 overlap region in the plot's interior (avoid the
+        // very first row/col so the rest-of-plot count is unambiguous).
+        let overlap_x0 = ag_rect.x0 + 2;
+        let overlap_y0 = ag_rect.y0 + 2;
+        let overlap_rect = TileRect::new(overlap_x0, overlap_y0, 2, 2);
+        let overlap_tiles: Vec<(i32, i32)> = (overlap_y0..overlap_y0 + 2)
+            .flat_map(|y| (overlap_x0..overlap_x0 + 2).map(move |x| (x, y)))
+            .collect();
+
+        // Inject a Residential zone over the overlap region in this
+        // faction's plan. Carve will treat the overlap tiles as non-Ag
+        // and stage them for retirement.
+        {
+            let mut plans = sim.app.world_mut().resource_mut::<SettlementPlans>();
+            let plan = plans
+                .0
+                .get_mut(&target_fid)
+                .expect("target faction should have a SettlementPlan");
+            plan.zones.push(Zone {
+                kind: ZoneKind::Residential,
+                rect: overlap_rect,
+                priority: 100,
+                capacity: 1,
+                filled: 0,
+            });
+        }
+
+        sim.app
+            .world_mut()
+            .run_system_once(carve_plots_system)
+            .expect("carve_plots_system run");
+
+        let world = sim.app.world();
+        let plot_index = world.resource::<PlotIndex>();
+        let field_tiles = world.resource::<FieldTileIndex>();
+        let retirements = world.resource::<FarmRetirements>();
+
+        // Plot id + entity survive (sticky identity).
+        assert_eq!(
+            plot_index.by_id.get(&ag_pid).copied(),
+            Some(ag_entity),
+            "Ag plot entity must survive a partial-overlap carve"
+        );
+
+        // Overlap tiles are in `FarmRetirements`. They still sit in
+        // `ag_tiles` and `FieldTileIndex` until the drain finalises them
+        // (the carve cannot remove tiles whose retirement is staged but
+        // not yet drained).
+        for t in &overlap_tiles {
+            assert!(
+                retirements.is_retiring(*t),
+                "overlap tile {:?} must be staged in FarmRetirements",
+                t
+            );
+            assert!(
+                plot_index.ag_tiles.contains(t),
+                "overlap tile {:?} must remain in ag_tiles until drain finalises",
+                t
+            );
+            assert!(
+                field_tiles.by_tile.contains_key(t),
+                "overlap tile {:?} keeps its FieldTileIndex entry pre-drain",
+                t
+            );
+        }
+
+        // Non-overlap interior tiles of the plot still belong to it and
+        // are NOT retiring.
+        let mut sampled_non_overlap = 0;
+        for y in ag_rect.y0..ag_rect.y0 + ag_rect.h as i32 {
+            for x in ag_rect.x0..ag_rect.x0 + ag_rect.w as i32 {
+                if overlap_tiles.contains(&(x, y)) {
+                    continue;
+                }
+                if field_tiles.by_tile.get(&(x, y)).map(|s| s.plot_id) == Some(ag_pid) {
+                    assert!(
+                        !retirements.is_retiring((x, y)),
+                        "non-overlap tile ({x},{y}) must NOT be retiring"
+                    );
+                    sampled_non_overlap += 1;
+                }
+            }
+        }
+        assert!(
+            sampled_non_overlap >= 100,
+            "expected ≥100 non-overlap plot tiles still owned by plot {ag_pid}, got {sampled_non_overlap}"
+        );
     }
 
     fn assert_perm_settlement_adopted(sim: &TestSim, label: &str) {

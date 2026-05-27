@@ -2142,6 +2142,10 @@ pub struct FarmJobPostingParams<'w, 's> {
     /// posting target).
     pub plant_map: Res<'w, crate::simulation::plants::PlantMap>,
     pub plant_q: Query<'w, 's, &'static crate::simulation::plants::Plant>,
+    /// Sticky-farm retirement queue. The foreman pass excludes retiring
+    /// tiles from posting counts so no new Prepare/Plant work targets them
+    /// (Harvest still fires through the `PlantMap` mature sweep).
+    pub retirements: Res<'w, crate::simulation::farm::FarmRetirements>,
 }
 
 /// Step 3: rebuild every faction's `procurement_plan` once per chief-posting
@@ -3039,6 +3043,7 @@ pub fn chief_job_posting_system(
                         &farm_params.field_tiles,
                         &farm_params.plant_map,
                         &farm_params.plant_q,
+                        &farm_params.retirements,
                         *rect,
                     );
                     let dist = cheb(rect.center(), home);

@@ -308,6 +308,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(farm::FarmPlotAssignments::default())
             .insert_resource(farm::FieldTileIndex::default())
             .insert_resource(farm::PrepareFieldReservations::default())
+            .insert_resource(farm::FarmRetirements::default())
             .insert_resource(fishing::FishStock::default())
             .insert_resource(military::ActiveRallyPoints::default())
             .insert_resource(military::MilitaryFormationGroupGen::default())
@@ -1345,9 +1346,21 @@ impl Plugin for SimulationPlugin {
                 // gather (mutually exclusive task). Split into its own block
                 // because the main Sequential tuple is at Bevy's 21-element
                 // ceiling.
-                (farm::prepare_field_task_system
-                    .after(movement::movement_system)
-                    .before(gather::gather_system),)
+                (
+                    farm::prepare_field_task_system
+                        .after(movement::movement_system)
+                        .before(gather::gather_system),
+                    // Drains `FarmRetirements`: any retiring Ag tile with no
+                    // standing crop and no live field-work reservation gets
+                    // its `ag_tiles` / `FieldTileIndex` entry dropped and its
+                    // `Cropland` reverted to natural biome. Runs after gather
+                    // (harvest may have cleared `PlantMap` this tick) and
+                    // after `prepare_field_task_system` (a Prepare completion
+                    // releases its reservation this tick).
+                    farm::drain_farm_retirements_system
+                        .after(gather::gather_system)
+                        .after(farm::prepare_field_task_system),
+                )
                     .in_set(SimulationSet::Sequential),
             )
             .add_systems(

@@ -300,6 +300,65 @@ impl PrepareFieldReservations {
     }
 }
 
+/// Why an Agricultural tile is leaving its plot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetireReason {
+    /// A non-Ag district / road corridor inflated onto this tile. After the
+    /// drain, ownership will transfer (or simply revert to natural).
+    HardConflict,
+    /// The owning settlement (or its `SettlementPlan`) is gone; the plot
+    /// itself has no canonical home anymore.
+    SettlementGone,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FarmRetirement {
+    /// The Ag plot that previously owned the tile. Retained for diagnostics
+    /// + so the drain knows which plot to clean up if it becomes empty.
+    pub old_plot: PlotId,
+    /// Tick the retirement was queued. Used by a GC backstop so a tile that
+    /// got stuck (e.g. a despawned plant that never cleared `PlantMap`) can
+    /// time out.
+    pub requested_tick: u64,
+    pub reason: RetireReason,
+}
+
+/// Tiles waiting to leave an Ag plot. Populated by `carve_plots_system` when
+/// a committed plot loses tiles to a non-Ag expansion or to a planner that
+/// no longer covers them. Drained by `drain_farm_retirements_system` once
+/// the standing crop is harvested and any field-work reservation clears;
+/// the drain finalises by removing the tile from `PlotIndex.ag_tiles` +
+/// `FieldTileIndex` and reverting `Cropland` to its natural surface kind.
+///
+/// While a tile sits in this map it remains in `ag_tiles` and keeps its
+/// `FieldTileIndex` entry, so harvest work can still complete on a
+/// standing crop; farm-work scanners (`find_nearest_unprepared_in_rect`,
+/// `find_nearest_plantable_in_rect`, `plot_tile_counts` and the mature
+/// sweep) skip these tiles so no new Prepare/Plant work targets them.
+#[derive(Resource, Default, Debug)]
+pub struct FarmRetirements {
+    pub by_tile: AHashMap<(i32, i32), FarmRetirement>,
+}
+
+impl FarmRetirements {
+    #[inline]
+    pub fn is_retiring(&self, tile: (i32, i32)) -> bool {
+        self.by_tile.contains_key(&tile)
+    }
+
+    pub fn stage(&mut self, tile: (i32, i32), old_plot: PlotId, reason: RetireReason, tick: u64) {
+        self.by_tile.entry(tile).or_insert(FarmRetirement {
+            old_plot,
+            requested_tick: tick,
+            reason,
+        });
+    }
+
+    pub fn cancel(&mut self, tile: (i32, i32)) {
+        self.by_tile.remove(&tile);
+    }
+}
+
 /// Per-plot tile classification used by the foreman pass in
 /// `chief_job_posting_system`. Counts mirror the predicates encoded in
 /// `find_nearest_plantable_in_rect` / `find_nearest_unprepared_in_rect` plus
@@ -327,6 +386,7 @@ pub fn plot_tile_counts(
     field_tiles: &FieldTileIndex,
     plant_map: &crate::simulation::plants::PlantMap,
     plant_q: &Query<&crate::simulation::plants::Plant>,
+    retirements: &FarmRetirements,
     rect: crate::simulation::settlement::TileRect,
 ) -> PlotTileCounts {
     use crate::simulation::plants::GrowthStage;
@@ -334,6 +394,10 @@ pub fn plot_tile_counts(
     let mut out = PlotTileCounts::default();
     for ty in rect.y0..rect.y0 + rect.h as i32 {
         for tx in rect.x0..rect.x0 + rect.w as i32 {
+            // Retiring tiles must not anchor new Prepare/Plant work. Mature
+            // crops still standing on them harvest naturally through the
+            // PlantMap sweep, so we keep that count active.
+            let retiring = retirements.is_retiring((tx, ty));
             let is_cropland = matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Cropland));
             let nutrients = field_tiles
                 .by_tile
@@ -341,11 +405,15 @@ pub fn plot_tile_counts(
                 .map(|s| s.nutrients)
                 .unwrap_or(0);
             let exhausted = nutrients < EXHAUSTED_FLOOR;
-            if !is_cropland || exhausted {
+            if !retiring && (!is_cropland || exhausted) {
                 out.unprepared += 1;
             }
             let plant_here = plant_map.0.get(&(tx, ty)).copied();
-            if is_cropland && nutrients >= MIN_PLANTABLE_NUTRIENTS && plant_here.is_none() {
+            if !retiring
+                && is_cropland
+                && nutrients >= MIN_PLANTABLE_NUTRIENTS
+                && plant_here.is_none()
+            {
                 out.plantable += 1;
             }
             if is_cropland {
@@ -404,6 +472,7 @@ pub fn find_nearest_plantable_in_rect(
     plant_map: &crate::simulation::plants::PlantMap,
     field_tiles: &FieldTileIndex,
     reservations: &crate::simulation::plants::PlantingReservations,
+    retirements: &FarmRetirements,
     from: (i32, i32),
     rect_min: (i32, i32),
     rect_max: (i32, i32),
@@ -416,6 +485,9 @@ pub fn find_nearest_plantable_in_rect(
                 continue;
             }
             if reservations.is_reserved((tx, ty)) {
+                continue;
+            }
+            if retirements.is_retiring((tx, ty)) {
                 continue;
             }
             if !matches!(
@@ -450,6 +522,7 @@ pub fn find_nearest_unprepared_in_rect(
     chunk_map: &crate::world::chunk::ChunkMap,
     field_tiles: &FieldTileIndex,
     reservations: &PrepareFieldReservations,
+    retirements: &FarmRetirements,
     from: (i32, i32),
     rect_min: (i32, i32),
     rect_max: (i32, i32),
@@ -459,6 +532,9 @@ pub fn find_nearest_unprepared_in_rect(
     for ty in rect_min.1..=rect_max.1 {
         for tx in rect_min.0..=rect_max.0 {
             if reservations.is_reserved((tx, ty)) {
+                continue;
+            }
+            if retirements.is_retiring((tx, ty)) {
                 continue;
             }
             let is_cropland = matches!(
@@ -954,6 +1030,134 @@ pub fn backfill_field_tile_index_system(
     }
 }
 
+/// Sequential drain pass for `FarmRetirements`. A tile is eligible to finalise
+/// when (a) no plant stands on it (`PlantMap` empty), (b) no in-flight
+/// planting reservation holds it, and (c) no in-flight `PrepareField`
+/// reservation holds it. Finalising removes the tile from
+/// `PlotIndex.ag_tiles`, `PlotIndex.by_tile`, and `FieldTileIndex`, then
+/// reverts `Cropland` to its natural biome kind via `chunk_map.set_tile`
+/// (the same logic the old inline carve revert pass used).
+///
+/// After draining tiles, any plot whose member set is now empty (no
+/// `FieldTileIndex` entries left pointing at it) is despawned. This is how
+/// the deferred-despawn path for a wholly-retiring plot completes: the
+/// carve marks every tile retiring and leaves the plot entity alive; the
+/// drain reaps tiles and finally the plot once the last standing crop
+/// clears.
+///
+/// Runs in `SimulationSet::Sequential` after `gather_system` /
+/// `prepare_field_task_system` so a harvest or field-prep completed this
+/// same tick can release the tile.
+pub fn drain_farm_retirements_system(
+    mut commands: Commands,
+    mut chunk_map: ResMut<crate::world::chunk::ChunkMap>,
+    mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
+    mut plot_index: ResMut<crate::simulation::land::PlotIndex>,
+    mut field_tiles: ResMut<FieldTileIndex>,
+    mut retirements: ResMut<FarmRetirements>,
+    plant_map: Res<crate::simulation::plants::PlantMap>,
+    plant_reservations: Res<crate::simulation::plants::PlantingReservations>,
+    prep_reservations: Res<PrepareFieldReservations>,
+    globe: Res<crate::world::globe::Globe>,
+    gen: Res<crate::world::terrain::WorldGen>,
+    plot_q: Query<&crate::simulation::land::Plot>,
+) {
+    use crate::simulation::land::PlotId;
+    use crate::world::biome::classify_at_tile;
+    use crate::world::chunk::Z_MIN;
+    use crate::world::terrain::{biome_bands, surface_v};
+    use crate::world::tile::{TileData, TileKind};
+
+    if retirements.by_tile.is_empty() {
+        return;
+    }
+
+    let mut to_finalise: Vec<((i32, i32), PlotId)> = Vec::new();
+    for (&tile, retire) in retirements.by_tile.iter() {
+        if plant_map.0.contains_key(&tile) {
+            continue;
+        }
+        if plant_reservations.is_reserved(tile) {
+            continue;
+        }
+        if prep_reservations.is_reserved(tile) {
+            continue;
+        }
+        to_finalise.push((tile, retire.old_plot));
+    }
+
+    if to_finalise.is_empty() {
+        return;
+    }
+
+    let mut touched_plots: ahash::AHashSet<PlotId> = ahash::AHashSet::new();
+    for (tile, old_plot) in to_finalise.iter().copied() {
+        retirements.by_tile.remove(&tile);
+        let (tx, ty) = tile;
+
+        plot_index.ag_tiles.remove(&tile);
+        if plot_index.by_tile.get(&tile).copied() == Some(old_plot) {
+            plot_index.by_tile.remove(&tile);
+        }
+        field_tiles.by_tile.remove(&tile);
+        touched_plots.insert(old_plot);
+
+        // Revert Cropland → natural biome kind. Mirrors the old inline carve
+        // revert pass at land.rs:934. Tiles not currently `Cropland` (already
+        // built over, dug, etc.) are left as-is.
+        let z = chunk_map.surface_z_at(tx, ty);
+        if z < Z_MIN {
+            continue;
+        }
+        let cur = chunk_map.tile_at(tx, ty, z);
+        if cur.kind != TileKind::Cropland {
+            continue;
+        }
+        let biome = classify_at_tile(&globe, tx, ty);
+        let v = surface_v(tx, ty, &gen, &globe);
+        let natural_kind = biome_bands(biome).pick(v);
+        chunk_map.set_tile(
+            tx,
+            ty,
+            z,
+            TileData {
+                kind: natural_kind,
+                elevation: cur.elevation,
+                fertility: cur.fertility,
+                flags: cur.flags,
+                ore: cur.ore,
+            },
+        );
+        tile_changed.send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
+    }
+
+    // If any plot has zero remaining members, despawn it. The plot's entry in
+    // `PlotIndex.by_id` / `by_settlement` is cleared so the next carve sees
+    // a clean slate. Membership is the union over `FieldTileIndex.plot_id`
+    // (canonical source of truth per the sticky-farm design).
+    for pid in touched_plots {
+        let still_present = field_tiles
+            .by_tile
+            .values()
+            .any(|s| s.plot_id == pid);
+        if still_present {
+            continue;
+        }
+        let Some(entity) = plot_index.by_id.remove(&pid) else {
+            continue;
+        };
+        if let Ok(plot) = plot_q.get(entity) {
+            if let Some(list) = plot_index.by_settlement.get_mut(&plot.settlement_id) {
+                list.retain(|&p| p != pid);
+                if list.is_empty() {
+                    plot_index.by_settlement.remove(&plot.settlement_id);
+                }
+            }
+        }
+        commands.entity(entity).despawn();
+    }
+}
+
 /// Sequential executor for `Task::PrepareField`. Accumulates work_progress to
 /// `FIELD_PREP_WORK_TICKS`, then stamps `TileKind::Cropland` (preserving
 /// fertility), emits a `TileChangedEvent`, increments the worker's claimed
@@ -1156,15 +1360,21 @@ pub fn fallow_recovery_system(
 }
 
 /// Count tiles in `rect` that need Prepare work — see `find_nearest_unprepared_in_rect`.
+/// Retiring tiles (`FarmRetirements`) are excluded so a posting can't keep
+/// itself alive on capacity that's about to be released.
 pub fn count_unprepared_in_rect(
     chunk_map: &crate::world::chunk::ChunkMap,
     field_tiles: &FieldTileIndex,
+    retirements: &FarmRetirements,
     rect_min: (i32, i32),
     rect_max: (i32, i32),
 ) -> u32 {
     let mut n = 0u32;
     for ty in rect_min.1..=rect_max.1 {
         for tx in rect_min.0..=rect_max.0 {
+            if retirements.is_retiring((tx, ty)) {
+                continue;
+            }
             let is_cropland = matches!(
                 chunk_map.tile_kind_at(tx, ty),
                 Some(crate::world::tile::TileKind::Cropland)
@@ -1185,17 +1395,22 @@ pub fn count_unprepared_in_rect(
 /// Count tiles in `rect` that are currently plantable — see
 /// `find_nearest_plantable_in_rect`. Does NOT consult `PlantingReservations`
 /// (the reservation is for in-flight worker chains; the underlying tile is
-/// still "plantable" capacity from the posting's point of view).
+/// still "plantable" capacity from the posting's point of view). Retiring
+/// tiles (`FarmRetirements`) are excluded.
 pub fn count_plantable_in_rect(
     chunk_map: &crate::world::chunk::ChunkMap,
     plant_map: &crate::simulation::plants::PlantMap,
     field_tiles: &FieldTileIndex,
+    retirements: &FarmRetirements,
     rect_min: (i32, i32),
     rect_max: (i32, i32),
 ) -> u32 {
     let mut n = 0u32;
     for ty in rect_min.1..=rect_max.1 {
         for tx in rect_min.0..=rect_max.0 {
+            if retirements.is_retiring((tx, ty)) {
+                continue;
+            }
             if plant_map.0.contains_key(&(tx, ty)) {
                 continue;
             }
@@ -1280,6 +1495,7 @@ pub fn fieldwork_expiry_system(
     chunk_map: Res<crate::world::chunk::ChunkMap>,
     plant_map: Res<crate::simulation::plants::PlantMap>,
     field_tiles: Res<FieldTileIndex>,
+    retirements: Res<FarmRetirements>,
     storage_reservations: Res<crate::simulation::faction::StorageReservations>,
     faction_registry: Res<crate::simulation::faction::FactionRegistry>,
     mut board: ResMut<crate::simulation::jobs::JobBoard>,
@@ -1334,11 +1550,11 @@ pub fn fieldwork_expiry_system(
             let rect_max = area.max;
             let remaining_capacity: u32 = match phase {
                 FarmWorkPhase::Prepare => {
-                    count_unprepared_in_rect(&chunk_map, &field_tiles, rect_min, rect_max)
+                    count_unprepared_in_rect(&chunk_map, &field_tiles, &retirements, rect_min, rect_max)
                 }
                 FarmWorkPhase::Plant => {
                     let plantable =
-                        count_plantable_in_rect(&chunk_map, &plant_map, &field_tiles, rect_min, rect_max);
+                        count_plantable_in_rect(&chunk_map, &plant_map, &field_tiles, &retirements, rect_min, rect_max);
                     let seed_pool = faction_registry
                         .factions
                         .get(faction_id)
@@ -1833,6 +2049,7 @@ mod tests {
         let chunk_map = crate::world::chunk::ChunkMap::default();
         let field_tiles = FieldTileIndex::default();
         let mut reservations = PrepareFieldReservations::default();
+        let retirements = FarmRetirements::default();
         let from = (0, 0);
         let rect_min = (0, 0);
         let rect_max = (2, 0);
@@ -1843,6 +2060,7 @@ mod tests {
             &chunk_map,
             &field_tiles,
             &reservations,
+            &retirements,
             from,
             rect_min,
             rect_max,
@@ -1856,11 +2074,58 @@ mod tests {
                 &chunk_map,
                 &field_tiles,
                 &reservations,
+                &retirements,
                 from,
                 rect_min,
                 rect_max,
             ),
             None,
+        );
+    }
+
+    #[test]
+    fn scanners_skip_retiring_tiles() {
+        // Three-tile rect, the nearest tile (0,0) is retiring. All three
+        // tiles read as unprepared with the default ChunkMap (no Cropland
+        // chunk loaded → `tile_kind_at` returns None → !is_cropland → the
+        // unprepared predicate fires). A retirement-blind scan would
+        // prefer (0,0); the retirement-aware scan should pick (1,0).
+        let chunk_map = crate::world::chunk::ChunkMap::default();
+        let field_tiles = FieldTileIndex::default();
+        let reservations = PrepareFieldReservations::default();
+        let mut retirements = FarmRetirements::default();
+        retirements.stage((0, 0), 7, RetireReason::HardConflict, 0);
+
+        let pick = find_nearest_unprepared_in_rect(
+            &chunk_map,
+            &field_tiles,
+            &reservations,
+            &retirements,
+            (0, 0),
+            (0, 0),
+            (2, 0),
+        );
+        assert_eq!(
+            pick,
+            Some((1, 0)),
+            "find_nearest_unprepared_in_rect must skip retiring tiles"
+        );
+
+        // count_unprepared_in_rect respects retirements: a retiring tile
+        // contributes no count even when it would otherwise be unprepared.
+        let count_with_retire =
+            count_unprepared_in_rect(&chunk_map, &field_tiles, &retirements, (0, 0), (2, 0));
+        let count_blind = count_unprepared_in_rect(
+            &chunk_map,
+            &field_tiles,
+            &FarmRetirements::default(),
+            (0, 0),
+            (2, 0),
+        );
+        assert_eq!(count_blind, 3, "all 3 tiles unprepared in default ChunkMap");
+        assert_eq!(
+            count_with_retire, 2,
+            "the retiring tile must not contribute to count_unprepared_in_rect"
         );
     }
 

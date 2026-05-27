@@ -7503,6 +7503,7 @@ pub fn htn_plant_from_storage_dispatch_system(
     item_query: Query<&crate::simulation::items::GroundItem>,
     farm_plot_params: FarmScopeParams,
     field_tiles: Res<crate::simulation::farm::FieldTileIndex>,
+    farm_retirements: Res<crate::simulation::farm::FarmRetirements>,
     mut query: Query<
         (
             Entity,
@@ -7744,6 +7745,7 @@ pub fn htn_plant_from_storage_dispatch_system(
                 &planting.plant_map,
                 &field_tiles,
                 &planting.plant_reservations,
+                &farm_retirements,
                 (cur_tx, cur_ty),
                 rmin,
                 rmax,
@@ -7929,6 +7931,7 @@ pub fn htn_prepare_field_dispatch_system(
     board: Res<crate::simulation::jobs::JobBoard>,
     field_tiles: Res<crate::simulation::farm::FieldTileIndex>,
     mut reservations: ResMut<crate::simulation::farm::PrepareFieldReservations>,
+    farm_retirements: Res<crate::simulation::farm::FarmRetirements>,
     mut query: Query<
         (
             Entity,
@@ -8021,6 +8024,7 @@ pub fn htn_prepare_field_dispatch_system(
             &chunk_map,
             &field_tiles,
             &reservations,
+            &farm_retirements,
             (cur_tx, cur_ty),
             area.min,
             area.max,

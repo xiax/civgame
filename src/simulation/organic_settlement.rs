@@ -798,6 +798,12 @@ pub struct SettlementSurveyInput {
     pub maps: SurveyStructureSnapshot,
     pub member_offsets: Vec<(i32, i32)>,
     pub snapshot_chunks: usize,
+    /// Sticky-farm input: rects of every Agricultural `Plot` currently
+    /// owned by this settlement. `build_ag_belt` pre-accepts these so the
+    /// belt cannot relocate for scoring or demand-shift reasons — only a
+    /// hard non-Ag-district overlap can release tiles, and only through
+    /// the carve's per-tile retirement path.
+    pub committed_ag_rects: Vec<TileRect>,
 }
 
 pub struct SettlementSurveyDiff {
@@ -821,9 +827,11 @@ pub fn compute_settlement_survey(input: SettlementSurveyInput) -> SettlementSurv
         &input.maps,
         &input.member_offsets,
         input.snapshot_chunks,
+        &input.committed_ag_rects,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_settlement_survey_core<F: SurveyFactionView>(
     settlement: &Settlement,
     faction: &F,
@@ -833,6 +841,7 @@ fn compute_settlement_survey_core<F: SurveyFactionView>(
     maps: &SurveyStructureSnapshot,
     member_offsets: &[(i32, i32)],
     snapshot_chunks: usize,
+    committed_ag_rects: &[TileRect],
 ) -> SettlementSurveyDiff {
     let seed = organic_seed(settlement, faction);
     let mut brain = prior_brain
@@ -852,7 +861,7 @@ fn compute_settlement_survey_core<F: SurveyFactionView>(
     brain.road_tiles = road_tiles_for_segments(&brain.road_segments);
     brain.road_corridor_tiles = road_corridor_tiles_for_segments(&brain.road_segments);
     brain.frontier = build_frontier(faction, &brain, chunk_map, maps);
-    brain.parcels = build_parcels(faction, settlement, &brain, chunk_map, maps);
+    brain.parcels = build_parcels(faction, settlement, &brain, chunk_map, maps, committed_ag_rects);
     brain.layout_hash = layout_hash(faction, &brain);
 
     let road_pushes = desire_path_push(
@@ -898,6 +907,7 @@ pub fn survey_one_settlement(
     chunk_map: &ChunkMap,
     maps: &OrganicStructureMaps,
     member_q: &Query<(&FactionMember, &Transform)>,
+    committed_ag_rects: &[TileRect],
 ) {
     let member_offsets =
         collect_member_offsets(faction.home_tile, settlement.owner_faction, member_q);
@@ -911,6 +921,7 @@ pub fn survey_one_settlement(
         &structure_snapshot,
         &member_offsets,
         chunk_map.0.len(),
+        committed_ag_rects,
     );
     for road_push in &diff.road_pushes {
         road_queue.0.push(*road_push);
@@ -947,6 +958,9 @@ pub fn resurvey_after_seeding_system(
         if settlement.owner_faction == SOLO || !faction.caps.settlement.is_full_settlement() {
             continue;
         }
+        // OnEnter call sites run before `carve_plots_system`, so no
+        // committed Ag plots exist yet — pass an empty slice. Runtime
+        // surveys snapshot real committed rects via `schedule_survey_tasks_system`.
         survey_one_settlement(
             settlement,
             faction,
@@ -956,6 +970,7 @@ pub fn resurvey_after_seeding_system(
             &chunk_map,
             &maps,
             &member_q,
+            &[],
         );
     }
     parcel_index.rebuild(&brains);
@@ -988,6 +1003,9 @@ pub fn kickoff_initial_survey_system(
         if settlement.owner_faction == SOLO || !faction.caps.settlement.is_full_settlement() {
             continue;
         }
+        // OnEnter call sites run before `carve_plots_system`, so no
+        // committed Ag plots exist yet — pass an empty slice. Runtime
+        // surveys snapshot real committed rects via `schedule_survey_tasks_system`.
         survey_one_settlement(
             settlement,
             faction,
@@ -997,6 +1015,7 @@ pub fn kickoff_initial_survey_system(
             &chunk_map,
             &maps,
             &member_q,
+            &[],
         );
     }
     parcel_index.rebuild(&brains);
@@ -2162,6 +2181,7 @@ fn build_parcels<F: SurveyFactionView>(
     brain: &SettlementBrain,
     chunk_map: &ChunkMap,
     maps: &SurveyStructureSnapshot,
+    committed_ag_rects: &[TileRect],
 ) -> Vec<Parcel> {
     // Permanent settlements with a road skeleton: sweep road tiles for
     // road-fronted parcel candidates. Camps & nomadic factions (no
@@ -2181,7 +2201,14 @@ fn build_parcels<F: SurveyFactionView>(
             .unwrap_or(0);
         let budget = MAX_PARCELS.saturating_sub(parcels.len());
         let belt = build_ag_belt(
-            faction, settlement, brain, chunk_map, &occupied, next_id, budget,
+            faction,
+            settlement,
+            brain,
+            chunk_map,
+            &occupied,
+            next_id,
+            budget,
+            committed_ag_rects,
         );
         parcels.extend(belt);
         // Per-dwelling kitchen-garden pass: emit a house-sized Agricultural
@@ -2758,6 +2785,7 @@ fn parcels_conflict(
 /// with a `tile_hash` final tiebreak, no ahash-iteration dependence. `occupied`
 /// is the non-ag road-driven parcel set; `start_id` continues the parcel id
 /// sequence; `budget` is the remaining `MAX_PARCELS` headroom.
+#[allow(clippy::too_many_arguments)]
 fn build_ag_belt<F: SurveyFactionView>(
     faction: &F,
     settlement: &Settlement,
@@ -2766,6 +2794,7 @@ fn build_ag_belt<F: SurveyFactionView>(
     occupied: &[TileRect],
     start_id: u32,
     budget: usize,
+    committed_ag_rects: &[TileRect],
 ) -> Vec<Parcel> {
     const BELT_CLEARANCE: i32 = 3;
     const ACCESS_SOFT: i32 = 12;
@@ -2780,10 +2809,45 @@ fn build_ag_belt<F: SurveyFactionView>(
         current_ag_tile_count(brain),
     );
     let ag_target = *targets.get(&DistrictKind::Agricultural).unwrap_or(&0);
-    if ag_target == 0 {
-        return Vec::new();
-    }
     let home = faction.home_tile();
+
+    // Sticky-belt pre-accept. Every committed Ag plot rect that fits inside
+    // the survey window joins the belt verbatim — the planner is never
+    // allowed to relocate it. Footprint exclusion is computed below for
+    // *new* candidates only; committed plots stay even if a later non-Ag
+    // district has inflated onto them. The carve handles the per-tile
+    // overlap retirement (see `carve_plots_system` + `FarmRetirements`).
+    let mut parcels: Vec<Parcel> = Vec::new();
+    let mut next_id = start_id;
+    let mut accepted_rects: Vec<TileRect> = Vec::new();
+    let mut committed_accepted: usize = 0;
+    for r in committed_ag_rects {
+        if accepted_rects.iter().any(|a| rects_overlap(*a, *r)) {
+            continue;
+        }
+        let c = r.center();
+        let suitability = parcel_suitability(faction, settlement, brain, chunk_map, c);
+        parcels.push(Parcel {
+            id: next_id,
+            shape: ParcelShape::Rect(*r),
+            frontage_edge: None,
+            access_tile: None,
+            holder: TenureHolder::State {
+                faction_id: settlement.owner_faction,
+            },
+            district_hint: Some(DistrictKind::Agricultural),
+            suitability,
+        });
+        accepted_rects.push(*r);
+        next_id = next_id.wrapping_add(1);
+        committed_accepted += 1;
+    }
+
+    let remaining_budget = budget.saturating_sub(committed_accepted);
+    let remaining_target = ag_target.saturating_sub(committed_accepted);
+    if remaining_target == 0 || remaining_budget == 0 {
+        return parcels;
+    }
 
     // Built-up footprint: non-ag parcels + Civic/Residential/Crafting
     // district discs, each inflated by `BELT_CLEARANCE` so fields keep a
@@ -2810,6 +2874,13 @@ fn build_ag_belt<F: SurveyFactionView>(
                 (2 * r + 1) as u16,
             )));
         }
+    }
+    // Committed Ag plots count as occupied territory for the *new* candidate
+    // scan, so a fresh belt block cannot land on top of an existing plot.
+    // They are not inflated (no clearance margin between committed Ag and a
+    // proposed Ag extension — the belt is allowed to be contiguous).
+    for r in committed_ag_rects {
+        footprint.push(*r);
     }
 
     let (bw, bh) = parcel_size(DistrictKind::Agricultural, brain.phase);
@@ -2935,7 +3006,7 @@ fn build_ag_belt<F: SurveyFactionView>(
         (dx == bw as i32 && dy == 0) || (dy == bh as i32 && dx == 0)
     };
 
-    let cap = ag_target.min(budget);
+    let cap = remaining_target.min(remaining_budget);
     let mut accepted: Vec<usize> = Vec::new();
     let mut used = vec![false; cands.len()];
     while accepted.len() < cap {
@@ -2976,8 +3047,6 @@ fn build_ag_belt<F: SurveyFactionView>(
         accepted.push(idx);
     }
 
-    let mut parcels = Vec::with_capacity(accepted.len());
-    let mut next_id = start_id;
     for idx in accepted {
         let c = &cands[idx];
         parcels.push(Parcel {
@@ -5471,6 +5540,7 @@ mod tests {
             &brain,
             &map,
             &SurveyStructureSnapshot::default(),
+            &[],
         );
         let residential: Vec<_> = parcels
             .iter()
@@ -5557,7 +5627,7 @@ mod tests {
         let map = fertile_grass_map();
         let settlement = ag_test_settlement();
 
-        let parcels = build_ag_belt(&faction, &settlement, &brain, &map, &[], 100, MAX_PARCELS);
+        let parcels = build_ag_belt(&faction, &settlement, &brain, &map, &[], 100, MAX_PARCELS, &[]);
         assert!(
             !parcels.is_empty(),
             "robust belt must yield ≥1 ag block on fertile land even with no \
@@ -5621,14 +5691,57 @@ mod tests {
         let map = fertile_grass_map();
         let settlement = ag_test_settlement();
 
-        let a = build_ag_belt(&faction, &settlement, &brain, &map, &[], 0, MAX_PARCELS);
-        let b = build_ag_belt(&faction, &settlement, &brain, &map, &[], 0, MAX_PARCELS);
+        let a = build_ag_belt(&faction, &settlement, &brain, &map, &[], 0, MAX_PARCELS, &[]);
+        let b = build_ag_belt(&faction, &settlement, &brain, &map, &[], 0, MAX_PARCELS, &[]);
         assert!(!a.is_empty());
         let rects_a: Vec<TileRect> = a.iter().map(|p| p.rect()).collect();
         let rects_b: Vec<TileRect> = b.iter().map(|p| p.rect()).collect();
         assert_eq!(
             rects_a, rects_b,
             "build_ag_belt must be deterministic across calls"
+        );
+    }
+
+    /// Sticky-belt regression: when `build_ag_belt` is given a committed
+    /// Ag plot rect that sits at an *un-fertile-favoured* location, that
+    /// committed rect must still appear in the output (pre-accepted),
+    /// even if the scoring system would otherwise prefer different
+    /// blocks. The fertility-driven scan is only allowed to fill any
+    /// remaining demand, never to relocate committed plots.
+    #[test]
+    fn build_ag_belt_preserves_committed_rects() {
+        let mut faction = dummy_faction((0, 0), 30);
+        force_adopt(&mut faction, PERM_SETTLEMENT);
+        force_adopt(&mut faction, CROP_CULTIVATION);
+        let mut brain = SettlementBrain::new(SettlementId(1), 1, 42);
+        brain.phase = SettlementPhase::Chiefdom;
+        brain.anchors = vec![SettlementAnchor {
+            kind: SettlementAnchorKind::Field,
+            tile: (10, 10),
+            weight: 1.0,
+        }];
+        let map = fertile_grass_map();
+        let settlement = ag_test_settlement();
+
+        // An off-axis committed rect that the home-anchored lattice would
+        // *not* pick first. Its placement must survive the call.
+        let committed = TileRect::new(40, 40, 16, 16);
+        let belt = build_ag_belt(
+            &faction,
+            &settlement,
+            &brain,
+            &map,
+            &[],
+            500,
+            MAX_PARCELS,
+            &[committed],
+        );
+
+        assert!(
+            belt.iter().any(|p| p.rect() == committed),
+            "committed Ag rect must be pre-accepted into the belt regardless of scoring; \
+             got {:?}",
+            belt.iter().map(|p| p.rect()).collect::<Vec<_>>()
         );
     }
 

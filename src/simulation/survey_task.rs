@@ -93,6 +93,8 @@ pub fn schedule_survey_tasks_system(
     chunk_map: Res<ChunkMap>,
     maps: OrganicStructureMapsParam,
     member_q: Query<(&FactionMember, &Transform)>,
+    plot_index: Res<crate::simulation::land::PlotIndex>,
+    plot_q: Query<&crate::simulation::land::Plot>,
     mut perf: ResMut<BackgroundWorkDiagnostics>,
 ) {
     // Snapshot eligible settlements in stable order.
@@ -148,6 +150,8 @@ pub fn schedule_survey_tasks_system(
     let maps_view = maps.view();
     let terrain_snapshot = clone_chunk_window(&chunk_map, faction.home_tile);
     let snapshot_chunks = terrain_snapshot.0.len();
+    let committed_ag_rects =
+        snapshot_committed_ag_rects(&plot_index, &plot_q, settlement.id.0);
     let input = SettlementSurveyInput {
         settlement: settlement.clone(),
         faction: SurveyFactionSnapshot::from_faction(faction),
@@ -162,6 +166,7 @@ pub fn schedule_survey_tasks_system(
         )
         .offsets,
         snapshot_chunks,
+        committed_ag_rects,
     };
     let pool = AsyncComputeTaskPool::get();
     let task = pool.spawn(async move {
@@ -294,6 +299,33 @@ pub fn clone_chunk_window(chunk_map: &ChunkMap, centre: (i32, i32)) -> ChunkMap 
     for (&coord, chunk) in &chunk_map.0 {
         if coord.chebyshev_dist(centre_coord) <= radius_chunks {
             out.0.insert(coord, chunk.clone());
+        }
+    }
+    out
+}
+
+/// Helper: capture the rects of every Agricultural plot currently owned by
+/// `settlement_id`. Used by the survey path to feed `build_ag_belt`'s
+/// sticky pre-accept pass so committed farm land cannot be relocated by
+/// the planner.
+pub fn snapshot_committed_ag_rects(
+    plot_index: &crate::simulation::land::PlotIndex,
+    plot_q: &Query<&crate::simulation::land::Plot>,
+    settlement_id: u32,
+) -> Vec<crate::simulation::settlement::TileRect> {
+    let mut out = Vec::new();
+    let Some(pids) = plot_index.by_settlement.get(&settlement_id) else {
+        return out;
+    };
+    for &pid in pids {
+        let Some(&entity) = plot_index.by_id.get(&pid) else {
+            continue;
+        };
+        let Ok(plot) = plot_q.get(entity) else {
+            continue;
+        };
+        if plot.zone_kind == crate::simulation::settlement::ZoneKind::Agricultural {
+            out.push(plot.rect);
         }
     }
     out
