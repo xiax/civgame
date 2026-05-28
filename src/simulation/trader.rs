@@ -181,6 +181,7 @@ fn pick_arbitrage(
 /// Snapshot of a trader's relevant state captured before mutation.
 /// Built in a parallel-safe pre-pass; the mutation pass walks this
 /// list and `world.get_*` to apply trades / install plans.
+#[derive(Clone)]
 struct TraderSnapshot {
     entity: Entity,
     tile: (i32, i32),
@@ -203,9 +204,16 @@ struct TraderSnapshot {
 /// For idle traders without a plan: scans known settlements for an
 /// arbitrage opportunity and installs a `TraderPlan` so the route
 /// dispatcher will route them.
+/// Round-robin cursor over per-tick trader processing.
+/// Advances by `PerfWorkBudget::trader_market_plans_per_tick` each tick.
+#[derive(Resource, Default)]
+pub struct TraderCursor {
+    pub next_entity_bits: u64,
+}
+
 pub fn trader_market_step_system(world: &mut World) {
     // ── Pass 1: snapshot relevant trader state ───────────────────
-    let snapshots: Vec<TraderSnapshot> = {
+    let snapshots_all: Vec<TraderSnapshot> = {
         let mut q = world.query::<(
             Entity,
             &Profession,
@@ -254,12 +262,43 @@ pub fn trader_market_step_system(world: &mut World) {
         out
     };
 
-    if snapshots.is_empty() {
+    if snapshots_all.is_empty() {
         return;
     }
 
+    // Phase 2.5: per-tick trader cursor. Process at most `budget.trader_market_plans_per_tick`
+    // traders this tick. Sort by entity bits for deterministic round-robin;
+    // pick the slice starting at the cursor's position. This smooths the
+    // per-trader arbitrage scan cost across ticks instead of paying it all
+    // at once when many traders go idle simultaneously.
+    let cap = world
+        .resource::<crate::simulation::perf::PerfWorkBudget>()
+        .trader_market_plans_per_tick
+        .max(1);
+    let mut snapshots = snapshots_all;
+    snapshots.sort_by_key(|s| s.entity.to_bits());
+    let pivot_bits = world.resource::<TraderCursor>().next_entity_bits;
+    let pivot = snapshots
+        .iter()
+        .position(|s| s.entity.to_bits() >= pivot_bits)
+        .unwrap_or(0);
+    let take = cap.min(snapshots.len());
+    let slice: Vec<TraderSnapshot> = (0..take)
+        .map(|offset| snapshots[(pivot + offset) % snapshots.len()].clone())
+        .collect();
+    // Advance cursor past the last entity in the slice.
+    if let Some(last) = slice.last() {
+        world.resource_mut::<TraderCursor>().next_entity_bits =
+            last.entity.to_bits().saturating_add(1);
+    }
+    // Diagnostics.
+    {
+        let mut bg = world.resource_mut::<crate::simulation::perf::BackgroundWorkDiagnostics>();
+        bg.trader_snapshots_last_tick = snapshots.len() as u32;
+    }
+
     // ── Pass 2: trade-on-arrival + plan creation ─────────────────
-    for snap in snapshots {
+    for snap in slice {
         // Re-resolve plan tile lookups via a query each iteration —
         // settlements rarely change tile and plans are short-lived,
         // so cost is negligible.

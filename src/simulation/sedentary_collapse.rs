@@ -92,9 +92,8 @@ pub fn sedentary_collapse_system(
     members: Query<&FactionMember>,
     mut lifecycle_queue: ResMut<LifecycleEventQueue>,
 ) {
-    if clock.tick % TICKS_PER_DAY as u64 != 0 {
-        return;
-    }
+    // Phase 1.2: per-faction stagger inside an every-tick run.
+    const SYSTEM_OFFSET: u64 = 167;
     // Snapshot per-faction trigger state. Two-pass so we can mutate
     // `collapse_streak` and emit events without holding the registry
     // borrow during the event push.
@@ -107,6 +106,14 @@ pub fn sedentary_collapse_system(
     }
     let mut samples: Vec<Sample> = Vec::new();
     for (&fid, faction) in registry.factions.iter() {
+        if !crate::simulation::perf::faction_stagger_due(
+            clock.tick,
+            fid,
+            SYSTEM_OFFSET,
+            TICKS_PER_DAY as u64,
+        ) {
+            continue;
+        }
         // Only settled, top-level factions can collapse. Households (sub-
         // factions) inherit lifestyle from their parent and aren't
         // independently mobile.

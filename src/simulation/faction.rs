@@ -265,9 +265,11 @@ pub fn faction_hunter_assignment_system(
         Option<&crate::simulation::knowledge::PersonKnowledge>,
     )>,
 ) {
-    if clock.tick % HUNTER_ASSIGNMENT_CADENCE != 0 {
-        return;
-    }
+    // Phase 1.2: per-faction stagger inside an every-tick run. Each faction
+    // is still evaluated at HUNTER_ASSIGNMENT_CADENCE cadence, but offsets
+    // spread the work across the window instead of every faction firing the
+    // same tick. `system_offset` deconflicts from sibling cadence systems.
+    const SYSTEM_OFFSET: u64 = 17;
 
     // Snapshot per-faction target headcounts so we don't borrow registry
     // across the mutable query iteration.
@@ -278,6 +280,14 @@ pub fn faction_hunter_assignment_system(
     let mut targets: AHashMap<u32, FactionTarget> = AHashMap::default();
     for (&fid, faction) in registry.factions.iter() {
         if fid == SOLO {
+            continue;
+        }
+        if !crate::simulation::perf::faction_stagger_due(
+            clock.tick,
+            fid,
+            SYSTEM_OFFSET,
+            HUNTER_ASSIGNMENT_CADENCE,
+        ) {
             continue;
         }
         let has_tech = faction.techs.has(HUNTING_SPEAR);
@@ -331,10 +341,17 @@ pub fn faction_hunter_assignment_system(
     // peer when wages are non-zero.
     let mut by_faction_hunters: AHashMap<u32, Vec<(Entity, f32, u32)>> = AHashMap::default();
     let mut by_faction_none: AHashMap<u32, Vec<(Entity, f32, u32)>> = AHashMap::default();
+    // No-op early-out when no faction is due this tick (most ticks).
+    if targets.is_empty() {
+        return;
+    }
     for (entity, prof, member, skills, agent, carrier, xf, household_opt, _, _, knowledge_opt) in
         query.iter()
     {
         if member.faction_id == SOLO {
+            continue;
+        }
+        if !targets.contains_key(&member.faction_id) {
             continue;
         }
         let combat = skills.0[SkillKind::Combat as usize];
@@ -487,9 +504,8 @@ pub fn chief_bureaucrat_appointment_system(
         Option<&mut crate::simulation::typed_task::ActionQueue>,
     )>,
 ) {
-    if clock.tick % BUREAUCRAT_ASSIGNMENT_CADENCE != 0 {
-        return;
-    }
+    // Phase 1.2: per-faction stagger inside an every-tick run.
+    const SYSTEM_OFFSET: u64 = 37;
 
     // Per-faction target headcount, snapshotted to avoid borrowing the
     // registry during the mutable query iteration. Treasury bust forces
@@ -498,6 +514,14 @@ pub fn chief_bureaucrat_appointment_system(
     let mut targets: AHashMap<u32, usize> = AHashMap::default();
     for (&fid, faction) in registry.factions.iter() {
         if fid == SOLO || !faction.state_funds_public_works {
+            continue;
+        }
+        if !crate::simulation::perf::faction_stagger_due(
+            clock.tick,
+            fid,
+            SYSTEM_OFFSET,
+            BUREAUCRAT_ASSIGNMENT_CADENCE,
+        ) {
             continue;
         }
         // Phase 4b survival override: starving factions zero
@@ -675,21 +699,33 @@ pub fn chief_architect_appointment_system(
         Without<FactionChief>,
     >,
 ) {
-    if clock.tick % ARCHITECT_ASSIGNMENT_CADENCE != 0 {
-        return;
-    }
+    // Phase 1.2: per-faction stagger inside an every-tick run.
+    const SYSTEM_OFFSET: u64 = 53;
 
     let constr_techs = crate::simulation::construction::construction_relevant_techs();
 
     // Per-faction: the construction techs the chief is Aware of but has
     // NOT personally Learned. Non-empty → settlements want an architect.
     // Also stash the chief's Learned set for the coverage-gain rank.
+    //
+    // `evaluated_fids` distinguishes "due this tick and has no gap" (demote
+    // architects) from "not due this tick" (preserve architects untouched).
     let mut chief_gap: AHashMap<u32, Vec<crate::simulation::technology::TechId>> =
         AHashMap::default();
+    let mut evaluated_fids: ahash::AHashSet<u32> = ahash::AHashSet::default();
     for (&fid, faction) in registry.factions.iter() {
         if fid == SOLO || faction.member_count == 0 {
             continue;
         }
+        if !crate::simulation::perf::faction_stagger_due(
+            clock.tick,
+            fid,
+            SYSTEM_OFFSET,
+            ARCHITECT_ASSIGNMENT_CADENCE,
+        ) {
+            continue;
+        }
+        evaluated_fids.insert(fid);
         // Camps / no-posting archetypes don't run chief construction.
         if faction.caps.posting.is_disabled() {
             continue;
@@ -736,6 +772,11 @@ pub fn chief_architect_appointment_system(
     for (entity, prof, member, skills, xf, knowledge, _, _) in query.iter() {
         let fid = member.faction_id;
         if fid == SOLO {
+            continue;
+        }
+        if !evaluated_fids.contains(&fid) {
+            // Faction not due this tick — leave architects untouched. They
+            // will be re-evaluated when the stagger predicate fires next.
             continue;
         }
         let Some(gap) = chief_gap.get(&fid) else {
@@ -897,11 +938,36 @@ pub fn chief_craft_assignment_system(
         Option<&mut crate::simulation::typed_task::ActionQueue>,
     )>,
 ) {
-    if clock.tick % CRAFTER_ASSIGNMENT_CADENCE != 0 {
+    // Phase 1.2: per-faction stagger inside an every-tick run. We still
+    // pre-pass the crafter/mentor census so the hysteresis deadband uses
+    // live numbers, but BOTH the census and the target write/promote pass
+    // are restricted to staggered-due factions — without the `due` gate the
+    // full-population census ran every tick (the cadence-gate used to short-
+    // circuit the whole system on off-ticks).
+    const SYSTEM_OFFSET: u64 = 71;
+
+    // Which factions fire this tick? Compute once (cheap registry walk) so the
+    // population census below can skip non-due factions, and bail entirely on
+    // ticks where no faction is due.
+    let due: ahash::AHashSet<u32> = registry
+        .factions
+        .keys()
+        .copied()
+        .filter(|&fid| {
+            fid != SOLO
+                && crate::simulation::perf::faction_stagger_due(
+                    clock.tick,
+                    fid,
+                    SYSTEM_OFFSET,
+                    CRAFTER_ASSIGNMENT_CADENCE,
+                )
+        })
+        .collect();
+    if due.is_empty() {
         return;
     }
 
-    // Pre-pass: count current crafters per faction so the deadband
+    // Pre-pass: count current crafters per due faction so the deadband
     // can hold steady when ema sits between the promote / demote
     // thresholds. Apprentices count toward the headcount target — they
     // are committed Crafters-in-training. Pre-passing also lets us
@@ -913,7 +979,7 @@ pub fn chief_craft_assignment_system(
     let mut current_crafters: AHashMap<u32, usize> = AHashMap::default();
     let mut available_mentors: AHashMap<u32, Vec<Entity>> = AHashMap::default();
     for (entity, prof, member, skills, _, _, _, _, _, _) in query.iter() {
-        if member.faction_id == SOLO {
+        if !due.contains(&member.faction_id) {
             continue;
         }
         match *prof {
@@ -946,6 +1012,14 @@ pub fn chief_craft_assignment_system(
     let mut targets: AHashMap<u32, usize> = AHashMap::default();
     for (&fid, faction) in registry.factions.iter() {
         if fid == SOLO {
+            continue;
+        }
+        if !crate::simulation::perf::faction_stagger_due(
+            clock.tick,
+            fid,
+            SYSTEM_OFFSET,
+            CRAFTER_ASSIGNMENT_CADENCE,
+        ) {
             continue;
         }
         // Phase 4b survival override: starving factions zero crafter
@@ -1694,11 +1768,18 @@ pub fn faction_profession_system(
         Option<&crate::simulation::reproduction::HouseholdMember>,
     )>,
 ) {
-    if clock.tick % FARMER_ASSIGNMENT_CADENCE != 0 {
-        return;
-    }
+    // Phase 1.2: per-faction stagger inside an every-tick run.
+    const SYSTEM_OFFSET: u64 = 89;
     for (&faction_id, faction) in registry.factions.iter_mut() {
         if !faction.techs.has(CROP_CULTIVATION) {
+            continue;
+        }
+        if !crate::simulation::perf::faction_stagger_due(
+            clock.tick,
+            faction_id,
+            SYSTEM_OFFSET,
+            FARMER_ASSIGNMENT_CADENCE,
+        ) {
             continue;
         }
 
@@ -3712,7 +3793,9 @@ pub fn sync_faction_center_hotspots_system(
 /// — it's a tight inner loop with a per-target faction lookup, not a
 /// per-faction call into `storage_backend::rollup_for_kind` (that
 /// helper is the off-system / test verifier).
+#[allow(clippy::too_many_arguments)]
 pub fn compute_faction_storage_system(
+    clock: Res<SimClock>,
     storage_tile_map: Res<StorageTileMap>,
     ground_items: Query<(&GroundItem, &Transform)>,
     members: Query<
@@ -3727,9 +3810,50 @@ pub fn compute_faction_storage_system(
         &crate::simulation::vehicle::Vehicle,
         &crate::simulation::vehicle::VehicleInventory,
     )>,
+    // Change-detection gate: any storage-bearing component touched this tick.
+    // `Changed<T>` fires for `Added` too, so spawns are covered.
+    touched: Query<
+        (),
+        Or<(
+            Changed<GroundItem>,
+            Changed<crate::economy::agent::EconomicAgent>,
+            Changed<crate::simulation::animals::PackAnimalInventory>,
+            Changed<crate::simulation::vehicle::VehicleInventory>,
+        )>,
+    >,
+    mut gi_removed: RemovedComponents<GroundItem>,
+    mut members_removed: RemovedComponents<crate::economy::agent::EconomicAgent>,
+    mut pack_removed: RemovedComponents<crate::simulation::animals::PackAnimalInventory>,
+    mut veh_removed: RemovedComponents<crate::simulation::vehicle::VehicleInventory>,
+    mut last_full_tick: Local<u64>,
+    mut ran_once: Local<bool>,
     mut registry: ResMut<FactionRegistry>,
 ) {
     use crate::simulation::archetype::StorageBackendKind;
+
+    // Storage totals are a decision-support summary read by faction-level
+    // systems on daily / quarter-day cadences plus goal scoring — none need
+    // per-tick freshness (the only near-real-time reader is the
+    // `food_total > 0` withdraw gate, where staleness costs at most one
+    // redundant withdraw attempt). So skip the full O(entities) rescan on
+    // ticks where nothing storage-bearing changed. The rescan stays a full
+    // self-correcting sweep when it runs; a once-per-day forced rebuild is
+    // the backstop for any change the detection missed (drain every
+    // `RemovedComponents` reader each tick so their cursors advance).
+    let now = clock.tick;
+    let removed_any = gi_removed.read().count() > 0;
+    let removed_any = members_removed.read().count() > 0 || removed_any;
+    let removed_any = pack_removed.read().count() > 0 || removed_any;
+    let removed_any = veh_removed.read().count() > 0 || removed_any;
+    let day = TICKS_PER_DAY as u64;
+    let backstop = !*ran_once || now.saturating_sub(*last_full_tick) >= day;
+    let dirty =
+        backstop || removed_any || storage_tile_map.is_changed() || !touched.is_empty();
+    if !dirty {
+        return;
+    }
+    *ran_once = true;
+    *last_full_tick = now;
 
     for faction in registry.factions.values_mut() {
         faction.storage.totals.clear();

@@ -177,11 +177,11 @@ Need UI overhaul to add commands for all actions players can take, in a way that
 
 Need debug menu overhaul that works with the current version of the game and contains all important tools a developer needs to debug and test the game like entity spawners and ways to give resources to factions, etc.
 
-Fix workers standing too far away from their work targets when interacting with them.
+X - Fix workers standing too far away from their work targets when interacting with them.
 
 X - I want to add diplomacy and territory to the game. Each faction should exert influence over a certain amount of territory based on each of their settlements and era, and they should try and protect their territory. Factions can also form agreements with other factions, whether that is trade, alliance, or war. By default factions should not like strangers trespassing on their land, maybe they should even send a message to them. Diplomacy with players should be handled through some form of diplomacy screen.
 
-I want to add diplomacy AI that allows AI to initiate and make deals with other AI and players they are aware of, and judge the value of fair deals, including warning players for intruding in their territory and stuff like that.
+X - I want to add diplomacy AI that allows AI to initiate and make deals with other AI and players they are aware of, and judge the value of fair deals, including warning players for intruding in their territory and stuff like that.
 
 Barter economies
 

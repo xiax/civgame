@@ -441,28 +441,29 @@ pub fn find_seed_well_site(
 
 /// Stamp a finished, water-bearing seeded well at `center` (caller must have
 /// resolved a valid 5×5 site via [`find_seed_well_site`]). Spawns the [`Well`]
-/// entity, charges its `RuntimeWater` shaft column, stamps the outer-ring
-/// lining walls (minus the north gateway) into `WallMap`, and reserves every
+/// entity, charges its `RuntimeWater` shaft column, and reserves every
 /// footprint tile in both the per-faction `used` set and the
-/// [`SeedReservation`] so the in-chain `road_carve_system` and downstream
-/// plant / obstacle paths route around the structure. The visible shaft and
-/// helix carve runs later in `carve_seeded_wells_system`.
+/// [`SeedReservation`] so downstream plant / obstacle / road paths route
+/// around the structure. The visible shaft and helix carve runs later in
+/// `carve_seeded_wells_system`.
+///
+/// No lining walls are stamped at seed time — `road_carve_system` consults
+/// `WellMap` and skips any tile within chebyshev 2 of a well centre, so the
+/// 5×5 disc is already protected from paving without a wall ring. Player-
+/// built wells still go through `well_site_progression_system`'s Lining
+/// phase to acquire the wall rim through normal labor.
 pub fn stamp_seeded_well(
     commands: &mut Commands,
-    chunk_map: &mut ChunkMap,
-    well_map: &mut WellMap,
-    wall_map: &mut crate::simulation::construction::WallMap,
     runtime_water: &mut RuntimeWater,
+    well_map: &mut WellMap,
     seed_reservation: &mut crate::simulation::seed_reservation::SeedReservation,
     tile_changed: &mut EventWriter<TileChangedEvent>,
     used: &mut AHashSet<(i32, i32)>,
     faction_id: u32,
     center: (i32, i32),
     spec: WellSpec,
-    seed_techs: &FactionTechs,
 ) {
-    use crate::simulation::construction::{BuildSiteKind, Wall};
-    use crate::world::tile::{TileData, TileKind};
+    use crate::simulation::construction::BuildSiteKind;
 
     // 1. Reserve every footprint tile — keeps road carving, parcel
     // allocation, and downstream wild-plant / obstacle paths off the
@@ -504,50 +505,6 @@ pub fn stamp_seeded_well(
         ))
         .id();
     well_map.0.insert(center, e);
-
-    // 4. Stamp the outer-ring lining walls (mirrors
-    // `well_site_progression_system`'s Lining phase but bakes finished walls
-    // directly rather than blueprints). The north gateway tile stays open.
-    let mat = best_wall_material(seed_techs);
-    let gateway = gateway_tile(center);
-    for tile in outer_ring(center) {
-        if tile == gateway || wall_map.0.contains_key(&tile) {
-            continue;
-        }
-        let surf_z = chunk_map.surface_z_at(tile.0, tile.1);
-        chunk_map.set_tile(
-            tile.0,
-            tile.1,
-            surf_z + 1,
-            TileData {
-                kind: TileKind::Wall,
-                elevation: 0,
-                fertility: 0,
-                flags: 0b0001,
-                ore: 0,
-            },
-        );
-        let wp = tile_to_world(tile.0, tile.1);
-        let wall_entity = commands
-            .spawn((
-                Wall {
-                    material: mat,
-                    owner_faction: Some(faction_id),
-                },
-                crate::simulation::combat::Health::new(mat.max_hp()),
-                StructureLabel(mat.label()),
-                Transform::from_xyz(wp.x, wp.y, 0.4),
-                GlobalTransform::default(),
-                Visibility::Visible,
-                InheritedVisibility::default(),
-            ))
-            .id();
-        wall_map.0.insert(tile, wall_entity);
-        tile_changed.send(TileChangedEvent {
-            tx: tile.0,
-            ty: tile.1,
-        });
-    }
 
     tile_changed.send(TileChangedEvent {
         tx: center.0,

@@ -17,7 +17,7 @@
 //! Per project convention: per-agent local nav is A\*, flow fields
 //! reserved for many-agent shared goals.
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use bevy::prelude::*;
 
 use crate::pathfinding::astar::{find_path_in, AStarResult};
@@ -25,6 +25,7 @@ use crate::pathfinding::flow_field::{build_flow_field, walk_to_goal, FlowField};
 use crate::pathfinding::pool::AStarScratch;
 use crate::simulation::animals::{AnimalAI, AnimalState, Fox, HerdMember, Wolf};
 use crate::simulation::lod::LodLevel;
+use crate::simulation::perf::{BackgroundWorkDiagnostics, PerfWorkBudget};
 use crate::simulation::schedule::SimClock;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::TICKS_PER_DAY;
@@ -71,6 +72,14 @@ pub struct HerdCluster {
 #[derive(Resource, Default)]
 pub struct HerdClusterRegistry {
     pub by_id: AHashMap<u32, HerdCluster>,
+}
+
+/// Round-robin cursor over cluster ids for the per-tick herd-threat scan.
+/// Each tick advances `PerfWorkBudget::herd_repulsion_rebuilds_per_tick`
+/// clusters; the rest of the work amortises across the remaining ticks.
+#[derive(Resource, Default)]
+pub struct HerdClusterCursor {
+    pub next_idx: u32,
 }
 
 impl HerdClusterRegistry {
@@ -168,72 +177,143 @@ pub fn herd_cohesion_field_system(
     entry.cohesion_anchor = (cx, cy);
 }
 
-/// Scan bloomed herd members for nearby predators. Sets / clears each
-/// cluster's repulsion field. Cheap: O(herd_members × predators_within_radius)
-/// via spatial index, runs every 20 ticks.
+/// Per-tick predator-vs-herd scan. Replaces the legacy 20-tick burst
+/// (which did a 25×25 spatial scan per bloomed member) with:
+///
+/// 1. **Predator snapshot** built every tick from `Wolf`/`Fox` queries.
+/// 2. **Per-cluster bounds** aggregated from bloomed `HerdMember`s
+///    (one pass, not per-member).
+/// 3. **Cursor-driven cluster scan** — advance `PerfWorkBudget::
+///    herd_repulsion_rebuilds_per_tick` clusters per tick, search the
+///    predator snapshot against each cluster's expanded bounds.
+///
+/// Aggregate revisit rate per cluster is preserved (matches the legacy
+/// 20-tick cadence at default budget), but no tick does the full sweep.
 pub fn herd_threat_detect_system(
     clock: Res<SimClock>,
     chunk_map: Res<ChunkMap>,
-    spatial: Res<SpatialIndex>,
+    budget: Res<PerfWorkBudget>,
     mut registry: ResMut<HerdClusterRegistry>,
+    mut cursor: ResMut<HerdClusterCursor>,
+    mut bg: ResMut<BackgroundWorkDiagnostics>,
     members: Query<(&HerdMember, &Transform, &LodLevel)>,
-    wolf_q: Query<(), With<Wolf>>,
-    fox_q: Query<(), With<Fox>>,
+    wolf_xf: Query<&Transform, With<Wolf>>,
+    fox_xf: Query<&Transform, With<Fox>>,
 ) {
-    if clock.tick % 20 != 0 {
-        return;
-    }
     let now = clock.tick;
+    let t_start = std::time::Instant::now();
 
-    // For each cluster, gather the nearest predator (chebyshev) seen by
-    // any bloomed member. One-pass.
-    let mut nearest_threat: AHashMap<u32, ((i32, i32), i32)> = AHashMap::new();
+    // (1) Predator snapshot — one cheap pass, all predator tiles.
+    let mut predator_tiles: AHashSet<(i32, i32)> = AHashSet::new();
+    for xf in wolf_xf.iter() {
+        let tx = (xf.translation.x / TILE_SIZE).floor() as i32;
+        let ty = (xf.translation.y / TILE_SIZE).floor() as i32;
+        predator_tiles.insert((tx, ty));
+    }
+    for xf in fox_xf.iter() {
+        let tx = (xf.translation.x / TILE_SIZE).floor() as i32;
+        let ty = (xf.translation.y / TILE_SIZE).floor() as i32;
+        predator_tiles.insert((tx, ty));
+    }
+    bg.herd_predators_indexed = predator_tiles.len() as u32;
+
+    // (2) Per-cluster bounds from bloomed members.
+    struct ClusterBounds {
+        x_min: i32,
+        y_min: i32,
+        x_max: i32,
+        y_max: i32,
+    }
+    let mut bounds: AHashMap<u32, ClusterBounds> = AHashMap::new();
     for (hm, transform, lod) in members.iter() {
         if *lod == LodLevel::Dormant {
             continue;
         }
         let mx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let my = (transform.translation.y / TILE_SIZE).floor() as i32;
-
-        // Scan neighbours within HERD_THREAT_RADIUS via spatial index.
-        for dy in -HERD_THREAT_RADIUS..=HERD_THREAT_RADIUS {
-            for dx in -HERD_THREAT_RADIUS..=HERD_THREAT_RADIUS {
-                let tx = mx + dx;
-                let ty = my + dy;
-                for &ent in spatial.get(tx, ty) {
-                    if wolf_q.get(ent).is_ok() || fox_q.get(ent).is_ok() {
-                        let d = dx.abs().max(dy.abs());
-                        let slot = nearest_threat.entry(hm.cluster_id).or_insert(((tx, ty), d));
-                        if d < slot.1 {
-                            *slot = ((tx, ty), d);
-                        }
-                    }
-                }
-            }
-        }
+        bounds
+            .entry(hm.cluster_id)
+            .and_modify(|b| {
+                b.x_min = b.x_min.min(mx);
+                b.y_min = b.y_min.min(my);
+                b.x_max = b.x_max.max(mx);
+                b.y_max = b.y_max.max(my);
+            })
+            .or_insert(ClusterBounds {
+                x_min: mx,
+                y_min: my,
+                x_max: mx,
+                y_max: my,
+            });
     }
 
-    // Apply: rebuild repulsion when threat present + tile changed; expire after cooldown.
-    for (cid, entry) in registry.by_id.iter_mut() {
+    // (3) Cursor over cluster ids. Sort for deterministic round-robin.
+    let mut cluster_ids: Vec<u32> = registry.by_id.keys().copied().collect();
+    cluster_ids.sort_unstable();
+    if cluster_ids.is_empty() {
+        return;
+    }
+    // `cap` is the floor for the per-tick scan window; revisit rate per
+    // cluster ≈ N_clusters / scan_cap ticks.
+    let cap = budget
+        .herd_repulsion_rebuilds_per_tick
+        .max(1)
+        .min(cluster_ids.len());
+    // NOTE: the budget bounds how many clusters we SCAN per tick, not how many
+    // flow-field rebuilds fire — a scanned cluster whose nearest-threat tile
+    // changed rebuilds immediately, so up to `scan_cap` rebuilds can happen in
+    // one tick if many clusters' threats shift together. Acceptable because the
+    // predator check is O(small) and live herd-cluster counts are low (a
+    // handful); if cluster counts ever grow large, add a separate per-tick
+    // rebuild cap + deferral queue here.
+    let scan_cap = cap.max((cluster_ids.len() + 19) / 20).min(cluster_ids.len());
+
+    // Locate cursor start.
+    let pivot = cluster_ids
+        .iter()
+        .position(|&c| c >= cursor.next_idx)
+        .unwrap_or(0);
+    let mut scanned: u32 = 0;
+    let mut rebuilt: u32 = 0;
+
+    for offset in 0..scan_cap {
+        let i = (pivot + offset) % cluster_ids.len();
+        let cid = cluster_ids[i];
+        scanned += 1;
+        let entry = match registry.by_id.get_mut(&cid) {
+            Some(e) => e,
+            None => continue,
+        };
         if entry.members == 0 {
             entry.repulsion_field = None;
             entry.repulsion_threat_tile = None;
             continue;
         }
-        match nearest_threat.get(cid) {
+
+        // Find nearest predator within cluster bounds expanded by HERD_THREAT_RADIUS.
+        let nearest = bounds.get(&cid).and_then(|b| {
+            nearest_predator_in_bounds(
+                &predator_tiles,
+                (b.x_min, b.x_max, b.y_min, b.y_max),
+                entry.center_tile,
+            )
+        });
+
+        match nearest {
             Some((threat_tile, _)) => {
-                let rebuild = entry.repulsion_threat_tile != Some(*threat_tile)
+                let rebuild = entry.repulsion_threat_tile != Some(threat_tile)
                     || entry.repulsion_field.is_none();
-                entry.repulsion_threat_tile = Some(*threat_tile);
+                entry.repulsion_threat_tile = Some(threat_tile);
                 entry.repulsion_last_sighting_tick = now;
                 if rebuild {
                     let field = build_repulsion_field(
                         &chunk_map,
                         entry.center_tile,
                         entry.center_z,
-                        *threat_tile,
+                        threat_tile,
                     );
                     entry.repulsion_field = field;
+                    rebuilt += 1;
                 }
             }
             None => {
@@ -246,6 +326,41 @@ pub fn herd_threat_detect_system(
             }
         }
     }
+
+    // Advance cursor past the last scanned cluster id.
+    let last_idx = (pivot + scan_cap.saturating_sub(1)) % cluster_ids.len();
+    cursor.next_idx = cluster_ids[last_idx].saturating_add(1);
+
+    bg.herd_clusters_scanned = scanned;
+    bg.herd_repulsion_built_last_tick = rebuilt;
+    bg.herd_threat_scan_us = crate::simulation::perf::micros_u32(t_start.elapsed());
+}
+
+/// Nearest predator tile to a herd cluster, used by `herd_threat_detect_system`.
+///
+/// A predator counts when it lies inside the cluster's bounding box
+/// (`bounds = (x_min, x_max, y_min, y_max)`) expanded by `HERD_THREAT_RADIUS`
+/// on every side. Among those, returns the one nearest `center` by chebyshev
+/// distance, with a deterministic `(distance, x, y)` tie-break — `predators`
+/// is a process-seeded `AHashSet`, so a bare distance `min` would pick a
+/// run-dependent tile on ties and make the herd's flee direction
+/// non-deterministic. Returns `(threat_tile, chebyshev_distance)`.
+pub(crate) fn nearest_predator_in_bounds(
+    predators: &AHashSet<(i32, i32)>,
+    bounds: (i32, i32, i32, i32),
+    center: (i32, i32),
+) -> Option<((i32, i32), i32)> {
+    let (x_min, x_max, y_min, y_max) = bounds;
+    let lo_x = x_min - HERD_THREAT_RADIUS;
+    let hi_x = x_max + HERD_THREAT_RADIUS;
+    let lo_y = y_min - HERD_THREAT_RADIUS;
+    let hi_y = y_max + HERD_THREAT_RADIUS;
+    let (cx, cy) = center;
+    predators
+        .iter()
+        .filter(|&&(tx, ty)| tx >= lo_x && tx <= hi_x && ty >= lo_y && ty <= hi_y)
+        .map(|&(tx, ty)| ((tx, ty), (tx - cx).abs().max((ty - cy).abs())))
+        .min_by_key(|&((tx, ty), d)| (d, tx, ty))
 }
 
 /// Build a single-chunk repulsion field: goal = a "safe anchor" projected
@@ -399,4 +514,69 @@ pub fn try_replan_via_flow_field(
 /// per-tick for the field builders).
 pub fn build(app: &mut App) {
     app.init_resource::<HerdClusterRegistry>();
+    app.init_resource::<HerdClusterCursor>();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(tiles: &[(i32, i32)]) -> AHashSet<(i32, i32)> {
+        tiles.iter().copied().collect()
+    }
+
+    #[test]
+    fn no_predators_in_range_returns_none() {
+        // Cluster box [0,0], radius 12 → window [-12,12]. Predator at (50,50) outside.
+        let preds = set(&[(50, 50)]);
+        assert_eq!(
+            nearest_predator_in_bounds(&preds, (0, 0, 0, 0), (0, 0)),
+            None
+        );
+    }
+
+    #[test]
+    fn predator_just_inside_expanded_window_detected() {
+        // x_max=0 + HERD_THREAT_RADIUS(12) = 12 → predator at (12,0) is the edge.
+        let preds = set(&[(HERD_THREAT_RADIUS, 0)]);
+        let got = nearest_predator_in_bounds(&preds, (0, 0, 0, 0), (0, 0));
+        assert_eq!(got, Some(((HERD_THREAT_RADIUS, 0), HERD_THREAT_RADIUS)));
+        // One tile further out is excluded.
+        let preds_out = set(&[(HERD_THREAT_RADIUS + 1, 0)]);
+        assert_eq!(
+            nearest_predator_in_bounds(&preds_out, (0, 0, 0, 0), (0, 0)),
+            None
+        );
+    }
+
+    #[test]
+    fn nearest_by_chebyshev_to_center_wins() {
+        let preds = set(&[(10, 0), (3, 0), (7, 7)]);
+        let got = nearest_predator_in_bounds(&preds, (0, 0, 0, 0), (0, 0));
+        assert_eq!(got, Some(((3, 0), 3)));
+    }
+
+    #[test]
+    fn distance_ties_broken_deterministically_by_coords() {
+        // (2,0),(0,2),(-2,0),(0,-2) all chebyshev 2 from origin. Tie-break
+        // is (d, x, y) ascending → smallest x then y → (-2, 0).
+        let preds = set(&[(2, 0), (0, 2), (-2, 0), (0, -2)]);
+        let got = nearest_predator_in_bounds(&preds, (-4, 4, -4, 4), (0, 0));
+        assert_eq!(got, Some(((-2, 0), 2)));
+        // Insertion order must not matter (set is process-hashed anyway).
+        let preds_rev = set(&[(0, -2), (-2, 0), (0, 2), (2, 0)]);
+        assert_eq!(
+            nearest_predator_in_bounds(&preds_rev, (-4, 4, -4, 4), (0, 0)),
+            got
+        );
+    }
+
+    #[test]
+    fn window_expands_with_cluster_bounds_not_just_center() {
+        // Cluster spans x in [0,20]; center at (10,0). Predator at (31,0) is
+        // within x_max(20)+12 = 32, so detected even though it's 21 from center.
+        let preds = set(&[(31, 0)]);
+        let got = nearest_predator_in_bounds(&preds, (0, 20, 0, 0), (10, 0));
+        assert_eq!(got, Some(((31, 0), 21)));
+    }
 }

@@ -2947,9 +2947,13 @@ pub fn chief_directive_system(
     plot_q: Query<&crate::simulation::land::Plot>,
     settlement_map: Res<crate::simulation::settlement::SettlementMap>,
 ) {
-    if clock.tick % 60 != 0 || !auto_build.0 {
+    // Phase 2.2: per-faction stagger replacing the legacy 60-tick whole-system
+    // burst. Each faction is evaluated once per 60-tick window, but offsets
+    // spread the work across the window. `auto_build` still hard-disables.
+    if !auto_build.0 {
         return;
     }
+    const SYSTEM_OFFSET: u64 = 223;
     // sleepy-dove Phase 4: poster pool (bundled in `maps`) replaces the
     // faction-wide community-adoption gate. The settlement's buildable
     // surface is the union of resident chief + architect Learned; each
@@ -2975,6 +2979,14 @@ pub fn chief_directive_system(
     }
     for (&faction_id, faction) in faction_registry.factions.iter() {
         if faction_id == SOLO || faction.member_count == 0 {
+            continue;
+        }
+        if !crate::simulation::perf::faction_stagger_due(
+            clock.tick,
+            faction_id,
+            SYSTEM_OFFSET,
+            60,
+        ) {
             continue;
         }
         // Household sub-factions (Market one-person + bootstrap P2 communal
@@ -3543,18 +3555,16 @@ fn seed_apply_intent(
             )?;
             crate::simulation::well::stamp_seeded_well(
                 commands,
-                chunk_map,
-                &mut maps.well_map,
-                &mut maps.wall_map,
                 &mut maps.runtime_water,
+                &mut maps.well_map,
                 seed_reservation,
                 tile_changed,
                 used,
                 faction_id,
                 center,
                 spec,
-                seed_techs,
             );
+            let _ = seed_techs;
             Some(center)
         }
         BuildIntent::Single(kind) => {

@@ -351,9 +351,20 @@ pub fn relationship_decay_system(clock: Res<SimClock>, mut query: Query<&mut Rel
     }
 }
 
+/// Round-robin cursor over Persons for the per-tick vision cap. Together
+/// with the existing bucket gate, this ensures a mass-movement tick (e.g.
+/// every Person crossing a tile boundary at once) cannot spike vision-scan
+/// cost above `PerfWorkBudget::vision_recomputes_per_tick`.
+#[derive(Resource, Default)]
+pub struct VisionCursor {
+    pub next_entity_bits: u64,
+}
+
 pub fn vision_system(
     spatial: Res<SpatialIndex>,
     clock: Res<SimClock>,
+    budget: Res<crate::simulation::perf::PerfWorkBudget>,
+    mut cursor: ResMut<VisionCursor>,
     chunk_map: Res<ChunkMap>,
     door_map: Res<crate::simulation::construction::DoorMap>,
     plant_map: Res<crate::simulation::plants::PlantMap>,
@@ -382,6 +393,7 @@ pub fn vision_system(
     mut shared: ResMut<crate::simulation::shared_knowledge::SharedKnowledge>,
     mut query: Query<
         (
+            Entity,
             &Transform,
             &BucketSlot,
             &LodLevel,
@@ -397,11 +409,52 @@ pub fn vision_system(
     use crate::simulation::shared_knowledge::KnowledgeTier;
 
     let now = clock.tick;
-    for (transform, slot, lod, ai, faction_member, household_member, active_lookout, mut current_vision) in
+
+    // Phase 3.1: per-tick vision cap. Bucket gating (`clock.is_active(slot)`)
+    // already amortises across `population/bucket_size` ticks; this cap is
+    // the safety net against mass-movement bursts (every Person crossing
+    // a tile boundary at once shouldn't spike vision-scan cost above
+    // `budget.vision_recomputes_per_tick`).
+    //
+    // Build the eligible-this-tick set, sort by entity bits, rotate by
+    // cursor pivot, take cap. Pure round-robin with no per-tick gap.
+    let cap = budget.vision_recomputes_per_tick.max(1);
+    let mut eligible: Vec<Entity> = Vec::new();
+    for (entity, _, slot, lod, _, _, _, _, _) in query.iter() {
+        if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
+        eligible.push(entity);
+    }
+    let allowed: ahash::AHashSet<Entity> = if eligible.is_empty() {
+        ahash::AHashSet::default()
+    } else {
+        eligible.sort_unstable_by_key(|e| e.to_bits());
+        let pivot = eligible
+            .iter()
+            .position(|e| e.to_bits() >= cursor.next_entity_bits)
+            .unwrap_or(0);
+        let take = cap.min(eligible.len());
+        let slice: ahash::AHashSet<Entity> = (0..take)
+            .map(|offset| eligible[(pivot + offset) % eligible.len()])
+            .collect();
+        if let Some(&last) = (0..take)
+            .map(|offset| &eligible[(pivot + offset) % eligible.len()])
+            .last()
+        {
+            cursor.next_entity_bits = last.to_bits().saturating_add(1);
+        }
+        slice
+    };
+
+    for (entity, transform, slot, lod, ai, faction_member, household_member, active_lookout, mut current_vision) in
         query.iter_mut()
     {
         let view_radius = crate::simulation::vision::effective_vision_radius(active_lookout) as i32;
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
+            continue;
+        }
+        if !allowed.contains(&entity) {
             continue;
         }
         // Refresh the per-agent buffer every time the bucket fires. Dispatchers

@@ -1222,10 +1222,19 @@ impl PerceivedFactionWages {
 pub const WAGE_GOSSIP_TOP_K: usize = 4;
 pub const WAGE_GOSSIP_RADIUS: i32 = 3;
 
+/// Wage-gossip cursor — independent of the awareness gossip cursor so
+/// each system makes deterministic round-robin progress on its own.
+#[derive(Resource, Default)]
+pub struct WageGossipCursor {
+    pub next_entity_bits: u64,
+}
+
 pub fn wage_gossip_system(
     spatial: Res<crate::world::spatial::SpatialIndex>,
     registry: Res<crate::simulation::faction::FactionRegistry>,
     clock: Res<SimClock>,
+    budget: Res<crate::simulation::perf::PerfWorkBudget>,
+    mut cursor: ResMut<WageGossipCursor>,
     mut q: Query<(
         Entity,
         &Transform,
@@ -1285,8 +1294,34 @@ pub fn wage_gossip_system(
         return;
     }
 
+    // Phase 3.2: cursor-amortised merge pass. See `awareness_gossip_system`
+    // for the pattern. Snapshot above is full-population (cheap); merge
+    // here only runs for `budget.gossip_agents_per_tick` agents per tick.
+    let mut social_entities: Vec<Entity> = snapshots.keys().copied().collect();
+    social_entities.sort_unstable_by_key(|e| e.to_bits());
+    let cap = budget
+        .gossip_agents_per_tick
+        .max(1)
+        .min(social_entities.len());
+    let pivot = social_entities
+        .iter()
+        .position(|e| e.to_bits() >= cursor.next_entity_bits)
+        .unwrap_or(0);
+    let slice: ahash::AHashSet<Entity> = (0..cap)
+        .map(|offset| social_entities[(pivot + offset) % social_entities.len()])
+        .collect();
+    if let Some(&last) = (0..cap)
+        .map(|offset| &social_entities[(pivot + offset) % social_entities.len()])
+        .last()
+    {
+        cursor.next_entity_bits = last.to_bits().saturating_add(1);
+    }
+
     for (entity, transform, goal, lod, fm, perceived, sec) in q.iter_mut() {
         if !is_social_contact(*goal, *lod, sec, now) {
+            continue;
+        }
+        if !slice.contains(&entity) {
             continue;
         }
         let tx = (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i32;
@@ -2086,7 +2121,7 @@ impl Plugin for JobsPlugin {
 }
 
 /// How often the chief reconciles the job board, in fixed-update ticks.
-const CHIEF_POSTING_INTERVAL: u64 = 60;
+pub const CHIEF_POSTING_INTERVAL: u64 = 60;
 
 /// Player postings use a high static priority so manual overrides win against
 /// chief-posted jobs. Chief priority is no longer constant — see
@@ -2157,9 +2192,8 @@ pub fn classify_construction_procurement_system(
     settlement_q: Query<&crate::simulation::settlement::Settlement>,
     camp_q: Query<&crate::simulation::camp::Camp>,
 ) {
-    if clock.tick % CHIEF_POSTING_INTERVAL != 0 {
-        return;
-    }
+    // Phase 2.2: per-faction stagger.
+    const SYSTEM_OFFSET: u64 = 251;
     use crate::economy::resource_catalog::ResourceId;
     use crate::simulation::camp::MarketNodeRef;
     use crate::simulation::construction::{
@@ -2183,6 +2217,14 @@ pub fn classify_construction_procurement_system(
     }
 
     for (&faction_id, faction) in registry.factions.iter_mut() {
+        if !crate::simulation::perf::faction_stagger_due(
+            clock.tick,
+            faction_id,
+            SYSTEM_OFFSET,
+            CHIEF_POSTING_INTERVAL,
+        ) {
+            continue;
+        }
         faction.procurement_plan.clear();
         faction.procurement_market = None;
         let mut view = MaterialAvailabilityView::default();
@@ -2266,9 +2308,10 @@ pub fn chief_job_posting_system(
     mut board: ResMut<JobBoard>,
     mut completed_events: EventWriter<JobCompletedEvent>,
 ) {
-    if clock.tick % CHIEF_POSTING_INTERVAL != 0 {
-        return;
-    }
+    // Phase 2.2: per-faction stagger. CHIEF_POSTING_INTERVAL (60) is the
+    // per-faction revisit cadence; the system now runs every tick and
+    // gates per-faction inside the loop.
+    const SYSTEM_OFFSET: u64 = 269;
     // Resolve the `poster_class` for a blueprint-backed posting from the
     // blueprint's snapshotted `posted_by`. Architect-authored work
     // carries `PosterClass::Architect`; everything else (chief, seed,
@@ -2317,6 +2360,14 @@ pub fn chief_job_posting_system(
 
     for (&faction_id, faction) in registry.factions.iter() {
         if faction_id == SOLO {
+            continue;
+        }
+        if !crate::simulation::perf::faction_stagger_due(
+            clock.tick,
+            faction_id,
+            SYSTEM_OFFSET,
+            CHIEF_POSTING_INTERVAL,
+        ) {
             continue;
         }
         // Nomadic factions don't post Stockpile/Farm/Build/Craft/Haul jobs:
@@ -3879,13 +3930,20 @@ pub fn chief_loose_stockpile_posting_system(
     item_query: Query<&crate::simulation::items::GroundItem>,
     mut board: ResMut<JobBoard>,
 ) {
-    if clock.tick % CHIEF_POSTING_INTERVAL != 0 {
-        return;
-    }
+    // Phase 2.2: per-faction stagger.
+    const SYSTEM_OFFSET: u64 = 281;
     let posted_tick = clock.tick as u32;
 
     for (&faction_id, faction) in registry.factions.iter() {
         if faction_id == SOLO {
+            continue;
+        }
+        if !crate::simulation::perf::faction_stagger_due(
+            clock.tick,
+            faction_id,
+            SYSTEM_OFFSET,
+            CHIEF_POSTING_INTERVAL,
+        ) {
             continue;
         }
         if !faction.materialized {

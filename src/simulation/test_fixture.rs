@@ -16100,11 +16100,18 @@ mod baseline_behaviour {
             .0
             .insert(job_id, escrow_entity);
 
-        // Pre-set SimClock.tick to a multiple of CHIEF_POSTING_INTERVAL = 60
-        // so the system's tick-gate passes when we invoke it directly.
+        // Pre-set SimClock.tick to the stagger-adjusted firing tick for
+        // the player faction so chief_job_posting_system processes it when
+        // we invoke it directly. CHIEF_POSTING_INTERVAL = 60.
         {
+            let target = crate::simulation::perf::next_stagger_fire_tick(
+                1,
+                sim.player_faction_id,
+                269, // chief_job_posting_system SYSTEM_OFFSET
+                crate::simulation::jobs::CHIEF_POSTING_INTERVAL,
+            );
             let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
-            clock.tick = 60;
+            clock.tick = target;
         }
 
         // Run the chief posting system once — emits JobCompletedEvent for
@@ -16850,11 +16857,17 @@ mod baseline_behaviour {
             let torso = body.get_mut(BodyPart::Torso);
             torso.current = 4;
         }
-        // Land on a HEALER_ASSIGNMENT_CADENCE boundary so the chief
-        // pass fires on the next tick.
+        // Land on the stagger-adjusted HEALER cadence boundary so the
+        // chief pass fires on the next tick.
         {
             let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
-            clock.tick = HEALER_ASSIGNMENT_CADENCE - 1;
+            clock.tick = crate::simulation::perf::next_stagger_fire_tick(
+                1,
+                fid,
+                crate::simulation::perf::stagger_offsets::HEALER,
+                HEALER_ASSIGNMENT_CADENCE,
+            )
+            .saturating_sub(1);
         }
         sim.tick_n(2);
 
@@ -16877,15 +16890,17 @@ mod baseline_behaviour {
                 limb.current = limb.max;
             }
         }
-        // Two more cadence cycles + the demote-buffer pass: cadence
-        // fires once with no injuries (target = 0), and the
-        // single-slot demote buffer means `current (1) > target (0) +
-        // buffer (1)` is false on the first pass — but the `want == 0`
-        // arm bypasses the buffer for full stand-down. So one cadence
-        // tick after the injury clears is enough.
+        // Advance to the next stagger-adjusted firing tick for this fid.
         {
+            let cur = sim.app.world().resource::<SimClock>().tick;
+            let next = crate::simulation::perf::next_stagger_fire_tick(
+                cur + 1,
+                fid,
+                crate::simulation::perf::stagger_offsets::HEALER,
+                HEALER_ASSIGNMENT_CADENCE,
+            );
             let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
-            clock.tick = HEALER_ASSIGNMENT_CADENCE * 3 - 1;
+            clock.tick = next.saturating_sub(1);
         }
         sim.tick_n(2);
 
@@ -16968,10 +16983,17 @@ mod baseline_behaviour {
             let head = body.get_mut(BodyPart::Head);
             head.current = head.current.saturating_sub(8).max(4);
         }
-        // Cadence-boundary, two ticks for Injury stamp + chief promote.
+        // Stagger-adjusted cadence boundary, two ticks for Injury stamp +
+        // chief promote.
         {
             let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
-            clock.tick = HEALER_ASSIGNMENT_CADENCE - 1;
+            clock.tick = crate::simulation::perf::next_stagger_fire_tick(
+                1,
+                fid,
+                crate::simulation::perf::stagger_offsets::HEALER,
+                HEALER_ASSIGNMENT_CADENCE,
+            )
+            .saturating_sub(1);
         }
         sim.tick_n(2);
 
@@ -18013,13 +18035,17 @@ mod wage_aware_phase0_phase1 {
         // can fire.
         sim.seed_faction_food(fid, 7 * 32);
 
-        // Advance to a CRAFTER_ASSIGNMENT_CADENCE multiple so the system
-        // fires next tick (cadence = TICKS_PER_DAY / 4 = 900). Need two
-        // ticks — the first warms FixedUpdate / drains the clock advance,
-        // the second observes the new cadence boundary in Economy.
+        // Advance to the stagger-adjusted CRAFTER cadence firing tick so
+        // the system fires next tick.
         {
             let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
-            clock.tick = crate::simulation::faction::CRAFTER_ASSIGNMENT_CADENCE - 1;
+            clock.tick = crate::simulation::perf::next_stagger_fire_tick(
+                1,
+                fid,
+                crate::simulation::perf::stagger_offsets::CRAFTER,
+                crate::simulation::faction::CRAFTER_ASSIGNMENT_CADENCE,
+            )
+            .saturating_sub(1);
         }
         sim.tick_n(2);
 
@@ -18086,16 +18112,18 @@ mod wage_aware_phase0_phase1 {
             .entity_mut(mentor)
             .insert(MentorOf { apprentice });
 
-        // Land the next tick on a TICKS_PER_DAY boundary so
-        // `apprentice_progress_system`'s daily gate fires.
-        {
-            let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
-            clock.tick = TICKS_PER_DAY as u64 - 1;
-        }
+        // Land the next tick on the stagger-adjusted APPRENTICESHIP firing
+        // tick so the daily gate fires for this faction id.
+        let target = crate::simulation::perf::next_stagger_fire_tick(
+            1,
+            fid,
+            crate::simulation::perf::stagger_offsets::APPRENTICESHIP,
+            TICKS_PER_DAY as u64,
+        );
         // Run the system directly to avoid having to wait for the full
         // Economy schedule. We're testing the system contract, not its
         // ordering — which is covered elsewhere.
-        sim.app.world_mut().resource_mut::<SimClock>().tick = TICKS_PER_DAY as u64;
+        sim.app.world_mut().resource_mut::<SimClock>().tick = target;
         sim.app.add_systems(Update, apprentice_progress_system);
         sim.tick_n(1);
 
@@ -18228,10 +18256,16 @@ mod wage_aware_phase0_phase1 {
             FARMER_SURVIVAL_FLOOR
         );
 
-        // Fire the hunter assignment system at its cadence.
+        // Fire the hunter assignment system at its stagger-adjusted cadence.
         {
             let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
-            clock.tick = HUNTER_ASSIGNMENT_CADENCE - 1;
+            clock.tick = crate::simulation::perf::next_stagger_fire_tick(
+                1,
+                fid,
+                crate::simulation::perf::stagger_offsets::HUNTER,
+                HUNTER_ASSIGNMENT_CADENCE,
+            )
+            .saturating_sub(1);
         }
         sim.tick_n(2);
 
@@ -18378,7 +18412,13 @@ mod wage_aware_phase0_phase1 {
             })
             .insert(ApprenticeProgress::default());
 
-        sim.app.world_mut().resource_mut::<SimClock>().tick = TICKS_PER_DAY as u64;
+        let target = crate::simulation::perf::next_stagger_fire_tick(
+            1,
+            fid,
+            crate::simulation::perf::stagger_offsets::APPRENTICESHIP,
+            TICKS_PER_DAY as u64,
+        );
+        sim.app.world_mut().resource_mut::<SimClock>().tick = target;
         sim.app.add_systems(Update, apprentice_progress_system);
         sim.tick_n(1);
 
@@ -21916,9 +21956,23 @@ mod loose_resource_cleanup {
         // Public grain spill at (5, 0) — well inside LOOSE_SCAN_RADIUS = 32.
         sim.spawn_ground_item((5, 0), crate::economy::core_ids::grain(), 12);
 
-        // Drive enough ticks that CHIEF_POSTING_INTERVAL (60) fires at least
-        // once. `tick_n(70)` gives plenty of margin.
-        sim.tick_n(70);
+        // Tick a few times so SpatialIndex picks up the new GroundItem, then
+        // pin clock.tick to the stagger-adjusted firing tick for the loose
+        // pass. SimClock doesn't auto-advance in test fixtures without a
+        // population, so we set the firing tick directly and tick once to
+        // run the system at that tick.
+        sim.tick_n(2);
+        {
+            let target = crate::simulation::perf::next_stagger_fire_tick(
+                1,
+                faction,
+                281, // chief_loose_stockpile_posting_system SYSTEM_OFFSET
+                crate::simulation::jobs::CHIEF_POSTING_INTERVAL,
+            );
+            let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
+            clock.tick = target;
+        }
+        sim.tick_n(1);
 
         let board = sim.app.world().resource::<JobBoard>();
         let posted: Vec<_> = board
@@ -21955,7 +22009,18 @@ mod loose_resource_cleanup {
         // it. household_id = 999 is fine; the gate is purely `is_public()`.
         sim.spawn_private_ground_item((5, 0), crate::economy::core_ids::grain(), 12, 999);
 
-        sim.tick_n(70);
+        sim.tick_n(2);
+        {
+            let target = crate::simulation::perf::next_stagger_fire_tick(
+                1,
+                faction,
+                281, // chief_loose_stockpile_posting_system SYSTEM_OFFSET
+                crate::simulation::jobs::CHIEF_POSTING_INTERVAL,
+            );
+            let mut clock = sim.app.world_mut().resource_mut::<SimClock>();
+            clock.tick = target;
+        }
+        sim.tick_n(1);
 
         let board = sim.app.world().resource::<JobBoard>();
         let has_grain_posting = board

@@ -126,10 +126,20 @@ pub fn apprentice_progress_system(
     )>,
     mentors: Query<&MentorOf>,
 ) {
-    if clock.tick % TICKS_PER_DAY as u64 != 0 {
-        return;
-    }
+    // Phase 1.2: per-faction stagger inside an every-tick run.
+    // Apprenticeship is per-entity but we stagger by faction id so all
+    // apprentices in a faction tick together (preserves the +1 day/day
+    // rate while spreading the work across the cadence window).
+    const SYSTEM_OFFSET: u64 = 191;
     for (entity, mut prof, mut skills, link, mut progress, member) in apprentices.iter_mut() {
+        if !crate::simulation::perf::faction_stagger_due(
+            clock.tick,
+            member.faction_id,
+            SYSTEM_OFFSET,
+            TICKS_PER_DAY as u64,
+        ) {
+            continue;
+        }
         let mentor_intact = mentors
             .get(link.mentor)
             .map(|m| m.apprentice == entity)

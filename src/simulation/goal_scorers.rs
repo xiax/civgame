@@ -1167,6 +1167,8 @@ pub fn register_default_scorers(registry: &mut GoalScorerRegistry) {
 pub fn sample_decision_metrics_system(
     clock: Res<crate::simulation::schedule::SimClock>,
     mut metrics: ResMut<DecisionMetrics>,
+    debug_panel: Option<Res<crate::ui::debug_panel::DebugPanelState>>,
+    mut bg_diag: Option<ResMut<crate::simulation::perf::BackgroundWorkDiagnostics>>,
     q: Query<
         (
             &crate::simulation::lod::LodLevel,
@@ -1175,7 +1177,13 @@ pub fn sample_decision_metrics_system(
         With<crate::simulation::person::Person>,
     >,
 ) {
-    if clock.tick % 20 != 0 {
+    // Phase 1.1: pure analytics — skip entirely when the debug panel is closed
+    // (event-driven, not cadence). When open, run every tick so the panel
+    // shows fresh numbers without a 20-tick burst.
+    if !debug_panel.map(|p| p.open).unwrap_or(false) {
+        if let Some(ref mut diag) = bg_diag {
+            diag.diagnostics_skipped_closed = diag.diagnostics_skipped_closed.saturating_add(1);
+        }
         return;
     }
     metrics.lod_full = 0;

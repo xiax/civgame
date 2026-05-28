@@ -146,18 +146,23 @@ pub fn handle_speed_keybinds_system(
     }
 }
 
-const TIMING_WINDOW_CAP: usize = 60;
+const TIMING_WINDOW_CAP: usize = 200;
 const TIMING_EMA_ALPHA: f32 = 0.05;
 
 /// Per-tick CPU timing + ticks-per-frame counter. Populated by:
 /// - [`fixed_tick_timing_start_system`] (FixedUpdate, first in tick)
 /// - [`fixed_tick_timing_end_system`] (FixedUpdate, last in tick)
 /// - [`frame_tick_count_system`] (Update, once per render frame)
+///
+/// `worst_tick_us_p99` is the load-bearing spike metric. EMA hides the rare
+/// burst; worst-of-window catches it once; p99 across the 200-tick window
+/// shows the *upper-tail* shape that the user actually feels as freezes.
 #[derive(Resource, Default)]
 pub struct SimTimingDiagnostics {
     pub fixed_ticks_this_frame: u32,
     pub avg_tick_us_ema: f32,
     pub worst_tick_us_recent: u32,
+    pub worst_tick_us_p99: u32,
     pub recent_worst_window: VecDeque<u32>,
 }
 
@@ -191,6 +196,20 @@ pub fn fixed_tick_timing_end_system(
         diag.recent_worst_window.pop_front();
     }
     diag.worst_tick_us_recent = diag.recent_worst_window.iter().copied().max().unwrap_or(0);
+    diag.worst_tick_us_p99 = compute_p99(&diag.recent_worst_window);
+}
+
+/// p99 from the rolling tick-time window. With a 200-tick window this is the
+/// 198th-ranked sample — the *upper tail*, not the single worst outlier.
+fn compute_p99(window: &VecDeque<u32>) -> u32 {
+    if window.is_empty() {
+        return 0;
+    }
+    let mut sorted: Vec<u32> = window.iter().copied().collect();
+    sorted.sort_unstable();
+    let idx = ((sorted.len() as f32) * 0.99).floor() as usize;
+    let idx = idx.min(sorted.len() - 1);
+    sorted[idx]
 }
 
 /// Per-render-frame: how many fixed ticks ran since the last Update? Bevy

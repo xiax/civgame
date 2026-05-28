@@ -153,46 +153,136 @@ pub enum FullSimPinReason {
     Combat,
 }
 
+/// Pin promotable agents to Full LOD.
+///
+/// Phase 3.3: dirty-driven. Most ticks no agent's pin-relevant state has
+/// changed — the legacy full-population scan paid that cost anyway. Now
+/// the hot path only re-evaluates `Changed`/`Added` agents this tick. A
+/// daily backstop walks the full population to catch `Removed`
+/// components (which don't show up via `Changed`).
+#[allow(clippy::type_complexity)]
 pub fn cohort_pin_full_sim_system(
     mut commands: Commands,
     clock: Res<SimClock>,
-    mut q: Query<
-        (
-            Entity,
-            &PersonAI,
-            &AgentGoal,
-            Option<&FactionChief>,
-            Option<&crate::simulation::player_command::Commanded>,
-            Option<&Drafted>,
-            Option<&PinnedFullSim>,
-            &mut LodLevel,
-        ),
-        With<Person>,
-    >,
+    mut queries: ParamSet<(
+        Query<
+            (
+                Entity,
+                &'static PersonAI,
+                &'static AgentGoal,
+                Option<&'static FactionChief>,
+                Option<&'static crate::simulation::player_command::Commanded>,
+                Option<&'static Drafted>,
+                Option<&'static PinnedFullSim>,
+                &'static mut LodLevel,
+            ),
+            (
+                With<Person>,
+                Or<(
+                    Changed<PersonAI>,
+                    Changed<AgentGoal>,
+                    Added<crate::simulation::player_command::Commanded>,
+                    Added<Drafted>,
+                    Added<FactionChief>,
+                )>,
+            ),
+        >,
+        Query<
+            (
+                Entity,
+                &'static PersonAI,
+                &'static AgentGoal,
+                Option<&'static FactionChief>,
+                Option<&'static crate::simulation::player_command::Commanded>,
+                Option<&'static Drafted>,
+                Option<&'static PinnedFullSim>,
+                &'static mut LodLevel,
+            ),
+            With<Person>,
+        >,
+    )>,
+    mut last_audit_tick: Local<u64>,
 ) {
-    for (entity, ai, goal, chief, commanded, drafted, existing_pin, mut lod) in q.iter_mut() {
-        let reason = if commanded.is_some() || matches!(*goal, AgentGoal::FollowingPlayerCommand) {
-            Some(FullSimPinReason::Commanded)
-        } else if drafted.is_some() {
-            Some(FullSimPinReason::Drafted)
-        } else if chief.is_some() {
-            Some(FullSimPinReason::Chief)
-        } else if matches!(ai.state, AiState::Attacking) {
-            Some(FullSimPinReason::Combat)
-        } else {
-            None
-        };
-        if let Some(reason) = reason {
-            *lod = LodLevel::Full;
-            if existing_pin.map(|pin| pin.reason) != Some(reason) {
-                commands.entity(entity).insert(PinnedFullSim {
-                    reason,
-                    since_tick: clock.tick,
-                });
-            }
-        } else if existing_pin.is_some() {
-            commands.entity(entity).remove::<PinnedFullSim>();
+    // Hot path: re-evaluate only Changed/Added agents this tick.
+    {
+        let mut hot_q = queries.p0();
+        for (entity, ai, goal, chief, commanded, drafted, existing_pin, mut lod) in
+            hot_q.iter_mut()
+        {
+            apply_pin_reason(
+                &mut commands,
+                clock.tick,
+                entity,
+                ai,
+                goal,
+                chief,
+                commanded,
+                drafted,
+                existing_pin,
+                lod.as_mut(),
+            );
         }
+    }
+
+    // Daily backstop: walk every agent to catch Removed components and
+    // any tick where the change-detection bit was cleared between writes.
+    let day = crate::world::seasons::TICKS_PER_DAY as u64;
+    if *last_audit_tick == 0 || clock.tick.saturating_sub(*last_audit_tick) >= day {
+        let mut full_q = queries.p1();
+        for (entity, ai, goal, chief, commanded, drafted, existing_pin, mut lod) in
+            full_q.iter_mut()
+        {
+            apply_pin_reason(
+                &mut commands,
+                clock.tick,
+                entity,
+                ai,
+                goal,
+                chief,
+                commanded,
+                drafted,
+                existing_pin,
+                lod.as_mut(),
+            );
+        }
+        *last_audit_tick = clock.tick;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_pin_reason(
+    commands: &mut Commands,
+    now: u64,
+    entity: Entity,
+    ai: &PersonAI,
+    goal: &AgentGoal,
+    chief: Option<&FactionChief>,
+    commanded: Option<&crate::simulation::player_command::Commanded>,
+    drafted: Option<&Drafted>,
+    existing_pin: Option<&PinnedFullSim>,
+    lod: &mut LodLevel,
+) {
+    let reason = if commanded.is_some() || matches!(*goal, AgentGoal::FollowingPlayerCommand) {
+        Some(FullSimPinReason::Commanded)
+    } else if drafted.is_some() {
+        Some(FullSimPinReason::Drafted)
+    } else if chief.is_some() {
+        Some(FullSimPinReason::Chief)
+    } else if matches!(ai.state, AiState::Attacking) {
+        Some(FullSimPinReason::Combat)
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        *lod = LodLevel::Full;
+        if existing_pin.map(|pin| pin.reason) != Some(reason) {
+            commands.entity(entity).insert(PinnedFullSim {
+                reason,
+                since_tick: now,
+            });
+        }
+    } else if existing_pin.is_some() {
+        commands.entity(entity).remove::<PinnedFullSim>();
     }
 }
 
@@ -232,6 +322,7 @@ pub fn rebuild_cohort_registry_system(
     clock: Res<SimClock>,
     factions: Res<FactionRegistry>,
     mut registry: ResMut<CohortRegistry>,
+    debug_panel: Option<Res<crate::ui::debug_panel::DebugPanelState>>,
     q: Query<
         (
             &LodLevel,
@@ -245,7 +336,13 @@ pub fn rebuild_cohort_registry_system(
         With<Person>,
     >,
 ) {
-    if clock.tick % 20 != 0 {
+    // Phase 1.1: registry feeds only the debug panel. Closed → zero cost.
+    // Open → full clear-and-rebuild every tick (a single steady per-tick cost
+    // while the panel is visible) instead of the old *unconditional* 20-tick
+    // clear-and-rebuild burst. This is more total work while open, but it only
+    // runs when a human is watching, and the off-screen burst it removes was
+    // paid even when nobody had the panel up.
+    if !debug_panel.map(|p| p.open).unwrap_or(false) {
         return;
     }
     registry.cohorts.clear();
@@ -288,8 +385,9 @@ fn wealth_band(currency: f32) -> WealthBand {
 
 #[allow(clippy::type_complexity)]
 pub fn cohort_demote_candidate_count_system(
-    clock: Res<SimClock>,
+    _clock: Res<SimClock>,
     mut registry: ResMut<CohortRegistry>,
+    debug_panel: Option<Res<crate::ui::debug_panel::DebugPanelState>>,
     q: Query<
         (
             &PersonAI,
@@ -303,7 +401,8 @@ pub fn cohort_demote_candidate_count_system(
         With<Person>,
     >,
 ) {
-    if clock.tick % 20 != 0 {
+    // Phase 1.1: debug-panel-only counter; skip entirely when closed.
+    if !debug_panel.map(|p| p.open).unwrap_or(false) {
         return;
     }
     let count = q

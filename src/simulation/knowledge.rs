@@ -597,16 +597,34 @@ pub struct DiscoveryActionEvent {
     pub activity: ActivityKind,
 }
 
+/// Round-robin cursor over social-contact agents for the per-tick
+/// awareness + wage gossip merge passes. Both systems advance this cursor
+/// in lock-step so the same slice runs through both gossip channels on a
+/// given tick — one snapshot, two consumers.
+#[derive(Resource, Default)]
+pub struct GossipCursor {
+    pub next_entity_bits: u64,
+}
+
 /// Tech-awareness gossip between agents within 3 tiles whose goal is
 /// `Socialize`. Awareness is free (single bit) and propagates only between
 /// socializing agents; mastery (Learned) only spreads via the explicit
 /// `tech_teaching_system` chance roll.
+///
+/// Phase 3.2: per-tick cursor amortisation. The snapshot pass stays full
+/// (cheap copy of `KnowledgeBits` + small `Vec<SettlementId>`); the merge
+/// pass — the expensive O(N × 49) part — only runs for a slice of
+/// `budget.gossip_agents_per_tick` agents per tick. Each agent is revisited
+/// every ~`N_social / cap` ticks, well below the awareness-bit propagation
+/// horizon.
 ///
 /// Lifted from the deleted `plan_gossip_system` which also gossiped
 /// `KnownPlans` entries — that half is gone with the plan/ module retirement
 /// in Phase 7. Runs in `SimulationSet::Economy` after
 /// `conversation_memory_system`, before `tech_teaching_system`.
 pub fn awareness_gossip_system(
+    budget: Res<crate::simulation::perf::PerfWorkBudget>,
+    mut cursor: ResMut<GossipCursor>,
     spatial: Res<crate::world::spatial::SpatialIndex>,
     clock: Res<crate::simulation::schedule::SimClock>,
     mut q: Query<(
@@ -649,8 +667,31 @@ pub fn awareness_gossip_system(
         return;
     }
 
+    // Build a sorted list of socializing-agent entities for the cursor.
+    let mut social_entities: Vec<Entity> = snapshots.keys().copied().collect();
+    social_entities.sort_unstable_by_key(|e| e.to_bits());
+
+    let cap = budget.gossip_agents_per_tick.max(1).min(social_entities.len());
+    let pivot = social_entities
+        .iter()
+        .position(|e| e.to_bits() >= cursor.next_entity_bits)
+        .unwrap_or(0);
+    let slice: ahash::AHashSet<Entity> = (0..cap)
+        .map(|offset| social_entities[(pivot + offset) % social_entities.len()])
+        .collect();
+    // Advance cursor past the last entity in the slice.
+    if let Some(&last) = (0..cap)
+        .map(|offset| &social_entities[(pivot + offset) % social_entities.len()])
+        .last()
+    {
+        cursor.next_entity_bits = last.to_bits().saturating_add(1);
+    }
+
     for (entity, transform, goal, lod, mut knowledge, mem_opt, sec) in q.iter_mut() {
         if !is_social_contact(*goal, *lod, sec, now) {
+            continue;
+        }
+        if !slice.contains(&entity) {
             continue;
         }
         let tx = (transform.translation.x / TILE_SIZE_LOCAL).floor() as i32;

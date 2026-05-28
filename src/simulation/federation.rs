@@ -240,6 +240,11 @@ pub fn federation_alliance_sync_system(
     if clock.tick == 0 || clock.tick % TICKS_PER_DAY as u64 != 0 {
         return;
     }
+    // Phase 1.2 note: NOT staggered. The post-loop teardown rebuilds
+    // `live_pairs` and tears down any pair missing from it; staggering
+    // federations would mis-classify staggered-out pairs as stale. Cost
+    // is bounded by the 5-member cap and small federation count, so this
+    // is left as a single daily pass.
     let now = clock.tick;
     let mut live_pairs: ahash::AHashSet<(u32, u32)> = ahash::AHashSet::new();
     for fed in map.by_id.values() {

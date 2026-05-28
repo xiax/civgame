@@ -624,14 +624,36 @@ pub fn chief_healer_assignment_system(
     use crate::simulation::faction::{FARMER_SURVIVAL_FLOOR, SOLO};
     use crate::simulation::person::Profession;
 
-    if clock.tick % HEALER_ASSIGNMENT_CADENCE != 0 {
+    // Phase 1.2: per-faction stagger inside an every-tick run.
+    const SYSTEM_OFFSET: u64 = 103;
+
+    // Which factions fire this tick? Compute once so the Pass-1 census below
+    // is restricted to due factions and bails entirely on ticks where none is
+    // due — without this gate the full-population injured/Healer census ran
+    // every tick (the cadence-gate used to short-circuit the whole system).
+    let due: ahash::AHashSet<u32> = registry
+        .factions
+        .keys()
+        .copied()
+        .filter(|&fid| {
+            fid != SOLO
+                && crate::simulation::perf::faction_stagger_due(
+                    clock.tick,
+                    fid,
+                    SYSTEM_OFFSET,
+                    HEALER_ASSIGNMENT_CADENCE,
+                )
+        })
+        .collect();
+    if due.is_empty() {
         return;
     }
 
-    // Pass 1: per-faction injured tally + Healer / Apprentice census.
+    // Pass 1: per-faction injured tally + Healer / Apprentice census
+    // (restricted to due factions).
     let mut injured_per_faction: ahash::AHashMap<u32, u32> = ahash::AHashMap::default();
     for member in injured_q.iter() {
-        if member.faction_id == SOLO {
+        if !due.contains(&member.faction_id) {
             continue;
         }
         *injured_per_faction.entry(member.faction_id).or_insert(0) += 1;
@@ -639,7 +661,7 @@ pub fn chief_healer_assignment_system(
     let mut current_healers: ahash::AHashMap<u32, usize> = ahash::AHashMap::default();
     let mut available_mentors: ahash::AHashMap<u32, Vec<Entity>> = ahash::AHashMap::default();
     for (entity, prof, member, skills, _, _, _, _, _, _) in query.iter() {
-        if member.faction_id == SOLO {
+        if !due.contains(&member.faction_id) {
             continue;
         }
         match *prof {
@@ -673,6 +695,14 @@ pub fn chief_healer_assignment_system(
     let mut targets: ahash::AHashMap<u32, usize> = ahash::AHashMap::default();
     for (&fid, faction) in registry.factions.iter() {
         if fid == SOLO {
+            continue;
+        }
+        if !crate::simulation::perf::faction_stagger_due(
+            clock.tick,
+            fid,
+            SYSTEM_OFFSET,
+            HEALER_ASSIGNMENT_CADENCE,
+        ) {
             continue;
         }
         let per_head = if faction.member_count > 0 {

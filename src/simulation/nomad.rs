@@ -3188,11 +3188,18 @@ pub fn nomad_sedentarize_system(
     clock: Res<SimClock>,
     mut lifecycle_queue: ResMut<crate::simulation::lifecycle::LifecycleEventQueue>,
 ) {
-    if clock.tick % TICKS_PER_DAY as u64 != 0 {
-        return;
-    }
+    // Phase 1.2: per-faction stagger inside an every-tick run.
+    const SYSTEM_OFFSET: u64 = 131;
     let now = clock.tick as u32;
     for (&fid, faction) in registry.factions.iter() {
+        if !crate::simulation::perf::faction_stagger_due(
+            clock.tick,
+            fid,
+            SYSTEM_OFFSET,
+            TICKS_PER_DAY as u64,
+        ) {
+            continue;
+        }
         // Capability check: only mobile-home archetypes can sedentarize.
         if !faction.caps.home.is_mobile() {
             continue;
@@ -3295,11 +3302,18 @@ pub fn nomad_chief_directive_system(
 ) {
     use crate::simulation::construction::{next_clear_tile, Blueprint, BuildSiteKind, ShelterTier};
 
-    if clock.tick % TICKS_PER_DAY as u64 != 0 {
-        return;
-    }
+    // Phase 1.2: per-faction stagger inside an every-tick run.
+    const SYSTEM_OFFSET: u64 = 149;
     let now_tick = clock.tick;
     for (&fid, faction) in registry.factions.iter() {
+        if !crate::simulation::perf::faction_stagger_due(
+            clock.tick,
+            fid,
+            SYSTEM_OFFSET,
+            TICKS_PER_DAY as u64,
+        ) {
+            continue;
+        }
         if !faction.caps.home.is_mobile() {
             continue;
         }

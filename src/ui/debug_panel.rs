@@ -827,8 +827,7 @@ pub fn debug_panel_system(
                     );
                     ui.label(
                         egui::RichText::new(format!(
-                            "Planner backlog: factions {}  •  settlement surveys {}{}",
-                            path.bg.faction_planner_backlog,
+                            "Planner backlog: settlement surveys {}{}",
                             path.bg.settlement_planner_backlog,
                             if path.bg.settlement_survey_in_flight {
                                 "  •  in flight"
@@ -865,6 +864,7 @@ pub fn debug_panel_system(
                 .show(ui, |ui| {
                     let avg_ms = path.timing.avg_tick_us_ema / 1000.0;
                     let worst_ms = path.timing.worst_tick_us_recent as f32 / 1000.0;
+                    let p99_ms = path.timing.worst_tick_us_p99 as f32 / 1000.0;
                     let budget_ms = path.game_speed.current.budget_ms_per_tick();
                     let over_budget = avg_ms > budget_ms;
                     let avg_color = if over_budget {
@@ -900,7 +900,12 @@ pub fn debug_panel_system(
                             .size(11.0),
                     );
                     ui.label(
-                        egui::RichText::new(format!("Worst tick (60): {worst_ms:.2} ms"))
+                        egui::RichText::new(format!("Worst tick (200): {worst_ms:.2} ms"))
+                            .color(egui::Color32::GRAY)
+                            .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("p99 tick (200): {p99_ms:.2} ms"))
                             .color(egui::Color32::GRAY)
                             .size(11.0),
                     );
