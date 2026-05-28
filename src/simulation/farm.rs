@@ -18,7 +18,7 @@
 //! - `fallow_recovery_system` (Economy, season-edge) — restores nutrients on
 //!   rested tiles up to the per-tile fertility ceiling.
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use bevy::prelude::*;
 
 use crate::economy::core_ids;
@@ -148,11 +148,11 @@ pub enum FarmSeasonPhase {
     WinterDormant,
 }
 
-/// How long `goal_update_system`'s farm precompute may reuse a cached
-/// `households_with_seasonal_work` snapshot before rebuilding. Invalidated
-/// immediately on season transitions; otherwise the scan rebuilds at this
-/// cadence. 60 ticks ≈ 3 s at 1× speed — well under the 200-tick per-agent
-/// goal re-eval cadence so no FarmWorkScorer-driven agent observes staleness.
+/// Legacy alias retained for documentation cross-references. The
+/// per-tick rebuild cadence was replaced by the shared `FarmWorkIndex`
+/// dirty-tracked snapshot (`refresh_farm_work_index_system`) — consumers
+/// now read the snapshot directly rather than rebuilding a local cache.
+#[deprecated = "Replaced by FarmWorkIndex dirty tracking — see refresh_farm_work_index_system"]
 pub const FARM_PRECOMPUTE_CADENCE_TICKS: u64 = 60;
 
 /// Map `Calendar.season` to a `FarmSeasonPhase`. Pure helper.
@@ -226,26 +226,229 @@ pub struct FieldTileState {
 /// Sparse, persistent-by-resource. Populated at `carve_plots_system` for every
 /// tile in `PlotIndex.ag_tiles`. Pruned when a plot teardown removes the tile
 /// from `ag_tiles`.
+///
+/// Carries a reverse index `by_plot: plot_id → tile set` so the per-plot
+/// scanners (foreman pass, dispatchers, work-state snapshot) iterate the
+/// plot's current member tiles directly instead of re-deriving membership from
+/// the (now hull-only) `Plot.rect`. The reverse map is private — every
+/// mutation goes through `ensure_entry` / `remove_tile` so the two views never
+/// disagree.
 #[derive(Resource, Default, Debug)]
 pub struct FieldTileIndex {
     pub by_tile: AHashMap<(i32, i32), FieldTileState>,
+    by_plot: AHashMap<PlotId, AHashSet<(i32, i32)>>,
 }
 
 impl FieldTileIndex {
     /// Seed a fresh entry for a newly-carved Agricultural tile.
     /// Idempotent — existing entries are preserved.
     pub fn ensure_entry(&mut self, tile: (i32, i32), plot_id: PlotId, fertility: u8) {
-        self.by_tile.entry(tile).or_insert(FieldTileState {
-            plot_id,
-            nutrients: fertility,
-            last_crop: None,
-            last_worked_year: 0,
-        });
+        // If the tile already belongs to a different plot, fix the reverse
+        // index — `by_tile.entry().or_insert` would silently keep the old
+        // plot_id and the views would drift.
+        if let Some(existing) = self.by_tile.get(&tile) {
+            if existing.plot_id != plot_id {
+                // Transfer: drop from old set first (rare path — carve
+                // step 4 will hit this when the largest-overlap plot
+                // absorbs a tile previously assigned to a sibling).
+                if let Some(set) = self.by_plot.get_mut(&existing.plot_id) {
+                    set.remove(&tile);
+                    if set.is_empty() {
+                        self.by_plot.remove(&existing.plot_id);
+                    }
+                }
+                if let Some(s) = self.by_tile.get_mut(&tile) {
+                    s.plot_id = plot_id;
+                }
+            }
+        } else {
+            self.by_tile.insert(
+                tile,
+                FieldTileState {
+                    plot_id,
+                    nutrients: fertility,
+                    last_crop: None,
+                    last_worked_year: 0,
+                },
+            );
+        }
+        self.by_plot.entry(plot_id).or_default().insert(tile);
     }
 
-    /// Drop an entry when a tile is removed from a plot.
+    /// Drop a tile from both views. Returns the plot id it used to belong to,
+    /// if any — callers (the retirement drain) feed it back into the dirty
+    /// queue so the affected plot's snapshot rebuilds.
+    pub fn remove_tile(&mut self, tile: (i32, i32)) -> Option<PlotId> {
+        let state = self.by_tile.remove(&tile)?;
+        if let Some(set) = self.by_plot.get_mut(&state.plot_id) {
+            set.remove(&tile);
+            if set.is_empty() {
+                self.by_plot.remove(&state.plot_id);
+            }
+        }
+        Some(state.plot_id)
+    }
+
+    /// Iterator over tiles currently owned by `plot_id`. Empty when the plot
+    /// has no members (either never carved or every tile retired).
+    pub fn plot_tiles(&self, plot_id: PlotId) -> impl Iterator<Item = (i32, i32)> + '_ {
+        self.by_plot
+            .get(&plot_id)
+            .into_iter()
+            .flat_map(|set| set.iter().copied())
+    }
+
+    /// Cheap test: does `plot_id` still own at least one tile?
+    #[inline]
+    pub fn plot_has_members(&self, plot_id: PlotId) -> bool {
+        self.by_plot
+            .get(&plot_id)
+            .map_or(false, |set| !set.is_empty())
+    }
+
+    /// Cheap tile-count read.
+    #[inline]
+    pub fn plot_tile_count(&self, plot_id: PlotId) -> usize {
+        self.by_plot.get(&plot_id).map_or(0, |set| set.len())
+    }
+
+    /// Drop a tile (legacy name kept for backward compatibility with sites
+    /// that don't care which plot it came from).
+    #[inline]
     pub fn remove(&mut self, tile: (i32, i32)) {
-        self.by_tile.remove(&tile);
+        self.remove_tile(tile);
+    }
+
+    /// Debug-only consistency check: every `by_tile` entry has a matching
+    /// `by_plot` set membership, and vice versa.
+    #[cfg(debug_assertions)]
+    pub fn debug_assert_consistent(&self) {
+        use std::collections::HashSet;
+        let mut from_tile: HashSet<(PlotId, (i32, i32))> = HashSet::new();
+        for (&t, s) in &self.by_tile {
+            from_tile.insert((s.plot_id, t));
+        }
+        let mut from_plot: HashSet<(PlotId, (i32, i32))> = HashSet::new();
+        for (&pid, set) in &self.by_plot {
+            assert!(!set.is_empty(), "by_plot for {pid:?} is empty");
+            for &t in set {
+                from_plot.insert((pid, t));
+            }
+        }
+        assert_eq!(
+            from_tile, from_plot,
+            "FieldTileIndex by_tile / by_plot views drifted"
+        );
+    }
+}
+
+/// Shared, dirty-tracked snapshot of per-plot farm-work classification.
+///
+/// Replaces the three independent scanners that previously walked each Ag
+/// plot's rect every tick (`goal_update_system`'s `seasonal_work_cache`,
+/// `chief_job_posting_system`'s `plot_tile_counts`, `fieldwork_expiry_system`'s
+/// `count_*_in_rect`) with a single source of truth that consumers read from.
+///
+/// Counts mirror the predicates in `plot_tile_counts` so the snapshot can
+/// substitute everywhere the legacy scan was consumed.
+///
+/// Refreshed by `refresh_farm_work_index_system` (Economy, before
+/// `fieldwork_expiry_system` + `chief_job_posting_system`): season-edge
+/// rebuilds every snapshot, the `dirty` queue drains up to
+/// `MAX_DIRTY_REBUILDS_PER_TICK` entries per tick, and once per game day a
+/// full audit rebuilds every snapshot as a backstop against missed dirty
+/// writes while the new code matures.
+#[derive(Resource, Default, Debug)]
+pub struct FarmWorkIndex {
+    /// Per-plot work snapshot.
+    pub by_plot: AHashMap<PlotId, PlotWorkSnapshot>,
+    /// `faction_id → state-owned Agricultural plot ids` for the chief Farm
+    /// branch's foreman pass. Rebuilt during refresh from `PlotIndex` +
+    /// `Plot.{faction_id, zone_kind, tenure}`.
+    pub state_owned_by_faction: AHashMap<u32, Vec<PlotId>>,
+    /// `household_id → Agricultural plot ids` for the `FarmWorkScorer`'s
+    /// household-availability gate.
+    pub household_plots: AHashMap<u32, Vec<PlotId>>,
+    /// Derived: factions for which at least one state-owned plot has work in
+    /// the current `FarmSeasonPhase`. Powers the cheap `chief_job_posting`
+    /// short-circuit checks. Households surface separately through
+    /// `households_with_seasonal_work`.
+    pub households_with_seasonal_work: AHashSet<u32>,
+    /// Plot ids waiting for a rebuild. Source of truth for "which snapshots
+    /// are stale".
+    pub dirty: AHashSet<PlotId>,
+    /// Calendar day of the last full audit. Used by the daily-audit backstop.
+    pub last_full_audit_day: u32,
+    /// Cached current season phase. Lets consumers check seasonal-validity
+    /// without re-deriving from `Calendar`.
+    pub farm_season: FarmSeasonPhase,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlotWorkSnapshot {
+    pub unprepared: u32,
+    pub plantable: u32,
+    pub mature: u32,
+    pub updated_tick: u64,
+}
+
+impl PlotWorkSnapshot {
+    /// True when the plot has any season-appropriate work surface for an
+    /// agent's `FarmWorkScorer` gate. Spring counts both Prepare and Plant
+    /// surface; Summer Prepare only (caretaker mode); Autumn Harvest; Winter
+    /// nothing.
+    #[inline]
+    pub fn has_seasonal_work(&self, phase: FarmSeasonPhase) -> bool {
+        match phase {
+            FarmSeasonPhase::SpringPrepPlant => self.unprepared > 0 || self.plantable > 0,
+            FarmSeasonPhase::SummerMaintenance => self.unprepared > 0,
+            FarmSeasonPhase::AutumnHarvest => self.mature > 0,
+            FarmSeasonPhase::WinterDormant => false,
+        }
+    }
+}
+
+/// Default `FarmSeasonPhase` so `FarmWorkIndex::default()` is meaningful for
+/// the headless test fixture.
+impl Default for FarmSeasonPhase {
+    fn default() -> Self {
+        FarmSeasonPhase::WinterDormant
+    }
+}
+
+/// Maximum number of stale plots that the refresh system rebuilds per tick.
+/// Tuned to keep the worst-case tick under a few thousand tile reads.
+pub const MAX_DIRTY_REBUILDS_PER_TICK: usize = 16;
+
+impl FarmWorkIndex {
+    /// Mark `plot_id` for rebuild on the next refresh tick. Cheap — single
+    /// hash-set insert. Idempotent; callers can stamp the same plot many
+    /// times per tick without growing the queue.
+    #[inline]
+    pub fn mark_dirty(&mut self, plot_id: PlotId) {
+        self.dirty.insert(plot_id);
+    }
+
+    /// Lookup helper for the goal-scorer path. `None` when the plot has no
+    /// snapshot yet (freshly carved, or scrubbed by a teardown). Treat as
+    /// "no work" — a fresh carve marks the plot dirty so it'll appear next
+    /// refresh tick.
+    #[inline]
+    pub fn snapshot(&self, plot_id: PlotId) -> Option<&PlotWorkSnapshot> {
+        self.by_plot.get(&plot_id)
+    }
+
+    /// True iff `faction_id` (a household root) has at least one state-owned
+    /// Agricultural plot with current-season work.
+    #[inline]
+    pub fn faction_has_seasonal_work(&self, faction_id: u32) -> bool {
+        self.state_owned_by_faction
+            .get(&faction_id)
+            .map_or(false, |plots| {
+                plots
+                    .iter()
+                    .any(|pid| self.snapshot(*pid).map_or(false, |s| s.has_seasonal_work(self.farm_season)))
+            })
     }
 }
 
@@ -1061,6 +1264,7 @@ pub fn drain_farm_retirements_system(
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
     mut plot_index: ResMut<crate::simulation::land::PlotIndex>,
     mut field_tiles: ResMut<FieldTileIndex>,
+    mut work_index: ResMut<FarmWorkIndex>,
     mut retirements: ResMut<FarmRetirements>,
     plant_map: Res<crate::simulation::plants::PlantMap>,
     plant_reservations: Res<crate::simulation::plants::PlantingReservations>,
@@ -1106,8 +1310,10 @@ pub fn drain_farm_retirements_system(
         if plot_index.by_tile.get(&tile).copied() == Some(old_plot) {
             plot_index.by_tile.remove(&tile);
         }
-        field_tiles.by_tile.remove(&tile);
+        field_tiles.remove_tile(tile);
         touched_plots.insert(old_plot);
+        // Plot lost a member tile — its snapshot must rebuild.
+        work_index.mark_dirty(old_plot);
 
         // Revert Cropland → natural biome kind. Mirrors the old inline carve
         // revert pass at land.rs:934. Tiles not currently `Cropland` (already
@@ -1143,11 +1349,7 @@ pub fn drain_farm_retirements_system(
     // a clean slate. Membership is the union over `FieldTileIndex.plot_id`
     // (canonical source of truth per the sticky-farm design).
     for pid in touched_plots {
-        let still_present = field_tiles
-            .by_tile
-            .values()
-            .any(|s| s.plot_id == pid);
-        if still_present {
+        if field_tiles.plot_has_members(pid) {
             continue;
         }
         let Some(entity) = plot_index.by_id.remove(&pid) else {
@@ -1176,6 +1378,7 @@ pub fn prepare_field_task_system(
     mut chunk_map: ResMut<crate::world::chunk::ChunkMap>,
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
     mut field_tiles: ResMut<FieldTileIndex>,
+    mut work_index: ResMut<FarmWorkIndex>,
     mut reservations: ResMut<PrepareFieldReservations>,
     mut board: ResMut<crate::simulation::jobs::JobBoard>,
     mut completed_events: EventWriter<crate::simulation::jobs::JobCompletedEvent>,
@@ -1255,10 +1458,18 @@ pub fn prepare_field_task_system(
             );
             tile_changed.send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
         }
+        let mut dirty_plot: Option<crate::simulation::land::PlotId> = None;
         if let Some(state) = field_tiles.by_tile.get_mut(&tile) {
             if state.nutrients < EXHAUSTED_FLOOR {
                 state.nutrients = EXHAUSTED_FLOOR;
             }
+            dirty_plot = Some(state.plot_id);
+        }
+        if let Some(pid) = dirty_plot {
+            // Tile flipped from `unprepared → plantable` (or stayed
+            // plantable but its kind/nutrients changed). Rebuild on next
+            // refresh tick.
+            work_index.mark_dirty(pid);
         }
         // Credit the claimed posting's Prepare phase. `record_fieldwork_progress`
         // no-ops unless the backing posting is `FieldWork { phase: Prepare }`,
@@ -1332,6 +1543,7 @@ pub fn fallow_recovery_system(
     chunk_map: Res<crate::world::chunk::ChunkMap>,
     plant_map: Res<crate::simulation::plants::PlantMap>,
     mut field_tiles: ResMut<FieldTileIndex>,
+    mut work_index: ResMut<FarmWorkIndex>,
     mut last_seen: Local<Option<Season>>,
 ) {
     // Season-edge gate: only run once per season change. Mirrors
@@ -1362,7 +1574,234 @@ pub fn fallow_recovery_system(
             .nutrients
             .saturating_add(FALLOW_NUTRIENTS_PER_SEASON)
             .min(cap);
+        let old = state.nutrients;
         state.nutrients = new_nut;
+        // Crossing `MIN_PLANTABLE_NUTRIENTS` upward changes the plot's
+        // `plantable` count — mark it dirty.
+        if old < MIN_PLANTABLE_NUTRIENTS && new_nut >= MIN_PLANTABLE_NUTRIENTS {
+            work_index.mark_dirty(state.plot_id);
+        }
+    }
+}
+
+/// Recompute one plot's `PlotWorkSnapshot` from current world state. Pure
+/// helper — same predicates as the legacy `plot_tile_counts`, but iterates
+/// `FieldTileIndex::plot_tiles(plot_id)` instead of walking the (now
+/// hull-only) `Plot.rect`. When the plot has no `FieldTileIndex` members yet
+/// (a freshly-spawned plot before `carve_plots_system` ran its tile pass, or
+/// a test-fixture plot built without backfilling `ag_tiles`), falls back to
+/// walking `Plot.rect` so the snapshot reflects the rect-derived state.
+fn recompute_plot_snapshot(
+    plot_id: PlotId,
+    plot_rect: Option<crate::simulation::settlement::TileRect>,
+    chunk_map: &crate::world::chunk::ChunkMap,
+    field_tiles: &FieldTileIndex,
+    plant_map: &crate::simulation::plants::PlantMap,
+    plant_q: &Query<&crate::simulation::plants::Plant>,
+    retirements: &FarmRetirements,
+    now: u64,
+) -> PlotWorkSnapshot {
+    use crate::simulation::plants::GrowthStage;
+    use crate::world::tile::TileKind;
+    let mut snap = PlotWorkSnapshot {
+        updated_tick: now,
+        ..PlotWorkSnapshot::default()
+    };
+    // Iterate the plot's authoritative tile membership when present; fall
+    // back to the rect hull only if the reverse index hasn't been
+    // populated yet.
+    let from_index: Vec<(i32, i32)> = field_tiles.plot_tiles(plot_id).collect();
+    let tiles: Box<dyn Iterator<Item = (i32, i32)>> = if !from_index.is_empty() {
+        Box::new(from_index.into_iter())
+    } else if let Some(rect) = plot_rect {
+        Box::new(
+            (rect.y0..rect.y0 + rect.h as i32)
+                .flat_map(move |ty| (rect.x0..rect.x0 + rect.w as i32).map(move |tx| (tx, ty))),
+        )
+    } else {
+        Box::new(std::iter::empty())
+    };
+    for (tx, ty) in tiles {
+        let retiring = retirements.is_retiring((tx, ty));
+        let is_cropland = matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Cropland));
+        let nutrients = field_tiles
+            .by_tile
+            .get(&(tx, ty))
+            .map(|s| s.nutrients)
+            .unwrap_or(0);
+        let exhausted = nutrients < EXHAUSTED_FLOOR;
+        if !retiring && (!is_cropland || exhausted) {
+            snap.unprepared += 1;
+        }
+        let plant_here = plant_map.0.get(&(tx, ty)).copied();
+        if !retiring && is_cropland && nutrients >= MIN_PLANTABLE_NUTRIENTS && plant_here.is_none()
+        {
+            snap.plantable += 1;
+        }
+        if is_cropland {
+            if let Some(pent) = plant_here {
+                if let Ok(pl) = plant_q.get(pent) {
+                    if pl.kind.is_farm_plantable() && pl.stage == GrowthStage::Mature {
+                        snap.mature += 1;
+                    }
+                }
+            }
+        }
+    }
+    snap
+}
+
+/// Economy system that rebuilds stale `FarmWorkIndex` snapshots.
+///
+/// Refresh strategy:
+/// 1. **Season transition** (`farm_season_phase` changed): rebuild every
+///    snapshot. Bounded by plot count, typically < 100.
+/// 2. **Dirty drain**: pop up to `MAX_DIRTY_REBUILDS_PER_TICK` plot ids from
+///    the dirty queue and rebuild each. Surplus stays for the next tick.
+/// 3. **Daily audit**: once per game-day, force-rebuild every snapshot
+///    regardless of `dirty` — backstop against missed dirty writes while
+///    the new code matures.
+///
+/// Runs `.before(fieldwork_expiry_system)` and `.before(chief_job_posting_system)`
+/// so both reconcilers read a fresh snapshot.
+pub fn refresh_farm_work_index_system(
+    clock: Res<SimClock>,
+    calendar: Res<Calendar>,
+    chunk_map: Res<crate::world::chunk::ChunkMap>,
+    field_tiles: Res<FieldTileIndex>,
+    plant_map: Res<crate::simulation::plants::PlantMap>,
+    plant_q: Query<&crate::simulation::plants::Plant>,
+    retirements: Res<FarmRetirements>,
+    plot_index: Res<crate::simulation::land::PlotIndex>,
+    plot_q: Query<&crate::simulation::land::Plot>,
+    mut work_index: ResMut<FarmWorkIndex>,
+) {
+    use crate::simulation::land::{PlotId, TenureHolder};
+
+    let now = clock.tick;
+    let cur_phase = farm_season_phase(&calendar);
+    let cur_day = (now / TICKS_PER_DAY as u64) as u32;
+
+    // Rebuild the by-faction / by-household plot indices each refresh tick
+    // (cheap O(plots) walk — a few hundred at most). Keeps state coherent
+    // even when plots flip tenure mid-game without explicit dirty marks.
+    work_index.state_owned_by_faction.clear();
+    work_index.household_plots.clear();
+    for (&pid, &ent) in plot_index.by_id.iter() {
+        let Ok(plot) = plot_q.get(ent) else { continue };
+        if plot.zone_kind != crate::simulation::settlement::ZoneKind::Agricultural {
+            continue;
+        }
+        match plot.holder {
+            TenureHolder::State { faction_id } => {
+                work_index
+                    .state_owned_by_faction
+                    .entry(faction_id)
+                    .or_default()
+                    .push(pid);
+            }
+            TenureHolder::Household { faction_id } => {
+                work_index
+                    .household_plots
+                    .entry(faction_id)
+                    .or_default()
+                    .push(pid);
+            }
+        }
+    }
+    // Stable iteration order: sort each faction's plot list (deterministic
+    // across runs, useful for tests + debugging).
+    for plots in work_index.state_owned_by_faction.values_mut() {
+        plots.sort_unstable();
+    }
+    for plots in work_index.household_plots.values_mut() {
+        plots.sort_unstable();
+    }
+
+    // GC: drop snapshots for plots that no longer exist + dirty entries
+    // pointing at removed plots.
+    let existing: AHashSet<PlotId> = plot_index.by_id.keys().copied().collect();
+    work_index.by_plot.retain(|pid, _| existing.contains(pid));
+    work_index.dirty.retain(|pid| existing.contains(pid));
+
+    let season_changed = work_index.farm_season != cur_phase;
+    let daily_audit_due = cur_day != work_index.last_full_audit_day;
+
+    if season_changed || daily_audit_due {
+        // Full rebuild — every Ag plot.
+        for (&pid, &ent) in plot_index.by_id.iter() {
+            let Ok(plot) = plot_q.get(ent) else { continue };
+            if plot.zone_kind != crate::simulation::settlement::ZoneKind::Agricultural {
+                continue;
+            }
+            let snap = recompute_plot_snapshot(
+                pid,
+                Some(plot.rect),
+                &chunk_map,
+                &field_tiles,
+                &plant_map,
+                &plant_q,
+                &retirements,
+                now,
+            );
+            work_index.by_plot.insert(pid, snap);
+        }
+        work_index.dirty.clear();
+        work_index.farm_season = cur_phase;
+        work_index.last_full_audit_day = cur_day;
+    } else if !work_index.dirty.is_empty() {
+        // Dirty drain — up to MAX_DIRTY_REBUILDS_PER_TICK per tick.
+        // Stable order (sorted) so behaviour is deterministic across runs.
+        let mut to_drain: Vec<PlotId> = work_index.dirty.iter().copied().collect();
+        to_drain.sort_unstable();
+        let take = MAX_DIRTY_REBUILDS_PER_TICK.min(to_drain.len());
+        for pid in to_drain.drain(..take) {
+            work_index.dirty.remove(&pid);
+            // Skip plots that vanished between mark + drain.
+            let Some(&ent) = plot_index.by_id.get(&pid) else {
+                work_index.by_plot.remove(&pid);
+                continue;
+            };
+            let Ok(plot) = plot_q.get(ent) else {
+                continue;
+            };
+            if plot.zone_kind != crate::simulation::settlement::ZoneKind::Agricultural {
+                continue;
+            }
+            let snap = recompute_plot_snapshot(
+                pid,
+                Some(plot.rect),
+                &chunk_map,
+                &field_tiles,
+                &plant_map,
+                &plant_q,
+                &retirements,
+                now,
+            );
+            work_index.by_plot.insert(pid, snap);
+        }
+    }
+
+    // Derived sets: `households_with_seasonal_work` powers the
+    // `FarmWorkScorer` gate cheaply (one snapshot lookup per household).
+    work_index.households_with_seasonal_work.clear();
+    if cur_phase != FarmSeasonPhase::WinterDormant {
+        // The legacy goal-scorer gate keyed on `TenureHolder::Household`;
+        // mirror that here so the consumer rewrite is a drop-in.
+        let mut to_insert: Vec<u32> = Vec::new();
+        for (&household_id, plots) in &work_index.household_plots {
+            if plots.iter().any(|pid| {
+                work_index
+                    .by_plot
+                    .get(pid)
+                    .map_or(false, |s| s.has_seasonal_work(cur_phase))
+            }) {
+                to_insert.push(household_id);
+            }
+        }
+        for id in to_insert {
+            work_index.households_with_seasonal_work.insert(id);
+        }
     }
 }
 
@@ -1505,6 +1944,7 @@ pub fn fieldwork_expiry_system(
     retirements: Res<FarmRetirements>,
     storage_reservations: Res<crate::simulation::faction::StorageReservations>,
     faction_registry: Res<crate::simulation::faction::FactionRegistry>,
+    work_index: Res<FarmWorkIndex>,
     mut board: ResMut<crate::simulation::jobs::JobBoard>,
     mut completed_events: EventWriter<crate::simulation::jobs::JobCompletedEvent>,
     plant_q: Query<&crate::simulation::plants::Plant>,
@@ -1541,6 +1981,7 @@ pub fn fieldwork_expiry_system(
                 target,
                 area,
                 assigned_farmer,
+                plot_id,
                 ..
             } = p.progress
             else {
@@ -1553,15 +1994,36 @@ pub fn fieldwork_expiry_system(
                 continue;
             }
             // In-season capacity probe.
+            // Snapshot-driven path: when the posting carries a `plot_id`
+            // (every chief-emitted FieldWork posting since 2026-05), read
+            // counts off the shared snapshot. Legacy / synthetic postings
+            // without a plot_id fall back to the rect-walk helpers so test
+            // fixtures and unit shims still work.
             let rect_min = area.min;
             let rect_max = area.max;
             let remaining_capacity: u32 = match phase {
-                FarmWorkPhase::Prepare => {
-                    count_unprepared_in_rect(&chunk_map, &field_tiles, &retirements, rect_min, rect_max)
-                }
+                FarmWorkPhase::Prepare => match plot_id.and_then(|pid| work_index.snapshot(pid)) {
+                    Some(snap) => snap.unprepared,
+                    None => count_unprepared_in_rect(
+                        &chunk_map,
+                        &field_tiles,
+                        &retirements,
+                        rect_min,
+                        rect_max,
+                    ),
+                },
                 FarmWorkPhase::Plant => {
-                    let plantable =
-                        count_plantable_in_rect(&chunk_map, &plant_map, &field_tiles, &retirements, rect_min, rect_max);
+                    let plantable = match plot_id.and_then(|pid| work_index.snapshot(pid)) {
+                        Some(snap) => snap.plantable,
+                        None => count_plantable_in_rect(
+                            &chunk_map,
+                            &plant_map,
+                            &field_tiles,
+                            &retirements,
+                            rect_min,
+                            rect_max,
+                        ),
+                    };
                     let seed_pool = faction_registry
                         .factions
                         .get(faction_id)
@@ -1569,9 +2031,10 @@ pub fn fieldwork_expiry_system(
                         .unwrap_or(0);
                     plantable.min(seed_pool)
                 }
-                FarmWorkPhase::Harvest => {
-                    count_mature_crop_in_rect(&plant_map, &plant_q, rect_min, rect_max)
-                }
+                FarmWorkPhase::Harvest => match plot_id.and_then(|pid| work_index.snapshot(pid)) {
+                    Some(snap) => snap.mature,
+                    None => count_mature_crop_in_rect(&plant_map, &plant_q, rect_min, rect_max),
+                },
             };
             let remaining_target = target.saturating_sub(completed);
             if remaining_capacity == 0 {
@@ -1651,6 +2114,91 @@ pub fn fieldwork_expiry_system(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn field_tile_index_reverse_index_stays_consistent() {
+        let mut idx = FieldTileIndex::default();
+        // Three tiles, two plots.
+        idx.ensure_entry((1, 1), 10u32, 200);
+        idx.ensure_entry((2, 1), 10u32, 200);
+        idx.ensure_entry((5, 5), 11u32, 200);
+        idx.debug_assert_consistent();
+        assert_eq!(idx.plot_tile_count(10), 2);
+        assert_eq!(idx.plot_tile_count(11), 1);
+        assert!(idx.plot_has_members(10));
+        assert!(idx.plot_has_members(11));
+        let tiles_10: Vec<_> = {
+            let mut v: Vec<_> = idx.plot_tiles(10).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(tiles_10, vec![(1, 1), (2, 1)]);
+
+        // Idempotent re-ensure preserves live nutrients AND set membership.
+        if let Some(s) = idx.by_tile.get_mut(&(1, 1)) {
+            s.nutrients = 50;
+        }
+        idx.ensure_entry((1, 1), 10u32, 200);
+        assert_eq!(idx.by_tile.get(&(1, 1)).unwrap().nutrients, 50);
+        idx.debug_assert_consistent();
+
+        // Transferring a tile between plots updates both reverse-index sets.
+        idx.ensure_entry((1, 1), 11u32, 200);
+        idx.debug_assert_consistent();
+        assert_eq!(idx.plot_tile_count(10), 1);
+        assert_eq!(idx.plot_tile_count(11), 2);
+
+        // remove_tile drops from both views and reports the prior owner.
+        assert_eq!(idx.remove_tile((2, 1)), Some(10));
+        idx.debug_assert_consistent();
+        assert!(!idx.plot_has_members(10));
+        assert_eq!(idx.plot_tile_count(10), 0);
+
+        // Idempotent remove_tile on absent tile.
+        assert_eq!(idx.remove_tile((999, 999)), None);
+        idx.debug_assert_consistent();
+    }
+
+    #[test]
+    fn farm_work_index_dirty_drain_is_bounded() {
+        // The drain cap is `MAX_DIRTY_REBUILDS_PER_TICK` (currently 16).
+        // Stage 50 dirty plots and assert the queue isn't drained in one
+        // pass — the pure check on the cap is sufficient here without
+        // standing up a full App fixture.
+        let mut idx = FarmWorkIndex::default();
+        for pid in 0..50u32 {
+            idx.mark_dirty(pid);
+        }
+        assert_eq!(idx.dirty.len(), 50);
+        assert!(MAX_DIRTY_REBUILDS_PER_TICK < 50);
+    }
+
+    #[test]
+    fn plot_work_snapshot_seasonal_work_classification() {
+        let snap = PlotWorkSnapshot {
+            unprepared: 0,
+            plantable: 0,
+            mature: 3,
+            updated_tick: 1,
+        };
+        assert!(!snap.has_seasonal_work(FarmSeasonPhase::SpringPrepPlant));
+        assert!(!snap.has_seasonal_work(FarmSeasonPhase::SummerMaintenance));
+        assert!(snap.has_seasonal_work(FarmSeasonPhase::AutumnHarvest));
+        assert!(!snap.has_seasonal_work(FarmSeasonPhase::WinterDormant));
+
+        let snap = PlotWorkSnapshot {
+            unprepared: 4,
+            plantable: 0,
+            mature: 0,
+            updated_tick: 1,
+        };
+        // Unprepared counts in Spring AND Summer (caretaker).
+        assert!(snap.has_seasonal_work(FarmSeasonPhase::SpringPrepPlant));
+        assert!(snap.has_seasonal_work(FarmSeasonPhase::SummerMaintenance));
+        // No plantable / no mature → nothing for Autumn or Winter.
+        assert!(!snap.has_seasonal_work(FarmSeasonPhase::AutumnHarvest));
+        assert!(!snap.has_seasonal_work(FarmSeasonPhase::WinterDormant));
+    }
 
     fn cal_with(season: Season, year: u32) -> Calendar {
         let mut c = Calendar::default();

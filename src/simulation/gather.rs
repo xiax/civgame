@@ -366,6 +366,10 @@ pub struct GatherRoutingResources<'w, 's> {
     /// Grain harvest yield scaling + post-harvest debit. Bundled here so
     /// `gather_system` stays under Bevy's 16-param ceiling.
     pub field_tiles: ResMut<'w, crate::simulation::farm::FieldTileIndex>,
+    /// Dirty-marked when the Grain harvest path mutates `PlantMap` /
+    /// nutrients on an Ag tile, so the shared `FarmWorkIndex` rebuilds the
+    /// owning plot's snapshot next refresh tick.
+    pub farm_work_index: ResMut<'w, crate::simulation::farm::FarmWorkIndex>,
     pub calendar: Res<'w, crate::world::seasons::Calendar>,
     /// Draftwork v2: marker filter on Plant entities born inside a plot that
     /// was plowed this calendar year. Read by the Grain branch of the harvest
@@ -1001,12 +1005,17 @@ pub fn gather_system(
             // Apply the per-tile nutrient debit + last-crop tag for Grain.
             if matches!(kind, crate::simulation::plants::PlantKind::Grain) {
                 let cur_year = routing.calendar.year as u16;
+                let mut dirty_plot: Option<crate::simulation::land::PlotId> = None;
                 if let Some(state) = routing.field_tiles.by_tile.get_mut(&(tx, ty)) {
                     state.nutrients = state
                         .nutrients
                         .saturating_sub(crate::simulation::farm::HARVEST_NUTRIENT_DEBIT);
                     state.last_crop = Some(crate::simulation::plants::PlantKind::Grain);
                     state.last_worked_year = cur_year;
+                    dirty_plot = Some(state.plot_id);
+                }
+                if let Some(pid) = dirty_plot {
+                    routing.farm_work_index.mark_dirty(pid);
                 }
             }
             let (agent_tx, agent_ty) = world_to_tile(transform.translation.truncate());

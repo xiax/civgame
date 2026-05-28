@@ -307,8 +307,10 @@ impl Plugin for SimulationPlugin {
             .insert_resource(land::LandListings::default())
             .insert_resource(farm::FarmPlotAssignments::default())
             .insert_resource(farm::FieldTileIndex::default())
+            .insert_resource(farm::FarmWorkIndex::default())
             .insert_resource(farm::PrepareFieldReservations::default())
             .insert_resource(farm::FarmRetirements::default())
+            .insert_resource(land::PlotCarveCache::default())
             .insert_resource(fishing::FishStock::default())
             .insert_resource(military::ActiveRallyPoints::default())
             .insert_resource(military::MilitaryFormationGroupGen::default())
@@ -1276,6 +1278,13 @@ impl Plugin for SimulationPlugin {
                     projects::project_stagnation_system.after(projects::project_lifecycle_system),
                     jobs::classify_construction_procurement_system
                         .after(faction::compute_faction_storage_system)
+                        .before(jobs::chief_job_posting_system),
+                    // Shared per-plot farm-work snapshot. Runs before any
+                    // consumer (fieldwork_expiry, chief_job_posting, the
+                    // FarmWorkScorer gate) so they all read the same fresh
+                    // counts.
+                    farm::refresh_farm_work_index_system
+                        .before(farm::fieldwork_expiry_system)
                         .before(jobs::chief_job_posting_system),
                     // Unified FieldWork seasonal / capacity reconciliation.
                     // Runs before workforce budgeting + chief posting so a

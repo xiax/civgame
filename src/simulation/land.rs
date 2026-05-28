@@ -258,6 +258,56 @@ impl PlotIndex {
     }
 }
 
+/// Bundled mutable farm-state resources for `carve_plots_system`. Keeps the
+/// outer system signature under Bevy's 16-param ceiling without forcing
+/// callers to thread six discrete `ResMut`s through.
+#[derive(SystemParam)]
+pub struct CarveFarmState<'w> {
+    pub field_tiles: ResMut<'w, crate::simulation::farm::FieldTileIndex>,
+    pub work_index: ResMut<'w, crate::simulation::farm::FarmWorkIndex>,
+    pub carve_cache: ResMut<'w, PlotCarveCache>,
+    pub retirements: ResMut<'w, crate::simulation::farm::FarmRetirements>,
+    pub plant_map: ResMut<'w, crate::simulation::plants::PlantMap>,
+    pub plant_sprite_index: ResMut<'w, crate::simulation::plants::PlantSpriteIndex>,
+}
+
+/// Per-faction geometry hash of the last `SettlementPlan` that
+/// `carve_plots_system` consumed. When the hash matches AND no live
+/// `FarmRetirements` covers this faction's plots, the carve loop short-
+/// circuits for that faction — the planner shape hasn't changed and the
+/// retirement queue is empty, so nothing the carve produces will differ.
+#[derive(Resource, Default, Debug)]
+pub struct PlotCarveCache {
+    pub last_hash: AHashMap<u32, u64>,
+}
+
+/// Deterministic geometry hash. Inputs (sorted): every `(zone_kind, rect)`
+/// tuple, every `StreetSegment` endpoint pair, `culture_hash`.
+fn hash_carve_geometry(
+    culture_hash: u64,
+    zones: &[(ZoneKind, TileRect)],
+    spine: &StreetSpine,
+) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut sorted_zones: Vec<(u8, i32, i32, u16, u16)> = zones
+        .iter()
+        .map(|(k, r)| (*k as u8, r.x0, r.y0, r.w, r.h))
+        .collect();
+    sorted_zones.sort_unstable();
+    let mut sorted_segments: Vec<(i32, i32, i32, i32)> = spine
+        .segments()
+        .iter()
+        .map(|seg| (seg.start.0, seg.start.1, seg.end.0, seg.end.1))
+        .collect();
+    sorted_segments.sort_unstable();
+    let mut h = DefaultHasher::new();
+    culture_hash.hash(&mut h);
+    sorted_zones.hash(&mut h);
+    sorted_segments.hash(&mut h);
+    h.finish()
+}
+
 /// True when `tile` must never be overwritten by road carving — it is inside
 /// an `Agricultural` plot or carries a planted crop. The single predicate
 /// behind the `road_carve_system` / `write_road_tile` guard, so every
@@ -734,13 +784,16 @@ pub fn carve_plots_system(
     gen: Res<WorldGen>,
     globe: Res<Globe>,
     mut plot_index: ResMut<PlotIndex>,
-    mut field_tiles: ResMut<crate::simulation::farm::FieldTileIndex>,
-    mut retirements: ResMut<crate::simulation::farm::FarmRetirements>,
-    mut plant_map: ResMut<crate::simulation::plants::PlantMap>,
-    mut plant_sprite_index: ResMut<crate::simulation::plants::PlantSpriteIndex>,
+    mut farm_state: CarveFarmState,
     plot_q: Query<&Plot>,
     _tile_changed: EventWriter<TileChangedEvent>,
 ) {
+    let field_tiles = &mut *farm_state.field_tiles;
+    let work_index = &mut *farm_state.work_index;
+    let carve_cache = &mut *farm_state.carve_cache;
+    let retirements = &mut *farm_state.retirements;
+    let plant_map = &mut *farm_state.plant_map;
+    let plant_sprite_index = &mut *farm_state.plant_sprite_index;
     // Phase 1: surface-only plots. Underground plot variants come with
     // the tunneling-aware land model in a later phase.
     const PLOT_Z: i8 = 0;
@@ -791,6 +844,23 @@ pub fn carve_plots_system(
 
     let now = clock.tick;
 
+    // Geometry-hash short-circuit: skip the per-tile reconciliation for
+    // factions whose `SettlementPlan` shape hasn't changed AND have zero
+    // live retirements (`drain_farm_retirements_system` still needs the
+    // carve loop to keep running through a multi-tick drain so hard-
+    // conflict subtraction can re-evaluate as crops clear).
+    let factions_with_live_retirements: AHashSet<u32> = {
+        let mut set: AHashSet<u32> = AHashSet::new();
+        for retire in retirements.by_tile.values() {
+            if let Some(&ent) = plot_index.by_id.get(&retire.old_plot) {
+                if let Ok(plot) = plot_q.get(ent) {
+                    set.insert(plot.faction_id);
+                }
+            }
+        }
+        set
+    };
+
     for CarveJob {
         fid,
         sid: sid_u32,
@@ -801,6 +871,13 @@ pub fn carve_plots_system(
         spine,
     } in work
     {
+        let geo_hash = hash_carve_geometry(culture_hash, &zones, &spine);
+        let unchanged = carve_cache.last_hash.get(&fid).copied() == Some(geo_hash);
+        let has_retirements = factions_with_live_retirements.contains(&fid);
+        if unchanged && !has_retirements {
+            continue;
+        }
+        carve_cache.last_hash.insert(fid, geo_hash);
         // 1. Build canonical desired sets. Non-Ag zones retain
         //    `(zone_kind, rect)` identity (after subdivision); Ag zones
         //    flatten to a tile set, with any tile also covered by a non-Ag
@@ -866,12 +943,7 @@ pub fn carve_plots_system(
                 continue;
             };
             if plot.zone_kind == ZoneKind::Agricultural {
-                let current_members: Vec<(i32, i32)> = field_tiles
-                    .by_tile
-                    .iter()
-                    .filter(|(_, s)| s.plot_id == pid)
-                    .map(|(t, _)| *t)
-                    .collect();
+                let current_members: Vec<(i32, i32)> = field_tiles.plot_tiles(pid).collect();
                 for t in current_members {
                     if desired_ag_tile_set.remove(&t) {
                         // Tile stays with plot. If a prior carve queued
@@ -885,6 +957,9 @@ pub fn carve_plots_system(
                             crate::simulation::farm::RetireReason::SettlementGone
                         };
                         retirements.stage(t, pid, reason, now);
+                        // Dirty: the plot just lost a tile from its
+                        // work-eligible set.
+                        work_index.mark_dirty(pid);
                     }
                 }
                 kept_pids.push(pid);
@@ -971,11 +1046,9 @@ pub fn carve_plots_system(
                     continue;
                 }
                 let count = field_tiles
-                    .by_tile
-                    .iter()
-                    .filter(|(t, s)| {
-                        s.plot_id == pid
-                            && t.0 >= ag_rect.x0
+                    .plot_tiles(pid)
+                    .filter(|t| {
+                        t.0 >= ag_rect.x0
                             && t.0 < ag_rect.x0 + ag_rect.w as i32
                             && t.1 >= ag_rect.y0
                             && t.1 < ag_rect.y0 + ag_rect.h as i32
@@ -1032,8 +1105,8 @@ pub fn carve_plots_system(
                             &mut commands,
                             plant_entity,
                             t,
-                            &mut plant_map,
-                            &mut plant_sprite_index,
+                            plant_map,
+                            plant_sprite_index,
                         );
                     }
                 }
@@ -1045,6 +1118,8 @@ pub fn carve_plots_system(
                 // retirement (e.g. an earlier carve queued it while it
                 // sat outside the desired set).
                 retirements.cancel(t);
+                // Dirty: a fresh tile joined this plot's set.
+                work_index.mark_dirty(target_pid);
             }
         }
 

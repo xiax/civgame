@@ -2134,18 +2134,11 @@ pub struct FarmJobPostingParams<'w, 's> {
     /// Plot-level reachability gate for Farm postings (validated once per
     /// posting, not per tile). Bundled here to stay under the 16-param ceiling.
     pub chunk_map: Res<'w, crate::world::chunk::ChunkMap>,
-    /// Seasonal farming jellyfish: per-tile nutrient + last-crop state,
-    /// read by the chief Farm branch to classify each plot's tiles into
-    /// `{unprepared, plantable, mature_grain}` buckets.
-    pub field_tiles: Res<'w, crate::simulation::farm::FieldTileIndex>,
-    /// Read to detect mature Grain plants in plot rects (Autumn harvest
-    /// posting target).
-    pub plant_map: Res<'w, crate::simulation::plants::PlantMap>,
-    pub plant_q: Query<'w, 's, &'static crate::simulation::plants::Plant>,
-    /// Sticky-farm retirement queue. The foreman pass excludes retiring
-    /// tiles from posting counts so no new Prepare/Plant work targets them
-    /// (Harvest still fires through the `PlantMap` mature sweep).
-    pub retirements: Res<'w, crate::simulation::farm::FarmRetirements>,
+    /// Seasonal farming jellyfish: shared per-plot work snapshot. Replaces
+    /// the per-plot rect walks the legacy `plot_tile_counts` performed every
+    /// posting cycle; the foreman pass reads `unprepared / plantable / mature`
+    /// directly off the snapshot.
+    pub farm_work_index: Res<'w, crate::simulation::farm::FarmWorkIndex>,
 }
 
 /// Step 3: rebuild every faction's `procurement_plan` once per chief-posting
@@ -3038,14 +3031,20 @@ pub fn chief_job_posting_system(
                     ) {
                         continue;
                     }
-                    let counts = crate::simulation::farm::plot_tile_counts(
-                        &farm_params.chunk_map,
-                        &farm_params.field_tiles,
-                        &farm_params.plant_map,
-                        &farm_params.plant_q,
-                        &farm_params.retirements,
-                        *rect,
-                    );
+                    // Read counts from the shared FarmWorkIndex snapshot
+                    // (refreshed earlier this tick by
+                    // `refresh_farm_work_index_system`). A freshly-carved plot
+                    // without a snapshot yet defaults to zero counts; the next
+                    // refresh tick will fill it in.
+                    let counts = farm_params
+                        .farm_work_index
+                        .snapshot(*pid)
+                        .map(|s| crate::simulation::farm::PlotTileCounts {
+                            unprepared: s.unprepared,
+                            plantable: s.plantable,
+                            mature: s.mature,
+                        })
+                        .unwrap_or_default();
                     let dist = cheb(rect.center(), home);
                     let score = crate::simulation::farm::plot_focus_score(&counts, dist, *rect);
                     ranked.push((*pid, *rect, counts, score));
