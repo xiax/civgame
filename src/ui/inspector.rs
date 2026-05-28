@@ -1304,9 +1304,33 @@ pub fn inspector_panel_system(
                                 let mut work_str = "Working".to_string();
 
                                 if aq.current_task_kind() == TaskKind::Gather as u16 {
+                                    // Storage-first survival food fix: read the
+                                    // worker's outstanding `MemoryKind` intent so
+                                    // a hungry forager on an oak shows "Foraging
+                                    // acorns" while a woodsman on the same oak
+                                    // shows "Felling Tree for wood". Without
+                                    // the intent the same `Task::Gather` would
+                                    // render `Harvesting Tree` in both cases.
+                                    use crate::simulation::memory::MemoryKind;
+                                    let intent_kind = ai.active_gather_claim.as_ref().map(|c| c.kind);
                                     if let Some(&p_entity) = plant_map.0.get(&(tx, ty)) {
                                         if let Ok(plant) = task_display.plants.get(p_entity) {
-                                            work_str = format!("Harvesting {:?}", plant.kind);
+                                            work_str = match intent_kind {
+                                                Some(MemoryKind::AnyEdible) => {
+                                                    format!("Foraging from {:?}", plant.kind)
+                                                }
+                                                Some(MemoryKind::Resource(rid))
+                                                    if rid == crate::economy::core_ids::wood() =>
+                                                {
+                                                    format!("Felling {:?} for wood", plant.kind)
+                                                }
+                                                Some(MemoryKind::Resource(rid)) => format!(
+                                                    "Gathering {} from {:?}",
+                                                    crate::economy::core_ids::display_name(rid),
+                                                    plant.kind
+                                                ),
+                                                _ => format!("Harvesting {:?}", plant.kind),
+                                            };
                                         }
                                     } else if let Some(tile_kind) = chunk_map.tile_kind_at(tx, ty) {
                                         if tile_kind == TileKind::Stone {

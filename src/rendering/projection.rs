@@ -317,21 +317,20 @@ pub fn project_delta(
     mode: MapViewMode,
     proj: &MapProjection,
 ) -> (f32, f32) {
-    match mode {
-        MapViewMode::TopDown => (0.0, 0.0),
-        MapViewMode::Tilted => {
-            // Compress Y by `y_scale`, lift by elevation in pixels.
-            let dy = logical_y * (proj.y_scale - 1.0) + elev_z as f32 * proj.z_step_px;
-            // Small per-y depth offset for screen-local y-sort. Scale chosen
-            // so two adjacent rows differ by ~0.0016 z (smaller than
-            // kind-bias gaps of 0.1) but accumulates noticeably across a
-            // visible screen (~50 rows → ~0.08 z). Walls and ground items
-            // therefore y-sort within their layer; cross-layer ordering
-            // still respects kind_bias.
-            let dz = -logical_y * 0.0001 - (elev_z as f32) * 0.0005;
-            (dy, dz)
-        }
-    }
+    // y-sort dz applies in both modes — keeps overlapping bottom-anchored
+    // sprites in consistent screen-front-to-back order. Scale chosen so
+    // two adjacent rows differ by ~0.0016 z (smaller than kind-bias gaps
+    // of 0.1) but accumulates noticeably across a visible screen
+    // (~50 rows → ~0.08 z). Walls, plants and ground items therefore
+    // y-sort within their layer; cross-layer ordering still respects
+    // kind_bias.
+    let dz = -logical_y * 0.0001 - (elev_z as f32) * 0.0005;
+    let dy = match mode {
+        MapViewMode::TopDown => 0.0,
+        // Tilted compresses Y by `y_scale` and lifts by elevation in pixels.
+        MapViewMode::Tilted => logical_y * (proj.y_scale - 1.0) + elev_z as f32 * proj.z_step_px,
+    };
+    (dy, dz)
 }
 
 /// Convenience wrapper for callers that already have a logical `Vec3`.
@@ -408,15 +407,12 @@ pub fn tile_to_view_camera(
 /// entity, so simulation systems in FixedUpdate / Update see logical
 /// (top-down) `Transform.translation` values.
 pub fn revert_view_projection_system(
-    mode: Res<MapViewMode>,
+    _mode: Res<MapViewMode>,
     mut q: Query<(&mut Transform, &mut ProjectionState), With<ProjectedAnchor>>,
 ) {
-    // Cheap fast path: in TopDown the apply pass never wrote a delta, so
-    // every `last_*` is zero. Iterating to subtract zero is wasted work —
-    // skip outright. The same logic applies on the apply side.
-    if *mode == MapViewMode::TopDown {
-        return;
-    }
+    // Both modes write a delta now: Tilted writes dy + dz; TopDown writes
+    // a dz-only y-sort offset so overlapping bottom-anchored sprites stack
+    // by screen position rather than entity-spawn order.
     for (mut tf, mut state) in &mut q {
         if state.last_dy != 0.0 {
             tf.translation.y -= state.last_dy;
@@ -439,9 +435,6 @@ pub fn apply_view_projection_system(
     chunk_map: Res<ChunkMap>,
     mut q: Query<(&mut Transform, &ProjectedAnchor, &mut ProjectionState)>,
 ) {
-    if *mode == MapViewMode::TopDown {
-        return;
-    }
     for (mut tf, anchor, mut state) in &mut q {
         let elev_z = match *anchor {
             ProjectedAnchor::Static { z } => z,
@@ -604,13 +597,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn topdown_is_identity() {
+    fn topdown_is_xy_identity_with_ysort_dz() {
         let proj = MapProjection::default();
         let v = Vec3::new(123.0, 456.0, 0.5);
         let p = project(v, 7, MapViewMode::TopDown, &proj);
-        assert_eq!(v, p);
+        // X and Y are unchanged in TopDown — only Z carries the tiny
+        // per-y depth offset that lets bottom-anchored sprites y-sort.
+        assert_eq!((p.x, p.y), (v.x, v.y));
+        assert!(p.z < v.z, "TopDown should push z slightly negative for y-sort");
         let (dy, dz) = project_delta(456.0, 7, MapViewMode::TopDown, &proj);
-        assert_eq!((dy, dz), (0.0, 0.0));
+        assert_eq!(dy, 0.0);
+        // dz = -y * 0.0001 - elev * 0.0005 = -0.0456 - 0.0035 = -0.0491
+        assert!((dz - (-0.0491)).abs() < 1e-4, "got {dz}");
     }
 
     #[test]

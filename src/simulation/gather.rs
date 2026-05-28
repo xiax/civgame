@@ -179,23 +179,32 @@ pub fn is_target_still_valid(
     chunk_map: &ChunkMap,
     spatial_index: &crate::world::spatial::SpatialIndex,
     ground_item_lookup: impl Fn(Entity) -> Option<(ResourceId, u32)>,
+    season: crate::world::seasons::Season,
+    has_tool: impl Fn(crate::simulation::tools::ToolForm) -> bool,
 ) -> bool {
     let wood = MemoryKind::wood();
     let stone = MemoryKind::stone();
 
     let plant_kind_ok = |pk: PlantKind,
+                         stage: GrowthStage,
                          species: Option<crate::simulation::plant_catalog::PlantSpeciesId>,
                          expected: MemoryKind|
      -> bool {
         if expected == MemoryKind::AnyEdible {
-            // Catalog species: any harvest profile yielding a Food rid.
+            // Catalog species: must yield Food in a *currently selectable*
+            // harvest profile (season + tool + non-despawn-preferred). Drops
+            // out-of-season fruit trees and felling-only profiles so a
+            // food-survival plan can't pick up an axe-only oak in winter.
             if let Some(sid) = species {
-                let cat = crate::simulation::plant_catalog::catalog();
-                if let Some(def) = cat.def(sid) {
-                    if def.yields_food() {
-                        return true;
-                    }
+                if crate::simulation::plants::species_has_current_edible_harvest(
+                    sid, stage, season, &has_tool,
+                ) {
+                    return true;
                 }
+                // Catalog species that don't pass the strict food gate
+                // shouldn't fall through to the legacy `Grain | BerryBush`
+                // backstop — the species' own profiles already had their say.
+                return false;
             }
             matches!(pk, PlantKind::Grain | PlantKind::BerryBush)
         } else if expected == wood {
@@ -226,7 +235,7 @@ pub fn is_target_still_valid(
     // Plant slot.
     if let Some(&entity) = plant_map.0.get(&tile) {
         if let Some((pk, stage, species)) = plant_lookup(entity) {
-            if plant_kind_ok(pk, species, kind) {
+            if plant_kind_ok(pk, stage, species, kind) {
                 // Tree-on-no-Axe still validates: we'd switch to deadwood,
                 // not bounce the chain.
                 if pk == PlantKind::Tree {

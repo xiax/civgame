@@ -434,6 +434,35 @@ pub fn species_yields_resource(
         .any(|p| p.yields.iter().any(|(y, _)| *y == rid))
 }
 
+/// Storage-first food fix: a species is a valid `AnyEdible` target *right now*
+/// iff `PlantCatalog::pick_harvest_profile(prefer_despawn=false)` resolves to a
+/// profile that yields at least one `ResourceClass::Food` resource at the
+/// agent's current `(stage, season, tools)`.
+///
+/// Compare to `ResolvedPlantDef::yields_food()` — which returns `true` if ANY
+/// profile across the species' definition yields food, regardless of trigger,
+/// season, or tool. The broader predicate is correct for memory tagging
+/// (`plant_memory_kinds`, observer-agnostic) but wrong for dispatch validation:
+/// an oak in winter only has its `OnFell → wood` profile eligible, so this
+/// helper returns `false` and `Survive → ForageFromKnown` falls through to
+/// `ExploreForFood`. An oak in autumn returns `true` (fruit profile wins under
+/// `prefer_despawn=false`, even for an axe-bearing forager).
+pub fn species_has_current_edible_harvest(
+    species: crate::simulation::plant_catalog::PlantSpeciesId,
+    stage: GrowthStage,
+    season: crate::world::seasons::Season,
+    has_tool: impl Fn(crate::simulation::tools::ToolForm) -> bool,
+) -> bool {
+    use crate::economy::resource_catalog::ResourceClass;
+    let cat = crate::simulation::plant_catalog::catalog();
+    let Some(profile) = cat.pick_harvest_profile(species, stage, season, has_tool, false) else {
+        return false;
+    };
+    profile.yields.iter().any(|(rid, _)| {
+        matches!(rid.class(), Some(ResourceClass::Food))
+    })
+}
+
 /// P6a: live `PlantMap` fast path. Probes for a mature plant of a
 /// kind passing `kind_filter` within chebyshev `radius` of `from`,
 /// returning the closest hit. The original "agent stands in a wheat

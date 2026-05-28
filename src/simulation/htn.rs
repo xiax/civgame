@@ -683,6 +683,15 @@ pub fn method_passes_policy_gate(
 pub const METHOD_HISTORY_LEN: usize = 6;
 pub const METHOD_HISTORY_TTL_TICKS: u64 = 600;
 
+/// Storage-first survival food: number of fresh `WITHDRAW_FROM_STORAGE`
+/// failures (within `METHOD_HISTORY_TTL_TICKS`) at which the AcquireFood
+/// dispatcher gives up on storage-first and lets the fallback concretes
+/// (Scavenge / Forage / Fish) compete. `1` means one fresh failure is
+/// enough — the worker doesn't grind a broken withdraw before reaching
+/// wild food. After the failure entry ages out at 600 ticks the gate
+/// re-engages.
+pub const STORAGE_FIRST_RECENT_FAILURE_LIMIT: u32 = 1;
+
 /// Per-agent ring buffer of the last few method outcomes. Phase 6a writes the
 /// component on every Person spawn site and exposes `recently_failed_count`;
 /// Phase 6b instruments the chain-teardown sites that push outcomes here, and
@@ -959,6 +968,17 @@ pub struct PlannerCtx {
     /// food" when the agent is hungry but has nothing in hand. Eat / Sleep
     /// dispatchers leave it at zero.
     pub faction_food_stock: u32,
+    /// Storage-first survival food gate. When `true`, `ScavengeFoodFromGroundMethod`,
+    /// `ForageFromKnownMethod`, and `FishForImmediateFoodMethod` precondition
+    /// out so `WithdrawFromStorageMethod` always wins when reachable, edible
+    /// faction storage exists. Populated only by `htn_acquire_food_dispatch_system`
+    /// — true iff `nearest_storage_tile.is_some()`, `faction_food_stock > 0`,
+    /// and the worker hasn't tripped `STORAGE_FIRST_RECENT_FAILURE_LIMIT` fresh
+    /// `WITHDRAW_FROM_STORAGE` failures within `METHOD_HISTORY_TTL_TICKS = 600`.
+    /// One fresh failure flips the gate and reopens forage/scavenge/fish for
+    /// the remaining TTL. All other dispatchers leave this `false` — SOLO is
+    /// dropped at dispatcher entry so the gate is dormant for solo agents.
+    pub storage_first_available: bool,
     /// Nearest faction storage tile that holds at least one unit of the
     /// `AcquireGood`'s target material. Read by
     /// `WithdrawMaterialFromStorageMethod` (5c-i) to seed the head of an
@@ -1667,6 +1687,14 @@ impl Method for ScavengeFoodFromGroundMethod {
         if !matches!(abstract_task, AbstractTask::AcquireFood) {
             return false;
         }
+        // Storage-first survival food: when reachable, edible faction storage
+        // is available and the worker hasn't just bounced off it, defer to
+        // `WithdrawFromStorageMethod` even if a loose edible sits closer.
+        // One fresh `WITHDRAW_FROM_STORAGE` failure flips the ctx flag false
+        // and this gate reopens for the rest of the 600-tick history TTL.
+        if ctx.storage_first_available {
+            return false;
+        }
         ctx.scavenge_target_entity.is_some()
             && ctx.scavenge_target_tile.is_some()
             && ctx.hunger >= EAT_TRIGGER_HUNGER as f32
@@ -2368,6 +2396,11 @@ impl Method for ForageFromKnownMethod {
         if !matches!(abstract_task, AbstractTask::AcquireFood) {
             return false;
         }
+        // Storage-first: defer to reachable storage when available (see
+        // `ScavengeFoodFromGroundMethod` for rationale).
+        if ctx.storage_first_available {
+            return false;
+        }
         ctx.gather_target_tile.is_some() && ctx.gather_target_valid
     }
 
@@ -2471,7 +2504,11 @@ pub struct FishForImmediateFoodMethod;
 
 impl Method for FishForImmediateFoodMethod {
     fn precondition(&self, abstract_task: AbstractTask, ctx: &PlannerCtx) -> bool {
-        matches!(abstract_task, AbstractTask::AcquireFood) && ctx.fish_spot_tile.is_some()
+        // Storage-first: defer to reachable storage when available (see
+        // `ScavengeFoodFromGroundMethod` for rationale).
+        matches!(abstract_task, AbstractTask::AcquireFood)
+            && ctx.fish_spot_tile.is_some()
+            && !ctx.storage_first_available
     }
 
     fn utility(&self, _abstract_task: AbstractTask, ctx: &PlannerCtx) -> f32 {
@@ -3655,6 +3692,7 @@ pub fn htn_sleep_dispatch_system(
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -3891,6 +3929,7 @@ pub fn htn_eat_dispatch_system(
                 // toward storage.
                 nearest_storage_tile: None,
                 faction_food_stock: 0,
+                storage_first_available: false,
                 // 5c-i material-storage fields. Eat doesn't consume them.
                 material_storage_tile: None,
                 material_stock_for_target: 0,
@@ -4049,6 +4088,7 @@ pub fn htn_acquire_food_dispatch_system(
             &LodLevel,
             Option<&crate::simulation::reproduction::HouseholdMember>,
             &crate::simulation::memory::CurrentVision,
+            Option<&crate::simulation::tools::ToolKit>,
         ),
         Without<Drafted>,
     >,
@@ -4073,6 +4113,7 @@ pub fn htn_acquire_food_dispatch_system(
             lod,
             household_member,
             current_vision,
+            toolkit,
         )| {
             if *lod == LodLevel::Dormant {
                 return;
@@ -4264,8 +4305,8 @@ pub fn htn_acquire_food_dispatch_system(
             // another agent already pressured the tile so the cluster
             // mutex still spreads workers.
             let underfoot = nearest_mature_plant_under_agent(
-                &plant_map,
-                &plant_query,
+                &gk.plant_map,
+                &gk.plant_q,
                 |k| matches!(k, PlantKind::Grain | PlantKind::BerryBush),
                 (cur_tx, cur_ty),
                 2,
@@ -4327,13 +4368,16 @@ pub fn htn_acquire_food_dispatch_system(
                 GrowthStage,
                 Option<crate::simulation::plant_catalog::PlantSpeciesId>,
             )> {
-                plant_query.get(e).ok().map(|p| {
+                gk.plant_q.get(e).ok().map(|p| {
                     let species = gk.plant_species_q.get(e).ok().map(|s| s.id());
                     (p.kind, p.stage, species)
                 })
             };
             let item_lookup_food = |e: Entity| -> Option<(crate::economy::resource_catalog::ResourceId, u32)> {
                 item_query.get(e).ok().map(|gi| (gi.item.resource_id, gi.qty))
+            };
+            let has_tool_food = |form: crate::simulation::tools::ToolForm| -> bool {
+                toolkit.map(|tk| tk.has_form(form)).unwrap_or(false)
             };
             let gather_target_valid = match gather_target_tile {
                 None => true,
@@ -4345,8 +4389,23 @@ pub fn htn_acquire_food_dispatch_system(
                     &chunk_map,
                     &spatial_index,
                     item_lookup_food,
+                    calendar.season,
+                    has_tool_food,
                 ),
             };
+            // Storage-first survival food: if reachable faction storage holds
+            // edibles and the worker hasn't just bounced off a withdraw, the
+            // other AcquireFood concretes (Scavenge / Forage / Fish) gate off
+            // via `storage_first_available` so the closer wild target can't
+            // beat the storage path on raw `dist_penalty`. One fresh
+            // `WITHDRAW_FROM_STORAGE` failure within the 600-tick TTL flips
+            // this back to false and reopens fallback methods.
+            let storage_first_available = nearest_storage_tile.is_some()
+                && faction_food_stock > 0
+                && history.recently_failed_count(
+                    MethodId::WITHDRAW_FROM_STORAGE,
+                    now,
+                ) < STORAGE_FIRST_RECENT_FAILURE_LIMIT;
             let ctx = PlannerCtx {
                 scope: context_aware_scope(&calendar, needs),
                 tile: (cur_tx, cur_ty),
@@ -4358,6 +4417,7 @@ pub fn htn_acquire_food_dispatch_system(
                 hunger: needs.hunger,
                 nearest_storage_tile,
                 faction_food_stock,
+                storage_first_available,
                 // 5c-i material-storage fields. AcquireFood doesn't consume them.
                 material_storage_tile: None,
                 material_stock_for_target: 0,
@@ -5047,6 +5107,10 @@ pub fn htn_acquire_good_dispatch_system(
                 };
                 let gather_target_valid = match gather_target_tile {
                     None => true,
+                    // AcquireGood targets named resources (wood, stone, fiber, …);
+                    // `memory_kind` is never `AnyEdible`, so the season / tool
+                    // gates aren't consulted by the validator's relevant branches.
+                    // Pass permissive defaults to keep the call shape consistent.
                     Some(t) => crate::simulation::gather::is_target_still_valid(
                         t,
                         memory_kind,
@@ -5055,6 +5119,8 @@ pub fn htn_acquire_good_dispatch_system(
                         &chunk_map,
                         &spatial,
                         item_lookup,
+                        calendar.season,
+                        |_| true,
                     ),
                 };
                 let ctx = PlannerCtx {
@@ -5068,6 +5134,7 @@ pub fn htn_acquire_good_dispatch_system(
                     hunger: 0.0,
                     nearest_storage_tile: None,
                     faction_food_stock: 0,
+                    storage_first_available: false,
                     material_storage_tile: None,
                     material_stock_for_target: 0,
                     claimed_blueprint: None,
@@ -5457,6 +5524,7 @@ pub fn htn_acquire_good_dispatch_system(
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: Some(storage_tile),
             material_stock_for_target: best_tile_stock,
             claimed_blueprint: Some(blueprint),
@@ -5627,11 +5695,10 @@ pub fn htn_stockpile_food_dispatch_system(
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
     clock: Res<SimClock>,
-    plant_map: Res<PlantMap>,
+    calendar: Res<Calendar>,
     gather_claims: Res<GatherClaims>,
     gk: crate::simulation::shared_knowledge::GatherKnowledge,
     item_query: Query<&crate::simulation::items::GroundItem>,
-    plant_query: Query<&Plant>,
     mut query: Query<
         (
             Entity,
@@ -5647,6 +5714,7 @@ pub fn htn_stockpile_food_dispatch_system(
             Option<&crate::simulation::reproduction::HouseholdMember>,
             &crate::simulation::memory::CurrentVision,
             &Profession,
+            Option<&crate::simulation::tools::ToolKit>,
         ),
         (
             Without<Drafted>,
@@ -5684,6 +5752,7 @@ pub fn htn_stockpile_food_dispatch_system(
             household_member,
             current_vision,
             profession,
+            toolkit,
         )| {
             if *lod == LodLevel::Dormant {
                 return;
@@ -5813,15 +5882,15 @@ pub fn htn_stockpile_food_dispatch_system(
             let viewer_household = household_member.map(|h| h.household_id);
             let viewer_settlement = gk.settlement_map.first_for_faction(member.faction_id);
             let underfoot = nearest_mature_plant_under_agent(
-                &plant_map,
-                &plant_query,
+                &gk.plant_map,
+                &gk.plant_q,
                 |k| matches!(k, PlantKind::Grain | PlantKind::BerryBush),
                 (cur_tx, cur_ty),
                 2,
             )
             .filter(|(t, _)| gather_claims.pressure(*t, now, actor) == 0)
             .and_then(|(tile, entity)| {
-                let plant = plant_query.get(entity).ok()?;
+                let plant = gk.plant_q.get(entity).ok()?;
                 let (id, _) = plant.kind.harvest_yield(false);
                 Some((tile, id))
             });
@@ -5843,8 +5912,8 @@ pub fn htn_stockpile_food_dispatch_system(
                     reach_from_agent,
                 )
                 .and_then(|tile| {
-                    let entity = plant_map.0.get(&tile).copied()?;
-                    let plant = plant_query.get(entity).ok()?;
+                    let entity = gk.plant_map.0.get(&tile).copied()?;
+                    let plant = gk.plant_q.get(entity).ok()?;
                     let (id, _) = plant.kind.harvest_yield(false);
                     Some((tile, id))
                 });
@@ -5859,8 +5928,8 @@ pub fn htn_stockpile_food_dispatch_system(
                     now,
                 )
                 .and_then(|tile| {
-                    let entity = plant_map.0.get(&tile).copied()?;
-                    let plant = plant_query.get(entity).ok()?;
+                    let entity = gk.plant_map.0.get(&tile).copied()?;
+                    let plant = gk.plant_q.get(entity).ok()?;
                     if plant.stage != GrowthStage::Mature {
                         return None;
                     }
@@ -5893,7 +5962,7 @@ pub fn htn_stockpile_food_dispatch_system(
                 GrowthStage,
                 Option<crate::simulation::plant_catalog::PlantSpeciesId>,
             )> {
-                plant_query.get(e).ok().map(|p| {
+                gk.plant_q.get(e).ok().map(|p| {
                     let species = gk.plant_species_q.get(e).ok().map(|s| s.id());
                     (p.kind, p.stage, species)
                 })
@@ -5901,16 +5970,21 @@ pub fn htn_stockpile_food_dispatch_system(
             let item_lookup_sf = |e: Entity| -> Option<(crate::economy::resource_catalog::ResourceId, u32)> {
                 item_query.get(e).ok().map(|gi| (gi.item.resource_id, gi.qty))
             };
+            let has_tool_sf = |form: crate::simulation::tools::ToolForm| -> bool {
+                toolkit.map(|tk| tk.has_form(form)).unwrap_or(false)
+            };
             let gather_target_valid = match gather_target_tile {
                 None => true,
                 Some(t) => crate::simulation::gather::is_target_still_valid(
                     t,
                     MemoryKind::AnyEdible,
-                    &plant_map,
+                    &gk.plant_map,
                     plant_lookup_sf,
                     &chunk_map,
                     &spatial_index,
                     item_lookup_sf,
+                    calendar.season,
+                    has_tool_sf,
                 ),
             };
 
@@ -5944,6 +6018,7 @@ pub fn htn_stockpile_food_dispatch_system(
                 hunger: 0.0,
                 nearest_storage_tile: None,
                 faction_food_stock: 0,
+                storage_first_available: false,
                 material_storage_tile: None,
                 material_stock_for_target: 0,
                 claimed_blueprint: None,
@@ -6392,6 +6467,7 @@ pub fn htn_equip_hunting_spear_dispatch_system(
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: Some(storage_tile),
             material_stock_for_target: best_tile_stock,
             claimed_blueprint: None,
@@ -6603,6 +6679,7 @@ pub fn htn_scout_dispatch_system(
                 hunger: 0.0,
                 nearest_storage_tile: None,
                 faction_food_stock: 0,
+                storage_first_available: false,
                 material_storage_tile: None,
                 material_stock_for_target: 0,
                 claimed_blueprint: None,
@@ -6822,6 +6899,7 @@ pub fn htn_return_surplus_dispatch_system(
                 hunger: 0.0,
                 nearest_storage_tile: Some(storage_tile),
                 faction_food_stock: 0,
+                storage_first_available: false,
                 material_storage_tile: None,
                 material_stock_for_target: 0,
                 claimed_blueprint: None,
@@ -7072,6 +7150,7 @@ pub fn htn_tame_animal_dispatch_system(
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -7775,6 +7854,7 @@ pub fn htn_plant_from_storage_dispatch_system(
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: Some(storage_tile),
             material_stock_for_target: best_tile_stock,
             claimed_blueprint: None,
@@ -8406,6 +8486,7 @@ pub fn htn_build_claimed_blueprint_dispatch_system(
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile,
             material_stock_for_target,
             claimed_blueprint: Some(bp_entity),
@@ -8670,6 +8751,7 @@ pub fn htn_deliver_hunt_kill_dispatch_system(
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -8995,6 +9077,7 @@ pub fn htn_engage_prey_dispatch_system(
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -9260,6 +9343,7 @@ pub fn htn_join_hunt_party_dispatch_system(
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -9488,6 +9572,7 @@ pub fn htn_socialize_dispatch_system(
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -9739,6 +9824,7 @@ pub fn htn_combat_faction_dispatch_system(
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -10259,6 +10345,7 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: Some((stx, sty)),
             material_stock_for_target: tile_stock,
             claimed_blueprint: None,
@@ -10539,6 +10626,7 @@ pub fn htn_work_on_craft_order_dispatch_system(
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -10873,6 +10961,7 @@ pub fn htn_harvest_grain_for_craft_order_dispatch_system(
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -11200,8 +11289,8 @@ pub fn htn_harvest_plant_dispatch_system(
                     now,
                 )
                 .and_then(|tile| {
-                    let entity = plant_map.0.get(&tile).copied()?;
-                    let plant = plant_query.get(entity).ok()?;
+                    let entity = gk.plant_map.0.get(&tile).copied()?;
+                    let plant = gk.plant_q.get(entity).ok()?;
                     if plant.stage != GrowthStage::Mature {
                         return None;
                     }
@@ -11227,6 +11316,7 @@ pub fn htn_harvest_plant_dispatch_system(
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -11947,6 +12037,7 @@ pub fn htn_play_dispatch_system(
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -12464,6 +12555,7 @@ mod tests {
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -12514,6 +12606,7 @@ mod tests {
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -12564,6 +12657,7 @@ mod tests {
             hunger,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -12618,6 +12712,7 @@ mod tests {
             hunger,
             nearest_storage_tile: storage_tile,
             faction_food_stock: food_stock,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -12671,6 +12766,7 @@ mod tests {
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: storage_tile,
             material_stock_for_target: material_stock,
             claimed_blueprint: None,
@@ -12734,6 +12830,7 @@ mod tests {
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: storage_tile,
             material_stock_for_target: material_stock,
             claimed_blueprint: blueprint,
@@ -13097,6 +13194,7 @@ mod tests {
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -13275,6 +13373,7 @@ mod tests {
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -13489,6 +13588,7 @@ mod tests {
             hunger,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -13740,6 +13840,7 @@ mod tests {
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -14416,6 +14517,7 @@ mod tests {
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,
@@ -15050,6 +15152,7 @@ mod tests {
             hunger: 0.0,
             nearest_storage_tile: None,
             faction_food_stock: 0,
+            storage_first_available: false,
             material_storage_tile: None,
             material_stock_for_target: 0,
             claimed_blueprint: None,

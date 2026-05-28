@@ -1103,6 +1103,16 @@ pub fn faction_craft_order_system(
     }
 }
 
+/// Routing resources bundled together so `craft_order_system` stays under
+/// Bevy's 16-tuple `IntoSystem` ceiling once the ground-spill query is added.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct CraftOrderRouting<'w> {
+    pub chunk_map: Res<'w, crate::world::chunk::ChunkMap>,
+    pub chunk_graph: Res<'w, crate::pathfinding::chunk_graph::ChunkGraph>,
+    pub chunk_router: Res<'w, crate::pathfinding::chunk_router::ChunkRouter>,
+    pub chunk_connectivity: Res<'w, crate::pathfinding::connectivity::ChunkConnectivity>,
+}
+
 /// Hauler/worker resolution for `CraftOrder`s. Mirrors `construction_system`:
 ///   • `TaskKind::HaulToCraftOrder` — drops matching held goods into the
 ///     order's deposit slots and returns to Idle the same tick.
@@ -1117,10 +1127,7 @@ pub fn craft_order_system(
     mut job_completed: EventWriter<JobCompletedEvent>,
     mut activity_log: EventWriter<crate::ui::activity_log::ActivityLogEvent>,
     storage_tile_map: Res<crate::simulation::faction::StorageTileMap>,
-    chunk_map: Res<crate::world::chunk::ChunkMap>,
-    chunk_graph: Res<crate::pathfinding::chunk_graph::ChunkGraph>,
-    chunk_router: Res<crate::pathfinding::chunk_router::ChunkRouter>,
-    chunk_connectivity: Res<crate::pathfinding::connectivity::ChunkConnectivity>,
+    routing: CraftOrderRouting,
     mut order_query: Query<&mut CraftOrder>,
     member_query: Query<&FactionMember>,
     mut agent_query: Query<(
@@ -1140,6 +1147,7 @@ pub fn craft_order_system(
     )>,
     spatial_index: Res<crate::world::spatial::SpatialIndex>,
     stand_reservations: Res<crate::simulation::stand_reservation::StandTileReservations>,
+    mut ground_item_q: Query<&mut crate::simulation::items::GroundItem>,
 ) {
     let mut order_haulers: AHashMap<Entity, Vec<(Entity, [u32; MAX_CRAFT_INPUTS])>> =
         AHashMap::new();
@@ -1261,8 +1269,11 @@ pub fn craft_order_system(
     // (agent_entity, resource_id, qty_to_remove)
     let mut good_removals: Vec<(Entity, crate::economy::resource_catalog::ResourceId, u32)> =
         Vec::new();
-    // (agent_entity, recipe_id, tech_payload) — paid out as inventory at end of pass.
-    let mut output_grants: Vec<(Entity, u8, Option<TechId>)> = Vec::new();
+    // (agent_entity, recipe_id, tech_payload, anchor_tile) — paid out at end of
+    // pass. Anchor tile snapshotted here so the post-despawn ground-spill path
+    // (hands → inventory → ground) still has somewhere to drop output that
+    // doesn't fit in the lead worker's hands or inventory.
+    let mut output_grants: Vec<(Entity, u8, Option<TechId>, (i32, i32))> = Vec::new();
     // Job board credits to apply (recipe, qty) per worker entity.
     let mut order_completion_credits: Vec<(Entity, u8, u32)> = Vec::new();
 
@@ -1347,7 +1358,12 @@ pub fn craft_order_system(
                 .get(&order_entity)
                 .and_then(|v| v.first().map(|(e, _)| *e));
             if let Some(lead_e) = lead {
-                output_grants.push((lead_e, order.recipe_id, order.tech_payload));
+                output_grants.push((
+                    lead_e,
+                    order.recipe_id,
+                    order.tech_payload,
+                    order.anchor_tile,
+                ));
                 order_completion_credits.push((lead_e, order.recipe_id, recipe.output_qty));
                 let faction_id = member_query.get(lead_e).map(|m| m.faction_id).unwrap_or(0);
                 activity_log.send(crate::ui::activity_log::ActivityLogEvent {
@@ -1416,7 +1432,7 @@ pub fn craft_order_system(
         }
 
         // Output payout & job credit for the lead worker on completed orders.
-        for &(ae, recipe_id, tech_payload) in &output_grants {
+        for &(ae, recipe_id, tech_payload, anchor_tile) in &output_grants {
             if ae != entity {
                 continue;
             }
@@ -1437,7 +1453,28 @@ pub fn craft_order_system(
             // partitions tablets-of-tech-A from tablets-of-tech-B in
             // inventories and ground-item piles.
             output_item.tech_payload = tech_payload;
-            agent.add_item(output_item, recipe.output_qty);
+            // Hands → inventory → ground cascade. Bulky outputs (Two-Hand cart
+            // parts, One-Hand armor) overflow `EconomicAgent.add_item`'s
+            // per-bucket volume cap; without the spill the unit silently
+            // vanishes and the trailing DepositToFactionStorage leg walks
+            // empty-handed to storage.
+            let mut remaining = recipe.output_qty;
+            let after_hands = carrier.try_pick_up(output_item, remaining);
+            remaining = after_hands;
+            if remaining > 0 {
+                remaining = agent.add_item(output_item, remaining);
+            }
+            if remaining > 0 {
+                crate::simulation::items::spawn_or_merge_ground_item_full(
+                    &mut commands,
+                    &spatial_index,
+                    &mut ground_item_q,
+                    anchor_tile.0,
+                    anchor_tile.1,
+                    output_item,
+                    remaining,
+                );
+            }
             // Phase 5b: deliberate-practice multiplier for apprentices.
             let xp = crate::simulation::apprenticeship::xp_with_apprentice_bonus(
                 recipe.crafting_xp,
@@ -1494,10 +1531,27 @@ pub fn craft_order_system(
             // crafted output goods from inventory on arrival. Hauler chains
             // (5e-xi-a) end at HaulToCraftOrder with no trailing deposit, so
             // this branch only fires for completed workers.
-            if matches!(
-                aq.current,
-                crate::simulation::typed_task::Task::DepositToFactionStorage { .. }
-            ) {
+            if let Some(deposit_rid) = aq.current.as_deposit_to_faction_storage() {
+                // Non-lead workers in a multi-worker order queued the same
+                // `DepositToFactionStorage` tail as the lead, but only the
+                // lead received the output. Walking to storage empty-handed
+                // burns a chain leg for no work. Cancel here so the next HTN
+                // tick re-dispatches them on something useful. Also catches
+                // the defensive case where the lead's hands + inventory +
+                // ground spill all failed (won't happen — ground spill is
+                // unbounded — but cheap).
+                let carrying = carrier.quantity_of_resource(deposit_rid)
+                    + agent.quantity_of_resource(deposit_rid);
+                if carrying == 0 {
+                    // Clear `active_method` before tearing the chain down so
+                    // `htn_method_completion_system` doesn't observe the
+                    // current=Idle/queued-empty/active_method=Some shape next
+                    // tick and record a phantom `Success`. See
+                    // simulation/CLAUDE.md → Task failure protocol.
+                    ai.active_method = None;
+                    aq.cancel_chain(&mut ai);
+                    continue;
+                }
                 use crate::world::chunk::{ChunkCoord, CHUNK_SIZE};
                 use crate::world::terrain::TILE_SIZE;
                 let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
@@ -1517,24 +1571,26 @@ pub fn craft_order_system(
                         TaskKind::DepositResource,
                         None,
                         None,
-                        &chunk_graph,
-                        &chunk_router,
-                        &chunk_map,
-                        &chunk_connectivity,
+                        &routing.chunk_graph,
+                        &routing.chunk_router,
+                        &routing.chunk_map,
+                        &routing.chunk_connectivity,
                         &spatial_index,
                         &stand_reservations,
                         entity,
                         clock.tick,
                 );
                     if !dispatched {
-                        aq.cancel();
+                        ai.active_method = None;
+                        aq.cancel_chain(&mut ai);
                     }
                 } else {
                     // No faction storage — drop the chain. Output stays in
                     // inventory until something else evicts it (matches the
                     // legacy plan's silent degradation when storage is
                     // unreachable).
-                    aq.cancel();
+                    ai.active_method = None;
+                    aq.cancel_chain(&mut ai);
                 }
             }
         } else if slice_candidates.contains(&entity)
