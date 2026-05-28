@@ -23,6 +23,7 @@ use crate::simulation::technology::{
     PERM_SETTLEMENT, PORTABLE_DWELLINGS, PROFESSIONAL_ARMY, SACRED_RITUAL, TECH_TREE, WELL_DIGGING,
 };
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE, Z_MAX, Z_MIN};
+use crate::world::globe::Globe;
 use crate::world::seasons::{Calendar, Season};
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
 use crate::world::tile::{TileData, TileKind};
@@ -3491,6 +3492,9 @@ fn seed_apply_intent(
     used: &mut AHashSet<(i32, i32)>,
     doormat: &mut crate::simulation::doormat::DoormatReservations,
     road_carve: &mut RoadCarveQueue,
+    seed_reservation: &mut crate::simulation::seed_reservation::SeedReservation,
+    globe: &Globe,
+    structure_index: &StructureIndex,
     faction_id: u32,
     home: (i32, i32),
     intent: BuildIntent,
@@ -3505,6 +3509,54 @@ fn seed_apply_intent(
     hearth_role: HearthRole,
 ) -> Option<(i32, i32)> {
     match intent {
+        BuildIntent::Single(BuildSiteKind::Well) => {
+            // Wells own a 5×5 footprint. Route through the shared seed-time
+            // search so the centre lands on a 5×5-clear tile AND the aquifer
+            // resolves to a buildable shaft. Original `surf - 3` constant is
+            // gone — `find_seed_well_site` returns the live `WellSpec`. We
+            // pass `brain: None` so the search ignores planned road tiles —
+            // `road_carve_system` consults `WellMap` and detours around the
+            // stamped 5×5 disc, so a footprint that overlaps a planned spine
+            // is harmless once the well is in place.
+            let _ = brain; // intentionally unused at seed-time well stamp
+            let empty_bp_map = BlueprintMap::default();
+            let empty_well_site_map = crate::simulation::well::WellSiteMap::default();
+            let ctx = crate::simulation::well::WellPlacementCtx {
+                structure_index,
+                bp_map: &empty_bp_map,
+                well_map: &maps.well_map,
+                well_site_map: &empty_well_site_map,
+                doormat: Some(doormat),
+                seed_reservation: Some(seed_reservation),
+                brain: None,
+                chunk_map: Some(chunk_map),
+                used: Some(used),
+                self_bp: None,
+            };
+            // Wider search than the runtime default — at seed time the
+            // dense civic build-up around home leaves many of the inner
+            // tiles in `used`, and the runtime picker only re-evaluates
+            // the anchor (not the disc) so we may need to walk outward
+            // for an unused 5×5 site.
+            let (center, spec) = crate::simulation::well::find_seed_well_site(
+                tile, &ctx, globe, chunk_map, 16,
+            )?;
+            crate::simulation::well::stamp_seeded_well(
+                commands,
+                chunk_map,
+                &mut maps.well_map,
+                &mut maps.wall_map,
+                &mut maps.runtime_water,
+                seed_reservation,
+                tile_changed,
+                used,
+                faction_id,
+                center,
+                spec,
+                seed_techs,
+            );
+            Some(center)
+        }
         BuildIntent::Single(kind) => {
             // Seed candidate generation is intentionally shared with the
             // runtime chief and cannot see the per-faction `used` set. If the
@@ -4462,6 +4514,7 @@ pub fn road_carve_system(
     mut chunk_map: ResMut<ChunkMap>,
     bp_map: Res<BlueprintMap>,
     bed_map: Res<BedMap>,
+    well_map: Res<WellMap>,
     plot_index: Res<crate::simulation::land::PlotIndex>,
     plant_map: Res<crate::simulation::plants::PlantMap>,
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
@@ -4474,12 +4527,26 @@ pub fn road_carve_system(
 
     // Helper: write a single tile as Road if it's writable + not blueprinted /
     // bedded / farm-protected. Returns true if the tile was actually flipped.
+    // A tile sits inside a well's 5×5 footprint iff its chebyshev distance
+    // to any registered well centre is `≤ 2`. The seed-time stamp pre-loads
+    // `WellMap` so this gate fires before the in-chain road carve reaches the
+    // 9 inner-helix tiles that haven't yet been excavated by
+    // `carve_seeded_wells_system`.
+    let in_well_footprint = |tile: (i32, i32)| -> bool {
+        well_map
+            .0
+            .keys()
+            .any(|c| (c.0 - tile.0).abs() <= 2 && (c.1 - tile.1).abs() <= 2)
+    };
     let try_write_road =
         |chunk_map: &mut ChunkMap,
          tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
          tile: (i32, i32)|
          -> bool {
-            if bp_map.0.contains_key(&tile) || bed_map.0.contains_key(&tile) {
+            if bp_map.0.contains_key(&tile)
+                || bed_map.0.contains_key(&tile)
+                || in_well_footprint(tile)
+            {
                 return false;
             }
             let surf_z = chunk_map.surface_z_at(tile.0, tile.1);
@@ -7213,43 +7280,16 @@ fn spawn_seeded_structure_at_tile(
                 .id();
             maps.monument_map.0.insert(tile, e);
         }
+        // Wells take a dedicated path (`well::stamp_seeded_well` via
+        // `seed_apply_intent`) because they need an aquifer-resolved
+        // `WellSpec` plus a footprint-aware placement search. Reaching this
+        // branch means a caller bypassed that route — drop without stamping.
         BuildSiteKind::Well => {
-            // Seed wells are pre-existing infrastructure — skip the multi-phase
-            // worker pipeline and stamp a finished, water-bearing well: charge
-            // the physical `RuntimeWater` column so the well is drinkable from
-            // tick 0. The visible stepwell shaft + helix are carved by the
-            // OnEnter `well::carve_seeded_wells_system` pass (it has the
-            // `WorldGen`/`Globe` the carve primitive needs); depth here stays a
-            // fixed shallow `surf - 3` seed simplification rather than an
-            // aquifer-derived `well_spec_at` resolve.
-            let surf = _chunk_map.surface_z_at(tile.0, tile.1).clamp(-16, 15) as i8;
-            let bottom_z = (surf as i32 - 3).clamp(-16, 15) as i8;
-            maps.runtime_water.set(
-                tile,
-                crate::world::water_runtime::RuntimeWaterCell {
-                    ground_z: bottom_z,
-                    depth: 2.0,
-                    reservoir_id: u32::MAX,
-                    salinity: 0.0,
-                    source_rate: crate::world::water_runtime::AQUIFER_SEEP_RATE,
-                },
+            debug_assert!(
+                false,
+                "BuildSiteKind::Well must route through well::stamp_seeded_well"
             );
-            let e = commands
-                .spawn((
-                    Well {
-                        faction_id,
-                        shaft_tile: tile,
-                        bottom_z,
-                        surf_z: surf,
-                    },
-                    StructureLabel(BuildSiteKind::Well.label()),
-                    Transform::from_xyz(world_pos.x, world_pos.y, 0.35),
-                    GlobalTransform::default(),
-                    Visibility::Visible,
-                    InheritedVisibility::default(),
-                ))
-                .id();
-            maps.well_map.0.insert(tile, e);
+            return;
         }
         // Wall and Door are placed by `seed_perimeter`, not here.
         _ => return,
@@ -7281,6 +7321,8 @@ pub fn seed_starting_buildings_system(
     options: Res<crate::GameStartOptions>,
     mut doormat_reservations: ResMut<crate::simulation::doormat::DoormatReservations>,
     mut road_carve_queue: ResMut<RoadCarveQueue>,
+    mut seed_reservation: ResMut<crate::simulation::seed_reservation::SeedReservation>,
+    globe: Res<Globe>,
     brains: Res<crate::simulation::organic_settlement::SettlementBrains>,
     settlement_map: Res<crate::simulation::settlement::SettlementMap>,
     structure_index: Res<StructureIndex>,
@@ -7530,6 +7572,9 @@ pub fn seed_starting_buildings_system(
                     &mut used,
                     &mut doormat_reservations,
                     &mut road_carve_queue,
+                    &mut seed_reservation,
+                    &globe,
+                    &structure_index,
                     faction_id,
                     home,
                     candidate.intent,

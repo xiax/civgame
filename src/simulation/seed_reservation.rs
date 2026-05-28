@@ -31,7 +31,7 @@
 use ahash::AHashSet;
 use bevy::prelude::*;
 
-use crate::simulation::construction::{RoadCarveQueue, StructureIndex};
+use crate::simulation::construction::{RoadCarveQueue, StructureIndex, WellMap};
 use crate::simulation::doormat::DoormatReservations;
 use crate::simulation::organic_settlement::SettlementBrains;
 
@@ -126,6 +126,7 @@ pub fn populate_seed_reservation_system(
     doormat: Res<DoormatReservations>,
     road_queue: Res<RoadCarveQueue>,
     brains: Res<SettlementBrains>,
+    well_map: Res<WellMap>,
     mut reservation: ResMut<SeedReservation>,
 ) {
     reservation.reserve_iter(structure_index.0.keys().copied());
@@ -135,6 +136,16 @@ pub fn populate_seed_reservation_system(
     }
     for &(_faction_id, from, to) in road_queue.0.iter() {
         rasterize_line_into(&mut reservation, from, to);
+    }
+    // Every well owns a 5×5 stepwell footprint, but only the centre tile sits
+    // in `StructureIndex` (the wellhead carries the `StructureLabel`). The
+    // remaining 24 tiles — outer-ring lining walls and the inner helix —
+    // must still reject wild-plant scatter and late-streamed obstacle
+    // clearing. The seed-time stamp inserts these into the reservation
+    // inline; this loop is the backstop for restamped / runtime-finalised
+    // wells that didn't go through `stamp_seeded_well`.
+    for &center in well_map.0.keys() {
+        reservation.reserve_iter(crate::simulation::well::well_footprint(center));
     }
 }
 

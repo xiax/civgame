@@ -167,6 +167,21 @@ pub fn well_footprint(center: (i32, i32)) -> Vec<(i32, i32)> {
     tiles
 }
 
+/// True if a well centred on `center` would have any of its 25 footprint
+/// tiles overlap any *other* well's footprint or any in-progress
+/// [`WellSite`]'s footprint. Two 5×5 wells overlap iff their centres are
+/// within chebyshev 4 of one another.
+pub fn well_footprint_overlaps_existing(
+    center: (i32, i32),
+    well_map: &crate::simulation::construction::WellMap,
+    well_site_map: &WellSiteMap,
+) -> bool {
+    let in_range = |other: &(i32, i32)| {
+        (center.0 - other.0).abs() <= 4 && (center.1 - other.1).abs() <= 4
+    };
+    well_map.0.keys().any(in_range) || well_site_map.0.keys().any(in_range)
+}
+
 /// Reconstruct the excavation [`WellSpec`] from a finished [`Well`]. `Well`
 /// stores `surf_z` + `bottom_z`; the helix length is exactly their difference.
 pub fn well_spec_of(well: &Well) -> WellSpec {
@@ -264,6 +279,282 @@ use crate::world::chunk_streaming::{ChunkLoadedEvent, TileChangedEvent};
 use crate::world::terrain::{tile_to_world, WorldGen};
 use crate::world::water_runtime::{RuntimeWater, RuntimeWaterCell, AQUIFER_SEEP_RATE};
 
+/// Why a candidate 5×5 well placement was rejected. Used at the seed-time
+/// search so the next anchor can be tried, and surfaced at the runtime
+/// blueprint converter for debug logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WellPlacementBlock {
+    OverlapsExistingWell,
+    OverlapsStructure,
+    OverlapsBlueprint,
+    OverlapsDoormat,
+    OverlapsRoad,
+    OverlapsSeedReservation,
+    OverlapsUsedSeedTile,
+    BlockedByTile,
+}
+
+/// Bundle of every map a well-placement validator consults. A `None` field
+/// means "this caller doesn't have that map at hand," skipping the
+/// corresponding check (e.g. the runtime blueprint converter does not
+/// resolve a [`SettlementBrain`]).
+#[derive(Copy, Clone)]
+pub struct WellPlacementCtx<'a> {
+    pub structure_index: &'a StructureIndex,
+    pub bp_map: &'a BlueprintMap,
+    pub well_map: &'a WellMap,
+    pub well_site_map: &'a WellSiteMap,
+    pub doormat: Option<&'a crate::simulation::doormat::DoormatReservations>,
+    pub seed_reservation:
+        Option<&'a crate::simulation::seed_reservation::SeedReservation>,
+    pub brain: Option<&'a crate::simulation::organic_settlement::SettlementBrain>,
+    pub chunk_map: Option<&'a ChunkMap>,
+    pub used: Option<&'a AHashSet<(i32, i32)>>,
+    /// Blueprint entity for the candidate being validated, if any. Lets the
+    /// runtime converter pass its own `bp_map` entry without self-rejecting.
+    pub self_bp: Option<Entity>,
+}
+
+/// Canonical "is this 5×5 buildable?" check. Walks every footprint tile and
+/// rejects on any of: other-well overlap, structure / blueprint / doormat /
+/// road-corridor collision, seed-reservation membership, or impassable
+/// (Wall/Road) tile underfoot.
+pub fn well_footprint_clear(
+    center: (i32, i32),
+    ctx: &WellPlacementCtx<'_>,
+) -> Result<(), WellPlacementBlock> {
+    if well_footprint_overlaps_existing(center, ctx.well_map, ctx.well_site_map) {
+        return Err(WellPlacementBlock::OverlapsExistingWell);
+    }
+    for tile in well_footprint(center) {
+        if ctx.structure_index.0.contains_key(&tile) {
+            return Err(WellPlacementBlock::OverlapsStructure);
+        }
+        if let Some(&e) = ctx.bp_map.0.get(&tile) {
+            if ctx.self_bp != Some(e) {
+                return Err(WellPlacementBlock::OverlapsBlueprint);
+            }
+        }
+        if let Some(dm) = ctx.doormat {
+            if dm.is_reserved(tile) {
+                return Err(WellPlacementBlock::OverlapsDoormat);
+            }
+        }
+        if let Some(brain) = ctx.brain {
+            if brain.road_tiles.contains(&tile)
+                || brain.road_corridor_tiles.contains(&tile)
+            {
+                return Err(WellPlacementBlock::OverlapsRoad);
+            }
+        }
+        if let Some(rsrv) = ctx.seed_reservation {
+            if rsrv.is_reserved(tile) {
+                return Err(WellPlacementBlock::OverlapsSeedReservation);
+            }
+        }
+        if let Some(used) = ctx.used {
+            if used.contains(&tile) {
+                return Err(WellPlacementBlock::OverlapsUsedSeedTile);
+            }
+        }
+        if let Some(cm) = ctx.chunk_map {
+            if let Some(kind) = cm.tile_kind_at(tile.0, tile.1) {
+                if matches!(
+                    kind,
+                    crate::world::tile::TileKind::Wall
+                        | crate::world::tile::TileKind::Road
+                ) {
+                    return Err(WellPlacementBlock::BlockedByTile);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Default-depth `WellSpec` for callers that need to stamp a well but the
+/// live aquifer can't be resolved (e.g. headless test fixtures with an empty
+/// `HydrologyMap`). Production seed-time always has built hydrology, so the
+/// real path goes through `well_spec_at`.
+pub fn fallback_well_spec(surf_z: i32) -> WellSpec {
+    let depth = MIN_WELL_DEPTH_Z;
+    WellSpec {
+        surf_z: surf_z.clamp(i8::MIN as i32, i8::MAX as i32) as i8,
+        bottom_z: (surf_z - depth).clamp(Z_MIN, i8::MAX as i32) as i8,
+        depth,
+    }
+}
+
+/// Chebyshev-ring search around `anchor` for the first tile where
+/// `well_footprint_clear` passes AND `well_spec_at` resolves to a buildable
+/// shaft. Returns `None` when nothing inside `search_radius` is valid, so the
+/// caller drops the well rather than placing a degenerate one.
+///
+/// Aquifer resolution:
+/// - `Ok(spec)` ⇒ use the live spec (aquifer-driven depth).
+/// - `TooDeep` ⇒ skip the anchor (water table beyond the hand-dug cap; a
+///   different site might still resolve, but this one is unbuildable).
+/// - `Unresolvable` ⇒ fall back to [`fallback_well_spec`]. In production the
+///   `HydrologyMap` is fully populated at seed time, so this branch only
+///   fires for headless test fixtures.
+pub fn find_seed_well_site(
+    anchor: (i32, i32),
+    ctx: &WellPlacementCtx<'_>,
+    globe: &Globe,
+    chunk_map: &ChunkMap,
+    search_radius: i32,
+) -> Option<((i32, i32), WellSpec)> {
+    let try_center = |center: (i32, i32)| -> Option<WellSpec> {
+        if well_footprint_clear(center, ctx).is_err() {
+            return None;
+        }
+        match well_spec_at(globe, chunk_map, center) {
+            WellResult::Ok(spec) => Some(spec),
+            WellResult::TooDeep => None,
+            WellResult::Unresolvable => {
+                let surf_z = chunk_map.surface_z_at(center.0, center.1);
+                if surf_z < Z_MIN {
+                    return None;
+                }
+                Some(fallback_well_spec(surf_z))
+            }
+        }
+    };
+    if let Some(spec) = try_center(anchor) {
+        return Some((anchor, spec));
+    }
+    for r in 1..=search_radius {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx.abs().max(dy.abs()) != r {
+                    continue;
+                }
+                let center = (anchor.0 + dx, anchor.1 + dy);
+                if let Some(spec) = try_center(center) {
+                    return Some((center, spec));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Stamp a finished, water-bearing seeded well at `center` (caller must have
+/// resolved a valid 5×5 site via [`find_seed_well_site`]). Spawns the [`Well`]
+/// entity, charges its `RuntimeWater` shaft column, stamps the outer-ring
+/// lining walls (minus the north gateway) into `WallMap`, and reserves every
+/// footprint tile in both the per-faction `used` set and the
+/// [`SeedReservation`] so the in-chain `road_carve_system` and downstream
+/// plant / obstacle paths route around the structure. The visible shaft and
+/// helix carve runs later in `carve_seeded_wells_system`.
+pub fn stamp_seeded_well(
+    commands: &mut Commands,
+    chunk_map: &mut ChunkMap,
+    well_map: &mut WellMap,
+    wall_map: &mut crate::simulation::construction::WallMap,
+    runtime_water: &mut RuntimeWater,
+    seed_reservation: &mut crate::simulation::seed_reservation::SeedReservation,
+    tile_changed: &mut EventWriter<TileChangedEvent>,
+    used: &mut AHashSet<(i32, i32)>,
+    faction_id: u32,
+    center: (i32, i32),
+    spec: WellSpec,
+    seed_techs: &FactionTechs,
+) {
+    use crate::simulation::construction::{BuildSiteKind, Wall};
+    use crate::world::tile::{TileData, TileKind};
+
+    // 1. Reserve every footprint tile — keeps road carving, parcel
+    // allocation, and downstream wild-plant / obstacle paths off the
+    // 5×5 disc.
+    for tile in well_footprint(center) {
+        used.insert(tile);
+        seed_reservation.reserve(tile);
+    }
+
+    // 2. Charge the central shaft's `RuntimeWater` column. The depth uses
+    // `WELL_INITIAL_CHARGE_Z` (a Z-unit standing column) and the seep rate
+    // uses `AQUIFER_SEEP_RATE` — two separate fields, never summed.
+    runtime_water.set(
+        center,
+        RuntimeWaterCell {
+            ground_z: spec.bottom_z,
+            depth: WELL_INITIAL_CHARGE_Z,
+            reservoir_id: u32::MAX,
+            salinity: 0.0,
+            source_rate: AQUIFER_SEEP_RATE,
+        },
+    );
+
+    // 3. Spawn the finished `Well`.
+    let wp = tile_to_world(center.0, center.1);
+    let e = commands
+        .spawn((
+            Well {
+                faction_id,
+                shaft_tile: center,
+                bottom_z: spec.bottom_z,
+                surf_z: spec.surf_z,
+            },
+            StructureLabel(BuildSiteKind::Well.label()),
+            Transform::from_xyz(wp.x, wp.y, 0.35),
+            GlobalTransform::default(),
+            Visibility::Visible,
+            InheritedVisibility::default(),
+        ))
+        .id();
+    well_map.0.insert(center, e);
+
+    // 4. Stamp the outer-ring lining walls (mirrors
+    // `well_site_progression_system`'s Lining phase but bakes finished walls
+    // directly rather than blueprints). The north gateway tile stays open.
+    let mat = best_wall_material(seed_techs);
+    let gateway = gateway_tile(center);
+    for tile in outer_ring(center) {
+        if tile == gateway || wall_map.0.contains_key(&tile) {
+            continue;
+        }
+        let surf_z = chunk_map.surface_z_at(tile.0, tile.1);
+        chunk_map.set_tile(
+            tile.0,
+            tile.1,
+            surf_z + 1,
+            TileData {
+                kind: TileKind::Wall,
+                elevation: 0,
+                fertility: 0,
+                flags: 0b0001,
+                ore: 0,
+            },
+        );
+        let wp = tile_to_world(tile.0, tile.1);
+        let wall_entity = commands
+            .spawn((
+                Wall {
+                    material: mat,
+                    owner_faction: Some(faction_id),
+                },
+                crate::simulation::combat::Health::new(mat.max_hp()),
+                StructureLabel(mat.label()),
+                Transform::from_xyz(wp.x, wp.y, 0.4),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ))
+            .id();
+        wall_map.0.insert(tile, wall_entity);
+        tile_changed.send(TileChangedEvent {
+            tx: tile.0,
+            ty: tile.1,
+        });
+    }
+
+    tile_changed.send(TileChangedEvent {
+        tx: center.0,
+        ty: center.1,
+    });
+}
+
 /// Spawn a staged `WellSite` and its excavation `TerraformSite`s. Used by every
 /// placement path (manual build, chief/organic, conversion of a placed
 /// `BuildSiteKind::Well` blueprint). Returns the `WellSite` entity.
@@ -328,6 +619,8 @@ pub fn convert_well_blueprint_system(
     mut terraform_map: ResMut<TerraformMap>,
     structure_index: Res<StructureIndex>,
     well_map: Res<WellMap>,
+    doormat: Res<crate::simulation::doormat::DoormatReservations>,
+    seed_reservation: Res<crate::simulation::seed_reservation::SeedReservation>,
     blueprints: Query<(Entity, &Blueprint)>,
 ) {
     for (entity, bp) in blueprints.iter() {
@@ -353,18 +646,26 @@ pub fn convert_well_blueprint_system(
                 commands.entity(entity).despawn();
             }
             WellResult::Ok(spec) => {
-                // Footprint validation — the 5×5 stepwell must not overlap an
-                // existing structure, blueprint, or another well. Manual and
-                // organic placement only check the centre tile, so a well sited
-                // one or two tiles from a hut would carve its helix through the
-                // wall. Reject (despawn the blueprint) exactly like `TooDeep`.
-                let footprint_clear = well_footprint(center).into_iter().all(|t| {
-                    !structure_index.0.contains_key(&t)
-                        && !well_map.0.contains_key(&t)
-                        && !well_site_map.0.contains_key(&t)
-                        && bp_map.0.get(&t).map_or(true, |&e| e == entity)
-                });
-                if !footprint_clear {
+                // Footprint validation through the shared
+                // `well_footprint_clear` predicate so runtime / seed / organic
+                // placement can't diverge on what "5×5 buildable" means.
+                let ctx = WellPlacementCtx {
+                    structure_index: &structure_index,
+                    bp_map: &bp_map,
+                    well_map: &well_map,
+                    well_site_map: &well_site_map,
+                    doormat: Some(&doormat),
+                    seed_reservation: Some(&seed_reservation),
+                    brain: None,
+                    chunk_map: Some(&chunk_map),
+                    used: None,
+                    self_bp: Some(entity),
+                };
+                if let Err(reason) = well_footprint_clear(center, &ctx) {
+                    debug!(
+                        "well blueprint at {:?} rejected: {:?}",
+                        center, reason
+                    );
                     if bp_map.0.get(&center) == Some(&entity) {
                         bp_map.0.remove(&center);
                     }
@@ -816,6 +1117,139 @@ mod tests {
             .resource::<WellSiteMap>()
             .0
             .contains_key(&center));
+    }
+
+    #[test]
+    fn well_footprint_overlap_at_center_distance_3_4_5() {
+        let well_map = WellMap::default();
+        let well_site_map = WellSiteMap::default();
+        let mut wm = well_map;
+        wm.0.insert((0, 0), Entity::PLACEHOLDER);
+        // chebyshev 3 → 5×5 discs share two columns of overlap.
+        assert!(well_footprint_overlaps_existing((3, 0), &wm, &well_site_map));
+        // chebyshev 4 → 5×5 discs share a single column of overlap.
+        assert!(well_footprint_overlaps_existing((4, 0), &wm, &well_site_map));
+        // chebyshev 5 → 5×5 discs are exactly tangent, no overlap.
+        assert!(!well_footprint_overlaps_existing((5, 0), &wm, &well_site_map));
+    }
+
+    fn empty_ctx<'a>(
+        structure_index: &'a StructureIndex,
+        bp_map: &'a BlueprintMap,
+        well_map: &'a WellMap,
+        well_site_map: &'a WellSiteMap,
+    ) -> WellPlacementCtx<'a> {
+        WellPlacementCtx {
+            structure_index,
+            bp_map,
+            well_map,
+            well_site_map,
+            doormat: None,
+            seed_reservation: None,
+            brain: None,
+            chunk_map: None,
+            used: None,
+            self_bp: None,
+        }
+    }
+
+    #[test]
+    fn well_footprint_clear_rejects_existing_well_within_4() {
+        let mut well_map = WellMap::default();
+        well_map.0.insert((0, 0), Entity::PLACEHOLDER);
+        let well_site_map = WellSiteMap::default();
+        let structure_index = StructureIndex::default();
+        let bp_map = BlueprintMap::default();
+        let ctx = empty_ctx(&structure_index, &bp_map, &well_map, &well_site_map);
+        assert_eq!(
+            well_footprint_clear((3, 0), &ctx),
+            Err(WellPlacementBlock::OverlapsExistingWell)
+        );
+        assert!(well_footprint_clear((5, 0), &ctx).is_ok());
+    }
+
+    #[test]
+    fn well_footprint_clear_rejects_structure_in_disc() {
+        let well_map = WellMap::default();
+        let well_site_map = WellSiteMap::default();
+        let bp_map = BlueprintMap::default();
+        let mut structure_index = StructureIndex::default();
+        // A bed two tiles north of the centre — inside the 5×5 disc.
+        structure_index.0.insert((0, -2), Entity::PLACEHOLDER);
+        let ctx = empty_ctx(&structure_index, &bp_map, &well_map, &well_site_map);
+        assert_eq!(
+            well_footprint_clear((0, 0), &ctx),
+            Err(WellPlacementBlock::OverlapsStructure)
+        );
+    }
+
+    #[test]
+    fn well_footprint_clear_self_blueprint_does_not_self_reject() {
+        let well_map = WellMap::default();
+        let well_site_map = WellSiteMap::default();
+        let structure_index = StructureIndex::default();
+        let mut bp_map = BlueprintMap::default();
+        let self_entity = Entity::from_raw(42);
+        bp_map.0.insert((0, 0), self_entity);
+        let mut ctx = empty_ctx(&structure_index, &bp_map, &well_map, &well_site_map);
+        // Without self_bp set, the centre tile blueprint blocks placement.
+        assert_eq!(
+            well_footprint_clear((0, 0), &ctx),
+            Err(WellPlacementBlock::OverlapsBlueprint)
+        );
+        // Caller passes its own entity → self-tolerant.
+        ctx.self_bp = Some(self_entity);
+        assert!(well_footprint_clear((0, 0), &ctx).is_ok());
+    }
+
+    #[test]
+    fn well_footprint_clear_rejects_doormat_in_disc() {
+        use crate::simulation::doormat::{DoormatEntry, DoormatReservations};
+        use crate::simulation::land::TileEdge;
+        let well_map = WellMap::default();
+        let well_site_map = WellSiteMap::default();
+        let structure_index = StructureIndex::default();
+        let bp_map = BlueprintMap::default();
+        let mut doormat = DoormatReservations::default();
+        doormat.0.insert(
+            (1, 1),
+            DoormatEntry {
+                owner_door: Entity::PLACEHOLDER,
+                door_tile: (0, 1),
+                dir: TileEdge::East,
+            },
+        );
+        let mut ctx = empty_ctx(&structure_index, &bp_map, &well_map, &well_site_map);
+        ctx.doormat = Some(&doormat);
+        assert_eq!(
+            well_footprint_clear((0, 0), &ctx),
+            Err(WellPlacementBlock::OverlapsDoormat)
+        );
+    }
+
+    #[test]
+    fn well_footprint_clear_rejects_used_seed_tile() {
+        use ahash::AHashSet;
+        let well_map = WellMap::default();
+        let well_site_map = WellSiteMap::default();
+        let structure_index = StructureIndex::default();
+        let bp_map = BlueprintMap::default();
+        let mut used: AHashSet<(i32, i32)> = AHashSet::default();
+        used.insert((-2, 2));
+        let mut ctx = empty_ctx(&structure_index, &bp_map, &well_map, &well_site_map);
+        ctx.used = Some(&used);
+        assert_eq!(
+            well_footprint_clear((0, 0), &ctx),
+            Err(WellPlacementBlock::OverlapsUsedSeedTile)
+        );
+    }
+
+    #[test]
+    fn fallback_well_spec_uses_min_depth() {
+        let spec = fallback_well_spec(10);
+        assert_eq!(spec.depth, MIN_WELL_DEPTH_Z);
+        assert_eq!(spec.surf_z, 10);
+        assert_eq!(spec.bottom_z, (10 - MIN_WELL_DEPTH_Z) as i8);
     }
 
     #[test]

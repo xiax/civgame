@@ -20232,14 +20232,48 @@ mod onenter_era_seeding {
         trigger_onenter(&mut sim);
 
         let world = sim.app.world();
-        let well_count = world
+        let well_centres: Vec<(i32, i32)> = world
             .resource::<crate::simulation::construction::WellMap>()
             .0
-            .len();
+            .keys()
+            .copied()
+            .collect();
         assert!(
-            well_count >= 1,
+            !well_centres.is_empty(),
             "Neolithic seed stamped zero wells (expected >= 1)"
         );
+
+        // Every seeded well must have its full 5×5 footprint reserved in
+        // `SeedReservation` so wild-plant scatter, late-streamed obstacle
+        // clearing, and any subsequent runtime road carve route around it.
+        let reservation =
+            world.resource::<crate::simulation::seed_reservation::SeedReservation>();
+        let doormat = world.resource::<crate::simulation::doormat::DoormatReservations>();
+        let chunk_map = world.resource::<crate::world::chunk::ChunkMap>();
+        for center in &well_centres {
+            for tile in crate::simulation::well::well_footprint(*center) {
+                assert!(
+                    reservation.is_reserved(tile),
+                    "well footprint tile {:?} for centre {:?} missing from SeedReservation",
+                    tile,
+                    center
+                );
+                assert!(
+                    !doormat.0.contains_key(&tile),
+                    "well footprint tile {:?} for centre {:?} overlaps a doormat",
+                    tile,
+                    center
+                );
+                if let Some(kind) = chunk_map.tile_kind_at(tile.0, tile.1) {
+                    assert!(
+                        kind != crate::world::tile::TileKind::Road,
+                        "well footprint tile {:?} for centre {:?} ended up as Road",
+                        tile,
+                        center
+                    );
+                }
+            }
+        }
     }
 
     #[test]

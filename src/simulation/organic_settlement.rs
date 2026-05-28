@@ -4150,6 +4150,35 @@ fn intent_site_clear(
     brain: &SettlementBrain,
 ) -> bool {
     match build_kind {
+        // Wells carry a 5×5 stepwell footprint, not a single tile. Route the
+        // whole disc through the shared `well_footprint_clear` predicate so
+        // the organic placement lane agrees with the seed-time search and
+        // runtime blueprint converter on what "buildable" means.
+        OrganicBuildKind::Single(BuildSiteKind::Well) => {
+            // Wells are stamped with an outer-ring lining wall (minus the
+            // gateway) and `road_carve_system` consults `WellMap` to route
+            // carved roads around the 5×5 disc, so a planned spine
+            // overlapping the future footprint is no longer fatal — the
+            // walls land first and the carver detours. Pass `brain: None`
+            // to skip the `road_tiles` / `road_corridor_tiles` check; the
+            // chunk-map `Road`/`Wall` gate inside `well_footprint_clear`
+            // still rejects tiles already paved or walled.
+            let empty_well_site_map =
+                crate::simulation::well::WellSiteMap::default();
+            let ctx = crate::simulation::well::WellPlacementCtx {
+                structure_index: maps.structure_index,
+                bp_map,
+                well_map: maps.well_map,
+                well_site_map: &empty_well_site_map,
+                doormat: Some(doormat),
+                seed_reservation: None,
+                brain: None,
+                chunk_map: Some(chunk_map),
+                used: None,
+                self_bp: None,
+            };
+            crate::simulation::well::well_footprint_clear(tile, &ctx).is_ok()
+        }
         OrganicBuildKind::Single(_) => {
             single_tile_clear(tile, chunk_map, maps, bp_map, doormat, brain)
         }
@@ -4187,6 +4216,11 @@ fn single_tile_clear(
     if bp_map.0.contains_key(&tile)
         || maps.structure_index.0.contains_key(&tile)
         || maps.bed_map.0.contains_key(&tile)
+        // A well's 5×5 footprint must reject non-well placements landing on
+        // any of its tiles — including the central shaft, which is registered
+        // in `WellMap` but not `StructureIndex` (the wellhead carries its own
+        // `StructureLabel`, but the eight inner-ring helix tiles do not).
+        || maps.well_map.0.contains_key(&tile)
         || doormat.is_reserved(tile)
         || brain.road_tiles.contains(&tile)
         // The widened corridor includes the perpendicular tile next to each
