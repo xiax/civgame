@@ -768,7 +768,12 @@ pub fn assign_task_with_routing(
     resource_z_override: Option<i8>,
     target_entity: Option<Entity>,
     chunk_graph: &ChunkGraph,
-    chunk_router: &ChunkRouter,
+    // Retained for signature stability across ~100 call sites. No longer used
+    // here: cross-chunk routing now stores the real destination in
+    // `ai.target_tile` and defers all segment/portal planning to the worker
+    // (`first_segment_target`), so this helper no longer pre-routes a legacy
+    // `first_waypoint`.
+    _chunk_router: &ChunkRouter,
     chunk_map: &ChunkMap,
     chunk_connectivity: &ChunkConnectivity,
     spatial_index: &SpatialIndex,
@@ -865,22 +870,17 @@ pub fn assign_task_with_routing(
         ai.current_z as i32,
     ) as i8;
 
-    let route_chunk = ChunkCoord(
-        (route_target.0 as i32).div_euclid(CHUNK_SIZE as i32),
-        (route_target.1 as i32).div_euclid(CHUNK_SIZE as i32),
-    );
-    if route_chunk == cur_chunk {
-        ai.state = AiState::Seeking;
-        ai.target_tile = route_target;
-    } else if let Some(wp) =
-        chunk_router.first_waypoint(chunk_graph, cur_chunk, route_chunk, ai.current_z)
-    {
-        ai.state = AiState::Routing;
-        ai.target_tile = wp;
-    } else {
-        ai.state = AiState::Seeking;
-        ai.target_tile = route_target;
-    }
+    // Store the *real* stand tile as the path goal and let the hierarchical
+    // PathFollow / drain_path_requests_system machinery own all segment
+    // planning. Previously cross-chunk tasks pre-truncated `target_tile` to a
+    // legacy scan-order chunk-border waypoint (`first_waypoint`), which the
+    // movement system fed verbatim as the PathRequest goal — so the worker
+    // never saw the true destination and zig-zagged through border corners.
+    // `AiState::Seeking` follows `pf.segment_path` identically to `Routing`
+    // (which now survives only for nomad migration checkpoints), and the worker
+    // handles arbitrary-distance multi-chunk routes transparently.
+    ai.state = AiState::Seeking;
+    ai.target_tile = route_target;
     true
 }
 
@@ -1826,5 +1826,59 @@ mod tests {
         // and the flow field would route at the surface, stranding the
         // agent in the tunnel.
         assert_eq!(ai.target_z, 0);
+    }
+
+    /// Regression for `plans/fix-illogical-chunk-pathing.md`: a cross-chunk
+    /// task must store the *real* destination in `ai.target_tile` (so the
+    /// PathFollow worker plans to it), not a legacy chunk-border waypoint, and
+    /// must use `AiState::Seeking` (Routing now survives only for nomad
+    /// migration checkpoints).
+    #[test]
+    fn cross_chunk_task_stores_real_destination_not_waypoint() {
+        // Two adjacent flat chunks; agent in chunk(0,0), target in chunk(1,0).
+        let mut map = flat_map_with_chunk(ChunkCoord(0, 0), 0);
+        let surface_z = Box::new([[0i8; CHUNK_SIZE]; CHUNK_SIZE]);
+        let surface_kind = Box::new([[TileKind::Grass; CHUNK_SIZE]; CHUNK_SIZE]);
+        let surface_fertility = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
+        map.0.insert(
+            ChunkCoord(1, 0),
+            Chunk::new(surface_z, surface_kind, surface_fertility),
+        );
+
+        let mut ai = PersonAI::default();
+        ai.current_z = 0;
+
+        let graph = ChunkGraph::default();
+        let router = ChunkRouter::default();
+        let conn = ChunkConnectivity::default();
+        let spatial = SpatialIndex::default();
+        let stand = StandTileReservations::default();
+
+        // Non-adjacent task ⇒ route_target == target (no stand-tile picking).
+        let target = (40, 10); // chunk(1,0), local (8,10)
+        assign_task_with_routing(
+            &mut ai,
+            (10, 10),
+            ChunkCoord(0, 0),
+            target,
+            TaskKind::Idle,
+            None,
+            None,
+            &graph,
+            &router,
+            &map,
+            &conn,
+            &spatial,
+            &stand,
+            Entity::PLACEHOLDER,
+            0,
+        );
+
+        assert_eq!(
+            ai.target_tile, target,
+            "target_tile must be the real destination, not a chunk-border waypoint",
+        );
+        assert_eq!(ai.dest_tile, target);
+        assert_eq!(ai.state(), AiState::Seeking);
     }
 }

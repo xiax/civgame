@@ -56,9 +56,11 @@ Internally: per-(chunk, ComponentId) → inter-chunk CC id (`tile_reachable` / `
 3. Reachability via `router.is_reachable`.
 4. `router.compute_route` produces the chunk sequence.
 5. Hotspot fast-path if goal is a registered hotspot in the start chunk and agent's z matches field's `cell_z`.
-6. Single-segment A* via `find_path_in` against `first_waypoint_full(...)`.
+6. Single-segment A* via `find_path_in` against `first_segment_target(...)`.
 
 Largest `chunk_route.len()` per tick surfaces as `chunk_route_len_max_last_tick`.
+
+**Router decides the hop, the worker decides the portal.** The graph stores one `ChunkEdge` per passable border tile, so on a uniform border the router's Dijkstra `next_hop` is just the first-relaxed (scan-order) edge — a corner unrelated to where the agent is or is going. `first_segment_target` uses `first_waypoint_full` only for the next chunk + component *identity*, then enumerates every edge from the start chunk into that exact `(neighbor, neighbor_component)` and picks the one minimising `chebyshev(start, exit) + chebyshev(entry, goal)` (traverse_cost rescaled to tile units as a tie-break). This re-runs per hop (movement re-enqueues the same final goal after each segment), so portals track the goal direction the whole way. Task dispatch (`assign_task_with_routing`) stores the **real** destination in `ai.target_tile` — never a pre-routed legacy `first_waypoint` — so the worker always sees the true goal (`plans/fix-illogical-chunk-pathing.md`).
 
 ## Hotspot flow fields (`hotspots.rs`)
 

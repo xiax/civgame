@@ -13,7 +13,7 @@ use crate::pathfinding::path_request::{
 };
 use crate::pathfinding::pool::{AStarPool, AStarScratch};
 use crate::pathfinding::step::{passable_diagonal_step, passable_diagonal_step_for};
-use crate::pathfinding::tile_cost::TraversalProfile;
+use crate::pathfinding::tile_cost::{TraversalProfile, BASE_STEP_COST};
 use crate::simulation::tasks::task_kind_label;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 
@@ -950,6 +950,20 @@ fn apply_outcome(
     }
 }
 
+#[inline]
+fn cheb(a: (i32, i32), b: (i32, i32)) -> i32 {
+    (a.0 - b.0).abs().max((a.1 - b.1).abs())
+}
+
+/// Pick the concrete first-hop portal for the current segment.
+///
+/// The router (`first_waypoint_full`) decides only the next chunk + component
+/// to enter. The chunk graph stores one edge per passable border tile, so on a
+/// uniform border the router's Dijkstra `next_hop` is just the first-relaxed
+/// (scan-order) edge — a corner, independent of where the agent is or where it's
+/// going. Here we enumerate every edge from the start chunk into that exact next
+/// chunk/component and pick the one nearest the straight line between `req.start`
+/// and `req.goal`, breaking ties on traversal cost (rescaled to tile units).
 fn first_segment_target(
     graph: &ChunkGraph,
     router: &ChunkRouter,
@@ -970,7 +984,49 @@ fn first_segment_target(
     ) else {
         return req.goal;
     };
-    (wp.entry_x, wp.entry_y, wp.entry_z)
+
+    // Router decides identity; geometry decides the concrete portal.
+    let next_chunk = wp.neighbor;
+    let next_component = wp.neighbor_component;
+    let start_xy = (req.start.0, req.start.1);
+    let goal_xy = (req.goal.0, req.goal.1);
+    let size = CHUNK_SIZE as i32;
+
+    let best = graph
+        .edges
+        .get(&start_chunk)
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e.neighbor == next_chunk
+                && e.from_component == start_component
+                && e.to_component == next_component
+        })
+        .map(|e| {
+            let exit = (
+                start_chunk.0 * size + e.exit_local.0 as i32,
+                start_chunk.1 * size + e.exit_local.1 as i32,
+            );
+            let entry = (
+                next_chunk.0 * size + e.entry_local.0 as i32,
+                next_chunk.1 * size + e.entry_local.1 as i32,
+            );
+            // Primary: minimise detour off the straight line start→goal.
+            // Secondary: cheaper terrain / flat-Z portal (cost rescaled to
+            // tile units so it only breaks ties between equidistant portals).
+            let cost_tiles =
+                (e.traverse_cost as f32 / BASE_STEP_COST as f32).round() as i32;
+            let score = cheb(start_xy, exit) + cheb(entry, goal_xy) + cost_tiles;
+            (score, entry, e.entry_z)
+        })
+        .min_by_key(|(score, _, _)| *score);
+
+    match best {
+        Some((_, (ex, ey), ez)) => (ex, ey, ez),
+        // Router said this hop exists but no matching edge was enumerable
+        // (shouldn't happen) — fall back to the router's own pick.
+        None => (wp.entry_x, wp.entry_y, wp.entry_z),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1251,6 +1307,72 @@ mod tests {
         map.0.insert(ChunkCoord(0, 0), flat_chunk(0));
         let path = vec![(6i32, 6i32, 0i8)];
         assert_eq!(first_invalid_step(&map, (5, 5, 0), &path, TraversalProfile::Land), None);
+    }
+
+    /// Regression for `plans/fix-illogical-chunk-pathing.md`: the worker must
+    /// pick the first-hop portal nearest the straight line between start and
+    /// goal, not the scan-order border corner the router's Dijkstra `next_hop`
+    /// happens to return on a uniform border.
+    #[test]
+    fn first_segment_target_picks_portal_near_straight_line() {
+        use crate::pathfinding::chunk_graph::{rebuild_chunk_graph_sync, ChunkGraph};
+        use crate::pathfinding::chunk_router::ChunkRouter;
+        use crate::pathfinding::path_request::{PathKind, PathRequest};
+        use crate::simulation::typed_task::UNEMPLOYED_TASK_KIND;
+
+        // Two adjacent flat chunks sharing an east/west border at x=31|32.
+        let mut chunk_map = ChunkMap::default();
+        chunk_map.0.insert(ChunkCoord(0, 0), flat_chunk(0));
+        chunk_map.0.insert(ChunkCoord(1, 0), flat_chunk(0));
+        let mut graph = ChunkGraph::default();
+        rebuild_chunk_graph_sync(&chunk_map, &mut graph);
+        let router = ChunkRouter::default();
+
+        // Start near the top-left of chunk(0,0); goal well into chunk(1,0) and
+        // offset down on Y. The straight line crosses the x=32 border around
+        // y ≈ 20; the scan-order corner would be y = 0.
+        let start = (5i32, 5i32, 0i8);
+        let goal = (40i32, 25i32, 0i8);
+        let start_component = graph
+            .component_for_tile(start.0, start.1, start.2)
+            .expect("start standable");
+        let goal_component = graph
+            .component_for_tile(goal.0, goal.1, goal.2)
+            .expect("goal standable");
+
+        let chunk_route = router
+            .compute_route(
+                &graph,
+                (ChunkCoord(0, 0), start_component),
+                (ChunkCoord(1, 0), goal_component),
+            )
+            .expect("route exists");
+        assert_eq!(chunk_route.len(), 2, "single cross-chunk hop");
+
+        let req = PathRequest {
+            id: 1,
+            agent: Entity::from_raw(0),
+            start,
+            goal,
+            kind: PathKind::BestEffort,
+            max_budget: 4096,
+            task_id: UNEMPLOYED_TASK_KIND,
+            profile: TraversalProfile::Land,
+        };
+
+        let (ex, ey, _ez) =
+            first_segment_target(&graph, &router, &chunk_route, &req, start_component, goal_component);
+
+        // Entry tile must be just across the border (x = 32) and track the
+        // line toward the goal, NOT the scan-order corner (y = 0). Under the
+        // chebyshev metric the portals y∈[17,25] are co-optimal (all within
+        // the goal's chebyshev shadow), so the straight-line crossing (~20)
+        // falls inside the selected band; the tie-break returns its low edge.
+        assert_eq!(ex, 32, "entry on the neighbour side of the shared border");
+        assert!(
+            (15..=25).contains(&ey),
+            "portal y={ey} should track the goal direction, not corner 0",
+        );
     }
 
     /// Regression for `plans/fix-sleep-stalls.md`: the hotspot fast path
