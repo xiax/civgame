@@ -287,28 +287,27 @@ mod gen {
         rows.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Shared 16×16 seed sprite for the four small static forms (grass / forb
+    /// / vine / tuber). A bright cotyledon sprout on a dark soil mound —
+    /// bottom-anchored and high-contrast so a freshly-sown seed reads against
+    /// brown dirt instead of vanishing (the old 8px speck did). At Seed stage
+    /// every form looks alike, so one motif is correct *and* DRY.
+    fn seed_sprout_16() -> Vec<String> {
+        from_static(&[
+            "................", "................", "................",
+            "................", "................", "................",
+            "................", "................", "................",
+            "................", "................", "......M..M......",
+            ".....MLmmLM.....", "......mGm.......", ".....sSGSs......",
+            "....sSSSSSs.....",
+        ])
+    }
+
     // ── 16×16 templates (unchanged forms) ──────────────────────────────
 
     fn grass_template(stem: &str) -> Vec<String> {
         match stem {
-            "seed" => from_static(&[
-                "................",
-                "................",
-                "................",
-                "................",
-                "................",
-                "................",
-                "................",
-                "................",
-                "................",
-                "................",
-                "................",
-                "................",
-                "................",
-                "......WW........",
-                ".....WBBW.......",
-                "......WW........",
-            ]),
+            "seed" => seed_sprout_16(),
             "seedling" => from_static(&[
                 "................",
                 "................",
@@ -319,13 +318,13 @@ mod gen {
                 "................",
                 "................",
                 "................",
-                "......m.........",
-                "......M.........",
-                ".....LMl........",
-                "......M.........",
-                "......m.........",
-                "......m.........",
                 "................",
+                ".....M.M.M......",
+                ".....MLMLM......",
+                "......MGM.......",
+                "......mGm.......",
+                ".....sSGSs......",
+                "....sSSSSSs.....",
             ]),
             "harvested" => from_static(&[
                 "................",
@@ -339,11 +338,11 @@ mod gen {
                 "................",
                 "................",
                 "................",
-                "......B.B.......",
-                "......B.B.......",
-                "......B.B.......",
-                ".....BBBBB......",
                 "................",
+                "....b.b.b.......",
+                "....b.b.b.......",
+                "...sbsbsbs......",
+                "..sSSSSSSSs.....",
             ]),
             "mature" => from_static(&[
                 "................",
@@ -387,29 +386,22 @@ mod gen {
 
     fn forb_template(stem: &str) -> Vec<String> {
         match stem {
-            "seed" => from_static(&[
-                "................", "................", "................",
-                "................", "................", "................",
-                "................", "................", "................",
-                "................", "................", "................",
-                "................", "......WW........", ".....WBBW.......",
-                "......WW........",
-            ]),
+            "seed" => seed_sprout_16(),
             "seedling" => from_static(&[
                 "................", "................", "................",
                 "................", "................", "................",
                 "................", "................", "................",
-                "......G.........", ".....MGM........", "......G.........",
-                "......G.........", "......G.........", ".....BGB........",
-                "................",
+                "......y.........", ".....MGM........", "...M.MGM.M......",
+                "..MLMMGMMLM.....", "...M.MGM.M......", ".....sSs........",
+                "....sSSSs.......",
             ]),
             "harvested" => from_static(&[
                 "................", "................", "................",
                 "................", "................", "................",
                 "................", "................", "................",
                 "................", "................", "................",
-                "......b.........", ".....BbB........", "......b.........",
-                "................",
+                "....b...b.......", "....b...b.......", "...sbs.sbs......",
+                "..sSSSSSSSs.....",
             ]),
             "mature" => from_static(&[
                 "................", "................", "................",
@@ -433,21 +425,14 @@ mod gen {
 
     fn vine_template(stem: &str) -> Vec<String> {
         match stem {
-            "seed" => from_static(&[
-                "................", "................", "................",
-                "................", "................", "................",
-                "................", "................", "................",
-                "................", "................", "................",
-                "................", "......WW........", ".....WBBW.......",
-                "......WW........",
-            ]),
+            "seed" => seed_sprout_16(),
             "seedling" => from_static(&[
                 "................", "................", "................",
                 "................", "................", "................",
                 "................", "................", "................",
-                "................", "....m...........", "...MGm..........",
-                "....G...........", "....G...........", "....G...........",
-                "................",
+                "................", "................", "......M.........",
+                ".....MGM........", "...M.MGM........", "...MLMGM.M......",
+                "...sSSGSSs......",
             ]),
             "harvested" => from_static(&[
                 "................", "................", "................",
@@ -479,29 +464,22 @@ mod gen {
 
     fn tuber_template(stem: &str) -> Vec<String> {
         match stem {
-            "seed" => from_static(&[
-                "................", "................", "................",
-                "................", "................", "................",
-                "................", "................", "................",
-                "................", "................", "................",
-                "................", "................", ".....SBBS.......",
-                "......SS........",
-            ]),
+            "seed" => seed_sprout_16(),
             "seedling" => from_static(&[
                 "................", "................", "................",
                 "................", "................", "................",
                 "................", "................", "................",
-                "................", "......G.........", ".....MGM........",
-                ".....GMG........", "................", ".....SBS........",
-                "......SS........",
+                "................", "......M.........", ".....MGM........",
+                "....MLGLM.......", ".....MGM........", "....sSGSs.......",
+                "...sSSSSSs......",
             ]),
             "harvested" => from_static(&[
                 "................", "................", "................",
                 "................", "................", "................",
                 "................", "................", "................",
                 "................", "................", "................",
-                "................", "................", ".....sss........",
-                "......sS........",
+                ".....d.d........", "....s.s.s.......", "...sSdSdSs......",
+                "..sSSSSSSSs.....",
             ]),
             "mature" => from_static(&[
                 "................", "................", "................",
@@ -530,10 +508,16 @@ mod gen {
         let mut c = Canvas::new(w, h);
         match stem {
             "seed" => {
-                c.fill_rect(10, 20, 4, 1, 'W');
-                c.set(11, 21, 'B');
-                c.set(12, 21, 'B');
-                c.fill_rect(10, 22, 4, 1, 'W');
+                // soil mound
+                c.fill_rect(8, 23, 8, 1, 'S');
+                c.fill_rect(9, 22, 6, 1, 's');
+                // sprout stem
+                for y in 18..22 { c.set(11, y, 'G'); c.set(12, y, 'G'); }
+                // bright cotyledon leaves
+                c.set(9, 19, 'M'); c.set(10, 19, 'M');
+                c.set(13, 19, 'M'); c.set(14, 19, 'M');
+                c.set(10, 18, 'L'); c.set(13, 18, 'L');
+                c.set(11, 17, 'M'); c.set(12, 17, 'M');
             }
             "seedling" => {
                 c.fill_ellipse(11, 17, 4, 3, 'M', 'm');
@@ -594,9 +578,13 @@ mod gen {
         let mut c = Canvas::new(w, h);
         match stem {
             "seed" => {
-                c.fill_rect(5, 28, 6, 1, 'E');
-                c.set(7, 29, 'B'); c.set(8, 29, 'B');
+                // sandy bed
+                c.fill_rect(4, 31, 8, 1, 'e');
                 c.fill_rect(5, 30, 6, 1, 'E');
+                // small green succulent nub
+                c.fill_rect(7, 27, 2, 3, 'G');
+                c.set(6, 28, 'M'); c.set(9, 28, 'M');
+                c.set(7, 26, 'M'); c.set(8, 26, 'M');
             }
             "seedling" => {
                 c.fill_rect(7, 23, 2, 7, 'G');
@@ -670,9 +658,12 @@ mod gen {
         c.set(10, water_top + 3, 'H');
         match stem {
             "seed" => {
-                // small floating seed
-                c.set(6, 21, 'W'); c.set(7, 21, 'W');
-                c.set(8, 21, 'B'); c.set(9, 21, 'B');
+                // green shoot rising from the water
+                for y in 14..19 { c.set(7, y, 'G'); c.set(8, y, 'G'); }
+                c.set(6, 15, 'M'); c.set(9, 15, 'M');
+                c.set(7, 13, 'M'); c.set(8, 13, 'M');
+                // cream seed husks at the waterline (pop against blue)
+                c.set(6, 18, 'W'); c.set(9, 18, 'W');
             }
             "seedling" => {
                 for y in 16..19 { c.set(7, y, 'G'); c.set(8, y, 'G'); }
@@ -718,9 +709,17 @@ mod gen {
         let mut c = Canvas::new(w, h);
         match stem {
             "seed" => {
-                c.fill_rect(22, 76, 4, 1, 'W');
-                c.set(23, 77, 'B'); c.set(24, 77, 'B');
-                c.fill_rect(22, 78, 4, 1, 'W');
+                // soil mound
+                c.fill_rect(18, 79, 12, 1, 'S');
+                c.fill_rect(20, 78, 8, 1, 's');
+                // sprout stem
+                for y in 72..78 { c.set(23, y, 'G'); c.set(24, y, 'G'); }
+                // bright cotyledon leaves
+                c.fill_ellipse(20, 73, 3, 2, 'M', 'm');
+                c.fill_ellipse(27, 73, 3, 2, 'M', 'm');
+                c.set(23, 71, 'M'); c.set(24, 71, 'M');
+                // pale seed husks at the base
+                c.set(22, 77, 'W'); c.set(25, 77, 'W');
             }
             "seedling" => {
                 // small sapling
@@ -895,16 +894,7 @@ mod gen {
     #[test]
     #[ignore = "PNG generator — run with --ignored when regenerating form fallback art"]
     fn gen_form_fallback_pngs() {
-        let forms = [
-            PlantForm::Grass,
-            PlantForm::Forb,
-            PlantForm::Shrub,
-            PlantForm::Vine,
-            PlantForm::Tree,
-            PlantForm::Aquatic,
-            PlantForm::Cactus,
-            PlantForm::Tuber,
-        ];
+        let forms = PlantForm::ALL;
         let stems: &[(&str, u8)] = &[
             ("seed", 1),
             ("seedling", 3),
@@ -921,6 +911,117 @@ mod gen {
                 let base = rows_for(form, stem);
                 for v in 0..*vcount {
                     write_variant(&folder, stem, v, &base);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sprite audit — non-ignored regression coverage (run in `cargo test`).
+//
+// Guards against the "invisible plant" class of bug: every plant must resolve
+// to a visible sprite at every growth stage. The form-fallback layer is the
+// anti-invisibility net (species folders ship no `seed.png`, so the Seed stage
+// of every plant routes to `_form_<form>/seed.png`), and these tests fail if
+// that net has a hole or a sprite is too faint to read against terrain.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod audit {
+    use super::*;
+
+    /// `(stem, max_variants)` for the early stages we hold to a visibility
+    /// floor. Mature/Overripe are large by construction and not policed here.
+    /// Floors: `(min non-transparent px, min painted-bbox edge)`.
+    const FLOORS: &[(&str, u8, u32, u32)] = &[
+        ("seed", 1, 16, 4),
+        ("seedling", 3, 20, 1),
+        ("harvested", 1, 16, 4),
+    ];
+
+    fn form_dir(form: PlantForm) -> String {
+        format!("{ASSET_ROOT_FS}/_form_{}", form_slug(form))
+    }
+
+    /// Decode a shipped PNG → (non-transparent pixel count, bbox width, height).
+    fn opaque_stats(path: &str) -> (u32, u32, u32) {
+        let img = image::open(path)
+            .unwrap_or_else(|e| panic!("audit: cannot open {path}: {e}"))
+            .to_rgba8();
+        let (mut count, mut min_x, mut min_y, mut max_x, mut max_y) =
+            (0u32, u32::MAX, u32::MAX, 0u32, 0u32);
+        for (x, y, px) in img.enumerate_pixels() {
+            if px.0[3] != 0 {
+                count += 1;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+        if count == 0 {
+            return (0, 0, 0);
+        }
+        (count, max_x - min_x + 1, max_y - min_y + 1)
+    }
+
+    /// The real anti-invisibility invariant: every form ships every stage +
+    /// variant, so the resolver's Tier-2 fallback always covers any plant and
+    /// legacy ASCII is never reached.
+    #[test]
+    fn form_fallback_complete() {
+        for form in PlantForm::ALL {
+            let dir = form_dir(form);
+            for (_stage, stem, max_variants) in STAGE_LAYOUT {
+                for v in 0..max_variants {
+                    let path = format!("{dir}/{}", file_name(stem, max_variants, v));
+                    assert!(
+                        std::path::Path::new(&path).exists(),
+                        "missing form-fallback sprite {path} — regenerate with \
+                         `cargo test --bin civgame -- --ignored gen_form_fallback_pngs`",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every catalog species resolves to a sprite folder on disk. A species
+    /// whose folder vanished/renamed would drop to form fallback silently;
+    /// this surfaces it.
+    #[test]
+    fn species_folders_exist() {
+        let catalog = crate::simulation::plant_catalog::catalog();
+        for def in catalog.iter() {
+            let dir = format!("{ASSET_ROOT_FS}/{}", def.sprite_folder());
+            assert!(
+                std::path::Path::new(&dir).is_dir(),
+                "species {:?} has no sprite folder at {dir}",
+                def.sprite_folder(),
+            );
+        }
+    }
+
+    /// Early-stage form sprites must clear a visibility floor. Reads the
+    /// *shipped* PNG (not the template) so a template edit that wasn't
+    /// regenerated also fails here.
+    #[test]
+    fn form_fallback_visibility_floor() {
+        for form in PlantForm::ALL {
+            let dir = form_dir(form);
+            for &(stem, max_variants, min_px, min_bbox) in FLOORS {
+                for v in 0..max_variants {
+                    let path = format!("{dir}/{}", file_name(stem, max_variants, v));
+                    let (count, w, h) = opaque_stats(&path);
+                    assert!(
+                        count >= min_px,
+                        "{path}: only {count} non-transparent px (floor {min_px}) \
+                         — sprite reads as invisible",
+                    );
+                    assert!(
+                        w >= min_bbox && h >= min_bbox,
+                        "{path}: painted bbox {w}x{h} below {min_bbox}x{min_bbox} floor",
+                    );
                 }
             }
         }

@@ -66,6 +66,20 @@ pub enum PlantForm {
 }
 
 impl PlantForm {
+    /// Every form, in stable order. Single source of truth for the
+    /// form-fallback PNG generator and the sprite-audit tests so they can't
+    /// drift from each other.
+    pub const ALL: [PlantForm; 8] = [
+        PlantForm::Grass,
+        PlantForm::Forb,
+        PlantForm::Shrub,
+        PlantForm::Vine,
+        PlantForm::Tree,
+        PlantForm::Aquatic,
+        PlantForm::Cactus,
+        PlantForm::Tuber,
+    ];
+
     /// Legacy form bucket for code paths that still match on `PlantKind`.
     /// Grass/Forb/Tuber/Cactus → Grain (annual food-crop-shaped); Shrub/Vine/
     /// Aquatic → BerryBush (perennial regrow-shaped); Tree → Tree.
