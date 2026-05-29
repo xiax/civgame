@@ -79,6 +79,9 @@ impl Plugin for RenderingPlugin {
                     path_debug::recent_failures_gizmo_system,
                     path_debug::selected_agent_failures_gizmo_system,
                     projection::update_skirt_visibility_system,
+                    entity_sprites::update_edge_wall_geometry_system
+                        .after(entity_sprites::spawn_edge_wall_sprites)
+                        .after(entity_sprites::spawn_edge_door_sprites),
                     day_night::update_day_night_overlay_system,
                     water_current_render::water_current_render_system,
                     water_current_render::animate_current_streaks_system,

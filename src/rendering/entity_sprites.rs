@@ -359,6 +359,9 @@ pub fn spawn_door_sprites(
 /// long dimension matches the 16 px tile span the edge runs along.
 const EDGE_STRIP_THICKNESS: f32 = 5.0;
 const EDGE_STRIP_SPAN: f32 = crate::world::terrain::TILE_SIZE;
+/// Upright pixel height an edge wall/door rises in Tilted view — matches the
+/// 16 px full-tile wall sprite so thin walls stand the same height as solid ones.
+const EDGE_WALL_RISE: f32 = 16.0;
 
 fn wall_material_texture(textures: &EntityTextures, material: WallMaterial) -> Handle<Image> {
     match material {
@@ -370,14 +373,48 @@ fn wall_material_texture(textures: &EntityTextures, material: WallMaterial) -> H
     }
 }
 
-/// Strip size for an edge of the given axis. A `Vertical` edge separates a
-/// left/right tile pair, so its wall runs north–south (tall thin bar); a
-/// `Horizontal` edge runs east–west (wide thin bar). The boundary midpoint is
-/// the entity origin, so `BottomCenter` + `y = -span/2` centres the strip on it.
-fn edge_strip_size(axis: EdgeAxis) -> Vec2 {
-    match axis {
-        EdgeAxis::Vertical => Vec2::new(EDGE_STRIP_THICKNESS, EDGE_STRIP_SPAN),
-        EdgeAxis::Horizontal => Vec2::new(EDGE_STRIP_SPAN, EDGE_STRIP_THICKNESS),
+/// Oriented child-sprite geometry `(custom_size, child_y_offset)` for an edge
+/// wall/door, per axis and view mode. Mirrors the skirt's mode-reactive sizing
+/// (`projection::skirt_sprite`). All sprites are `Anchor::BottomCenter`.
+///
+/// - **TopDown** (both axes): the legacy thin flat strip *centred* on the
+///   boundary midpoint (`offset = -size.y * 0.5`) — `Vertical` runs N–S
+///   (5×16), `Horizontal` runs E–W (16×5). Bit-identical to the pre-tilt look.
+/// - **Tilted Horizontal** (E–W wall): an upright bar planted *on* the seam.
+///   The entity sits at the edge midpoint, whose logical-y is exactly the shared
+///   boundary line, so `BottomCenter` + `offset 0` plants the base on the seam
+///   and rises `EDGE_WALL_RISE` — the same mechanic as a full-tile wall.
+/// - **Tilted Vertical** (N–S wall): the wall runs *into* the Y-compressed depth
+///   axis. The engine can't skew sprites, so this is a stylistic upright slab:
+///   width = thickness, height = the compressed N–S footprint (`span * y_scale`)
+///   plus a rise, planted at the south end of that footprint. Reads as a thin
+///   tall divider; `EDGE_WALL_RISE` / footprint are visual-tuning knobs. Uses
+///   `proj.y_scale` so it tracks any future projection retune (never hardcoded).
+fn edge_oriented_geometry(
+    axis: EdgeAxis,
+    mode: crate::rendering::projection::MapViewMode,
+    proj: &crate::rendering::projection::MapProjection,
+) -> (Vec2, f32) {
+    use crate::rendering::projection::MapViewMode;
+    match (mode, axis) {
+        (MapViewMode::TopDown, EdgeAxis::Vertical) => {
+            let s = Vec2::new(EDGE_STRIP_THICKNESS, EDGE_STRIP_SPAN);
+            (s, -s.y * 0.5)
+        }
+        (MapViewMode::TopDown, EdgeAxis::Horizontal) => {
+            let s = Vec2::new(EDGE_STRIP_SPAN, EDGE_STRIP_THICKNESS);
+            (s, -s.y * 0.5)
+        }
+        (MapViewMode::Tilted, EdgeAxis::Horizontal) => {
+            (Vec2::new(EDGE_STRIP_SPAN, EDGE_WALL_RISE), 0.0)
+        }
+        (MapViewMode::Tilted, EdgeAxis::Vertical) => {
+            let footprint = EDGE_STRIP_SPAN * proj.y_scale;
+            (
+                Vec2::new(EDGE_STRIP_THICKNESS, footprint + EDGE_WALL_RISE),
+                -footprint * 0.5,
+            )
+        }
     }
 }
 
@@ -389,9 +426,11 @@ pub fn spawn_edge_wall_sprites(
     mut commands: Commands,
     query: Query<(Entity, &EdgeWallVisual), Without<EdgeVisualSpawned>>,
     textures: Res<EntityTextures>,
+    mode: Res<crate::rendering::projection::MapViewMode>,
+    proj: Res<crate::rendering::projection::MapProjection>,
 ) {
     for (entity, ew) in query.iter() {
-        let size = edge_strip_size(ew.edge.axis);
+        let (size, offset_y) = edge_oriented_geometry(ew.edge.axis, *mode, &proj);
         let mut sprite = Sprite::from_image(wall_material_texture(&textures, ew.material));
         sprite.anchor = Anchor::BottomCenter;
         sprite.custom_size = Some(size);
@@ -402,7 +441,7 @@ pub fn spawn_edge_wall_sprites(
             parent.spawn((
                 VisualChild,
                 sprite,
-                Transform::from_xyz(0.0, -size.y * 0.5, 0.1),
+                Transform::from_xyz(0.0, offset_y, 0.1),
                 GlobalTransform::default(),
                 Visibility::Inherited,
                 InheritedVisibility::default(),
@@ -419,9 +458,11 @@ pub fn spawn_edge_door_sprites(
     mut commands: Commands,
     query: Query<(Entity, &EdgeDoorVisual), Without<EdgeVisualSpawned>>,
     textures: Res<EntityTextures>,
+    mode: Res<crate::rendering::projection::MapViewMode>,
+    proj: Res<crate::rendering::projection::MapProjection>,
 ) {
     for (entity, ed) in query.iter() {
-        let size = edge_strip_size(ed.edge.axis);
+        let (size, offset_y) = edge_oriented_geometry(ed.edge.axis, *mode, &proj);
         let mut sprite = Sprite::from_image(textures.door_ascii.clone());
         sprite.anchor = Anchor::BottomCenter;
         sprite.custom_size = Some(size);
@@ -435,12 +476,42 @@ pub fn spawn_edge_door_sprites(
             parent.spawn((
                 VisualChild,
                 sprite,
-                Transform::from_xyz(0.0, -size.y * 0.5, 0.1),
+                Transform::from_xyz(0.0, offset_y, 0.1),
                 GlobalTransform::default(),
                 Visibility::Inherited,
                 InheritedVisibility::default(),
             ));
         });
+    }
+}
+
+/// Mode-reactive resize of edge wall/door child sprites — keeps them upright and
+/// edge-aligned in Tilted view and thin/flat in TopDown. Mirrors
+/// `projection::update_skirt_visibility_system`. The marker lives on the parent
+/// and the strip on its `VisualChild`, so this walks `&Children` (the
+/// `update_plant_sprites` pattern). Only `custom_size` + child `translation.y`
+/// are written — `color` (the open-door dim alpha) and `.x`/`.z` are untouched.
+pub fn update_edge_wall_geometry_system(
+    mode: Res<crate::rendering::projection::MapViewMode>,
+    proj: Res<crate::rendering::projection::MapProjection>,
+    walls: Query<(&EdgeWallVisual, &Children)>,
+    doors: Query<(&EdgeDoorVisual, &Children)>,
+    mut child: Query<(&mut Sprite, &mut Transform), With<VisualChild>>,
+) {
+    let mut apply = |axis: EdgeAxis, children: &Children| {
+        let (size, offset_y) = edge_oriented_geometry(axis, *mode, &proj);
+        for &c in children.iter() {
+            if let Ok((mut sprite, mut tf)) = child.get_mut(c) {
+                sprite.custom_size = Some(size);
+                tf.translation.y = offset_y;
+            }
+        }
+    };
+    for (ew, children) in walls.iter() {
+        apply(ew.edge.axis, children);
+    }
+    for (ed, children) in doors.iter() {
+        apply(ed.edge.axis, children);
     }
 }
 
@@ -2681,5 +2752,48 @@ pub fn spawn_blueprint_sprites(
                     InheritedVisibility::default(),
                 ));
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rendering::projection::{MapProjection, MapViewMode};
+
+    #[test]
+    fn topdown_geometry_is_legacy_thin_strip() {
+        let proj = MapProjection::default();
+        // Vertical (N-S) wall: 5×16 strip, centred on the seam.
+        let (s, off) = edge_oriented_geometry(EdgeAxis::Vertical, MapViewMode::TopDown, &proj);
+        assert_eq!(s, Vec2::new(EDGE_STRIP_THICKNESS, EDGE_STRIP_SPAN));
+        assert_eq!(off, -EDGE_STRIP_SPAN * 0.5); // -8
+        // Horizontal (E-W) wall: 16×5 strip, centred on the seam.
+        let (s, off) = edge_oriented_geometry(EdgeAxis::Horizontal, MapViewMode::TopDown, &proj);
+        assert_eq!(s, Vec2::new(EDGE_STRIP_SPAN, EDGE_STRIP_THICKNESS));
+        assert_eq!(off, -EDGE_STRIP_THICKNESS * 0.5); // -2.5
+    }
+
+    #[test]
+    fn tilted_horizontal_stands_upright_on_seam() {
+        let proj = MapProjection::default();
+        let (s, off) = edge_oriented_geometry(EdgeAxis::Horizontal, MapViewMode::Tilted, &proj);
+        // Full tile-width bar, full wall rise, base planted exactly on the seam.
+        assert_eq!(s, Vec2::new(EDGE_STRIP_SPAN, EDGE_WALL_RISE));
+        assert_eq!(off, 0.0);
+    }
+
+    #[test]
+    fn tilted_vertical_is_thin_slab_tracking_y_scale() {
+        let proj = MapProjection::default();
+        let (s, off) = edge_oriented_geometry(EdgeAxis::Vertical, MapViewMode::Tilted, &proj);
+        let footprint = EDGE_STRIP_SPAN * proj.y_scale;
+        assert_eq!(s.x, EDGE_STRIP_THICKNESS); // stays thin
+        assert_eq!(s.y, footprint + EDGE_WALL_RISE); // compressed footprint + rise
+        assert_eq!(off, -footprint * 0.5); // base at south end of the footprint
+        // The footprint must track y_scale, not a hardcoded constant.
+        let mut squashed = MapProjection::default();
+        squashed.y_scale = 0.25;
+        let (s2, _) = edge_oriented_geometry(EdgeAxis::Vertical, MapViewMode::Tilted, &squashed);
+        assert!(s2.y < s.y);
     }
 }
