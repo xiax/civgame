@@ -250,6 +250,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(animals::HerdClusterGen::default())
             .insert_resource(animal_paths::HerdClusterRegistry::default())
             .insert_resource(animal_paths::HerdClusterCursor::default())
+            .insert_resource(animal_paths::AnimalReplanCursor::default())
             .insert_resource(construction::BedMap::default())
             .insert_resource(construction::WallMap::default())
             .insert_resource(construction::EdgeStructureMap::default())

@@ -14,12 +14,12 @@ The original five hot-path targets (vision / faction storage / loose-stockpile /
 - **Phase 3 — offscreen fidelity.** `perf::PerformanceSettings { OffscreenFidelity::{AllLive, Balanced(default), Minimal} }` wired into `update_simulation_focus_system` (off-camera region focus radius: base / base÷2 / none) and `update_lod_levels_system` (promote radius 8/4/0). Combo selector in the panel. Camera region always full.
 - Tests: `perf::tests` (series ring/delta/cap + fidelity ladders), `speed::tests` (per-set records, fold_sample). Suite green.
 
-## Phase 2 — DATA-DRIVEN, pending user panel reading
-Run year-1 with the Performance panel open; the climbing set + counter selects the fix. Pre-identified candidates (apply only what the panel implicates, via existing cursor/stagger — never `tick % N`):
-1. **Cluster scan** (`shared_knowledge.rs`) — if `know. clusters` climbs: tighten decay TTL/merge radius, round-robin the cluster walk, or spatial-bucket consumers.
-2. **Loaded chunks** (`chunk_streaming.rs`) — if `loaded chunks` climbs: verify off-camera focus pruning + `UNLOAD_RADIUS`; overlaps Minimal fidelity.
-3. **Gossip O(pop²)** (ParallelA) — if `ambient_social`/`awareness_gossip` µs climbs: cap candidate-pairs/tick via the existing cursor.
-4. **World-sim drain** (`world_sim.rs`) — if `worldsim queue` climbs: raise `world_sim_deltas_per_tick` or bound batch submission.
+## Phase 2 — Sequential attribution + animal-A* de-spike (shipped)
+Panel reading at ~20 pop localised the cost to **`SimulationSet::Sequential` = 65 ms of a 74 ms tick** (everything else < 8 ms). The climbing `know. clusters` was a red herring — its 7 dispatchers live in ParallelB (0.94 ms). Sequential had no per-system attribution (the 3 suspects were ParallelA/Economy). Fix (`plans/i-ran-the-performance-vast-dream.md`):
+- **2a — Sequential attribution.** Extended `speed.rs::suspect` with `vision` / `animal_movement` / `movement` / `gather` / `combat`; one-line `SuspectSystemTimings::guard` per system. `gather`/`combat` were at the 16-param ceiling → folded the `Res` into their existing `GatherRoutingResources` / `CombatEventWriters` bundles. Fold loop + panel already generic.
+- **2b — `animal_movement_system` de-spike.** Animals ran inline, un-budgeted 256-node A* every replan (vs persons' 64/tick queue), and `BudgetExhausted` partials made out-of-range goals re-A* every tick. Added `PerfWorkBudget::animal_replans_per_tick = 64` + `AnimalReplanCursor` (round-robin, `select_replan_slice` pure-fn unit-tested) gating only the A* call, and `AnimalAI.replan_cooldown_until` (`ANIMAL_REPLAN_COOLDOWN_TICKS = 20`) throttling fruitless searches. HERD flow-field replans stay free.
+
+Still data-driven: re-run year-1 with the panel **at 1×** to read the new per-system rows, confirm `animal_movement` dropped, and tune the two constants. If `vision` then dominates, its lever is the `report_sighting` cluster-write cost (already capped at 32 recomputes) — a separate pass. Other pre-identified candidates if a different row climbs (apply via cursor/stagger — never `tick % N`): cluster scan (`shared_knowledge.rs`), loaded chunks (`chunk_streaming.rs`), gossip O(pop²) cap, world-sim drain budget.
 
 ## Verify
 1. After Phase 0, `cargo run`, compare year-1 avg/p99 in "Sim Timing".

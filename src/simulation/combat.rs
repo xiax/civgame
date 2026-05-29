@@ -216,6 +216,9 @@ pub struct CombatEventWriters<'w> {
     pub discovery: EventWriter<'w, crate::simulation::knowledge::DiscoveryActionEvent>,
     pub retaliation: EventWriter<'w, CombatRetaliationStartedEvent>,
     pub projectile: EventWriter<'w, ProjectileFired>,
+    /// Per-suspect Sequential-set timing, folded here so `combat_system` stays
+    /// under Bevy's 16-param ceiling. Read once via `events.timings.guard(..)`.
+    pub timings: Res<'w, crate::simulation::speed::SuspectSystemTimings>,
 }
 
 pub fn combat_system(
@@ -249,6 +252,9 @@ pub fn combat_system(
     mut events: CombatEventWriters,
     vehicle_query: Query<(), With<crate::simulation::vehicle::Vehicle>>,
 ) {
+    let _t = events
+        .timings
+        .guard(crate::simulation::speed::suspect::COMBAT);
     let dt = time.delta_secs();
 
     // (target, attacker, damage)

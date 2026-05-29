@@ -402,6 +402,11 @@ pub struct GatherRoutingResources<'w, 's> {
     /// Threaded through to `agent_tier_set` for symmetric depletion in
     /// the failure paths (`plans/fix-repeating-gather-fail-loops.md`).
     pub settlement_map: Res<'w, crate::simulation::settlement::SettlementMap>,
+    /// Per-suspect Sequential-set timing (folded here so `gather_system`
+    /// stays under Bevy's 16-param ceiling). Read once at system entry via
+    /// `routing.timings.guard(suspect::GATHER)`; the `Res` is shared/atomic so
+    /// other holders of this bundle (`finish_gather`, `item_pickup`) ignore it.
+    pub timings: Res<'w, crate::simulation::speed::SuspectSystemTimings>,
 }
 
 /// Phase 5c-ii-c-ii chain handoff: called by every `gather_system` exit path
@@ -640,6 +645,9 @@ pub fn gather_system(
         Option<&crate::simulation::tools::ToolKit>,
     )>,
 ) {
+    let _t = routing
+        .timings
+        .guard(crate::simulation::speed::suspect::GATHER);
     for (
         actor,
         mut ai,

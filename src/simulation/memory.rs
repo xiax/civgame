@@ -405,9 +405,11 @@ pub fn vision_system(
         ),
         With<Person>,
     >,
+    timings: Res<crate::simulation::speed::SuspectSystemTimings>,
 ) {
     use crate::simulation::shared_knowledge::KnowledgeTier;
 
+    let _t = timings.guard(crate::simulation::speed::suspect::VISION);
     let now = clock.tick;
 
     // Phase 3.1: per-tick vision cap. Bucket gating (`clock.is_active(slot)`)

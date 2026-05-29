@@ -30,6 +30,12 @@ pub struct PerfWorkBudget {
     /// caches; only agents that moved or whose visible bbox was touched
     /// recompute, bounded by this cap to absorb mass-move spikes.
     pub vision_recomputes_per_tick: usize,
+    /// Per-tick cap on inline-A\* replans in `animal_movement_system`. Animals
+    /// keep stepping cached paths every tick (cheap); only the expensive A\*
+    /// replan is budgeted — mirrors the person path-request worker's 64/tick.
+    /// Round-robined by `AnimalReplanCursor` so no animal starves. Flow-field
+    /// (HERD) replans are not counted (cheap).
+    pub animal_replans_per_tick: usize,
 }
 
 impl Default for PerfWorkBudget {
@@ -54,6 +60,7 @@ impl Default for PerfWorkBudget {
             maintenance_factions_per_tick: 8,
             gossip_agents_per_tick: 64,
             vision_recomputes_per_tick: 32,
+            animal_replans_per_tick: 64,
         }
     }
 }

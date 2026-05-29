@@ -149,7 +149,9 @@ pub fn movement_system(
         // by their own path — skip them here.
         Without<BoardedVehicle>,
     >,
+    timings: Res<crate::simulation::speed::SuspectSystemTimings>,
 ) {
+    let _t = timings.guard(crate::simulation::speed::suspect::MOVEMENT);
     let dt = time.delta_secs();
     // Game speed lives on `Time<Virtual>::set_relative_speed` and drives
     // extra FixedUpdate firings per real second — no inline multiplier

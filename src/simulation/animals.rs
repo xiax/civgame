@@ -519,6 +519,12 @@ pub struct AnimalAI {
     pub path_cursor: u16,
     /// Tile this path was computed *to*. Replan when `target_tile` drifts.
     pub path_goal: (i32, i32),
+    /// Tick until which inline A\* replanning is suppressed for this animal.
+    /// Set when a replan returned `Unreachable` / `BudgetExhausted` (the
+    /// expensive-but-fruitless cases) so an out-of-range goal doesn't burn a
+    /// full 256-node search every tick. `0` ⇒ no cooldown. See
+    /// `animal_paths::ANIMAL_REPLAN_COOLDOWN_TICKS`.
+    pub replan_cooldown_until: u64,
 }
 
 /// Lightweight biological needs for animals. Separate from the person Needs struct —
@@ -1001,6 +1007,7 @@ pub fn animal_movement_system(
     mut pool: ResMut<crate::pathfinding::pool::AStarPool>,
     mut query: Query<
         (
+            Entity,
             &mut Transform,
             &mut AnimalAI,
             &LodLevel,
@@ -1014,11 +1021,46 @@ pub fn animal_movement_system(
         Without<Person>,
     >,
     clock: Res<SimClock>,
+    timings: Res<crate::simulation::speed::SuspectSystemTimings>,
+    budget: Res<crate::simulation::perf::PerfWorkBudget>,
+    mut replan_cursor: ResMut<crate::simulation::animal_paths::AnimalReplanCursor>,
 ) {
+    let _t = timings.guard(crate::simulation::speed::suspect::ANIMAL_MOVEMENT);
     let dt = time.delta_secs();
     let sim_dt = dt * clock.scale_factor();
+    let now = clock.tick;
 
-    for (mut transform, mut ai, lod, slot, carried, herd_member, is_deer, is_horse, is_cow) in
+    // Per-tick inline-A* replan budget (round-robin by entity bits, mirroring
+    // `vision_system`). Animals step cached paths every tick (cheap); only the
+    // expensive A* replan is capped. Build the eligible-this-tick set
+    // (need-replan, off-cooldown, A*-bound), sort, rotate by cursor, take cap.
+    // HERD flow-field replans are free and not gated here.
+    let cap = budget.animal_replans_per_tick.max(1);
+    let mut eligible: Vec<Entity> = Vec::new();
+    for (entity, _transform, ai, lod, _slot, carried, _hm, _d, _h, _c) in query.iter() {
+        if *lod == LodLevel::Dormant
+            || carried.is_some()
+            || ai.state == AnimalState::Attack
+            || ai.state == AnimalState::Sleeping
+            || ai.replan_cooldown_until > now
+        {
+            continue;
+        }
+        let need_replan = ai.path.is_empty()
+            || ai.path_goal != ai.target_tile
+            || (ai.path_cursor as usize) >= ai.path.len();
+        if need_replan {
+            eligible.push(entity);
+        }
+    }
+    let (allowed, next_bits) = crate::simulation::animal_paths::select_replan_slice(
+        &mut eligible,
+        cap,
+        replan_cursor.next_bits,
+    );
+    replan_cursor.next_bits = next_bits;
+
+    for (entity, mut transform, mut ai, lod, slot, carried, herd_member, is_deer, is_horse, is_cow) in
         query.iter_mut()
     {
         if *lod == LodLevel::Dormant {
@@ -1046,7 +1088,8 @@ pub fn animal_movement_system(
             ai.path.clear();
             ai.path_cursor = 0;
             let mut planned = false;
-            // HERD species try the flow field first.
+            // HERD species try the flow field first — cheap, always allowed,
+            // ignores the A* budget + cooldown (those gate inline A* only).
             if is_herd_species {
                 if let Some(hm) = herd_member {
                     if crate::simulation::animal_paths::try_replan_via_flow_field(
@@ -1060,27 +1103,48 @@ pub fn animal_movement_system(
                     }
                 }
             }
-            if !planned {
+            // Inline A* fallback — budgeted (this tick's round-robin slice) and
+            // throttled (no re-A* while a fruitless-search cooldown holds).
+            let mut gave_up = false;
+            if !planned && ai.replan_cooldown_until <= now && allowed.contains(&entity) {
                 let goal_z = chunk_map.surface_z_at(ai.target_tile.0, ai.target_tile.1) as i8;
                 let start = (cur_tx, cur_ty, cur_z);
                 let goal = (ai.target_tile.0, ai.target_tile.1, goal_z);
                 let scratch = pool.scratch(2);
-                if crate::simulation::animal_paths::replan_astar(
+                use crate::simulation::animal_paths::{
+                    AnimalReplanOutcome, ANIMAL_REPLAN_COOLDOWN_TICKS,
+                };
+                match crate::simulation::animal_paths::replan_astar(
                     scratch, &chunk_map, &mut ai, start, goal,
                 ) {
-                    planned = true;
+                    AnimalReplanOutcome::Planned => planned = true,
+                    AnimalReplanOutcome::PlannedPartial => {
+                        // Walkable one-step partial toward an out-of-range goal;
+                        // throttle the next full search.
+                        planned = true;
+                        ai.replan_cooldown_until = now + ANIMAL_REPLAN_COOLDOWN_TICKS;
+                    }
+                    AnimalReplanOutcome::Unreachable => {
+                        ai.replan_cooldown_until = now + ANIMAL_REPLAN_COOLDOWN_TICKS;
+                        gave_up = true;
+                    }
                 }
             }
             if !planned {
-                // Unreachable. Drop into Wander, stall on current tile,
-                // let wander_timer pick a new step next pass.
-                let tw = tile_to_world(cur_tx, cur_ty);
-                transform.translation.x = tw.x;
-                transform.translation.y = tw.y;
-                ai.state = AnimalState::Wander;
-                ai.target_entity = None;
-                ai.target_tile = (cur_tx, cur_ty);
-                ai.wander_timer = 0.0;
+                if gave_up {
+                    // Genuinely unreachable: drop into Wander, stall on current
+                    // tile, let wander_timer pick a new step next pass.
+                    let tw = tile_to_world(cur_tx, cur_ty);
+                    transform.translation.x = tw.x;
+                    transform.translation.y = tw.y;
+                    ai.state = AnimalState::Wander;
+                    ai.target_entity = None;
+                    ai.target_tile = (cur_tx, cur_ty);
+                    ai.wander_timer = 0.0;
+                }
+                // else: cooldown- or budget-deferred this tick. Keep the goal +
+                // empty path and skip movement; the animal rotates into the
+                // replan slice (or the cooldown lapses) within a few ticks.
                 continue;
             }
         }

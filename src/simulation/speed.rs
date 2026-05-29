@@ -332,9 +332,23 @@ pub mod suspect {
     pub const AMBIENT_SOCIAL: usize = 0;
     pub const AWARENESS_GOSSIP: usize = 1;
     pub const CLUSTER_DECAY: usize = 2;
-    pub const COUNT: usize = 3;
-    pub const LABELS: [&str; COUNT] =
-        ["ambient_social_pairing", "awareness_gossip", "cluster_decay"];
+    // Sequential-set attribution (the set that dominates the tick at ~20 pop).
+    pub const VISION: usize = 3;
+    pub const ANIMAL_MOVEMENT: usize = 4;
+    pub const MOVEMENT: usize = 5;
+    pub const GATHER: usize = 6;
+    pub const COMBAT: usize = 7;
+    pub const COUNT: usize = 8;
+    pub const LABELS: [&str; COUNT] = [
+        "ambient_social_pairing",
+        "awareness_gossip",
+        "cluster_decay",
+        "vision",
+        "animal_movement",
+        "movement",
+        "gather",
+        "combat",
+    ];
 }
 
 /// Last-invocation microseconds per suspect system, folded into

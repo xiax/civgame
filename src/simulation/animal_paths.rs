@@ -35,6 +35,67 @@ use crate::world::terrain::TILE_SIZE;
 /// A* node budget per animal replan. Far below the person worker's 1500.
 pub const ANIMAL_PATH_BUDGET: usize = 256;
 
+/// Ticks an animal suppresses inline A\* replanning after a fruitless search
+/// (`Unreachable` / `BudgetExhausted`). Without this, an animal whose goal sits
+/// beyond `ANIMAL_PATH_BUDGET` nodes re-runs a full 256-node A\* every single
+/// tick (the partial path is consumed in one step). One game-second at 20 Hz.
+pub const ANIMAL_REPLAN_COOLDOWN_TICKS: u64 = 20;
+
+/// Outcome of [`replan_astar`], so the caller can tell a clean path from a
+/// fruitless search and apply [`ANIMAL_REPLAN_COOLDOWN_TICKS`] only to the
+/// expensive cases.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AnimalReplanOutcome {
+    /// Full path to the goal was found.
+    Planned,
+    /// A* ran out of budget; a one-step partial toward `best_so_far` was
+    /// stamped. Walkable, but the goal is out of short-horizon range.
+    PlannedPartial,
+    /// Goal unreachable; caller should drop into Wander.
+    Unreachable,
+}
+
+/// Round-robin cursor over animal entities for the per-tick inline-A\* replan
+/// budget (`PerfWorkBudget::animal_replans_per_tick`). Mirrors `VisionCursor`:
+/// eligible animals needing a replan are sorted by entity bits, the slice
+/// starting at `next_bits` consumes the budget, and the cursor advances past
+/// the last served entity so every animal is revisited within
+/// `ceil(N_needing_replan / cap)` ticks. Prevents starvation under a flat cap.
+#[derive(Resource, Default)]
+pub struct AnimalReplanCursor {
+    pub next_bits: u64,
+}
+
+/// Round-robin selection of which animals may run inline A\* this tick.
+///
+/// `eligible` (the entities that need a replan, off-cooldown) is sorted in
+/// place by entity bits. The slice of up to `cap` entities starting at the
+/// first whose bits are `>= cursor_bits` (wrapping around the ring) is
+/// returned as a set, along with the new cursor value — one past the last
+/// served entity, so the next tick begins where this one stopped and every
+/// animal is revisited within `ceil(len / cap)` ticks. Empty input → empty
+/// set and an unchanged cursor. `cap` is floored at 1.
+pub fn select_replan_slice(
+    eligible: &mut Vec<Entity>,
+    cap: usize,
+    cursor_bits: u64,
+) -> (AHashSet<Entity>, u64) {
+    if eligible.is_empty() {
+        return (AHashSet::default(), cursor_bits);
+    }
+    eligible.sort_unstable_by_key(|e| e.to_bits());
+    let pivot = eligible
+        .iter()
+        .position(|e| e.to_bits() >= cursor_bits)
+        .unwrap_or(0);
+    let take = cap.max(1).min(eligible.len());
+    let slice: AHashSet<Entity> = (0..take)
+        .map(|off| eligible[(pivot + off) % eligible.len()])
+        .collect();
+    let last = eligible[(pivot + take - 1) % eligible.len()];
+    (slice, last.to_bits().wrapping_add(1))
+}
+
 /// Maximum cells the cached path may be before we force a replan even if
 /// the destination hasn't changed (guards against stale partials).
 pub const ANIMAL_PATH_MAX_AGE_CURSOR: u16 = 200;
@@ -425,16 +486,15 @@ fn build_repulsion_field(
 
 /// Replan a path for a solo/pack animal using inline A*. Stashes the path
 /// on `ai.path` + sets `path_cursor=1` (cursor 0 is the start tile).
-/// Returns `true` when a usable path was found (full or partial),
-/// `false` when the goal is unreachable and the caller should drop into
-/// Wander.
+/// Returns an [`AnimalReplanOutcome`] so the caller can distinguish a full
+/// path from a fruitless search and apply a replan cooldown to the latter.
 pub fn replan_astar(
     scratch: &mut AStarScratch,
     chunk_map: &ChunkMap,
     ai: &mut AnimalAI,
     start: (i32, i32, i8),
     goal: (i32, i32, i8),
-) -> bool {
+) -> AnimalReplanOutcome {
     let (result, _) = find_path_in(scratch, chunk_map, start, goal, ANIMAL_PATH_BUDGET);
     ai.path.clear();
     ai.path_cursor = 0;
@@ -446,7 +506,7 @@ pub fn replan_astar(
             ai.path.extend(p);
             ai.path_cursor = 1;
             ai.path_goal = (goal.0, goal.1);
-            true
+            AnimalReplanOutcome::Planned
         }
         AStarResult::BudgetExhausted { best_so_far } => {
             // Walk toward the partial. We don't have the chain of waypoints
@@ -455,9 +515,9 @@ pub fn replan_astar(
             ai.path.push(best_so_far);
             ai.path_cursor = 1;
             ai.path_goal = (goal.0, goal.1);
-            true
+            AnimalReplanOutcome::PlannedPartial
         }
-        AStarResult::Unreachable => false,
+        AStarResult::Unreachable => AnimalReplanOutcome::Unreachable,
     }
 }
 
@@ -515,6 +575,7 @@ pub fn try_replan_via_flow_field(
 pub fn build(app: &mut App) {
     app.init_resource::<HerdClusterRegistry>();
     app.init_resource::<HerdClusterCursor>();
+    app.init_resource::<AnimalReplanCursor>();
 }
 
 #[cfg(test)]
@@ -569,6 +630,66 @@ mod tests {
             nearest_predator_in_bounds(&preds_rev, (-4, 4, -4, 4), (0, 0)),
             got
         );
+    }
+
+    fn ents(ids: &[u32]) -> Vec<Entity> {
+        ids.iter().map(|&i| Entity::from_raw(i)).collect()
+    }
+
+    #[test]
+    fn replan_slice_empty_input_keeps_cursor() {
+        let mut e: Vec<Entity> = Vec::new();
+        let (slice, next) = select_replan_slice(&mut e, 4, 99);
+        assert!(slice.is_empty());
+        assert_eq!(next, 99, "cursor must not move when nothing is eligible");
+    }
+
+    #[test]
+    fn replan_slice_cap_ge_len_takes_all() {
+        let mut e = ents(&[3, 1, 2]);
+        let (slice, next) = select_replan_slice(&mut e, 8, 0);
+        assert_eq!(slice.len(), 3);
+        for id in [1u32, 2, 3] {
+            assert!(slice.contains(&Entity::from_raw(id)));
+        }
+        // Sorted ascending, served all → cursor past the largest.
+        assert_eq!(next, Entity::from_raw(3).to_bits().wrapping_add(1));
+    }
+
+    #[test]
+    fn replan_slice_caps_and_advances_cursor() {
+        let mut e = ents(&[10, 20, 30, 40]);
+        // Start of ring, cap 2 → serve {10,20}, cursor past 20.
+        let (slice, next) = select_replan_slice(&mut e, 2, 0);
+        assert_eq!(slice.len(), 2);
+        assert!(slice.contains(&Entity::from_raw(10)));
+        assert!(slice.contains(&Entity::from_raw(20)));
+        assert_eq!(next, Entity::from_raw(20).to_bits().wrapping_add(1));
+    }
+
+    #[test]
+    fn replan_slice_two_ticks_cover_everyone_no_starvation() {
+        let ids = [10u32, 20, 30, 40];
+        let mut cursor = 0u64;
+        let mut seen: AHashSet<Entity> = AHashSet::new();
+        for _ in 0..2 {
+            let mut e = ents(&ids);
+            let (slice, next) = select_replan_slice(&mut e, 2, cursor);
+            seen.extend(slice);
+            cursor = next;
+        }
+        // ceil(4/2) = 2 ticks revisit everyone.
+        assert_eq!(seen.len(), 4, "every animal served within ceil(len/cap) ticks");
+    }
+
+    #[test]
+    fn replan_slice_cursor_past_all_wraps_to_front() {
+        let mut e = ents(&[10, 20, 30, 40]);
+        // Cursor beyond every entity's bits → pivot wraps to index 0.
+        let big = Entity::from_raw(40).to_bits().wrapping_add(1000);
+        let (slice, _next) = select_replan_slice(&mut e, 2, big);
+        assert!(slice.contains(&Entity::from_raw(10)));
+        assert!(slice.contains(&Entity::from_raw(20)));
     }
 
     #[test]
