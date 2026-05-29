@@ -6013,6 +6013,54 @@ pub(crate) fn bed_eligible_for_faction(
         dx.max(dy) <= BED_FALLBACK_RADIUS
     })
 }
+
+/// Pure predicate: should `assign_beds_system` clear this bed's `owner` (so it
+/// re-enters the claim pool)? Keeps `HomeBed == bed <=> Bed.owner == person` an
+/// invariant. `owner_alive` = the owner entity still exists; `owner_home_bed` =
+/// the owner's current `HomeBed` target; `owner_bed_eligible` = the bed passes
+/// `bed_eligible_for_faction` for the owner's root.
+pub(crate) fn bed_owner_is_stale(
+    bed_entity: Entity,
+    owner_alive: bool,
+    owner_home_bed: Option<Entity>,
+    owner_bed_eligible: bool,
+) -> bool {
+    !owner_alive                              // death / despawn left the claim dangling
+        || owner_home_bed != Some(bed_entity) // spouse-relocation left old bed tagged
+        || !owner_bed_eligible                // plot changed hands / no longer eligible
+}
+
+/// Pure predicate: is `person`'s `HomeBed` claim stale, so the homeless pass
+/// should reassign them? `home_bed` = the claimed entity (None = no claim);
+/// `bed_alive` = the claimed bed entity still exists; `bed_owner` = its `owner`;
+/// `bed_eligible` = it passes eligibility for the person's root.
+pub(crate) fn home_bed_claim_is_stale(
+    person: Entity,
+    home_bed: Option<Entity>,
+    bed_alive: bool,
+    bed_owner: Option<Entity>,
+    bed_eligible: bool,
+) -> bool {
+    match home_bed {
+        None => true,                              // no claim
+        Some(_) if !bed_alive => true,             // claimed bed despawned
+        Some(_) => bed_owner != Some(person) || !bed_eligible, // phantom / ineligible
+    }
+}
+
+/// Pure predicate: should `assign_beds_system` cancel an in-flight
+/// `Task::Sleep { bed: None }` so the sleeper re-routes onto a now-valid bed?
+/// `valid_claim` = a live bed reciprocally owned by the sleeper; `on_bed` = the
+/// sleeper already stands on the bed tile; `recent_sleep_route_failure` = a
+/// SLEEP routing failure inside the `MethodHistory` TTL (cooldown that prevents
+/// per-pass churn against a genuinely unreachable bed).
+pub(crate) fn should_reroute_bedless_sleeper(
+    valid_claim: bool,
+    on_bed: bool,
+    recent_sleep_route_failure: bool,
+) -> bool {
+    valid_claim && !on_bed && !recent_sleep_route_failure
+}
 /// Higher bar for an *already-housed* woman to abandon her bed for one closer
 /// to her partner (hysteresis vs PARTNER_AFFINITY_THRESHOLD prevents flapping).
 const REASSIGN_AFFINITY_THRESHOLD: i8 = 80;
@@ -6061,6 +6109,7 @@ pub fn assign_beds_system(
     plot_q: Query<&crate::simulation::land::Plot>,
     settlement_map: Res<crate::simulation::settlement::SettlementMap>,
     settlement_q: Query<&crate::simulation::settlement::Settlement>,
+    method_history_q: Query<&crate::simulation::htn::MethodHistory>,
 ) {
     use crate::simulation::reproduction::BiologicalSex;
     use crate::simulation::settlement_bootstrap::SPOUSE_AFFINITY;
@@ -6070,17 +6119,81 @@ pub fn assign_beds_system(
     }
 
     let mut claimed_this_pass: AHashSet<Entity> = AHashSet::new();
-    // Workers freshly assigned a `HomeBed` this pass — drained after every
-    // assignment loop to cancel any in-flight `Task::Sleep { bed: None }` so the
-    // next `htn_sleep_dispatch_system` tick re-routes them to the new bed
-    // instead of finishing the night outside. See `bed_eligible_for_faction`
-    // header for the wider fix.
-    let mut cancel_bedless_sleep: Vec<Entity> = Vec::new();
 
     // Reverse lookup: bed entity → tile position. BedMap is sparse so the
     // collect is cheap.
     let bed_pos_by_entity: AHashMap<Entity, (i32, i32)> =
         bed_map.0.iter().map(|(&pos, &e)| (e, pos)).collect();
+
+    // ── Resolvers + bed-claim reconciliation (run before any assignment) ─────
+    // `root_of` / `plot_faction_at` / `anchors_by_root` back the eligibility
+    // predicate used by every pass below and by the stale-owner sweep. Hoisted
+    // here so a bed freed from a dead/relocated owner re-enters the `available`
+    // pool this same tick.
+    let root_of = |fid: u32| faction_registry.root_faction(fid);
+    let plot_faction_at = |tile: (i32, i32)| -> Option<u32> {
+        let plot_id = plot_index.plot_at(tile.0, tile.1)?;
+        let plot_entity = *plot_index.by_id.get(&plot_id)?;
+        let plot = plot_q.get(plot_entity).ok()?;
+        Some(plot.faction_id)
+    };
+    let mut anchors_by_root: AHashMap<u32, Vec<(i32, i32)>> = AHashMap::new();
+    for (faction_id, data) in faction_registry.factions.iter() {
+        let root = faction_registry.root_faction(*faction_id);
+        anchors_by_root.entry(root).or_default().push(data.home_tile);
+    }
+    for (faction_id, ids) in settlement_map.by_faction.iter() {
+        let root = faction_registry.root_faction(*faction_id);
+        let bucket = anchors_by_root.entry(root).or_default();
+        for sid in ids {
+            if let Some(&se) = settlement_map.by_id.get(sid) {
+                if let Ok(s) = settlement_q.get(se) {
+                    bucket.push(s.market_tile);
+                }
+            }
+        }
+    }
+    let empty_anchors: Vec<(i32, i32)> = Vec::new();
+
+    // Clear leaked `Bed.owner` so `HomeBed == bed <=> Bed.owner == person`
+    // stays an invariant: owner entity gone (death / despawn), owner's `HomeBed`
+    // no longer points back (spouse-relocation left the old bed tagged), or the
+    // bed is no longer eligible for the owner's root faction. A cleared bed
+    // re-enters the claim pool below.
+    {
+        let mut to_clear: Vec<Entity> = Vec::new();
+        for (&pos, &bed_entity) in bed_map.0.iter() {
+            let Ok(bed) = bed_query.get(bed_entity) else {
+                continue;
+            };
+            let Some(owner) = bed.owner else { continue };
+            let owning_faction = bed.owning_faction;
+            let drop = match person_query.get(owner) {
+                Ok((_, member, _, home_bed, _, _, _, _, _)) => {
+                    let owner_root = faction_registry.root_faction(member.faction_id);
+                    let anchors = anchors_by_root.get(&owner_root).unwrap_or(&empty_anchors);
+                    let eligible = bed_eligible_for_faction(
+                        owning_faction,
+                        pos,
+                        owner_root,
+                        &root_of,
+                        &plot_faction_at,
+                        anchors,
+                    );
+                    bed_owner_is_stale(bed_entity, true, home_bed.and_then(|h| h.0), eligible)
+                }
+                Err(_) => bed_owner_is_stale(bed_entity, false, None, false),
+            };
+            if drop {
+                to_clear.push(bed_entity);
+            }
+        }
+        for bed_entity in to_clear {
+            if let Ok(mut bed) = bed_query.get_mut(bed_entity) {
+                bed.owner = None;
+            }
+        }
+    }
 
     // Snapshot every person's HomeBed entity, sex, faction, household, and
     // current tile so Pass 0 (seeded-spouse pairing) and Pass A can resolve
@@ -6287,8 +6400,6 @@ pub fn assign_beds_system(
         }
         commands.entity(person).insert(HomeBed(Some(first_e)));
         commands.entity(partner).insert(HomeBed(Some(second_e)));
-        cancel_bedless_sleep.push(person);
-        cancel_bedless_sleep.push(partner);
         claimed_this_pass.insert(first_e);
         claimed_this_pass.insert(second_e);
         paired_this_pass.insert(person);
@@ -6516,30 +6627,6 @@ pub fn assign_beds_system(
         }
     }
 
-    // ── Anchor tiles per root faction ────────────────────────────────────────
-    // Backstop anchors for legacy untagged beds in `bed_eligible_for_faction`:
-    // every faction's `home_tile` (households contribute their own home so a
-    // member-local fallback still works) plus every owned `Settlement.market_tile`.
-    // Keyed by `root_faction` so household members share the parent village's
-    // anchors.
-    let mut anchors_by_root: AHashMap<u32, Vec<(i32, i32)>> = AHashMap::new();
-    for (faction_id, data) in faction_registry.factions.iter() {
-        let root = faction_registry.root_faction(*faction_id);
-        anchors_by_root.entry(root).or_default().push(data.home_tile);
-    }
-    for (faction_id, ids) in settlement_map.by_faction.iter() {
-        let root = faction_registry.root_faction(*faction_id);
-        let bucket = anchors_by_root.entry(root).or_default();
-        for sid in ids {
-            if let Some(&se) = settlement_map.by_id.get(sid) {
-                if let Ok(s) = settlement_q.get(se) {
-                    bucket.push(s.market_tile);
-                }
-            }
-        }
-    }
-    let empty_anchors: Vec<(i32, i32)> = Vec::new();
-
     // ── Faction pass ─────────────────────────────────────────────────────────
     struct Homeless {
         person: Entity,
@@ -6554,8 +6641,29 @@ pub fn assign_beds_system(
         if member.faction_id == SOLO {
             continue;
         }
-        let stale = match home_bed.and_then(|h| h.0) {
-            Some(bed_entity) => bed_query.get(bed_entity).is_err(),
+        let root = faction_registry.root_faction(member.faction_id);
+        // Homeless = no claim, despawned bed, mismatched/non-reciprocal claim,
+        // or a claim that is no longer faction-eligible.
+        let claim = home_bed.and_then(|h| h.0);
+        let stale = match claim {
+            Some(bed_entity) => match bed_query.get(bed_entity) {
+                Ok(bed) => {
+                    let bed_tile = bed_pos_by_entity
+                        .get(&bed_entity)
+                        .copied()
+                        .unwrap_or((i32::MIN, i32::MIN));
+                    let eligible = bed_eligible_for_faction(
+                        bed.owning_faction,
+                        bed_tile,
+                        root,
+                        &root_of,
+                        &plot_faction_at,
+                        anchors_by_root.get(&root).unwrap_or(&empty_anchors),
+                    );
+                    home_bed_claim_is_stale(person, claim, true, bed.owner, eligible)
+                }
+                Err(_) => home_bed_claim_is_stale(person, claim, false, None, false),
+            },
             None => true,
         };
         if !stale {
@@ -6573,7 +6681,6 @@ pub fn assign_beds_system(
             ),
             _ => None,
         };
-        let root = faction_registry.root_faction(member.faction_id);
         homeless_by_root
             .entry(root)
             .or_default()
@@ -6583,14 +6690,6 @@ pub fn assign_beds_system(
                 partner_bed,
             });
     }
-
-    let root_of = |fid: u32| faction_registry.root_faction(fid);
-    let plot_faction_at = |tile: (i32, i32)| -> Option<u32> {
-        let plot_id = plot_index.plot_at(tile.0, tile.1)?;
-        let plot_entity = *plot_index.by_id.get(&plot_id)?;
-        let plot = plot_q.get(plot_entity).ok()?;
-        Some(plot.faction_id)
-    };
 
     for (root, homeless) in homeless_by_root {
         let anchors = anchors_by_root.get(&root).unwrap_or(&empty_anchors);
@@ -6649,7 +6748,6 @@ pub fn assign_beds_system(
             let (bed_e, _) = available.swap_remove(best_idx);
             claimed_this_pass.insert(bed_e);
             commands.entity(h.person).insert(HomeBed(Some(bed_e)));
-            cancel_bedless_sleep.push(h.person);
             if let Ok(mut bed_comp) = bed_query.get_mut(bed_e) {
                 bed_comp.owner = Some(h.person);
             }
@@ -6663,8 +6761,26 @@ pub fn assign_beds_system(
         if member.faction_id != SOLO {
             continue;
         }
-        let stale = match home_bed.and_then(|h| h.0) {
-            Some(bed_entity) => bed_query.get(bed_entity).is_err(),
+        let claim = home_bed.and_then(|h| h.0);
+        let stale = match claim {
+            Some(bed_entity) => match bed_query.get(bed_entity) {
+                Ok(bed) => {
+                    let bed_tile = bed_pos_by_entity
+                        .get(&bed_entity)
+                        .copied()
+                        .unwrap_or((i32::MIN, i32::MIN));
+                    let eligible = bed_eligible_for_faction(
+                        bed.owning_faction,
+                        bed_tile,
+                        SOLO,
+                        &root_of,
+                        &plot_faction_at,
+                        solo_anchors,
+                    );
+                    home_bed_claim_is_stale(person, claim, true, bed.owner, eligible)
+                }
+                Err(_) => home_bed_claim_is_stale(person, claim, false, None, false),
+            },
             None => true,
         };
         if !stale {
@@ -6706,7 +6822,6 @@ pub fn assign_beds_system(
         if let Some((bed_e, _)) = best_bed {
             claimed_this_pass.insert(bed_e);
             commands.entity(person).insert(HomeBed(Some(bed_e)));
-            cancel_bedless_sleep.push(person);
             if let Ok(mut bed_comp) = bed_query.get_mut(bed_e) {
                 bed_comp.owner = Some(person);
             }
@@ -6735,18 +6850,41 @@ pub fn assign_beds_system(
         }
     }
 
-    // ── Cancel any in-flight bedless Sleep on freshly-bedded workers ─────────
-    // Workers that were dispatched `Task::Sleep { bed: None }` (in-place /
-    // home-tile fallback) need their chain cancelled now that they have a
-    // `HomeBed`, otherwise they finish the night outside and only re-route on
-    // the next dispatch. `htn_sleep_dispatch_system` re-evaluates next tick.
-    for person in cancel_bedless_sleep {
-        if let Ok((_, _, _, _, _, _, _, Some(mut ai), Some(mut aq))) =
-            person_query.get_mut(person)
-        {
-            if aq.current.as_sleep() == Some(None) {
-                aq.cancel_chain(&mut ai);
-            }
+    // ── Re-route any valid-bed worker still sleeping bedless ────────────────
+    // Covers both workers freshly assigned a `HomeBed` this pass AND those who
+    // fell back to `Task::Sleep { bed: None }` after a transient dusk routing
+    // failure. A worker with a live, reciprocal `HomeBed` who isn't already on
+    // the bed and has no recent SLEEP routing failure gets its chain cancelled
+    // so the next `htn_sleep_dispatch_system` tick routes to
+    // `Sleep { bed: Some(_) }`. The `recently_failed_count` guard caps retries
+    // at one per `MethodHistory` TTL window — a genuinely-unreachable bed never
+    // causes per-pass churn (the worker still recovers in place at 1× meanwhile).
+    let now = clock.tick;
+    for (person, _member, transform, home_bed, _, _, _, ai_opt, aq_opt) in person_query.iter_mut() {
+        let (Some(mut ai), Some(mut aq)) = (ai_opt, aq_opt) else {
+            continue;
+        };
+        if aq.current.as_sleep() != Some(None) {
+            continue;
+        }
+        let Some(bed_entity) = home_bed.and_then(|h| h.0) else {
+            continue;
+        };
+        // Only a live, reciprocal claim earns a reroute.
+        let valid_claim = matches!(bed_query.get(bed_entity), Ok(bed) if bed.owner == Some(person));
+        let on_bed = bed_pos_by_entity.get(&bed_entity).is_some_and(|&bed_tile| {
+            let cur = (
+                (transform.translation.x / crate::world::terrain::TILE_SIZE).floor() as i32,
+                (transform.translation.y / crate::world::terrain::TILE_SIZE).floor() as i32,
+            );
+            cur == bed_tile
+        });
+        let recent_sleep_route_failure = method_history_q
+            .get(person)
+            .map(|h| h.recently_failed_count(crate::simulation::htn::MethodId::SLEEP, now) > 0)
+            .unwrap_or(false);
+        if should_reroute_bedless_sleeper(valid_claim, on_bed, recent_sleep_route_failure) {
+            aq.cancel_chain(&mut ai);
         }
     }
 }
@@ -9273,5 +9411,87 @@ mod tests {
             &no_plot,
             &anchors,
         ));
+    }
+
+    // ───────────── Bed-claim reconciliation predicates ─────────────
+
+    #[test]
+    fn bed_owner_cleared_when_owner_entity_gone() {
+        let bed = Entity::from_raw(1);
+        // Dead/despawned owner → clear regardless of the other inputs.
+        assert!(bed_owner_is_stale(bed, false, Some(bed), true));
+    }
+
+    #[test]
+    fn bed_owner_cleared_when_claim_not_reciprocal() {
+        let bed = Entity::from_raw(1);
+        let other_bed = Entity::from_raw(2);
+        // Owner alive + eligible but its HomeBed points elsewhere (or nowhere).
+        assert!(bed_owner_is_stale(bed, true, Some(other_bed), true));
+        assert!(bed_owner_is_stale(bed, true, None, true));
+    }
+
+    #[test]
+    fn bed_owner_cleared_when_no_longer_eligible() {
+        let bed = Entity::from_raw(1);
+        // Reciprocal claim but bed no longer eligible for the owner's root.
+        assert!(bed_owner_is_stale(bed, true, Some(bed), false));
+    }
+
+    #[test]
+    fn bed_owner_retained_when_live_reciprocal_eligible() {
+        let bed = Entity::from_raw(1);
+        assert!(!bed_owner_is_stale(bed, true, Some(bed), true));
+    }
+
+    #[test]
+    fn home_bed_claim_stale_when_missing_or_dead() {
+        let p = Entity::from_raw(10);
+        let bed = Entity::from_raw(1);
+        // No claim.
+        assert!(home_bed_claim_is_stale(p, None, false, None, false));
+        // Claim points at a despawned bed.
+        assert!(home_bed_claim_is_stale(p, Some(bed), false, None, false));
+    }
+
+    #[test]
+    fn home_bed_claim_stale_when_owner_mismatch_or_ineligible() {
+        let p = Entity::from_raw(10);
+        let other = Entity::from_raw(11);
+        let bed = Entity::from_raw(1);
+        // Phantom claim: bed owned by someone else.
+        assert!(home_bed_claim_is_stale(p, Some(bed), true, Some(other), true));
+        // Phantom claim: bed unowned.
+        assert!(home_bed_claim_is_stale(p, Some(bed), true, None, true));
+        // Reciprocal but ineligible (e.g. plot changed hands).
+        assert!(home_bed_claim_is_stale(p, Some(bed), true, Some(p), false));
+    }
+
+    #[test]
+    fn home_bed_claim_fresh_when_reciprocal_and_eligible() {
+        let p = Entity::from_raw(10);
+        let bed = Entity::from_raw(1);
+        assert!(!home_bed_claim_is_stale(p, Some(bed), true, Some(p), true));
+    }
+
+    #[test]
+    fn reroute_when_valid_claim_off_bed_and_no_recent_failure() {
+        assert!(should_reroute_bedless_sleeper(true, false, false));
+    }
+
+    #[test]
+    fn no_reroute_without_valid_claim() {
+        assert!(!should_reroute_bedless_sleeper(false, false, false));
+    }
+
+    #[test]
+    fn no_reroute_when_already_on_bed() {
+        assert!(!should_reroute_bedless_sleeper(true, true, false));
+    }
+
+    #[test]
+    fn no_reroute_during_sleep_route_failure_cooldown() {
+        // Guard against per-pass churn against a genuinely unreachable bed.
+        assert!(!should_reroute_bedless_sleeper(true, false, true));
     }
 }

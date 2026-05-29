@@ -3629,7 +3629,7 @@ pub fn htn_sleep_dispatch_system(
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
     clock: Res<SimClock>,
-    bed_query: Query<&Transform, With<Bed>>,
+    bed_query: Query<(&Transform, &Bed)>,
     mut query: Query<
         (
             Entity,
@@ -3668,13 +3668,23 @@ pub fn htn_sleep_dispatch_system(
             cur_ty.div_euclid(CHUNK_SIZE as i32),
         );
 
-        let home_bed = home_bed_opt.and_then(|h| h.0);
-        let home_bed_tile = home_bed.and_then(|b| bed_query.get(b).ok()).map(|t| {
-            (
-                (t.translation.x / TILE_SIZE).floor() as i32,
-                (t.translation.y / TILE_SIZE).floor() as i32,
-            )
-        });
+        // Only honour a bed claim that is live AND reciprocally owned by this
+        // actor. Defends against a stale `HomeBed` pointing at a foreign or
+        // reassigned bed in the window before `assign_beds_system` reconciles;
+        // a mismatch falls through to the home / in-place sleep path.
+        let (home_bed, home_bed_tile) = match home_bed_opt.and_then(|h| h.0) {
+            Some(b) => match bed_query.get(b) {
+                Ok((t, bed)) if bed.owner == Some(actor) => (
+                    Some(b),
+                    Some((
+                        (t.translation.x / TILE_SIZE).floor() as i32,
+                        (t.translation.y / TILE_SIZE).floor() as i32,
+                    )),
+                ),
+                _ => (None, None),
+            },
+            None => (None, None),
+        };
         let faction_home = if member.faction_id != SOLO {
             faction_registry.home_tile(member.faction_id)
         } else {
