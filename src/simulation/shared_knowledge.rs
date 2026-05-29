@@ -1030,7 +1030,9 @@ pub fn faction_knows_cluster(
 pub fn cluster_decay_system(
     clock: Res<crate::simulation::SimClock>,
     mut shared: ResMut<SharedKnowledge>,
+    timings: Res<crate::simulation::speed::SuspectSystemTimings>,
 ) {
+    let _t = timings.guard(crate::simulation::speed::suspect::CLUSTER_DECAY);
     if clock.tick % CLUSTER_DECAY_CADENCE != 0 {
         return;
     }

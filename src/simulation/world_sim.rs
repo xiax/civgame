@@ -24,6 +24,15 @@ pub struct WorldSimTaskState {
     pending_raids: VecDeque<RaidIntent>,
 }
 
+impl WorldSimTaskState {
+    /// Total queued main-thread apply backlog (deltas + raids). Surfaced in
+    /// the Performance debug panel as a growth-watch counter — a climbing
+    /// value means async world-sim is outrunning the bounded drain.
+    pub fn pending_total(&self) -> usize {
+        self.pending_deltas.len() + self.pending_raids.len()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct WorldSimCellSnapshot {
     gx: i32,

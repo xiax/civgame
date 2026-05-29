@@ -12,6 +12,8 @@ cargo check                # Fast type check
 cargo test --bin civgame   # Run tests (binary crate — `cargo test` alone errors)
 ```
 
+`[profile.dev.package."*"] opt-level = 3` (Cargo.toml) optimizes dependencies (Bevy etc.) even in debug, so `cargo run` is not bottlenecked on unoptimized deps; our own crate stays at `opt-level = 1` for fast incremental builds.
+
 ## Architecture
 
 CivGame is a Dwarf Fortress-style civilization simulation on **Bevy 0.15** (ECS). Six plugins:

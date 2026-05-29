@@ -1,29 +1,28 @@
-# Early-Game Performance Fix Plan
+# Early-Game Performance Fix Plan (revised)
 
-## Summary
-Fix the year-1, ~20-population slowdown first, then add a user-facing offscreen fidelity toggle for later-game scaling. The first patch should make performance visible in-game, remove obvious per-tick scans/allocation churn, and prevent over-time growth in jobs/items/storage/path work from quietly compounding.
+## Problem
+Year-1, ~20-pop slowdown in `cargo run` (debug); tick time **climbs over time**.
 
-## Key Changes
-- Add a lightweight “Performance” debug panel section showing live counts and timings: people by LOD, ground items, job postings, blueprints, loaded chunks, focus points, path queue/failures, storage recomputes, vision recomputes, settlement survey snapshots, and coarse `SimulationSet` timings.
-- Optimize early-game hot paths:
-  - Cache goal-system snapshots that are currently rebuilt every fixed tick, including population counts, household farm ownership/work availability, and nearby tameable-animal availability.
-  - Replace vision-system per-tick allocation/sort/cap selection with a cursor/budgeted scheduler, and only recompute vision for dirty, moved, lookout, or due-bucket agents.
-  - Reduce storage/resource-demand churn by making faction storage recomputes more targeted and surfacing why a full sweep happened.
-  - Rework loose-stockpile posting to use spatial lookups or bounded incremental scans instead of repeatedly sweeping full 65x65 home/market areas.
-  - Move settlement-plan projection behind its stale/dirty gate, and add survey backoff when no relevant terrain/member/building/road state changed.
-- Add `PerformanceSettings` with an in-game UI toggle for offscreen fidelity:
-  - `Balanced` default: fully simulate camera/current settlement, keep discovered regions remembered but cheaper.
-  - `All Live`: preserves current every-settled-region focus behavior.
-  - `Minimal`: strongest performance mode for offscreen regions.
-- Keep changes ECS-native, deterministic, and crate-free.
+## Diagnosis correction
+The original five hot-path targets (vision / faction storage / loose-stockpile / survey / goal snapshots) were **already optimized in commit 6d4f727** (round-robin cursors, per-faction stagger, change-detection gating, async surveys). A growth audit found all major accumulators (ground items, postings, blueprints, chunk graph, clusters, path logs, agent memory) **bounded**. So: not a leak. "Climbs over time" + everything-bounded ⇒ explored-area-correlated cost (resource clusters, loaded chunks, gossip) that plateaus. Decision: **measure-first**.
 
-## Tests
-- Add focused tests for cache invalidation in goal/farm/household state, vision scheduler budgeting, loose-item/job-posting bounds, and offscreen focus-mode point counts.
-- Add a deterministic perf smoke scenario for a 20-pop year-1 settlement that asserts bounded counts for path queue, postings, ground items, loaded chunks, and focus points.
-- Verify with `cargo test --bin civgame` and `cargo check`.
-- Manual acceptance: in the debug panel, average/p99 fixed tick time should stabilize instead of climbing, with no monotonic growth in ground items, postings, path queue, or storage full sweeps during the reported scenario.
+## Shipped
+- **Phase 0 — build profile.** `Cargo.toml`: `[profile.dev.package."*"] opt-level = 3` (deps optimized in debug; our crate stays opt-level 1). Highest-leverage debug-build fix.
+- **Phase 1a — per-set timing.** `SetTimingDiagnostics` (EMA/worst/p99 per `SimulationSet`) via boundary systems in `speed.rs` + `mod.rs`. Answers "which set climbs?".
+- **Phase 1b — suspect attribution.** `SuspectSystemTimings` (atomic, parallel-safe `Res` + `Drop` guard) on `cluster_decay` / `ambient_social_pairing` / `awareness_gossip`; folded into `SetTimingDiagnostics.system_us`. `goal_update` omitted (param ceiling → read ParallelA/B totals); `world_sim` reuses `world_sim_compute_us`.
+- **Phase 1c — Performance panel.** `render_performance_section` + `PerfPanelParams` in `debug_panel.rs`: per-set timings, suspect µs, and `PerfHistory` growth sparklines (ground items, postings, blueprints, loaded chunks, focus points, clusters, path failures, world-sim queue) with a Δ "climb" column. Sampler `perf::perf_history_sample_system` (panel-open-gated, 600-tick cadence).
+- **Phase 3 — offscreen fidelity.** `perf::PerformanceSettings { OffscreenFidelity::{AllLive, Balanced(default), Minimal} }` wired into `update_simulation_focus_system` (off-camera region focus radius: base / base÷2 / none) and `update_lod_levels_system` (promote radius 8/4/0). Combo selector in the panel. Camera region always full.
+- Tests: `perf::tests` (series ring/delta/cap + fidelity ladders), `speed::tests` (per-set records, fold_sample). Suite green.
 
-## Assumptions
-- Primary target is the user’s current case: year 1, ~20 population, workers still near the starting settlement.
-- Offscreen-region fidelity is a runtime preference, so the implementation should expose a toggle rather than hard-removing current behavior.
-- Behavior docs should be updated in the matching repo guidance file when simulation behavior changes.
+## Phase 2 — DATA-DRIVEN, pending user panel reading
+Run year-1 with the Performance panel open; the climbing set + counter selects the fix. Pre-identified candidates (apply only what the panel implicates, via existing cursor/stagger — never `tick % N`):
+1. **Cluster scan** (`shared_knowledge.rs`) — if `know. clusters` climbs: tighten decay TTL/merge radius, round-robin the cluster walk, or spatial-bucket consumers.
+2. **Loaded chunks** (`chunk_streaming.rs`) — if `loaded chunks` climbs: verify off-camera focus pruning + `UNLOAD_RADIUS`; overlaps Minimal fidelity.
+3. **Gossip O(pop²)** (ParallelA) — if `ambient_social`/`awareness_gossip` µs climbs: cap candidate-pairs/tick via the existing cursor.
+4. **World-sim drain** (`world_sim.rs`) — if `worldsim queue` climbs: raise `world_sim_deltas_per_tick` or bound batch submission.
+
+## Verify
+1. After Phase 0, `cargo run`, compare year-1 avg/p99 in "Sim Timing".
+2. Panel open at ~20 pop — watch per-set timings + sparkline Δ columns; identify the climber.
+3. After the Phase-2 fix, confirm the implicated Δ flattens and the set EMA stops climbing.
+4. Toggle Balanced→Minimal with off-camera regions; focus-point + Dormant counts drop, camera settlement unaffected.

@@ -231,7 +231,9 @@ pub fn ambient_social_pairing_system(
         ),
         With<Person>,
     >,
+    timings: Res<crate::simulation::speed::SuspectSystemTimings>,
 ) {
+    let _t = timings.guard(crate::simulation::speed::suspect::AMBIENT_SOCIAL);
     let now = clock.tick as u32;
 
     let mut snaps: Vec<Snap> = Vec::new();

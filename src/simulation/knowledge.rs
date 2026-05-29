@@ -636,8 +636,10 @@ pub fn awareness_gossip_system(
         Option<&mut super::memory::AgentMemory>,
         Option<&crate::simulation::social_contact::SecondarySocial>,
     )>,
+    timings: Res<crate::simulation::speed::SuspectSystemTimings>,
 ) {
     use crate::simulation::social_contact::is_social_contact;
+    let _t = timings.guard(crate::simulation::speed::suspect::AWARENESS_GOSSIP);
     let now = clock.tick as u32;
 
     // Snapshot each socializing agent's tech-awareness (aware|learned)

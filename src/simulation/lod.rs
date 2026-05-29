@@ -22,9 +22,14 @@ pub fn update_lod_levels_system(
     camera: Query<&Transform, With<Camera>>,
     camera_state: Res<CameraState>,
     focus: Res<SimulationFocus>,
+    perf_settings: Res<crate::simulation::perf::PerformanceSettings>,
     mut entities: Query<(&Transform, &mut LodLevel)>,
 ) {
     let zoom = camera_state.zoom;
+    // Offscreen-fidelity preference: how far an off-camera region centre
+    // promotes Dormant agents to Aggregate. 0 ⇒ off-camera regions stay
+    // Dormant (Minimal).
+    let promote_radius = perf_settings.offscreen_fidelity.lod_promote_radius();
     let full_dist = if zoom < 4.0 { 4 } else { 2 };
     let agg_dist = if zoom < 4.0 { 12 } else { 6 };
 
@@ -60,10 +65,12 @@ pub fn update_lod_levels_system(
         };
 
         // If the entity is also near a settled-region focus, promote it from
-        // Dormant to at least Aggregate so off-camera sim runs.
-        let near_region = region_chunks
-            .iter()
-            .any(|c| c.chebyshev_dist(entity_chunk) <= 8);
+        // Dormant to at least Aggregate so off-camera sim runs. The radius is
+        // the offscreen-fidelity preference (0 ⇒ never promote).
+        let near_region = promote_radius > 0
+            && region_chunks
+                .iter()
+                .any(|c| c.chebyshev_dist(entity_chunk) <= promote_radius);
         *lod = match (cam_lod, near_region) {
             (LodLevel::Dormant, true) => LodLevel::Aggregate,
             (other, _) => other,

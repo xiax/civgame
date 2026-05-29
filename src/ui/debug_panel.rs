@@ -101,6 +101,20 @@ pub struct DecisionPanelParams<'w> {
     pub sim_clock: Res<'w, crate::simulation::SimClock>,
 }
 
+/// Inputs for the Performance section: per-set timing + the growth-watch
+/// history rings, plus a few live resources for instantaneous "now" counts
+/// (the heavier counters come from the sampled history rings).
+#[derive(SystemParam)]
+pub struct PerfPanelParams<'w> {
+    pub history: Res<'w, crate::simulation::perf::PerfHistory>,
+    pub set_timing: Res<'w, crate::simulation::speed::SetTimingDiagnostics>,
+    pub focus: Res<'w, crate::simulation::region::SimulationFocus>,
+    pub job_board: Res<'w, crate::simulation::jobs::JobBoard>,
+    pub chunk_map: Res<'w, crate::world::chunk::ChunkMap>,
+    pub shared: Res<'w, crate::simulation::shared_knowledge::SharedKnowledge>,
+    pub settings: ResMut<'w, crate::simulation::perf::PerformanceSettings>,
+}
+
 pub fn debug_panel_system(
     mut contexts: EguiContexts,
     mut state: ResMut<DebugPanelState>,
@@ -123,6 +137,7 @@ pub fn debug_panel_system(
     terraform_map: Res<TerraformMap>,
     terraform_sites: Query<&TerraformSite>,
     decision_panel: DecisionPanelParams,
+    mut perf_panel: PerfPanelParams,
 ) {
     if !state.open {
         return;
@@ -913,6 +928,13 @@ pub fn debug_panel_system(
 
                 ui.add_space(4.0);
 
+                // ── Performance ───────────────────────────────────────────────
+                // Per-set timing answers "which set is the climber?"; the
+                // growth sparklines answer "which counter climbs over time?".
+                render_performance_section(ui, &mut perf_panel);
+
+                ui.add_space(4.0);
+
                 // ── Settlement Plan ───────────────────────────────────────────
                 egui::CollapsingHeader::new(
                     egui::RichText::new("Settlement Plan")
@@ -1000,4 +1022,183 @@ pub fn debug_panel_system(
     state.give_good_idx = give_idx;
     state.give_qty = give_qty;
     state.give_currency = give_currency;
+}
+
+/// Render the Performance section: per-`SimulationSet` timing, hand-instrumented
+/// suspect systems, and the growth-watch counters with trend sparklines.
+fn render_performance_section(ui: &mut egui::Ui, perf: &mut PerfPanelParams) {
+    use crate::simulation::perf::{OffscreenFidelity, PerfSeries};
+    use crate::simulation::speed::{SET_COUNT, SET_LABELS};
+
+    egui::CollapsingHeader::new(
+        egui::RichText::new("Performance")
+            .strong()
+            .color(egui::Color32::from_rgb(180, 240, 200)),
+    )
+    .default_open(false)
+    .show(ui, |ui| {
+        // Offscreen-fidelity preference (camera region always full).
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Offscreen fidelity:").size(11.0));
+            let cur = perf.settings.offscreen_fidelity;
+            egui::ComboBox::from_id_source("offscreen_fidelity")
+                .selected_text(cur.label())
+                .show_ui(ui, |ui| {
+                    for opt in OffscreenFidelity::ALL {
+                        ui.selectable_value(
+                            &mut perf.settings.offscreen_fidelity,
+                            opt,
+                            opt.label(),
+                        );
+                    }
+                });
+        });
+        ui.add_space(2.0);
+
+        // Per-set timing (EMA, worst, p99 — all microseconds → ms).
+        ui.label(
+            egui::RichText::new("Per-set CPU (avg · worst200 · p99)")
+                .strong()
+                .size(11.0),
+        );
+        for i in 0..SET_COUNT {
+            let s = &perf.set_timing.sets[i];
+            ui.label(
+                egui::RichText::new(format!(
+                    "  {}: {:.2} · {:.2} · {:.2} ms",
+                    SET_LABELS[i],
+                    s.avg_us_ema / 1000.0,
+                    s.worst_us_recent as f32 / 1000.0,
+                    s.worst_us_p99 as f32 / 1000.0,
+                ))
+                .color(egui::Color32::GRAY)
+                .size(11.0),
+            );
+        }
+
+        // Hand-instrumented suspect systems (per-tick amortised EMA µs).
+        if !perf.set_timing.system_us.is_empty() {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("Suspect systems (avg µs/tick)")
+                    .strong()
+                    .size(11.0),
+            );
+            let mut rows: Vec<(&&str, &f32)> = perf.set_timing.system_us.iter().collect();
+            rows.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (name, us) in rows {
+                ui.label(
+                    egui::RichText::new(format!("  {name}: {:.0} µs", us))
+                        .color(egui::Color32::GRAY)
+                        .size(11.0),
+                );
+            }
+        }
+
+        // Growth-watch counters: current value, delta over the retained
+        // window, and a sparkline. A persistently-positive delta is the
+        // "climbs over time" culprit.
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new("Growth watch (now · Δ over window)")
+                .strong()
+                .size(11.0),
+        );
+
+        let off_camera = perf
+            .focus
+            .points
+            .iter()
+            .filter(|p| !p.is_camera)
+            .count();
+
+        let mut row = |ui: &mut egui::Ui, label: &str, series: &PerfSeries| {
+            ui.horizontal(|ui| {
+                let delta = series.delta();
+                let delta_color = if delta > 0 {
+                    egui::Color32::from_rgb(220, 160, 80)
+                } else {
+                    egui::Color32::GRAY
+                };
+                ui.label(
+                    egui::RichText::new(format!("{label}: {}", series.latest()))
+                        .color(egui::Color32::LIGHT_GRAY)
+                        .size(11.0),
+                );
+                ui.label(
+                    egui::RichText::new(format!("Δ{delta:+}"))
+                        .color(delta_color)
+                        .size(11.0),
+                );
+                draw_sparkline(ui, series, 80.0, 14.0);
+            });
+        };
+
+        row(ui, "ground items", &perf.history.ground_items);
+        row(ui, "job postings", &perf.history.job_postings);
+        row(ui, "blueprints", &perf.history.blueprints);
+        row(ui, "loaded chunks", &perf.history.loaded_chunks);
+        row(ui, "focus points", &perf.history.focus_points);
+        ui.label(
+            egui::RichText::new(format!("  ({off_camera} off-camera)"))
+                .color(egui::Color32::DARK_GRAY)
+                .size(10.0),
+        );
+        row(ui, "know. clusters", &perf.history.knowledge_clusters);
+        row(ui, "path failures", &perf.history.path_failures);
+        row(ui, "worldsim queue", &perf.history.worldsim_pending);
+
+        // A couple of live-now counters the sampler also derives, for an
+        // at-a-glance check independent of the sparkline cadence.
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(format!(
+                "live: {} chunks · {} clusters · {} postings",
+                perf.chunk_map.0.len(),
+                perf.shared
+                    .tiers
+                    .values()
+                    .map(|m| m.clusters.len())
+                    .sum::<usize>(),
+                perf.job_board
+                    .postings
+                    .values()
+                    .map(|v| v.len())
+                    .sum::<usize>(),
+            ))
+            .color(egui::Color32::DARK_GRAY)
+            .size(10.0),
+        );
+    });
+}
+
+/// Minimal sparkline: maps a counter's sample ring to a polyline. No deps
+/// beyond egui's painter; scales to the series max.
+fn draw_sparkline(
+    ui: &mut egui::Ui,
+    series: &crate::simulation::perf::PerfSeries,
+    width: f32,
+    height: f32,
+) {
+    let (rect, _resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let n = series.samples.len();
+    if n < 2 {
+        return;
+    }
+    let maxv = series.max().max(1) as f32;
+    let pts: Vec<egui::Pos2> = series
+        .samples
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            let x = rect.left() + (i as f32 / (n - 1) as f32) * rect.width();
+            let y = rect.bottom() - (v as f32 / maxv) * rect.height();
+            egui::pos2(x, y)
+        })
+        .collect();
+    painter.add(egui::Shape::line(
+        pts,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 200, 140)),
+    ));
 }

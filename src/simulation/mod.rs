@@ -366,6 +366,30 @@ impl Plugin for SimulationPlugin {
                 FixedUpdate,
                 speed::fixed_tick_timing_end_system.after(SimulationSet::Economy),
             )
+            // Per-`SimulationSet` timing boundaries: each closes the set that
+            // just ran and opens the next. They sit in the gaps between sets
+            // so the start/end systems above still bracket the whole tick.
+            .insert_resource(speed::SetTimingDiagnostics::default())
+            .insert_resource(speed::SuspectSystemTimings::default())
+            .insert_resource(perf::PerfHistory::default())
+            .insert_resource(perf::PerformanceSettings::default())
+            .add_systems(
+                FixedUpdate,
+                (
+                    speed::set_timing_close_input_system
+                        .after(SimulationSet::Input)
+                        .before(SimulationSet::ParallelA),
+                    speed::set_timing_close_parallel_a_system
+                        .after(SimulationSet::ParallelA)
+                        .before(SimulationSet::ParallelB),
+                    speed::set_timing_close_parallel_b_system
+                        .after(SimulationSet::ParallelB)
+                        .before(SimulationSet::Sequential),
+                    speed::set_timing_close_sequential_system
+                        .after(SimulationSet::Sequential)
+                        .before(SimulationSet::Economy),
+                ),
+            )
             .add_systems(
                 OnEnter(crate::GameState::Playing),
                 (
@@ -646,6 +670,9 @@ impl Plugin for SimulationPlugin {
                     faction::sync_faction_center_hotspots_system,
                     animals::animal_needs_tick_system,
                     goal_scorers::sample_decision_metrics_system,
+                    // Growth-watch sampler for the Performance panel — pure
+                    // analytics, early-exits when the debug panel is closed.
+                    perf::perf_history_sample_system,
                     cohort::rebuild_cohort_registry_system,
                     // sleepy-dove Phase 2: rebuild the construction poster
                     // pool read-only so chief/architect Learned snapshots

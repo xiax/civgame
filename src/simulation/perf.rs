@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use std::collections::VecDeque;
 use std::time::Duration;
 
 /// Shared caps for background pipelines that must apply ECS/world mutations
@@ -189,4 +190,235 @@ pub mod stagger_offsets {
     pub const NOMAD_CHIEF_DIRECTIVE: u64 = 149;
     pub const SEDENTARY_COLLAPSE: u64 = 167;
     pub const APPRENTICESHIP: u64 = 191;
+}
+
+// ── Offscreen fidelity preference ───────────────────────────────────────────
+//
+// Runtime knob for later-game scaling: how much simulation/streaming detail
+// off-camera settled regions keep. Read by `update_simulation_focus_system`
+// (whether/how far to emit a data-only `FocusPoint` per region) and
+// `update_lod_levels_system` (how far a region centre promotes Dormant agents
+// to Aggregate). The camera region is always fully live regardless.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OffscreenFidelity {
+    /// Every settled region fully streamed + simulated (original behaviour).
+    AllLive,
+    /// Camera region full; off-camera regions kept at a reduced radius and
+    /// promote fewer agents. Remembered but cheaper. Default.
+    Balanced,
+    /// Off-camera regions emit no focus and stay Dormant — camera only.
+    Minimal,
+}
+
+impl OffscreenFidelity {
+    pub const ALL: [Self; 3] = [Self::AllLive, Self::Balanced, Self::Minimal];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AllLive => "All Live",
+            Self::Balanced => "Balanced",
+            Self::Minimal => "Minimal",
+        }
+    }
+
+    /// Off-camera settled-region focus radius (chunks), or `None` to emit no
+    /// off-camera region focus at all. `base` is the default
+    /// `REGION_LOAD_RADIUS`.
+    pub fn region_focus_radius(self, base: i32) -> Option<i32> {
+        match self {
+            Self::AllLive => Some(base),
+            Self::Balanced => Some((base / 2).max(2)),
+            Self::Minimal => None,
+        }
+    }
+
+    /// Chunk radius around an off-camera region centre within which Dormant
+    /// agents promote to Aggregate. 0 ⇒ no promotion.
+    pub fn lod_promote_radius(self) -> i32 {
+        match self {
+            Self::AllLive => 8,
+            Self::Balanced => 4,
+            Self::Minimal => 0,
+        }
+    }
+}
+
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct PerformanceSettings {
+    pub offscreen_fidelity: OffscreenFidelity,
+}
+
+impl Default for PerformanceSettings {
+    fn default() -> Self {
+        Self {
+            offscreen_fidelity: OffscreenFidelity::Balanced,
+        }
+    }
+}
+
+// ── Growth-history sampling (Performance debug panel) ───────────────────────
+//
+// "Climbs over time" with everything bounded ⇒ explored-area-correlated cost
+// (resource clusters, loaded chunks, gossip). To *identify* the climber
+// empirically rather than guess, the Performance panel sparklines a handful of
+// counters over game-time. This is pure analytics — sampled only while the
+// debug panel is open, on a coarse cadence, so it adds no steady-state cost.
+
+/// Ring length: number of retained samples per counter.
+pub const PERF_HISTORY_CAP: usize = 120;
+/// Spacing between samples, in fixed ticks (~600 ≈ a few game-minutes). Chosen
+/// so the full ring spans a meaningful slice of year 1 without per-tick churn.
+pub const PERF_SAMPLE_INTERVAL_TICKS: u64 = 600;
+
+/// One counter's bounded sample ring. `delta()` (newest − oldest) is the
+/// monotonic-growth signal; `max()` scales the sparkline.
+#[derive(Default, Clone)]
+pub struct PerfSeries {
+    pub samples: VecDeque<u32>,
+}
+
+impl PerfSeries {
+    pub fn push(&mut self, v: u32) {
+        self.samples.push_back(v);
+        if self.samples.len() > PERF_HISTORY_CAP {
+            self.samples.pop_front();
+        }
+    }
+    pub fn latest(&self) -> u32 {
+        self.samples.back().copied().unwrap_or(0)
+    }
+    pub fn oldest(&self) -> u32 {
+        self.samples.front().copied().unwrap_or(0)
+    }
+    /// Newest minus oldest retained sample — the climb signal.
+    pub fn delta(&self) -> i64 {
+        self.latest() as i64 - self.oldest() as i64
+    }
+    pub fn max(&self) -> u32 {
+        self.samples.iter().copied().max().unwrap_or(0)
+    }
+}
+
+/// Per-counter sample rings for the Performance panel. Populated by
+/// [`perf_history_sample_system`]; read-only for the UI.
+#[derive(Resource, Default)]
+pub struct PerfHistory {
+    pub ground_items: PerfSeries,
+    pub job_postings: PerfSeries,
+    pub blueprints: PerfSeries,
+    pub loaded_chunks: PerfSeries,
+    pub focus_points: PerfSeries,
+    pub knowledge_clusters: PerfSeries,
+    pub path_failures: PerfSeries,
+    pub worldsim_pending: PerfSeries,
+    pub last_sample_tick: u64,
+}
+
+/// Sample the growth-watch counters into `PerfHistory`. Early-exits when the
+/// debug panel is closed (matches `sample_decision_metrics_system`'s gating);
+/// when open, samples once per [`PERF_SAMPLE_INTERVAL_TICKS`]. The
+/// elapsed-since-last check is a cursor, not a `tick % N` burst.
+#[allow(clippy::too_many_arguments)]
+pub fn perf_history_sample_system(
+    clock: Res<crate::simulation::schedule::SimClock>,
+    debug_panel: Option<Res<crate::ui::debug_panel::DebugPanelState>>,
+    mut hist: ResMut<PerfHistory>,
+    job_board: Res<crate::simulation::jobs::JobBoard>,
+    chunk_map: Res<crate::world::chunk::ChunkMap>,
+    focus: Res<crate::simulation::region::SimulationFocus>,
+    shared: Res<crate::simulation::shared_knowledge::SharedKnowledge>,
+    failures: Res<crate::pathfinding::path_request::FailureLog>,
+    world_sim: Res<crate::simulation::world_sim::WorldSimTaskState>,
+    ground_items: Query<(), With<crate::simulation::items::GroundItem>>,
+    blueprints: Query<(), With<crate::simulation::construction::Blueprint>>,
+) {
+    if !debug_panel.map(|p| p.open).unwrap_or(false) {
+        return;
+    }
+    // Seed on first open (last_sample_tick == 0), then space by interval.
+    if hist.last_sample_tick != 0
+        && clock.tick.saturating_sub(hist.last_sample_tick) < PERF_SAMPLE_INTERVAL_TICKS
+    {
+        return;
+    }
+    hist.last_sample_tick = clock.tick.max(1);
+
+    hist.ground_items.push(ground_items.iter().count() as u32);
+    hist.blueprints.push(blueprints.iter().count() as u32);
+    hist.job_postings
+        .push(job_board.postings.values().map(|v| v.len()).sum::<usize>() as u32);
+    hist.loaded_chunks.push(chunk_map.0.len() as u32);
+    hist.focus_points.push(focus.points.len() as u32);
+    hist.knowledge_clusters.push(
+        shared
+            .tiers
+            .values()
+            .map(|m| m.clusters.len())
+            .sum::<usize>() as u32,
+    );
+    hist.path_failures.push(failures.recent.len() as u32);
+    hist.worldsim_pending.push(world_sim.pending_total() as u32);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn perf_series_rings_and_reports_delta() {
+        let mut s = PerfSeries::default();
+        for v in [3u32, 5, 4, 10] {
+            s.push(v);
+        }
+        assert_eq!(s.oldest(), 3);
+        assert_eq!(s.latest(), 10);
+        assert_eq!(s.delta(), 7, "newest - oldest");
+        assert_eq!(s.max(), 10);
+    }
+
+    #[test]
+    fn perf_series_bounded_by_cap() {
+        let mut s = PerfSeries::default();
+        for v in 0..(PERF_HISTORY_CAP as u32 + 50) {
+            s.push(v);
+        }
+        assert_eq!(
+            s.samples.len(),
+            PERF_HISTORY_CAP,
+            "ring never exceeds its cap"
+        );
+        // Oldest retained sample dropped the first 50.
+        assert_eq!(s.oldest(), 50);
+        assert_eq!(s.latest(), PERF_HISTORY_CAP as u32 + 49);
+    }
+
+    #[test]
+    fn offscreen_fidelity_region_radius_ladder() {
+        let base = 6;
+        assert_eq!(OffscreenFidelity::AllLive.region_focus_radius(base), Some(6));
+        // Balanced halves (floored at 2).
+        assert_eq!(
+            OffscreenFidelity::Balanced.region_focus_radius(base),
+            Some(3)
+        );
+        // Minimal emits no off-camera region focus.
+        assert_eq!(OffscreenFidelity::Minimal.region_focus_radius(base), None);
+    }
+
+    #[test]
+    fn offscreen_fidelity_promote_radius_ladder() {
+        assert_eq!(OffscreenFidelity::AllLive.lod_promote_radius(), 8);
+        assert_eq!(OffscreenFidelity::Balanced.lod_promote_radius(), 4);
+        // Minimal never promotes off-camera agents out of Dormant.
+        assert_eq!(OffscreenFidelity::Minimal.lod_promote_radius(), 0);
+    }
+
+    #[test]
+    fn default_offscreen_fidelity_is_balanced() {
+        assert_eq!(
+            PerformanceSettings::default().offscreen_fidelity,
+            OffscreenFidelity::Balanced
+        );
+    }
 }

@@ -134,6 +134,7 @@ pub struct StreamBudgetParams<'w> {
 pub fn update_simulation_focus_system(
     mut focus: ResMut<crate::simulation::region::SimulationFocus>,
     settled: Res<crate::simulation::region::SettledRegions>,
+    perf_settings: Res<crate::simulation::perf::PerformanceSettings>,
     camera_q: Query<&Transform, With<Camera>>,
     map_view_mode: Res<crate::rendering::projection::MapViewMode>,
     map_projection: Res<crate::rendering::projection::MapProjection>,
@@ -166,17 +167,25 @@ pub fn update_simulation_focus_system(
         });
     }
 
-    for region in settled.by_id.values() {
-        let (tx, ty) = MegaChunkCoord::center_tile(region.megachunk.0, region.megachunk.1);
-        let world_pos = Vec2::new(
-            tx as f32 * TILE_SIZE + TILE_SIZE * 0.5,
-            ty as f32 * TILE_SIZE + TILE_SIZE * 0.5,
-        );
-        focus.points.push(FocusPoint {
-            world_pos,
-            chunk_radius: REGION_LOAD_RADIUS,
-            is_camera: false,
-        });
+    // Offscreen-fidelity preference: off-camera settled regions get a
+    // data-only focus at a reduced radius (Balanced) or none (Minimal). The
+    // camera focus above is always full regardless.
+    if let Some(region_radius) = perf_settings
+        .offscreen_fidelity
+        .region_focus_radius(REGION_LOAD_RADIUS)
+    {
+        for region in settled.by_id.values() {
+            let (tx, ty) = MegaChunkCoord::center_tile(region.megachunk.0, region.megachunk.1);
+            let world_pos = Vec2::new(
+                tx as f32 * TILE_SIZE + TILE_SIZE * 0.5,
+                ty as f32 * TILE_SIZE + TILE_SIZE * 0.5,
+            );
+            focus.points.push(FocusPoint {
+                world_pos,
+                chunk_radius: region_radius,
+                is_camera: false,
+            });
+        }
     }
 
     // Test-drive anchor — keep `ChunkMap::passable_at` answering as the

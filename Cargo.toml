@@ -7,6 +7,12 @@ edition = "2021"
 opt-level = 1
 overflow-checks = false
 
+# Optimize dependencies (Bevy, glam, etc.) even in debug builds. Our own crate
+# stays at opt-level 1 for fast incremental compiles; deps at 3 fix the largest
+# `cargo run` slowdown for a Bevy ECS sim (one slow rebuild of deps, then cached).
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = "thin"

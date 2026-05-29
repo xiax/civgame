@@ -10,10 +10,12 @@
 //! in `ui/debug_panel.rs`; reddens when the rolling average exceeds the
 //! current preset's CPU budget.
 
+use ahash::AHashMap;
 use bevy::input::ButtonInput;
 use bevy::prelude::*;
 use bevy_egui::EguiContexts;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use crate::simulation::schedule::SimClock;
@@ -174,29 +176,211 @@ pub struct TickTimer {
     pub last_start: Option<Instant>,
 }
 
-pub fn fixed_tick_timing_start_system(mut timer: ResMut<TickTimer>) {
-    timer.last_start = Some(Instant::now());
+pub fn fixed_tick_timing_start_system(
+    mut timer: ResMut<TickTimer>,
+    mut set_diag: ResMut<SetTimingDiagnostics>,
+) {
+    let now = Instant::now();
+    timer.last_start = Some(now);
+    // Open the first per-set window (start of the Input set). Subsequent
+    // boundaries fold + re-stamp; the end system folds the Economy set.
+    set_diag.boundary_mark = Some(now);
 }
 
 pub fn fixed_tick_timing_end_system(
     mut timer: ResMut<TickTimer>,
     mut diag: ResMut<SimTimingDiagnostics>,
+    mut set_diag: ResMut<SetTimingDiagnostics>,
+    suspects: Res<SuspectSystemTimings>,
 ) {
+    // Close the Economy set window first (between the close-Sequential
+    // boundary and now). Then fold the whole-tick total.
+    set_diag.close_set(SET_ECONOMY);
+    set_diag.boundary_mark = None;
+
+    // Fold this tick's hand-instrumented suspect-system samples (0 on ticks
+    // a gated system didn't run — amortises daily costs per-tick).
+    for i in 0..suspect::COUNT {
+        let us = suspects.take_us(i);
+        set_diag.record_system_us(suspect::LABELS[i], us);
+    }
+
     let Some(t0) = timer.last_start.take() else {
         return;
     };
     let dt_us = t0.elapsed().as_micros().min(u32::MAX as u128) as u32;
-    if diag.avg_tick_us_ema == 0.0 {
-        diag.avg_tick_us_ema = dt_us as f32;
-    } else {
-        diag.avg_tick_us_ema += TIMING_EMA_ALPHA * (dt_us as f32 - diag.avg_tick_us_ema);
-    }
-    diag.recent_worst_window.push_back(dt_us);
-    if diag.recent_worst_window.len() > TIMING_WINDOW_CAP {
-        diag.recent_worst_window.pop_front();
-    }
+    let diag = &mut *diag; // single DerefMut so the two field borrows below split cleanly
+    fold_sample(
+        &mut diag.avg_tick_us_ema,
+        &mut diag.recent_worst_window,
+        dt_us,
+    );
     diag.worst_tick_us_recent = diag.recent_worst_window.iter().copied().max().unwrap_or(0);
     diag.worst_tick_us_p99 = compute_p99(&diag.recent_worst_window);
+}
+
+/// Fold one sample into an EMA + bounded rolling window (shared by the
+/// whole-tick total and every per-`SimulationSet` interval).
+fn fold_sample(ema: &mut f32, window: &mut VecDeque<u32>, dt_us: u32) {
+    if *ema == 0.0 {
+        *ema = dt_us as f32;
+    } else {
+        *ema += TIMING_EMA_ALPHA * (dt_us as f32 - *ema);
+    }
+    window.push_back(dt_us);
+    if window.len() > TIMING_WINDOW_CAP {
+        window.pop_front();
+    }
+}
+
+// ── Per-`SimulationSet` timing ──────────────────────────────────────────────
+//
+// The whole-tick total above answers "is the sim over budget?"; this answers
+// "*which set* is the climber?". Sets run in strict order
+// (Input → ParallelA → ParallelB → Sequential → Economy) and never overlap,
+// so a single rolling `boundary_mark` timestamp suffices: each boundary system
+// folds `now - boundary_mark` into the set that just finished, then re-stamps.
+
+pub const SET_INPUT: usize = 0;
+pub const SET_PARALLEL_A: usize = 1;
+pub const SET_PARALLEL_B: usize = 2;
+pub const SET_SEQUENTIAL: usize = 3;
+pub const SET_ECONOMY: usize = 4;
+pub const SET_COUNT: usize = 5;
+pub const SET_LABELS: [&str; SET_COUNT] =
+    ["Input", "ParallelA", "ParallelB", "Sequential", "Economy"];
+
+#[derive(Default, Clone)]
+pub struct SetTiming {
+    pub avg_us_ema: f32,
+    pub worst_us_recent: u32,
+    pub worst_us_p99: u32,
+    window: VecDeque<u32>,
+}
+
+/// Per-set EMA/worst/p99 plus an opt-in per-system attribution map for the
+/// handful of hand-instrumented suspect systems (see Phase 1b). Boundary
+/// systems live outside `SimulationSet` and bracket each set.
+#[derive(Resource, Default)]
+pub struct SetTimingDiagnostics {
+    pub sets: [SetTiming; SET_COUNT],
+    /// Last boundary timestamp. `None` outside a tick body.
+    boundary_mark: Option<Instant>,
+    /// Per-suspect-system EMA microseconds, keyed by a `'static` label.
+    pub system_us: AHashMap<&'static str, f32>,
+}
+
+impl SetTimingDiagnostics {
+    /// Fold the interval since the last boundary into `idx`, then re-stamp.
+    fn close_set(&mut self, idx: usize) {
+        if let Some(t0) = self.boundary_mark {
+            let dt_us = t0.elapsed().as_micros().min(u32::MAX as u128) as u32;
+            let s = &mut self.sets[idx];
+            fold_sample(&mut s.avg_us_ema, &mut s.window, dt_us);
+            s.worst_us_recent = s.window.iter().copied().max().unwrap_or(0);
+            s.worst_us_p99 = compute_p99(&s.window);
+        }
+        self.boundary_mark = Some(Instant::now());
+    }
+
+    /// Record a hand-instrumented system's elapsed time (microseconds) into
+    /// the per-system EMA. Called from Phase-1b suspect-system wrappers.
+    pub fn record_system_us(&mut self, name: &'static str, dt_us: u32) {
+        let e = self.system_us.entry(name).or_insert(0.0);
+        if *e == 0.0 {
+            *e = dt_us as f32;
+        } else {
+            *e += TIMING_EMA_ALPHA * (dt_us as f32 - *e);
+        }
+    }
+}
+
+/// Boundary: after Input, before ParallelA. Closes the Input set window and
+/// opens ParallelA. The first boundary is opened by
+/// [`fixed_tick_timing_start_system`] before Input.
+pub fn set_timing_close_input_system(mut set_diag: ResMut<SetTimingDiagnostics>) {
+    set_diag.close_set(SET_INPUT);
+}
+
+/// Boundary: after ParallelA, before ParallelB.
+pub fn set_timing_close_parallel_a_system(mut set_diag: ResMut<SetTimingDiagnostics>) {
+    set_diag.close_set(SET_PARALLEL_A);
+}
+
+/// Boundary: after ParallelB, before Sequential.
+pub fn set_timing_close_parallel_b_system(mut set_diag: ResMut<SetTimingDiagnostics>) {
+    set_diag.close_set(SET_PARALLEL_B);
+}
+
+/// Boundary: after Sequential, before Economy.
+pub fn set_timing_close_sequential_system(mut set_diag: ResMut<SetTimingDiagnostics>) {
+    set_diag.close_set(SET_SEQUENTIAL);
+}
+
+// ── Per-suspect-system attribution (Phase 1b) ───────────────────────────────
+//
+// Per-set timing localises the climb to a set; this narrows it to specific
+// pop/explored-area-scaling systems *within* a set. Writes go through atomics
+// behind a shared `Res` (NOT `ResMut`) so instrumenting a parallel system
+// never serialises it — adding `ResMut` here would perturb the very thing we
+// measure. `goal_update_system` is deliberately omitted (already at Bevy's
+// 16-param ceiling); its cost shows up in the ParallelA/ParallelB set totals.
+// `world_sim_system` already records `world_sim_compute_us` in
+// `BackgroundWorkDiagnostics`, so it isn't double-instrumented here.
+
+pub mod suspect {
+    pub const AMBIENT_SOCIAL: usize = 0;
+    pub const AWARENESS_GOSSIP: usize = 1;
+    pub const CLUSTER_DECAY: usize = 2;
+    pub const COUNT: usize = 3;
+    pub const LABELS: [&str; COUNT] =
+        ["ambient_social_pairing", "awareness_gossip", "cluster_decay"];
+}
+
+/// Last-invocation microseconds per suspect system, folded into
+/// `SetTimingDiagnostics.system_us` once per tick by
+/// [`fixed_tick_timing_end_system`]. Atomic interior so a `Res` (shared,
+/// parallel-friendly) handle is enough — no exclusive access on hot systems.
+#[derive(Resource)]
+pub struct SuspectSystemTimings {
+    last_us: [AtomicU32; suspect::COUNT],
+}
+
+impl Default for SuspectSystemTimings {
+    fn default() -> Self {
+        Self {
+            last_us: std::array::from_fn(|_| AtomicU32::new(0)),
+        }
+    }
+}
+
+impl SuspectSystemTimings {
+    /// Start timing a suspect system; the returned guard records the elapsed
+    /// time on drop (so any early `return` is still measured).
+    pub fn guard(&self, idx: usize) -> SuspectTimingGuard<'_> {
+        SuspectTimingGuard {
+            start: Instant::now(),
+            slot: &self.last_us[idx],
+        }
+    }
+
+    /// Read-and-clear this tick's recorded micros (0 on ticks the system was
+    /// gated out — folding 0 amortises a daily system's cost per-tick).
+    fn take_us(&self, idx: usize) -> u32 {
+        self.last_us[idx].swap(0, Ordering::Relaxed)
+    }
+}
+
+pub struct SuspectTimingGuard<'a> {
+    start: Instant,
+    slot: &'a AtomicU32,
+}
+
+impl Drop for SuspectTimingGuard<'_> {
+    fn drop(&mut self) {
+        let us = self.start.elapsed().as_micros().min(u32::MAX as u128) as u32;
+        self.slot.store(us, Ordering::Relaxed);
+    }
 }
 
 /// p99 from the rolling tick-time window. With a 200-tick window this is the
@@ -403,5 +587,38 @@ mod tests {
             !diag.recent_worst_window.is_empty(),
             "Expected the worst-tick window to have samples"
         );
+    }
+
+    #[test]
+    fn per_set_timing_records_after_ticks() {
+        let mut sim = flat_with_agent(6);
+        sim.tick_n(30);
+        let set_diag = sim.app.world().resource::<SetTimingDiagnostics>();
+        // Every set window should have folded at least one sample. Some sets
+        // (e.g. Input with no commands) can measure ~0µs, so assert the
+        // window has samples rather than a positive EMA.
+        for i in 0..SET_COUNT {
+            assert!(
+                !set_diag.sets[i].window.is_empty(),
+                "Expected set '{}' to have timing samples after 30 ticks",
+                SET_LABELS[i],
+            );
+        }
+        // The whole-tick total is the sum of the parts, so at least one set
+        // must have measurable CPU.
+        let any_positive = (0..SET_COUNT).any(|i| set_diag.sets[i].avg_us_ema > 0.0);
+        assert!(any_positive, "Expected some set to record positive CPU");
+    }
+
+    #[test]
+    fn fold_sample_seeds_then_emas() {
+        let mut ema = 0.0f32;
+        let mut window = VecDeque::new();
+        fold_sample(&mut ema, &mut window, 100);
+        assert_eq!(ema, 100.0, "first sample seeds the EMA directly");
+        fold_sample(&mut ema, &mut window, 200);
+        // EMA moves a fraction toward the new sample, not all the way.
+        assert!(ema > 100.0 && ema < 200.0, "got {ema}");
+        assert_eq!(window.len(), 2);
     }
 }
