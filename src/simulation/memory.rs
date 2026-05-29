@@ -647,9 +647,14 @@ pub fn vision_system(
                             entity: None,
                             owner: ResourceOwner::Public,
                         });
-                    } else {
-                        shared.report_depleted(write_tier, (ntx, nty), MemoryKind::stone());
                     }
+                    // Vision is additive only — it never depletes. Stone
+                    // cluster shrinkage fires on gather-arrival
+                    // (`gather.rs` `invalidate_tile_across_tier_set`), never
+                    // here. The old `else { report_depleted(stone) }` ran an
+                    // O(local-cluster-count) `cluster_at` scan on ~every
+                    // non-Stone tile in the view disc — the dominant
+                    // (cluster-density-scaling) cost of `vision_system`.
                     // Phase F.2 — Marsh tiles carry harvestable reed beds.
                     // Report as `MemoryKind::reeds()` so the standard
                     // AcquireGood / Stockpile gather chain (
