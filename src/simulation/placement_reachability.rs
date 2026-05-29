@@ -30,6 +30,7 @@ use crate::pathfinding::chunk_graph::ChunkGraph;
 use crate::pathfinding::connectivity::ChunkConnectivity;
 use crate::pathfinding::step::passable_diagonal_step;
 use crate::world::chunk::{ChunkMap, Z_MAX, Z_MIN};
+use crate::world::edge::EdgeKey;
 
 /// One-shot seed-time checks run once per faction at startup and can afford a
 /// generous bound (covers a ~50-tile open radius).
@@ -65,6 +66,12 @@ pub struct ReachOpts<'a> {
     /// walls before they are stamped (simulated house) or the door-cardinal
     /// Stone-aversion heuristic.
     pub blocked: Option<&'a dyn Fn((i32, i32, i32)) -> bool>,
+    /// Extra edge impassability: a step between two adjacent tile columns
+    /// `(a_xy, b_xy)` for which this returns true is rejected. Models thin
+    /// housing walls (`EdgeWall`) before they are stamped — the floor stays
+    /// passable but the boundary edge blocks. The door edge is simply absent
+    /// from the set, so the search walks through the doorway.
+    pub blocked_edge: Option<&'a dyn Fn((i32, i32), (i32, i32)) -> bool>,
 }
 
 impl<'a> ReachOpts<'a> {
@@ -72,16 +79,22 @@ impl<'a> ReachOpts<'a> {
         Self {
             max_expansions: SEED_MAX_EXPANSIONS,
             blocked: None,
+            blocked_edge: None,
         }
     }
     pub fn runtime() -> Self {
         Self {
             max_expansions: RUNTIME_MAX_EXPANSIONS,
             blocked: None,
+            blocked_edge: None,
         }
     }
     pub fn with_blocked(mut self, f: &'a dyn Fn((i32, i32, i32)) -> bool) -> Self {
         self.blocked = Some(f);
+        self
+    }
+    pub fn with_blocked_edge(mut self, f: &'a dyn Fn((i32, i32), (i32, i32)) -> bool) -> Self {
+        self.blocked_edge = Some(f);
         self
     }
     pub fn with_cap(mut self, cap: usize) -> Self {
@@ -112,6 +125,8 @@ pub fn path_exists(
         return true;
     }
     let blocked = |t: (i32, i32, i32)| opts.blocked.map_or(false, |f| f(t));
+    let blocked_edge =
+        |a: (i32, i32), b: (i32, i32)| opts.blocked_edge.map_or(false, |f| f(a, b));
     // Goal must be a standable, non-overlay-blocked column.
     if blocked(to) || !chunk_map.passable_at(to.0, to.1, to.2) {
         return false;
@@ -152,6 +167,21 @@ pub fn path_exists(
                 }
                 let nbr = (nx, ny, nz);
                 if blocked(nbr) {
+                    continue;
+                }
+                // Thin-wall edge gate (mirrors the diagonal corner rule: a
+                // diagonal is rejected if either flanking corner edge blocks).
+                if dx != 0 && dy != 0 {
+                    let ca = (nx, cur.1);
+                    let cb = (cur.0, ny);
+                    if blocked_edge((cur.0, cur.1), ca)
+                        || blocked_edge(ca, (nx, ny))
+                        || blocked_edge((cur.0, cur.1), cb)
+                        || blocked_edge(cb, (nx, ny))
+                    {
+                        continue;
+                    }
+                } else if blocked_edge((cur.0, cur.1), (nx, ny)) {
                     continue;
                 }
                 if passable_diagonal_step(chunk_map, cur, nbr) {
@@ -272,6 +302,48 @@ pub fn simulate_house_reachable(
             doormat3,
             resolve3(chunk_map, bed),
             ReachOpts::seed().with_blocked(&wall_overlay),
+        )
+    })
+}
+
+/// Thin-wall counterpart to `simulate_house_reachable`: the dwelling floor is
+/// fully passable; the finished envelope is a set of blocked *edges* with one
+/// gap at the door. Validates that the doormat connects to `home` and every
+/// interior bed is reachable from the doormat through the door edge — all while
+/// the wall edges (but not the door edge) block. `door_interior` is the floor
+/// tile just inside the door (for the door↔doormat single-step check).
+pub fn simulate_house_reachable_edges(
+    chunk_map: &ChunkMap,
+    home: (i32, i32),
+    doormat: (i32, i32),
+    door_interior: (i32, i32),
+    blocked_edges: &AHashSet<EdgeKey>,
+    beds: &[(i32, i32)],
+) -> bool {
+    let dz = chunk_map.surface_z_at(door_interior.0, door_interior.1);
+    let mz = chunk_map.surface_z_at(doormat.0, doormat.1);
+    if (dz - mz).abs() > 1 {
+        return false;
+    }
+    let edge_blk = |a: (i32, i32), b: (i32, i32)| {
+        EdgeKey::between(a, b).map_or(false, |k| blocked_edges.contains(&k))
+    };
+    let home3 = resolve3(chunk_map, home);
+    let doormat3 = resolve3(chunk_map, doormat);
+    if !path_exists(
+        chunk_map,
+        home3,
+        doormat3,
+        ReachOpts::seed().with_blocked_edge(&edge_blk),
+    ) {
+        return false;
+    }
+    beds.iter().all(|&bed| {
+        path_exists(
+            chunk_map,
+            doormat3,
+            resolve3(chunk_map, bed),
+            ReachOpts::seed().with_blocked_edge(&edge_blk),
         )
     })
 }
@@ -718,6 +790,71 @@ mod tests {
             doormat,
             door,
             &walls,
+            &beds
+        ));
+    }
+
+    /// Thin-wall 3×3 hut: a fully-passable footprint bounded by blocked edges
+    /// with one door gap. The interior bed is reachable through the door; seal
+    /// the door edge and it becomes unreachable.
+    fn hut_edges(c: (i32, i32)) -> (AHashSet<EdgeKey>, (i32, i32), (i32, i32)) {
+        let mut edges = AHashSet::new();
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if dx.abs() != 1 && dy.abs() != 1 {
+                    continue; // interior, no boundary edge
+                }
+                let t = (c.0 + dx, c.1 + dy);
+                if dx == -1 {
+                    edges.insert(EdgeKey::between(t, (t.0 - 1, t.1)).unwrap());
+                }
+                if dx == 1 {
+                    edges.insert(EdgeKey::between(t, (t.0 + 1, t.1)).unwrap());
+                }
+                if dy == -1 {
+                    edges.insert(EdgeKey::between(t, (t.0, t.1 - 1)).unwrap());
+                }
+                if dy == 1 {
+                    edges.insert(EdgeKey::between(t, (t.0, t.1 + 1)).unwrap());
+                }
+            }
+        }
+        let door_interior = (c.0 - 1, c.1); // west-mid floor tile
+        let doormat = (c.0 - 2, c.1);
+        edges.remove(&EdgeKey::between(door_interior, doormat).unwrap()); // door gap
+        (edges, doormat, door_interior)
+    }
+
+    #[test]
+    fn simulate_house_edges_bed_reachable_through_door() {
+        let map = flat_map();
+        let c = (16, 16);
+        let (edges, doormat, door_interior) = hut_edges(c);
+        let beds = [c]; // interior centre floor tile
+        assert!(simulate_house_reachable_edges(
+            &map,
+            (1, 1),
+            doormat,
+            door_interior,
+            &edges,
+            &beds
+        ));
+    }
+
+    #[test]
+    fn simulate_house_edges_rejects_sealed_door() {
+        let map = flat_map();
+        let c = (16, 16);
+        let (mut edges, doormat, door_interior) = hut_edges(c);
+        // Seal the door edge too — the interior is now fully enclosed.
+        edges.insert(EdgeKey::between(door_interior, doormat).unwrap());
+        let beds = [c];
+        assert!(!simulate_house_reachable_edges(
+            &map,
+            (1, 1),
+            doormat,
+            door_interior,
+            &edges,
             &beds
         ));
     }

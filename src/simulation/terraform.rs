@@ -369,6 +369,9 @@ pub fn footprint_completion_system(
             if let Some(role) = entry.hearth_role {
                 bp = bp.with_hearth_role(role);
             }
+            if entry.edge_sides != 0 {
+                bp = bp.with_edge_sides(entry.edge_sides);
+            }
             let e = commands
                 .spawn((
                     bp,

@@ -1321,10 +1321,34 @@ pub struct Blueprint {
     /// "manual/legacy site — default to `Civic` at finalize". Only
     /// meaningful for `BuildSiteKind::Campfire`.
     pub hearth_role: Option<HearthRole>,
-    /// Target tile-boundary edge for `EdgeWall`/`EdgeDoor` blueprints. `None`
-    /// for every whole-tile structure. `tile` is the build-stand flanking floor
-    /// tile; `edge` is what actually gets stamped at finalize.
-    pub edge: Option<crate::world::edge::EdgeKey>,
+    /// For `EdgeWall` blueprints: bitmask (`edge_side::{N,E,S,W}`) of the
+    /// outward footprint-boundary edges this perimeter tile owns — 1 bit for a
+    /// mid-wall tile, 2 for a corner. `tile` is the interior floor tile (the
+    /// build-stand); each set side stamps the boundary edge between `tile` and
+    /// its exterior neighbour. `0` for non-edge structures. `EdgeDoor` ignores
+    /// this and stamps the single edge in `door_dir`.
+    pub edge_sides: u8,
+}
+
+/// Bitflags for `Blueprint.edge_sides` — which outward edges a perimeter
+/// `EdgeWall` tile carries. Matches `simulation::land::TileEdge` semantics
+/// (`+y` North, `+x` East).
+pub mod edge_side {
+    pub const N: u8 = 1;
+    pub const E: u8 = 2;
+    pub const S: u8 = 4;
+    pub const W: u8 = 8;
+}
+
+/// Canonical `EdgeKey` for the boundary between `tile` and its neighbour one
+/// step in `side`. Always orthogonal, so `EdgeKey::between` never returns None.
+pub fn outward_edge_key(
+    tile: (i32, i32),
+    side: crate::simulation::land::TileEdge,
+) -> crate::world::edge::EdgeKey {
+    let (dx, dy) = side.delta();
+    crate::world::edge::EdgeKey::between(tile, (tile.0 + dx, tile.1 + dy))
+        .expect("cardinal neighbour is always orthogonally adjacent")
 }
 
 impl Blueprint {
@@ -1361,14 +1385,13 @@ impl Blueprint {
             posted_by: None,
             design_techs: FactionTechs::default(),
             hearth_role: None,
-            edge: None,
+            edge_sides: 0,
         }
     }
 
-    /// Builder: target a tile-boundary edge (for `EdgeWall`/`EdgeDoor`). The
-    /// blueprint's `tile` should already be the build-stand flanking floor tile.
-    pub fn with_edge(mut self, edge: crate::world::edge::EdgeKey) -> Self {
-        self.edge = Some(edge);
+    /// Builder: stamp the outward-edge bitmask for an `EdgeWall` perimeter tile.
+    pub fn with_edge_sides(mut self, sides: u8) -> Self {
+        self.edge_sides = sides;
         self
     }
 
@@ -3028,6 +3051,20 @@ pub struct PlannedHouseTile {
     pub tile: (i32, i32),
     pub door_edge: Option<crate::simulation::land::TileEdge>,
     pub hearth_role: Option<HearthRole>,
+    /// Outward-edge bitmask for `EdgeWall` perimeter tiles (`edge_side::*`).
+    /// `0` for doors / interior furniture.
+    pub edge_sides: u8,
+}
+
+/// `TileEdge` → `edge_side::*` bit.
+fn tile_edge_bit(e: crate::simulation::land::TileEdge) -> u8 {
+    use crate::simulation::land::TileEdge as TE;
+    match e {
+        TE::North => edge_side::N,
+        TE::East => edge_side::E,
+        TE::South => edge_side::S,
+        TE::West => edge_side::W,
+    }
 }
 
 pub(crate) fn walled_house_tile_plan(
@@ -3041,24 +3078,64 @@ pub(crate) fn walled_house_tile_plan(
     interior_beds: &[(i32, i32)],
     interior_hearth: Option<(i32, i32)>,
 ) -> Vec<PlannedHouseTile> {
+    // The whole footprint is passable floor now; walls + the one door live on
+    // boundary edges. One EdgeWall blueprint per perimeter tile carries that
+    // tile's outward-boundary `edge_sides` (each boundary edge has exactly one
+    // interior owner tile, so blueprints stay 1:1 with tiles).
     let mut plan: Vec<PlannedHouseTile> = Vec::new();
     for dy in -half_h..=half_h {
         for dx in -half_w..=half_w {
-            if dx.abs() < half_w && dy.abs() < half_h {
-                continue; // interior — beds + hearth go via the loops below
+            let on_perimeter = dx.abs() == half_w || dy.abs() == half_h;
+            if !on_perimeter {
+                continue; // interior floor — beds + hearth via the loops below
             }
             let tile = (cx + dx, cy + dy);
-            let (kind, edge) = if (dx, dy) == entrance {
-                (BuildSiteKind::Door, Some(door_edge))
+            let mut sides = 0u8;
+            if dx == -half_w {
+                sides |= edge_side::W;
+            }
+            if dx == half_w {
+                sides |= edge_side::E;
+            }
+            if dy == -half_h {
+                sides |= edge_side::S;
+            }
+            if dy == half_h {
+                sides |= edge_side::N;
+            }
+            if (dx, dy) == entrance {
+                // Entrance tile: the door-side edge is a door. Entrances are
+                // always mid-wall (one outward side), so the door is the only
+                // structure on this tile. A degenerate corner entrance would
+                // leave its other sides open (kept as a separate EdgeWall only
+                // when non-zero, which can't collide because it's unreached in
+                // practice).
+                plan.push(PlannedHouseTile {
+                    kind: BuildSiteKind::EdgeDoor,
+                    tile,
+                    door_edge: Some(door_edge),
+                    hearth_role: None,
+                    edge_sides: 0,
+                });
+                let wall_sides = sides & !tile_edge_bit(door_edge);
+                if wall_sides != 0 {
+                    plan.push(PlannedHouseTile {
+                        kind: BuildSiteKind::EdgeWall(wall_material),
+                        tile,
+                        door_edge: None,
+                        hearth_role: None,
+                        edge_sides: wall_sides,
+                    });
+                }
             } else {
-                (BuildSiteKind::Wall(wall_material), None)
-            };
-            plan.push(PlannedHouseTile {
-                kind,
-                tile,
-                door_edge: edge,
-                hearth_role: None,
-            });
+                plan.push(PlannedHouseTile {
+                    kind: BuildSiteKind::EdgeWall(wall_material),
+                    tile,
+                    door_edge: None,
+                    hearth_role: None,
+                    edge_sides: sides,
+                });
+            }
         }
     }
     for &(bdx, bdy) in interior_beds {
@@ -3068,19 +3145,19 @@ pub(crate) fn walled_house_tile_plan(
             tile,
             door_edge: None,
             hearth_role: None,
+            edge_sides: 0,
         });
     }
     if let Some((hdx, hdy)) = interior_hearth {
         let tile = (cx + hdx, cy + hdy);
-        // Interior dwelling hearths are by definition Domestic — they're
-        // inside a household's roof, not the village plaza. Caller doesn't
-        // need to specify because non-Domestic interior hearths would mean
-        // a different building intent entirely.
+        // Interior dwelling hearths are by definition Domestic — inside a
+        // household's roof, not the village plaza.
         plan.push(PlannedHouseTile {
             kind: BuildSiteKind::Campfire,
             tile,
             door_edge: None,
             hearth_role: Some(HearthRole::Domestic),
+            edge_sides: 0,
         });
     }
     plan
@@ -3097,24 +3174,39 @@ fn plan_reachable_from_home(
     doormat: (i32, i32),
     plan: &[PlannedHouseTile],
 ) -> bool {
-    let mut walls: AHashSet<(i32, i32)> = AHashSet::new();
+    use crate::simulation::land::TileEdge as TE;
+    let mut blocked_edges: AHashSet<crate::world::edge::EdgeKey> = AHashSet::new();
     let mut beds: Vec<(i32, i32)> = Vec::new();
-    let mut door: Option<(i32, i32)> = None;
+    let mut door_interior: Option<(i32, i32)> = None;
     for entry in plan {
         match entry.kind {
-            BuildSiteKind::Wall(_) => {
-                walls.insert(entry.tile);
+            BuildSiteKind::EdgeWall(_) => {
+                for (bit, side) in [
+                    (edge_side::N, TE::North),
+                    (edge_side::E, TE::East),
+                    (edge_side::S, TE::South),
+                    (edge_side::W, TE::West),
+                ] {
+                    if entry.edge_sides & bit != 0 {
+                        blocked_edges.insert(outward_edge_key(entry.tile, side));
+                    }
+                }
             }
             BuildSiteKind::Bed => beds.push(entry.tile),
-            BuildSiteKind::Door => door = Some(entry.tile),
+            BuildSiteKind::EdgeDoor => door_interior = Some(entry.tile),
             _ => {}
         }
     }
-    let Some(door) = door else {
+    let Some(door_interior) = door_interior else {
         return true;
     };
-    crate::simulation::placement_reachability::simulate_house_reachable(
-        chunk_map, home, doormat, door, &walls, &beds,
+    crate::simulation::placement_reachability::simulate_house_reachable_edges(
+        chunk_map,
+        home,
+        doormat,
+        door_interior,
+        &blocked_edges,
+        &beds,
     )
 }
 
@@ -3212,6 +3304,9 @@ fn plan_building(
             }
             if let Some(role) = entry.hearth_role {
                 bp = bp.with_hearth_role(role);
+            }
+            if entry.edge_sides != 0 {
+                bp = bp.with_edge_sides(entry.edge_sides);
             }
             let e = commands
                 .spawn((
@@ -5958,54 +6053,69 @@ pub fn construction_system(
                 }
                 BuildSiteKind::EdgeWall(material) => {
                     // Thin housing wall: no tile rewrite (the floor stays
-                    // passable). Stamp the durable `EdgeStructureMap` + the
-                    // per-chunk edge cache; the entity is the render handle.
-                    let Some(edge) = bp.edge else {
-                        warn!("EdgeWall blueprint at {:?} had no edge; skipping", tile);
-                        continue;
-                    };
-                    let mid = edge_world_mid(edge);
-                    let wall_entity = commands
-                        .spawn((
-                            EdgeWallVisual { material, edge },
-                            StructureLabel(material.label()),
-                            Transform::from_xyz(mid.x, mid.y, 0.4),
-                            GlobalTransform::default(),
-                            Visibility::Visible,
-                            InheritedVisibility::default(),
-                        ))
-                        .id();
-                    let entry = maps.edge_structures.0.entry(edge).or_default();
-                    entry.wall = Some(EdgeWall {
-                        material,
-                        owner_faction: Some(bp.faction_id),
-                        entity: wall_entity,
-                    });
-                    let state = entry.projected_state();
-                    chunk_map.set_edge_state(edge, state);
-                    // Reuse the wall-lifecycle vision-cache invalidation channel
-                    // (keyed on a flanking tile of the edge).
+                    // passable). One perimeter tile owns 1-2 outward boundary
+                    // edges (`edge_sides`); stamp each into `EdgeStructureMap` +
+                    // the per-chunk edge cache, one render entity per edge.
+                    use crate::simulation::land::TileEdge as TE;
+                    let sides = [
+                        (edge_side::N, TE::North),
+                        (edge_side::E, TE::East),
+                        (edge_side::S, TE::South),
+                        (edge_side::W, TE::West),
+                    ];
+                    let mut first_entity: Option<Entity> = None;
+                    for (bit, side) in sides {
+                        if bp.edge_sides & bit == 0 {
+                            continue;
+                        }
+                        let edge = outward_edge_key(tile, side);
+                        let mid = edge_world_mid(edge);
+                        let wall_entity = commands
+                            .spawn((
+                                EdgeWallVisual { material, edge },
+                                StructureLabel(material.label()),
+                                Transform::from_xyz(mid.x, mid.y, 0.4),
+                                GlobalTransform::default(),
+                                Visibility::Visible,
+                                InheritedVisibility::default(),
+                            ))
+                            .id();
+                        let entry = maps.edge_structures.0.entry(edge).or_default();
+                        entry.wall = Some(EdgeWall {
+                            material,
+                            owner_faction: Some(bp.faction_id),
+                            entity: wall_entity,
+                        });
+                        let state = entry.projected_state();
+                        chunk_map.set_edge_state(edge, state);
+                        first_entity.get_or_insert(wall_entity);
+                    }
+                    // Reuse the wall-lifecycle vision-cache invalidation channel.
                     maps.wall_constructed.send(WallConstructed {
-                        tile: edge.owner_tile(),
+                        tile,
                         faction: Some(bp.faction_id),
                     });
                     tile_changed
                         .send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
-                    wall_entity
+                    match first_entity {
+                        Some(e) => e,
+                        None => {
+                            warn!("EdgeWall blueprint at {:?} had empty edge_sides", tile);
+                            continue;
+                        }
+                    }
                 }
                 BuildSiteKind::EdgeDoor => {
                     // Thin housing door on a tile edge. Passable; opaque when
-                    // shut. The doormat is the *exterior* flanking tile (the
-                    // edge tile that is not the interior build-stand `tile`).
-                    let Some(edge) = bp.edge else {
-                        warn!("EdgeDoor blueprint at {:?} had no edge; skipping", tile);
-                        continue;
-                    };
-                    let (ea, eb) = edge.tiles();
-                    let doormat_tile = if (tx, ty) == ea { eb } else { ea };
-                    let door_edge = bp
-                        .door_dir
-                        .unwrap_or_else(|| crate::simulation::land::TileEdge::toward(tile, doormat_tile));
+                    // shut. `tile` is the interior floor tile; the doormat is
+                    // the exterior neighbour one step in `door_dir`.
+                    let door_edge = bp.door_dir.unwrap_or_else(|| {
+                        warn!("EdgeDoor blueprint at {:?} had no door_dir; defaulting East", tile);
+                        crate::simulation::land::TileEdge::East
+                    });
+                    let edge = outward_edge_key(tile, door_edge);
+                    let (ddx, ddy) = door_edge.delta();
+                    let doormat_tile = (tile.0 + ddx, tile.1 + ddy);
                     let mid = edge_world_mid(edge);
                     let door_entity = commands
                         .spawn((
@@ -8842,36 +8952,38 @@ fn seed_walled_house_at(
         let edge = entry.door_edge;
         let world_pos = tile_to_world(tile.0, tile.1);
         match kind {
-            BuildSiteKind::Door => {
-                let door_edge = edge.expect("door entry carries its edge");
+            BuildSiteKind::EdgeDoor => {
+                // Thin housing door on a boundary edge; `tile` is the interior
+                // floor tile, doormat is the exterior neighbour. Floor stays
+                // passable — no tile rewrite.
+                let door_edge = edge.expect("EdgeDoor entry carries its edge");
+                let key = outward_edge_key(tile, door_edge);
                 let (ddx, ddy) = door_edge.delta();
                 let doormat_tile = (tile.0 + ddx, tile.1 + ddy);
-                let door = Door {
-                    faction_id,
-                    open: false,
-                    tier: best_door_for(seed_techs),
-                    dir: door_edge,
-                    doormat_tile,
-                };
-                let label = door.tier.label();
+                let mid = edge_world_mid(key);
                 let e = commands
                     .spawn((
-                        door,
-                        StructureLabel(label),
-                        Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                        EdgeDoorVisual {
+                            edge: key,
+                            dir: door_edge,
+                            open: false,
+                        },
+                        StructureLabel("Door"),
+                        Transform::from_xyz(mid.x, mid.y, 0.4),
                         GlobalTransform::default(),
                         Visibility::Visible,
                         InheritedVisibility::default(),
                     ))
                     .id();
-                maps.door_map.0.insert(
-                    tile,
-                    DoorEntry {
-                        entity: e,
-                        open: false,
-                        faction_id,
-                    },
-                );
+                let ent = maps.edge_structures.0.entry(key).or_default();
+                ent.door = Some(EdgeDoorRef {
+                    entity: e,
+                    open: false,
+                    faction_id,
+                    dir: door_edge,
+                });
+                let st = ent.projected_state();
+                chunk_map.set_edge_state(key, st);
                 doormat.0.insert(
                     doormat_tile,
                     crate::simulation::doormat::DoormatEntry {
@@ -8880,12 +8992,6 @@ fn seed_walled_house_at(
                         dir: door_edge,
                     },
                 );
-                // Carve doormat tile directly to Road; the Bresenham
-                // road_carve_system skips both endpoints. Connector chosen by
-                // `find_door_connector`: a bounded cardinal search returning
-                // the carvable path to the nearest carved/planned spine tile,
-                // routing around structures + farms. Replaces the unconditional
-                // `(doormat → home)` push that produced the wagon-wheel layout.
                 write_road_tile(
                     &mut *chunk_map,
                     &maps.structure_index,
@@ -8894,35 +9000,44 @@ fn seed_walled_house_at(
                 );
                 queue_door_connector(road_carve, faction_id, doormat_tile, home);
             }
-            BuildSiteKind::Wall(mat) => {
-                let surf_z = chunk_map.surface_z_at(tile.0, tile.1);
-                chunk_map.set_tile(
-                    tile.0,
-                    tile.1,
-                    surf_z + 1,
-                    TileData {
-                        kind: TileKind::Wall,
-                        elevation: 0,
-                        fertility: 0,
-                        flags: 0b0001,
-                        ore: 0,
-                    },
-                );
-                let e = commands
-                    .spawn((
-                        Wall {
-                            material: *mat,
-                            owner_faction: Some(faction_id),
-                        },
-                        crate::simulation::combat::Health::new(mat.max_hp()),
-                        StructureLabel(mat.label()),
-                        Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
-                        GlobalTransform::default(),
-                        Visibility::Visible,
-                        InheritedVisibility::default(),
-                    ))
-                    .id();
-                maps.wall_map.0.insert(tile, e);
+            BuildSiteKind::EdgeWall(mat) => {
+                // One perimeter tile owns 1-2 outward boundary edges. Stamp each
+                // into `EdgeStructureMap` + the per-chunk edge cache; the floor
+                // tile is untouched.
+                use crate::simulation::land::TileEdge as TE;
+                for (bit, side) in [
+                    (edge_side::N, TE::North),
+                    (edge_side::E, TE::East),
+                    (edge_side::S, TE::South),
+                    (edge_side::W, TE::West),
+                ] {
+                    if entry.edge_sides & bit == 0 {
+                        continue;
+                    }
+                    let key = outward_edge_key(tile, side);
+                    let mid = edge_world_mid(key);
+                    let e = commands
+                        .spawn((
+                            EdgeWallVisual {
+                                material: *mat,
+                                edge: key,
+                            },
+                            StructureLabel(mat.label()),
+                            Transform::from_xyz(mid.x, mid.y, 0.4),
+                            GlobalTransform::default(),
+                            Visibility::Visible,
+                            InheritedVisibility::default(),
+                        ))
+                        .id();
+                    let ent = maps.edge_structures.0.entry(key).or_default();
+                    ent.wall = Some(EdgeWall {
+                        material: *mat,
+                        owner_faction: Some(faction_id),
+                        entity: e,
+                    });
+                    let st = ent.projected_state();
+                    chunk_map.set_edge_state(key, st);
+                }
             }
             BuildSiteKind::Bed => {
                 let bed = Bed {
@@ -9523,30 +9638,69 @@ mod tests {
             &[(0, 0)],
             None,
         );
-        // 8 perimeter + 1 interior bed = 9 entries.
+        // 8 perimeter tiles (thin-wall: one EdgeWall/EdgeDoor per perimeter
+        // tile, NOT per edge) + 1 interior bed = 9 entries.
         assert_eq!(plan.len(), 9);
-        // Exactly one Door cell, on the east side carrying its edge.
+        // Exactly one EdgeDoor, the east-mid perimeter tile (11,10), door East.
         let doors: Vec<_> = plan
             .iter()
-            .filter(|p| matches!(p.kind, BuildSiteKind::Door))
+            .filter(|p| matches!(p.kind, BuildSiteKind::EdgeDoor))
             .collect();
         assert_eq!(doors.len(), 1);
         assert_eq!(doors[0].tile, (11, 10));
         assert_eq!(doors[0].door_edge, Some(TileEdge::East));
-        // Exactly 7 walls, none carrying an edge.
+        assert_eq!(doors[0].edge_sides, 0);
+        // 7 EdgeWall perimeter tiles. Total outward edges = 12 (4 corners ×2 +
+        // 4 mids ×1), minus the door's 1 edge = 11 wall edges across the tiles.
         let walls: Vec<_> = plan
             .iter()
-            .filter(|p| matches!(p.kind, BuildSiteKind::Wall(_)))
+            .filter(|p| matches!(p.kind, BuildSiteKind::EdgeWall(_)))
             .collect();
         assert_eq!(walls.len(), 7);
-        assert!(walls.iter().all(|p| p.door_edge.is_none()));
-        // Exactly one bed at the interior.
+        let total_wall_edges: u32 = walls.iter().map(|p| p.edge_sides.count_ones()).sum();
+        assert_eq!(total_wall_edges, 11);
+        // Corners carry two outward sides; mids carry one.
+        let corner = walls.iter().find(|p| p.tile == (9, 9)).unwrap(); // SW corner
+        assert_eq!(corner.edge_sides, edge_side::S | edge_side::W);
+        // Exactly one bed at the interior centre.
         let beds: Vec<_> = plan
             .iter()
             .filter(|p| matches!(p.kind, BuildSiteKind::Bed))
             .collect();
         assert_eq!(beds.len(), 1);
         assert_eq!(beds[0].tile, (10, 10));
+    }
+
+    #[test]
+    fn plan_reachable_accepts_standard_thin_wall_hut() {
+        use crate::world::chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_SIZE};
+        use crate::world::tile::TileKind;
+        let mut m = ChunkMap::default();
+        let surface_z = Box::new([[0i8; CHUNK_SIZE]; CHUNK_SIZE]);
+        let surface_kind = Box::new([[TileKind::Grass; CHUNK_SIZE]; CHUNK_SIZE]);
+        let surface_fertility = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
+        m.0.insert(
+            ChunkCoord(0, 0),
+            Chunk::new(surface_z, surface_kind, surface_fertility),
+        );
+        // 3×3 hut at (10,10), east door (entrance rel (1,0)), one centre bed.
+        let plan = walled_house_tile_plan(
+            10,
+            10,
+            1,
+            1,
+            (1, 0),
+            crate::simulation::land::TileEdge::East,
+            WallMaterial::Palisade,
+            &[(0, 0)],
+            None,
+        );
+        // Doormat is one step east of the east-mid entrance tile (11,10).
+        let doormat = (12, 10);
+        assert!(
+            plan_reachable_from_home(&m, (1, 1), doormat, &plan),
+            "a standard thin-wall hut on flat ground must pass the reachability gate"
+        );
     }
 
     #[test]
@@ -9567,7 +9721,7 @@ mod tests {
         let mats: Vec<_> = plan
             .iter()
             .filter_map(|p| match p.kind {
-                BuildSiteKind::Wall(m) => Some(m),
+                BuildSiteKind::EdgeWall(m) => Some(m),
                 _ => None,
             })
             .collect();
@@ -9590,14 +9744,15 @@ mod tests {
             &[(-1, 0), (1, 0)],
             None,
         );
-        // Perimeter cells: 5*3 - (3*1 interior) = 15 - 3 = 12.
+        // Perimeter tiles: 5*3 - (3*1 interior) = 15 - 3 = 12.
         // Plus 2 bed entries = 14.
         assert_eq!(plan.len(), 14);
         let door = plan
             .iter()
-            .find(|p| matches!(p.kind, BuildSiteKind::Door))
+            .find(|p| matches!(p.kind, BuildSiteKind::EdgeDoor))
             .unwrap();
         assert_eq!(door.tile, (2, 0));
+        assert_eq!(door.door_edge, Some(TileEdge::East));
         // Bed cells exactly where requested.
         let bed_tiles: Vec<_> = plan
             .iter()
