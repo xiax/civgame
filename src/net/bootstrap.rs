@@ -66,6 +66,7 @@ pub fn build_bootstrap_snapshot(
     bridge_map: &BridgeMap,
     dam_map: &DamMap,
     runtime_water: &RuntimeWater,
+    edge_structures: &crate::simulation::construction::EdgeStructureMap,
     networked_q: &Query<&Networked>,
     wall_q: &Query<&crate::simulation::construction::Wall>,
     federation_map: &crate::simulation::federation::FederationMap,
@@ -118,6 +119,8 @@ pub fn build_bootstrap_snapshot(
         bridges: collect_bridge_entries(bridge_map, networked_q),
         dams: collect_dam_entries(dam_map, networked_q),
         runtime_water: collect_water_entries(runtime_water),
+        edge_walls: collect_edge_wall_entries(edge_structures, networked_q),
+        edge_doors: collect_edge_door_entries(edge_structures, networked_q),
     };
 
     let interest_chunks =
@@ -203,6 +206,45 @@ fn collect_dam_entries(map: &DamMap, q: &Query<&Networked>) -> Vec<WireDamEntry>
         .collect()
 }
 
+fn collect_edge_wall_entries(
+    edges: &crate::simulation::construction::EdgeStructureMap,
+    q: &Query<&Networked>,
+) -> Vec<crate::net::protocol::WireEdgeWallEntry> {
+    edges
+        .0
+        .iter()
+        .filter_map(|(&edge, entry)| {
+            let w = entry.wall.as_ref()?;
+            q.get(w.entity).ok().map(|n| crate::net::protocol::WireEdgeWallEntry {
+                edge,
+                entity_net_id: n.0,
+                material: w.material,
+                owner_faction: w.owner_faction,
+            })
+        })
+        .collect()
+}
+
+fn collect_edge_door_entries(
+    edges: &crate::simulation::construction::EdgeStructureMap,
+    q: &Query<&Networked>,
+) -> Vec<crate::net::protocol::WireEdgeDoorEntry> {
+    edges
+        .0
+        .iter()
+        .filter_map(|(&edge, entry)| {
+            let d = entry.door.as_ref()?;
+            q.get(d.entity).ok().map(|n| crate::net::protocol::WireEdgeDoorEntry {
+                edge,
+                entity_net_id: n.0,
+                open: d.open,
+                faction_id: d.faction_id,
+                dir: d.dir,
+            })
+        })
+        .collect()
+}
+
 fn collect_water_entries(water: &RuntimeWater) -> Vec<WireWaterEntry> {
     water
         .cells
@@ -272,6 +314,8 @@ pub fn apply_bootstrap_snapshot(
     bridge_map: &mut BridgeMap,
     dam_map: &mut DamMap,
     runtime_water: &mut RuntimeWater,
+    edge_structures: &mut crate::simulation::construction::EdgeStructureMap,
+    chunk_map: &mut crate::world::chunk::ChunkMap,
     ids: &NetIdMap,
     federation_map: &mut crate::simulation::federation::FederationMap,
 ) {
@@ -322,6 +366,37 @@ pub fn apply_bootstrap_snapshot(
     runtime_water.cells.clear();
     for entry in &snap.overlay_tiles.runtime_water {
         runtime_water.cells.insert(entry.tile, entry.cell);
+    }
+
+    // Thin housing edge walls/doors. Rebuild the durable `EdgeStructureMap` +
+    // stamp the per-chunk edge cache so client fog LOS + edge sprites match the
+    // server. Stubs (with `EdgeWallVisual`/`EdgeDoorVisual`) are spawned by the
+    // client system before this call, like wall/door entries.
+    edge_structures.0.clear();
+    for entry in &snap.overlay_tiles.edge_walls {
+        if let Some(entity) = ids.entity_of(entry.entity_net_id) {
+            let ent = edge_structures.0.entry(entry.edge).or_default();
+            ent.wall = Some(crate::simulation::construction::EdgeWall {
+                material: entry.material,
+                owner_faction: entry.owner_faction,
+                entity,
+            });
+            let st = ent.projected_state();
+            chunk_map.set_edge_state(entry.edge, st);
+        }
+    }
+    for entry in &snap.overlay_tiles.edge_doors {
+        if let Some(entity) = ids.entity_of(entry.entity_net_id) {
+            let ent = edge_structures.0.entry(entry.edge).or_default();
+            ent.door = Some(crate::simulation::construction::EdgeDoorRef {
+                entity,
+                open: entry.open,
+                faction_id: entry.faction_id,
+                dir: entry.dir,
+            });
+            let st = ent.projected_state();
+            chunk_map.set_edge_state(entry.edge, st);
+        }
     }
 
     federation_map.by_id.clear();
@@ -436,6 +511,8 @@ mod tests {
         let mut bridge = BridgeMap::default();
         let mut dam = DamMap::default();
         let mut water = RuntimeWater::default();
+        let mut edges = crate::simulation::construction::EdgeStructureMap::default();
+        let mut chunk_map = crate::world::chunk::ChunkMap::default();
         let ids = NetIdMap::default();
         let mut fed_map = crate::simulation::federation::FederationMap::default();
 
@@ -448,6 +525,8 @@ mod tests {
             &mut bridge,
             &mut dam,
             &mut water,
+            &mut edges,
+            &mut chunk_map,
             &ids,
             &mut fed_map,
         );

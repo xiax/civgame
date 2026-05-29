@@ -1109,6 +1109,14 @@ pub fn seed_starting_farms_system(
                     if starter_budget == 0 {
                         break 'rows;
                     }
+                    // `rect` is the plot HULL; Agricultural membership is
+                    // `ag_tiles` (the hull can contain holes carved out by
+                    // overlapping kitchen-garden plots or hard-conflict
+                    // subtraction). Only ever till an actual member tile, or
+                    // the starter patch would orphan Cropland outside any plot.
+                    if !plot_index.ag_tiles.contains(&(tx, ty)) {
+                        continue;
+                    }
                     let z = chunk_map.surface_z_at(tx, ty);
                     let cur = chunk_map.tile_at(tx, ty, z);
                     let pre_stamp = cur.kind != TileKind::Cropland

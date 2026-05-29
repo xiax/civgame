@@ -26,7 +26,10 @@ use crate::world::water_runtime::RuntimeWaterCell;
 // v9: added `BuildSiteKind::{SleepingMat, LightShelter}` (new serialized enum
 // discriminants ride `PlayerCommand::Build` / blueprint frames) — poor-housing
 // primitives. See plans/realistic-poor-shelter.md.
-pub const PROTOCOL_VERSION: u32 = 9;
+// v10: added `TileOverlayOp::{AddEdgeWall, RemoveEdgeWall, AddEdgeDoor,
+// RemoveEdgeDoor, SetEdgeDoorOpen}` — thin housing edge walls/doors replicate
+// over LAN. See plans/thin-edge-walls.md (Phase 6).
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// One UI- (or remote-client-)issued command, scoped to the faction that
 /// claims to be sending it. The loopback validates `sender_faction_id`
@@ -225,6 +228,38 @@ pub enum TileOverlayOp {
     RemoveStructure {
         tile: (i32, i32),
     },
+    // ---------------------------------------------------------------
+    // Thin housing edge walls/doors (plans/thin-edge-walls.md, Phase 6).
+    // Keyed by `EdgeKey` (the boundary between two tiles), not a tile.
+    // ---------------------------------------------------------------
+    /// Thin housing wall on the boundary `edge`. `owner_faction` mirrors the
+    /// `AddWall` field so client-side `has_vision_los` treats own walls as
+    /// transparent.
+    AddEdgeWall {
+        edge: crate::world::edge::EdgeKey,
+        entity_net_id: NetId,
+        material: crate::simulation::construction::WallMaterial,
+        owner_faction: Option<u32>,
+    },
+    RemoveEdgeWall {
+        edge: crate::world::edge::EdgeKey,
+    },
+    /// Thin housing door on the boundary `edge`. `dir` is the opening cardinal
+    /// (interior tile → doormat) the client needs to spawn `EdgeDoorVisual`.
+    AddEdgeDoor {
+        edge: crate::world::edge::EdgeKey,
+        entity_net_id: NetId,
+        open: bool,
+        faction_id: u32,
+        dir: crate::simulation::land::TileEdge,
+    },
+    RemoveEdgeDoor {
+        edge: crate::world::edge::EdgeKey,
+    },
+    SetEdgeDoorOpen {
+        edge: crate::world::edge::EdgeKey,
+        open: bool,
+    },
 }
 
 /// Wire projection of `PlantKind`. Adding a new kind = a new variant
@@ -359,6 +394,12 @@ pub struct OverlayTileSnapshot {
     pub bridges: Vec<WireBridgeEntry>,
     pub dams: Vec<WireDamEntry>,
     pub runtime_water: Vec<WireWaterEntry>,
+    /// Thin housing edge walls/doors (Phase 6). Late-joiners stamp these the
+    /// same way new construction arrives via `TileOverlayOp::AddEdge*`.
+    #[serde(default)]
+    pub edge_walls: Vec<WireEdgeWallEntry>,
+    #[serde(default)]
+    pub edge_doors: Vec<WireEdgeDoorEntry>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -395,6 +436,23 @@ pub struct WireDamEntry {
 pub struct WireWaterEntry {
     pub tile: (i32, i32),
     pub cell: RuntimeWaterCell,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct WireEdgeWallEntry {
+    pub edge: crate::world::edge::EdgeKey,
+    pub entity_net_id: NetId,
+    pub material: crate::simulation::construction::WallMaterial,
+    pub owner_faction: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct WireEdgeDoorEntry {
+    pub edge: crate::world::edge::EdgeKey,
+    pub entity_net_id: NetId,
+    pub open: bool,
+    pub faction_id: u32,
+    pub dir: crate::simulation::land::TileEdge,
 }
 
 /// Server's reply to a client-issued `NetPlayerCommandEvent`. The
@@ -884,6 +942,69 @@ mod tests {
         let bytes = bincode::serialize(&ops).expect("serialize");
         let restored: Vec<TileOverlayOp> = bincode::deserialize(&bytes).expect("deserialize");
         assert_eq!(restored.len(), ops.len());
+    }
+
+    #[test]
+    fn edge_overlay_ops_round_trip() {
+        use super::TileOverlayOp;
+        use crate::simulation::construction::WallMaterial;
+        use crate::simulation::land::TileEdge;
+        use crate::world::edge::{EdgeAxis, EdgeKey};
+        let v_edge = EdgeKey {
+            axis: EdgeAxis::Vertical,
+            x: 3,
+            y: -4,
+        };
+        let h_edge = EdgeKey {
+            axis: EdgeAxis::Horizontal,
+            x: 10,
+            y: 2,
+        };
+        let ops = vec![
+            TileOverlayOp::AddEdgeWall {
+                edge: v_edge,
+                entity_net_id: NetId(101),
+                material: WallMaterial::WattleDaub,
+                owner_faction: Some(5),
+            },
+            TileOverlayOp::RemoveEdgeWall { edge: v_edge },
+            TileOverlayOp::AddEdgeDoor {
+                edge: h_edge,
+                entity_net_id: NetId(102),
+                open: true,
+                faction_id: 5,
+                dir: TileEdge::North,
+            },
+            TileOverlayOp::SetEdgeDoorOpen {
+                edge: h_edge,
+                open: false,
+            },
+            TileOverlayOp::RemoveEdgeDoor { edge: h_edge },
+        ];
+        let bytes = bincode::serialize(&ops).expect("serialize");
+        let restored: Vec<TileOverlayOp> = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(restored.len(), ops.len());
+        match restored[0] {
+            TileOverlayOp::AddEdgeWall {
+                edge,
+                material,
+                owner_faction,
+                ..
+            } => {
+                assert_eq!(edge, v_edge);
+                assert_eq!(material, WallMaterial::WattleDaub);
+                assert_eq!(owner_faction, Some(5));
+            }
+            _ => panic!("variant order changed"),
+        }
+        match restored[2] {
+            TileOverlayOp::AddEdgeDoor { edge, dir, open, .. } => {
+                assert_eq!(edge, h_edge);
+                assert_eq!(dir, TileEdge::North);
+                assert!(open);
+            }
+            _ => panic!("variant order changed"),
+        }
     }
 
     #[test]

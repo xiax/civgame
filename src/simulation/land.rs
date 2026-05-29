@@ -101,7 +101,9 @@ pub fn field_tile_role(
 /// the plot's frontage (or a road halo / home cardinal fallback), and the door
 /// is placed on that side of the building. The doormat tile sits one step in
 /// the same direction outside the building.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum TileEdge {
     North,
     East,

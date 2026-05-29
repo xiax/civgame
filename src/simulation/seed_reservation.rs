@@ -158,10 +158,19 @@ pub fn populate_seed_reservation_system(
     road_queue: Res<RoadCarveQueue>,
     brains: Res<SettlementBrains>,
     well_map: Res<WellMap>,
+    dwelling_envelopes: Res<crate::simulation::construction::DwellingEnvelopeMap>,
     mut reservation: ResMut<SeedReservation>,
 ) {
     reservation.reserve_iter(structure_index.0.keys().copied());
     reservation.reserve_iter(doormat.0.keys().copied());
+    // Thin-wall dwelling floors are passable but must stay clear of wild
+    // plants + late-streamed obstacles, exactly like the old full-tile wall
+    // ring did. Folding the envelope in here routes those keep-outs through the
+    // existing `SeedReservation` consumers (`seed_target_tile_ok`,
+    // `spawn_chunk_plants`, obstacle clearing, stranded-member relocation) with
+    // no per-system plumbing. Interior beds/hearths are already covered via
+    // `StructureIndex`; this adds the perimeter + non-furniture interior floor.
+    reservation.reserve_iter(dwelling_envelopes.by_tile.keys().copied());
     for brain in brains.0.values() {
         // Reserve the full widened corridor, not just the centreline — the
         // carver stamps a 2-tile-wide road and the corridor cache already

@@ -6,9 +6,10 @@ use crate::simulation::vehicle::{
     Vehicle, VehicleData, VehicleDesign, VehicleDesignRegistry, VehiclePartKind, VehicleVisual,
 };
 use crate::simulation::construction::{
-    Bed, Blueprint, BuildSiteKind, Campfire, Chair, Door, Loom, ShelterTier, Table, TentShelter,
-    Wall, WallMaterial, Well, Workbench,
+    Bed, Blueprint, BuildSiteKind, Campfire, Chair, Door, EdgeDoorVisual, EdgeWallVisual, Loom,
+    ShelterTier, Table, TentShelter, Wall, WallMaterial, Well, Workbench,
 };
+use crate::world::edge::EdgeAxis;
 use crate::simulation::faction::{
     FactionCenter, FactionMember, PlayerFaction, PlayerFactionMarker,
 };
@@ -51,6 +52,12 @@ pub struct BedVisual;
 
 #[derive(Component)]
 pub struct WallVisual;
+
+/// Marks a thin edge wall/door durable entity (`EdgeWallVisual` /
+/// `EdgeDoorVisual`) whose oriented sprite child has been attached, so the
+/// spawn systems run once per entity.
+#[derive(Component)]
+pub struct EdgeVisualSpawned;
 
 #[derive(Component)]
 pub struct WolfVisual;
@@ -340,6 +347,95 @@ pub fn spawn_door_sprites(
                 VisualChild,
                 sprite,
                 Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+                InheritedVisibility::default(),
+            ));
+        });
+    }
+}
+
+/// Pixel thickness of a thin edge wall/door strip (across the boundary). The
+/// long dimension matches the 16 px tile span the edge runs along.
+const EDGE_STRIP_THICKNESS: f32 = 5.0;
+const EDGE_STRIP_SPAN: f32 = crate::world::terrain::TILE_SIZE;
+
+fn wall_material_texture(textures: &EntityTextures, material: WallMaterial) -> Handle<Image> {
+    match material {
+        WallMaterial::Palisade => textures.wall_palisade_ascii.clone(),
+        WallMaterial::WattleDaub => textures.wall_wattle_ascii.clone(),
+        WallMaterial::Stone => textures.wall_stone_ascii.clone(),
+        WallMaterial::Mudbrick => textures.wall_mudbrick_ascii.clone(),
+        WallMaterial::CutStone => textures.wall_cutstone_ascii.clone(),
+    }
+}
+
+/// Strip size for an edge of the given axis. A `Vertical` edge separates a
+/// left/right tile pair, so its wall runs north–south (tall thin bar); a
+/// `Horizontal` edge runs east–west (wide thin bar). The boundary midpoint is
+/// the entity origin, so `BottomCenter` + `y = -span/2` centres the strip on it.
+fn edge_strip_size(axis: EdgeAxis) -> Vec2 {
+    match axis {
+        EdgeAxis::Vertical => Vec2::new(EDGE_STRIP_THICKNESS, EDGE_STRIP_SPAN),
+        EdgeAxis::Horizontal => Vec2::new(EDGE_STRIP_SPAN, EDGE_STRIP_THICKNESS),
+    }
+}
+
+/// Attach an oriented strip sprite to each thin housing edge-wall entity. The
+/// entity Transform already sits at the edge world-midpoint (`edge_world_mid`);
+/// the child is a thin bar along the edge so the full footprint floor stays
+/// visibly open. Mirrors `spawn_wall_sprites` (fog + projection-driven y-sort).
+pub fn spawn_edge_wall_sprites(
+    mut commands: Commands,
+    query: Query<(Entity, &EdgeWallVisual), Without<EdgeVisualSpawned>>,
+    textures: Res<EntityTextures>,
+) {
+    for (entity, ew) in query.iter() {
+        let size = edge_strip_size(ew.edge.axis);
+        let mut sprite = Sprite::from_image(wall_material_texture(&textures, ew.material));
+        sprite.anchor = Anchor::BottomCenter;
+        sprite.custom_size = Some(size);
+        commands
+            .entity(entity)
+            .insert((EdgeVisualSpawned, EntityFogState::default(), FogPersistent));
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -size.y * 0.5, 0.1),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+                InheritedVisibility::default(),
+            ));
+        });
+    }
+}
+
+/// Attach an oriented strip sprite to each thin housing edge-door entity. An
+/// `open` door renders dimmer so the opening reads at a glance. Edge doors are
+/// not yet runtime-toggled (Phase 3 leaves them closed), so the `open` bit is
+/// fixed at spawn; a future open/close pass would add a swap-on-change system.
+pub fn spawn_edge_door_sprites(
+    mut commands: Commands,
+    query: Query<(Entity, &EdgeDoorVisual), Without<EdgeVisualSpawned>>,
+    textures: Res<EntityTextures>,
+) {
+    for (entity, ed) in query.iter() {
+        let size = edge_strip_size(ed.edge.axis);
+        let mut sprite = Sprite::from_image(textures.door_ascii.clone());
+        sprite.anchor = Anchor::BottomCenter;
+        sprite.custom_size = Some(size);
+        if ed.open {
+            sprite.color = Color::srgba(1.0, 1.0, 1.0, 0.45);
+        }
+        commands
+            .entity(entity)
+            .insert((EdgeVisualSpawned, EntityFogState::default(), FogPersistent));
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -size.y * 0.5, 0.1),
                 GlobalTransform::default(),
                 Visibility::Inherited,
                 InheritedVisibility::default(),
@@ -2410,6 +2506,7 @@ pub fn handle_art_mode_change(
         )>,
     >,
     walls: Query<Entity, With<WallVisual>>,
+    edge_visuals: Query<Entity, With<EdgeVisualSpawned>>,
     beds: Query<Entity, With<BedVisual>>,
     centers: Query<Entity, With<FactionCenterVisual>>,
     plants: Query<Entity, With<PlantVisual>>,
@@ -2424,6 +2521,7 @@ pub fn handle_art_mode_change(
             .chain(horses.iter())
             .chain(new_animals.iter())
             .chain(walls.iter())
+            .chain(edge_visuals.iter())
             .chain(beds.iter())
             .chain(centers.iter())
             .chain(plants.iter())
@@ -2447,6 +2545,7 @@ pub fn handle_art_mode_change(
                 FoxVisual,
                 CatVisual,
                 WallVisual,
+                EdgeVisualSpawned,
                 BedVisual,
                 FactionCenterVisual,
                 PlantVisual,

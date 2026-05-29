@@ -189,6 +189,7 @@ pub struct BootstrapParams<'w, 's> {
     pub bridge_map: Res<'w, BridgeMap>,
     pub dam_map: Res<'w, DamMap>,
     pub runtime_water: Res<'w, RuntimeWater>,
+    pub edge_structures: Res<'w, crate::simulation::construction::EdgeStructureMap>,
     pub networked_q: Query<'w, 's, &'static Networked>,
     pub wall_component_q: Query<'w, 's, &'static crate::simulation::construction::Wall>,
 }
@@ -273,6 +274,7 @@ pub fn handle_client_hello_system(
             &bootstrap.bridge_map,
             &bootstrap.dam_map,
             &bootstrap.runtime_water,
+            &bootstrap.edge_structures,
             &bootstrap.networked_q,
             &bootstrap.wall_component_q,
             &federation_map,
@@ -501,6 +503,7 @@ pub struct TileOverlayParams<'w, 's> {
     pub runtime_water: Res<'w, RuntimeWater>,
     pub plant_map: Res<'w, crate::simulation::plants::PlantMap>,
     pub structure_index: Res<'w, crate::simulation::construction::StructureIndex>,
+    pub edge_structures: Res<'w, crate::simulation::construction::EdgeStructureMap>,
     pub networked_q: Query<'w, 's, &'static Networked>,
     pub door_q: Query<'w, 's, &'static Door>,
     pub wall_q: Query<'w, 's, &'static crate::simulation::construction::Wall>,
@@ -703,6 +706,57 @@ fn push_ops_for_tile(
         }
         None => {
             out.push(TileOverlayOp::RemoveStructure { tile });
+        }
+    }
+
+    // Thin housing edge walls/doors. A tile owns its canonical N and E edges
+    // (`EdgeKey { Horizontal, x, y }` and `EdgeKey { Vertical, x, y }`); the S/W
+    // edges belong to the neighbour below/left and replicate when that tile is
+    // dirtied. Emit Add for present structures (idempotent), Remove otherwise.
+    use crate::world::edge::{EdgeAxis, EdgeKey};
+    for edge in [
+        EdgeKey {
+            axis: EdgeAxis::Horizontal,
+            x: tile.0,
+            y: tile.1,
+        },
+        EdgeKey {
+            axis: EdgeAxis::Vertical,
+            x: tile.0,
+            y: tile.1,
+        },
+    ] {
+        let entry = overlay.edge_structures.0.get(&edge);
+        match entry.and_then(|e| e.wall.as_ref()) {
+            Some(w) => {
+                if let Ok(n) = networked_q.get(w.entity) {
+                    out.push(TileOverlayOp::AddEdgeWall {
+                        edge,
+                        entity_net_id: n.0,
+                        material: w.material,
+                        owner_faction: w.owner_faction,
+                    });
+                }
+            }
+            None => out.push(TileOverlayOp::RemoveEdgeWall { edge }),
+        }
+        match entry.and_then(|e| e.door.as_ref()) {
+            Some(d) => {
+                if let Ok(n) = networked_q.get(d.entity) {
+                    out.push(TileOverlayOp::AddEdgeDoor {
+                        edge,
+                        entity_net_id: n.0,
+                        open: d.open,
+                        faction_id: d.faction_id,
+                        dir: d.dir,
+                    });
+                }
+                out.push(TileOverlayOp::SetEdgeDoorOpen {
+                    edge,
+                    open: d.open,
+                });
+            }
+            None => out.push(TileOverlayOp::RemoveEdgeDoor { edge }),
         }
     }
 

@@ -20506,18 +20506,21 @@ mod onenter_era_seeding {
     /// and the worker buys it — and the system-wide currency invariant holds
     /// at every sampled tick (including mid buy→return).
     ///
-    /// TEMPORARILY IGNORED (thin-edge-walls Phase 3→4 coupling): this scenario
-    /// removes ALL beds at runtime, forcing the chief to place *new* dwellings
-    /// amid the existing thin-wall huts. With Phase 3 landed but Phase 4's
-    /// `DwellingEnvelopeMap` keep-out not yet wired, the existing huts' floors
-    /// are passable but unmarked-occupied, so the route-aware residential
-    /// placement can't find a clear+reachable site and the chief posts nothing
-    /// (no wood-needing blueprint → no Market haul). Verified isolated: the
-    /// other 51 OnEnter-seeding tests pass, and `select_wall_material` correctly
-    /// returns `Palisade{Market}` here — only the placement step is blocked.
-    /// Re-enable once the dwelling-envelope keep-out (Phase 4) lands. See
-    /// `plans/...thin-edge-walls` resume notes.
-    #[ignore = "blocked on Phase 4 DwellingEnvelopeMap placement keep-out (thin-edge-walls)"]
+    /// This scenario removes ALL beds at runtime, forcing the chief to place
+    /// *new* dwellings amid the existing thin-wall huts. Phase 4's
+    /// `DwellingEnvelopeMap` keep-out (now wired: `single_tile_clear` rejects
+    /// envelope tiles, so residential placement routes around occupied hut
+    /// floors instead of repeatedly picking them and failing the door/reach
+    /// gate) lets placement find a clear+reachable site, the chief posts the
+    /// wood-needing blueprint, and the Market haul appears.
+    ///
+    /// NOTE: like its `carve_plots_*` / `hard_conflict_partial_retire` farm
+    /// siblings, this exercises the async survey → intent → placement chain,
+    /// whose result-application tick is not deterministic under shared
+    /// `AsyncComputeTaskPool` / same-process `fastrand` state. It passes
+    /// reliably in isolation; under heavy concurrent-suite load it can flake.
+    /// Per `feedback_flaky_behavioral_tests`, re-run any full-suite failure in
+    /// isolation before treating it as a regression.
     #[test]
     fn market_procurement_preserves_currency_invariant() {
         use crate::simulation::jobs::{HaulSource, JobBoard, JobProgress};
@@ -20556,7 +20559,14 @@ mod onenter_era_seeding {
 
         let baseline = CurrencySnapshot::capture(&mut sim.app);
         let mut saw_market_haul = false;
-        for i in 0..2000 {
+        // Wide window: placing the wood-needing dwelling depends on the chief's
+        // async settlement survey landing an intent, whose application tick is
+        // not deterministic under `AsyncComputeTaskPool` scheduling. Give it
+        // room, but stop ~400 ticks after the Market haul first appears so the
+        // test stays bounded regardless of when the survey resolved (the tail
+        // still samples the invariant through a full buy→return mid-chain).
+        let mut seen_tick: Option<usize> = None;
+        for i in 0..6000 {
             sim.tick();
             if i % 100 == 0 {
                 // Invariant must hold at every sample — including ticks where
@@ -20573,7 +20583,15 @@ mod onenter_era_seeding {
                     }
                 )
             }) {
+                if !saw_market_haul {
+                    seen_tick = Some(i);
+                }
                 saw_market_haul = true;
+            }
+            if let Some(t) = seen_tick {
+                if i >= t + 400 {
+                    break;
+                }
             }
         }
         assert_total_currency_invariant(&mut sim.app, baseline, 1e-2);

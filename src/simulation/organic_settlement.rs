@@ -587,6 +587,7 @@ pub struct OrganicStructureMapsParam<'w> {
     pub monument_map: Res<'w, MonumentMap>,
     pub well_map: Res<'w, WellMap>,
     pub structure_index: Res<'w, StructureIndex>,
+    pub dwelling_envelopes: Res<'w, crate::simulation::construction::DwellingEnvelopeMap>,
 }
 
 impl<'w> OrganicStructureMapsParam<'w> {
@@ -609,6 +610,7 @@ impl<'w> OrganicStructureMapsParam<'w> {
             monument_map: &*self.monument_map,
             well_map: &*self.well_map,
             structure_index: &*self.structure_index,
+            dwelling_envelopes: &*self.dwelling_envelopes,
         }
     }
 }
@@ -634,6 +636,10 @@ pub struct OrganicStructureMaps<'a> {
     pub monument_map: &'a MonumentMap,
     pub well_map: &'a WellMap,
     pub structure_index: &'a StructureIndex,
+    /// Dwelling-floor keep-out. Thin-wall huts/longhouses have fully-passable
+    /// interiors now, so placement helpers consult this to keep new builds,
+    /// roads, and gardens out of an existing dwelling's living space.
+    pub dwelling_envelopes: &'a crate::simulation::construction::DwellingEnvelopeMap,
 }
 
 /// Send-able structure-map view captured on the main thread before a
@@ -655,6 +661,11 @@ pub struct SurveyStructureSnapshot {
     pub monuments: AHashSet<(i32, i32)>,
     pub wells: AHashSet<(i32, i32)>,
     pub structures: AHashSet<(i32, i32)>,
+    /// Thin-wall dwelling footprints (rect + is_longhouse) captured from
+    /// `DwellingEnvelopeMap`. Huts/longhouses no longer stamp full-tile walls,
+    /// so `detect_dwellings(walls)` can't see them — kitchen-garden placement
+    /// reads these envelope rects instead.
+    pub dwelling_rects: Vec<(TileRect, bool)>,
 }
 
 impl SurveyStructureSnapshot {
@@ -698,6 +709,21 @@ impl SurveyStructureSnapshot {
                 .keys()
                 .filter(|t| in_window(t))
                 .copied()
+                .collect(),
+            dwelling_rects: maps
+                .dwelling_envelopes
+                .dwellings
+                .values()
+                .filter(|info| in_window(&info.min) || in_window(&info.max))
+                .map(|info| {
+                    let w = (info.max.0 - info.min.0 + 1).max(1) as u16;
+                    let h = (info.max.1 - info.min.1 + 1).max(1) as u16;
+                    let rect = TileRect::new(info.min.0, info.min.1, w, h);
+                    // 3×3 hut vs 5×3 / 3×5 longhouse: anything larger than a
+                    // 3×3 footprint is a longhouse for garden-shape purposes.
+                    let is_longhouse = w > 3 || h > 3;
+                    (rect, is_longhouse)
+                })
                 .collect(),
         }
     }
@@ -2379,7 +2405,15 @@ fn build_parcels<F: SurveyFactionView>(
         // 12-tile child-claim path in `land_listing_system` then binds it as
         // the household's child plot; carving still flows through
         // `carve_plots_system` — no new Plot construction path.
-        append_dwelling_gardens(faction, settlement, brain, chunk_map, &maps.walls, &mut parcels);
+        append_dwelling_gardens(
+            faction,
+            settlement,
+            brain,
+            chunk_map,
+            &maps.dwelling_rects,
+            &maps.walls,
+            &mut parcels,
+        );
         parcels
     } else {
         build_parcels_frontier_driven(faction, settlement, brain, chunk_map)
@@ -2460,13 +2494,21 @@ fn append_dwelling_gardens<F: SurveyFactionView>(
     settlement: &Settlement,
     brain: &SettlementBrain,
     chunk_map: &ChunkMap,
+    dwelling_rects: &[(TileRect, bool)],
     walls: &AHashSet<(i32, i32)>,
     parcels: &mut Vec<Parcel>,
 ) {
     const KITCHEN_PROXIMITY: i32 = 12;
     const BELT_CLEARANCE: i32 = 3;
 
-    let dwellings = detect_dwellings(walls);
+    // Thin-wall huts/longhouses come from the envelope snapshot; full-tile
+    // composite houses (if any) are still detected from the wall ring. Merge
+    // both so every dwelling kind gets a kitchen garden.
+    let mut dwellings: Vec<DetectedDwelling> = dwelling_rects
+        .iter()
+        .map(|&(rect, is_longhouse)| DetectedDwelling { rect, is_longhouse })
+        .collect();
+    dwellings.extend(detect_dwellings(walls));
     if dwellings.is_empty() {
         return;
     }
@@ -4621,6 +4663,7 @@ fn intent_site_clear(
                 brain: None,
                 chunk_map: Some(chunk_map),
                 used: None,
+                dwelling_envelopes: Some(maps.dwelling_envelopes),
                 self_bp: None,
             };
             crate::simulation::well::well_footprint_clear(tile, &ctx).is_ok()
@@ -4661,6 +4704,10 @@ fn single_tile_clear(
 ) -> bool {
     if bp_map.0.contains_key(&tile)
         || maps.structure_index.0.contains_key(&tile)
+        // Thin-wall dwelling floors are passable but occupied — a new build
+        // dropped onto another hut's interior would overlap its living space
+        // and confuse its edge-wall envelope. Reject the whole footprint.
+        || maps.dwelling_envelopes.contains_tile(tile)
         || maps.bed_map.0.contains_key(&tile)
         // A well's 5×5 footprint must reject non-well placements landing on
         // any of its tiles — including the central shaft, which is registered

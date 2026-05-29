@@ -310,6 +310,12 @@ pub struct WellPlacementCtx<'a> {
     pub brain: Option<&'a crate::simulation::organic_settlement::SettlementBrain>,
     pub chunk_map: Option<&'a ChunkMap>,
     pub used: Option<&'a AHashSet<(i32, i32)>>,
+    /// Thin-wall dwelling-floor keep-out. A well's 5×5 disc must not land on a
+    /// passable dwelling interior. Seed-time placement already gets this via
+    /// `seed_reservation` (which folds the envelope in); runtime placement
+    /// passes this explicitly since it carries no seed reservation.
+    pub dwelling_envelopes:
+        Option<&'a crate::simulation::construction::DwellingEnvelopeMap>,
     /// Blueprint entity for the candidate being validated, if any. Lets the
     /// runtime converter pass its own `bp_map` entry without self-rejecting.
     pub self_bp: Option<Entity>,
@@ -350,6 +356,11 @@ pub fn well_footprint_clear(
         if let Some(rsrv) = ctx.seed_reservation {
             if rsrv.is_reserved(tile) {
                 return Err(WellPlacementBlock::OverlapsSeedReservation);
+            }
+        }
+        if let Some(env) = ctx.dwelling_envelopes {
+            if env.contains_tile(tile) {
+                return Err(WellPlacementBlock::OverlapsStructure);
             }
         }
         if let Some(used) = ctx.used {
@@ -616,6 +627,11 @@ pub fn convert_well_blueprint_system(
                     brain: None,
                     chunk_map: Some(&chunk_map),
                     used: None,
+                    // Already gated against the envelope at intent-emit time;
+                    // re-validation here only needs the structure/blueprint
+                    // deltas since (a dwelling can't appear on a pending well
+                    // disc — placement keeps them mutually exclusive).
+                    dwelling_envelopes: None,
                     self_bp: Some(entity),
                 };
                 if let Err(reason) = well_footprint_clear(center, &ctx) {
@@ -1106,6 +1122,7 @@ mod tests {
             brain: None,
             chunk_map: None,
             used: None,
+            dwelling_envelopes: None,
             self_bp: None,
         }
     }

@@ -115,6 +115,8 @@ impl Plugin for RenderingPlugin {
                     entity_sprites::spawn_faction_center_sprites,
                     entity_sprites::spawn_bed_sprites,
                     entity_sprites::spawn_wall_sprites,
+                    entity_sprites::spawn_edge_wall_sprites,
+                    entity_sprites::spawn_edge_door_sprites,
                     entity_sprites::spawn_campfire_sprites,
                     entity_sprites::spawn_door_sprites,
                     entity_sprites::spawn_table_sprites,
@@ -229,6 +231,12 @@ impl Plugin for RenderingPlugin {
                     projection::auto_attach_dynamic::<crate::simulation::construction::Bed>,
                     projection::auto_attach_dynamic::<crate::simulation::construction::Wall>,
                     projection::auto_attach_dynamic::<crate::simulation::construction::Door>,
+                    projection::auto_attach_dynamic::<
+                        crate::simulation::construction::EdgeWallVisual,
+                    >,
+                    projection::auto_attach_dynamic::<
+                        crate::simulation::construction::EdgeDoorVisual,
+                    >,
                     projection::auto_attach_dynamic::<crate::simulation::construction::Workbench>,
                     projection::auto_attach_dynamic::<crate::simulation::construction::Loom>,
                     projection::auto_attach_dynamic::<crate::simulation::construction::Table>,

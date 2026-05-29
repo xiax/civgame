@@ -133,6 +133,12 @@ pub struct OverlayApplyMaps<'w> {
     pub runtime_water: ResMut<'w, RuntimeWater>,
     pub plant_map: ResMut<'w, ReplicatedPlantMap>,
     pub structure_map: ResMut<'w, ReplicatedStructureMap>,
+    /// Thin housing edge walls/doors. The client mirrors the server's durable
+    /// `EdgeStructureMap` (keyed by `EdgeKey`) and stamps the per-chunk edge
+    /// cache so client-side fog LOS (`has_vision_los`) + the Phase-5 edge
+    /// sprite spawners see the same walls/doors.
+    pub edge_structures: ResMut<'w, crate::simulation::construction::EdgeStructureMap>,
+    pub chunk_map: ResMut<'w, crate::world::chunk::ChunkMap>,
 }
 
 /// Drain `FactionAssignment` first (sets `PlayerFaction`), then any
@@ -195,6 +201,28 @@ pub fn apply_bootstrap_snapshot_system(
         for entry in &snap.overlay_tiles.dams {
             ensure_stub(&mut commands, &mut net_ids, entry.entity_net_id);
         }
+        // Thin housing edge walls/doors — spawn visual-carrying stubs so the
+        // Phase-5 edge sprite spawners render them, then `apply_bootstrap_snapshot`
+        // rebuilds the `EdgeStructureMap` + edge cache from these ids.
+        for entry in &snap.overlay_tiles.edge_walls {
+            ensure_edge_wall_stub(
+                &mut commands,
+                &mut net_ids,
+                entry.entity_net_id,
+                entry.material,
+                entry.edge,
+            );
+        }
+        for entry in &snap.overlay_tiles.edge_doors {
+            ensure_edge_door_stub(
+                &mut commands,
+                &mut net_ids,
+                entry.entity_net_id,
+                entry.edge,
+                entry.dir,
+                entry.open,
+            );
+        }
 
         apply_bootstrap_snapshot(
             snap,
@@ -205,6 +233,8 @@ pub fn apply_bootstrap_snapshot_system(
             &mut maps.bridge_map,
             &mut maps.dam_map,
             &mut maps.runtime_water,
+            &mut maps.edge_structures,
+            &mut maps.chunk_map,
             &net_ids,
             &mut federation_map,
         );
@@ -280,6 +310,66 @@ fn ensure_wall_stub(
     ids.bind(entity, net_id);
 }
 
+/// Spawn (or upgrade) a thin housing edge-wall stub carrying `EdgeWallVisual`
+/// at the edge world-midpoint, so the Phase-5 `spawn_edge_wall_sprites` system
+/// renders it client-side. Idempotent. Returns the bound entity.
+fn ensure_edge_wall_stub(
+    commands: &mut Commands,
+    ids: &mut NetIdMap,
+    net_id: NetId,
+    material: WallMaterial,
+    edge: crate::world::edge::EdgeKey,
+) -> Entity {
+    let visual = crate::simulation::construction::EdgeWallVisual { material, edge };
+    if let Some(entity) = ids.entity_of(net_id) {
+        commands.entity(entity).insert(visual);
+        return entity;
+    }
+    let mid = crate::simulation::construction::edge_world_mid(edge);
+    let entity = commands
+        .spawn((
+            Networked(net_id),
+            visual,
+            Transform::from_xyz(mid.x, mid.y, 0.4),
+            GlobalTransform::default(),
+            Visibility::Visible,
+            InheritedVisibility::default(),
+        ))
+        .id();
+    ids.bind(entity, net_id);
+    entity
+}
+
+/// Spawn (or upgrade) a thin housing edge-door stub carrying `EdgeDoorVisual`
+/// at the edge world-midpoint. Idempotent. Returns the bound entity.
+fn ensure_edge_door_stub(
+    commands: &mut Commands,
+    ids: &mut NetIdMap,
+    net_id: NetId,
+    edge: crate::world::edge::EdgeKey,
+    dir: crate::simulation::land::TileEdge,
+    open: bool,
+) -> Entity {
+    let visual = crate::simulation::construction::EdgeDoorVisual { edge, dir, open };
+    if let Some(entity) = ids.entity_of(net_id) {
+        commands.entity(entity).insert(visual);
+        return entity;
+    }
+    let mid = crate::simulation::construction::edge_world_mid(edge);
+    let entity = commands
+        .spawn((
+            Networked(net_id),
+            visual,
+            Transform::from_xyz(mid.x, mid.y, 0.4),
+            GlobalTransform::default(),
+            Visibility::Visible,
+            InheritedVisibility::default(),
+        ))
+        .id();
+    ids.bind(entity, net_id);
+    entity
+}
+
 fn apply_overlay_delta(
     delta: &ChunkOverlayDelta,
     commands: &mut Commands,
@@ -293,6 +383,8 @@ fn apply_overlay_delta(
     let runtime_water = &mut maps.runtime_water;
     let plant_map = &mut maps.plant_map;
     let structure_map = &mut maps.structure_map;
+    let edge_structures = &mut maps.edge_structures;
+    let chunk_map = &mut maps.chunk_map;
     for op in &delta.ops {
         match op {
             TileOverlayOp::AddWall {
@@ -403,6 +495,83 @@ fn apply_overlay_delta(
             }
             TileOverlayOp::RemoveStructure { tile } => {
                 structure_map.0.remove(tile);
+            }
+            TileOverlayOp::AddEdgeWall {
+                edge,
+                entity_net_id,
+                material,
+                owner_faction,
+            } => {
+                let entity =
+                    ensure_edge_wall_stub(commands, ids, *entity_net_id, *material, *edge);
+                let ent = edge_structures.0.entry(*edge).or_default();
+                ent.wall = Some(crate::simulation::construction::EdgeWall {
+                    material: *material,
+                    owner_faction: *owner_faction,
+                    entity,
+                });
+                let st = ent.projected_state();
+                chunk_map.set_edge_state(*edge, st);
+            }
+            TileOverlayOp::RemoveEdgeWall { edge } => {
+                if let Some(ent) = edge_structures.0.get_mut(edge) {
+                    ent.wall = None;
+                    let st = ent.projected_state();
+                    chunk_map.set_edge_state(*edge, st);
+                    if ent.wall.is_none() && ent.door.is_none() {
+                        edge_structures.0.remove(edge);
+                    }
+                } else {
+                    chunk_map
+                        .set_edge_state(*edge, crate::world::edge::EdgeState::Open);
+                }
+            }
+            TileOverlayOp::AddEdgeDoor {
+                edge,
+                entity_net_id,
+                open,
+                faction_id,
+                dir,
+            } => {
+                let entity = ensure_edge_door_stub(
+                    commands,
+                    ids,
+                    *entity_net_id,
+                    *edge,
+                    *dir,
+                    *open,
+                );
+                let ent = edge_structures.0.entry(*edge).or_default();
+                ent.door = Some(crate::simulation::construction::EdgeDoorRef {
+                    entity,
+                    open: *open,
+                    faction_id: *faction_id,
+                    dir: *dir,
+                });
+                let st = ent.projected_state();
+                chunk_map.set_edge_state(*edge, st);
+            }
+            TileOverlayOp::RemoveEdgeDoor { edge } => {
+                if let Some(ent) = edge_structures.0.get_mut(edge) {
+                    ent.door = None;
+                    let st = ent.projected_state();
+                    chunk_map.set_edge_state(*edge, st);
+                    if ent.wall.is_none() && ent.door.is_none() {
+                        edge_structures.0.remove(edge);
+                    }
+                } else {
+                    chunk_map
+                        .set_edge_state(*edge, crate::world::edge::EdgeState::Open);
+                }
+            }
+            TileOverlayOp::SetEdgeDoorOpen { edge, open } => {
+                if let Some(ent) = edge_structures.0.get_mut(edge) {
+                    if let Some(d) = ent.door.as_mut() {
+                        d.open = *open;
+                    }
+                    let st = ent.projected_state();
+                    chunk_map.set_edge_state(*edge, st);
+                }
             }
         }
     }

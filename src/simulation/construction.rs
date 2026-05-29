@@ -182,6 +182,35 @@ impl DwellingEnvelopeMap {
     pub fn contains_tile(&self, tile: (i32, i32)) -> bool {
         self.by_tile.contains_key(&tile)
     }
+
+    /// Register a rectangular dwelling footprint centred on `(cx, cy)` with the
+    /// given half-extents. The whole rect is now passable floor under edge
+    /// walls, so this marks every tile as keep-out for roads/plants/wells/
+    /// foreign structures. Idempotent guard: a footprint whose centre is
+    /// already enveloped is skipped so the immediate + deferred plan paths (and
+    /// any re-survey) can't leak duplicate ids for the same dwelling. Returns
+    /// the allocated id, or `None` when skipped.
+    pub fn register_footprint(
+        &mut self,
+        cx: i32,
+        cy: i32,
+        half_w: i32,
+        half_h: i32,
+    ) -> Option<DwellingId> {
+        if self.by_tile.contains_key(&(cx, cy)) {
+            return None;
+        }
+        let id = self.alloc_id();
+        let mut tiles =
+            Vec::with_capacity(((2 * half_w + 1) * (2 * half_h + 1)).max(0) as usize);
+        for dy in -half_h..=half_h {
+            for dx in -half_w..=half_w {
+                tiles.push((cx + dx, cy + dy));
+            }
+        }
+        self.insert(id, tiles);
+        Some(id)
+    }
 }
 
 /// Marker on the durable entity that renders a thin housing wall. Phase 5
@@ -609,6 +638,11 @@ pub struct FurnitureMaps<'w> {
     /// `EdgeDoor` finalize arms (the dwelling-floor envelope is registered at
     /// plan time, where the full footprint is known).
     pub edge_structures: ResMut<'w, EdgeStructureMap>,
+    /// Dwelling-floor keep-out. The seed walled-house stamper registers each
+    /// footprint rect here so roads/plants/wells/foreign structures stay out of
+    /// the now-passable interior (thin-wall replacement for the old wall-tile
+    /// ring keep-out).
+    pub dwelling_envelopes: ResMut<'w, DwellingEnvelopeMap>,
     pub campfire_map: ResMut<'w, CampfireMap>,
     pub door_map: ResMut<'w, DoorMap>,
     pub workbench_map: ResMut<'w, WorkbenchMap>,
@@ -3215,6 +3249,7 @@ fn plan_building(
     bp_map: &mut BlueprintMap,
     terraform_map: &mut crate::simulation::terraform::TerraformMap,
     pending_footprints: &mut crate::simulation::terraform::PendingFootprints,
+    dwelling_envelopes: &mut DwellingEnvelopeMap,
     chunk_map: &ChunkMap,
     bed_map: &BedMap,
     doormat_res: &crate::simulation::doormat::DoormatReservations,
@@ -3274,6 +3309,14 @@ fn plan_building(
     if !plan_reachable_from_home(chunk_map, camp_home, planned_doormat, &wall_plan) {
         return;
     }
+
+    // The build is committed (door + reachability gates passed). Register the
+    // full footprint as a dwelling envelope so the now-passable interior floor
+    // is kept clear of roads/plants/wells/foreign builds. Done here (not at
+    // wall finalize) so both the immediate flat-ground path AND the deferred
+    // terraform path are covered by one site — the footprint rect is known
+    // before either branch.
+    dwelling_envelopes.register_footprint(cx, cy, half_w, half_h);
 
     // Collect the tiles that need terraforming (footprint covers walls AND
     // interior — every tile under the building must sit at target_z so the
@@ -3410,6 +3453,7 @@ impl<'w> FurnitureMaps<'w> {
             monument_map: &*self.monument_map,
             well_map: &*self.well_map,
             structure_index,
+            dwelling_envelopes: &*self.dwelling_envelopes,
         }
     }
 }
@@ -3617,6 +3661,7 @@ pub fn chief_directive_system(
     mut bp_map: ResMut<BlueprintMap>,
     mut terraform_map: ResMut<crate::simulation::terraform::TerraformMap>,
     mut pending_footprints: ResMut<crate::simulation::terraform::PendingFootprints>,
+    mut dwelling_envelopes: ResMut<DwellingEnvelopeMap>,
     bp_query: Query<&Blueprint>,
     // Chief PersonKnowledge powers the sleepy-dove BlueprintAuthor snapshot
     // for runtime intent emission. Replaces the prior unused chief_query
@@ -3801,6 +3846,7 @@ pub fn chief_directive_system(
             &mut bp_map,
             &mut terraform_map,
             &mut pending_footprints,
+            &mut dwelling_envelopes,
             &chunk_map,
             &*maps.bed_map,
             &*maps.doormat,
@@ -3822,6 +3868,7 @@ fn spawn_intent(
     bp_map: &mut BlueprintMap,
     terraform_map: &mut crate::simulation::terraform::TerraformMap,
     pending_footprints: &mut crate::simulation::terraform::PendingFootprints,
+    dwelling_envelopes: &mut DwellingEnvelopeMap,
     chunk_map: &ChunkMap,
     bed_map: &BedMap,
     doormat: &crate::simulation::doormat::DoormatReservations,
@@ -3863,6 +3910,7 @@ fn spawn_intent(
                 bp_map,
                 terraform_map,
                 pending_footprints,
+                dwelling_envelopes,
                 chunk_map,
                 bed_map,
                 doormat,
@@ -3900,6 +3948,7 @@ fn spawn_intent(
                 bp_map,
                 terraform_map,
                 pending_footprints,
+                dwelling_envelopes,
                 chunk_map,
                 bed_map,
                 doormat,
@@ -4237,6 +4286,7 @@ fn seed_apply_intent(
                 brain: None,
                 chunk_map: Some(chunk_map),
                 used: Some(used),
+                dwelling_envelopes: Some(&maps.dwelling_envelopes),
                 self_bp: None,
             };
             // Wider search than the runtime default — at seed time the
@@ -5328,6 +5378,7 @@ pub fn road_carve_system(
     plant_map: Res<crate::simulation::plants::PlantMap>,
     brains: Res<crate::simulation::organic_settlement::SettlementBrains>,
     settlement_map: Res<crate::simulation::settlement::SettlementMap>,
+    dwelling_envelopes: Res<DwellingEnvelopeMap>,
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
 ) {
     if queue.0.is_empty() {
@@ -5362,6 +5413,10 @@ pub fn road_carve_system(
                 || bed_map.0.contains_key(&tile)
                 || structure_index.0.contains_key(&tile)
                 || in_well_footprint(tile)
+                // Thin-wall dwelling floors are passable — never pave a road
+                // through a living room. Routes the carve around the envelope
+                // exactly like the connector planner's `connector_blocked`.
+                || dwelling_envelopes.contains_tile(tile)
             {
                 return false;
             }
@@ -5468,6 +5523,7 @@ pub fn road_carve_system(
                         || bed_map.0.contains_key(&t)
                         || structure_index.0.contains_key(&t)
                         || in_well_footprint(t)
+                        || dwelling_envelopes.contains_tile(t)
                         || crate::simulation::land::tile_is_farm_protected(
                             &plot_index,
                             &plant_map,
@@ -9097,6 +9153,11 @@ fn seed_walled_house_at(
             ty: tile.1,
         });
     }
+    // Register the seeded footprint as a dwelling envelope so the seed
+    // reservation consolidation + runtime placement keep roads/plants/wells/
+    // foreign builds out of the now-passable interior.
+    maps.dwelling_envelopes
+        .register_footprint(cx, cy, half_w, half_h);
     true
 }
 

@@ -164,6 +164,11 @@ impl Plugin for NetIdPlugin {
                     auto_tag_replicable::<crate::simulation::construction::Bed>,
                     auto_tag_replicable::<crate::simulation::construction::Door>,
                     auto_tag_replicable::<crate::simulation::construction::Wall>,
+                    // Thin housing edge walls/doors replicate over LAN (Phase 6)
+                    // — tag the durable visual entities so they carry a stable
+                    // `NetId` like full-tile walls/doors.
+                    auto_tag_replicable::<crate::simulation::construction::EdgeWallVisual>,
+                    auto_tag_replicable::<crate::simulation::construction::EdgeDoorVisual>,
                     auto_tag_replicable::<crate::simulation::construction::Workbench>,
                     auto_tag_replicable::<crate::simulation::construction::Campfire>,
                     auto_tag_replicable::<crate::simulation::settlement::Settlement>,
