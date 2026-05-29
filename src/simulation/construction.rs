@@ -47,6 +47,169 @@ pub struct BedMap(pub AHashMap<(i32, i32), Entity>);
 #[derive(Resource, Default)]
 pub struct WallMap(pub AHashMap<(i32, i32), Entity>);
 
+/// A wall segment sitting on a tile-boundary edge (thin housing wall). Detail
+/// counterpart to the cheap `world::edge::EdgeState::Wall` cache bit.
+#[derive(Clone, Copy, Debug)]
+pub struct EdgeWall {
+    pub material: WallMaterial,
+    /// `None` = natural / unowned; `Some(fid)` = constructed by faction `fid`
+    /// (own-faction vision transparency, mirroring `Wall.owner_faction`).
+    pub owner_faction: Option<u32>,
+    /// The wall's renderable entity (durable across chunk streaming).
+    pub entity: Entity,
+}
+
+/// A door sitting on a tile-boundary edge (thin housing door).
+#[derive(Clone, Copy, Debug)]
+pub struct EdgeDoorRef {
+    pub entity: Entity,
+    pub open: bool,
+    pub faction_id: u32,
+    pub dir: crate::simulation::land::TileEdge,
+}
+
+/// What occupies a single housing edge. A given edge is a wall, a door, or
+/// nothing — never both — but both fields exist so deconstruction can clear one
+/// channel without disturbing the (mutually-exclusive) other.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EdgeStructureEntry {
+    pub wall: Option<EdgeWall>,
+    pub door: Option<EdgeDoorRef>,
+}
+
+impl EdgeStructureEntry {
+    /// Project to the cheap cache state read by movement/LOS hot paths.
+    pub fn projected_state(&self) -> crate::world::edge::EdgeState {
+        use crate::world::edge::EdgeState;
+        if self.wall.is_some() {
+            EdgeState::Wall
+        } else if let Some(d) = self.door {
+            if d.open {
+                EdgeState::OpenDoor
+            } else {
+                EdgeState::ClosedDoor
+            }
+        } else {
+            EdgeState::Open
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.wall.is_none() && self.door.is_none()
+    }
+}
+
+/// Durable source of truth for housing edge walls/doors, keyed by canonical
+/// `EdgeKey`. The per-chunk `ChunkEdgeBits` cache (`Chunk::edge_bits`) is a fast
+/// projection of this map, re-stamped on chunk load by
+/// `restamp_edge_structures_on_chunk_load` — exactly as `WallMap` ↔
+/// `TileKind::Wall`. Edge entities are durable across streaming.
+#[derive(Resource, Default)]
+pub struct EdgeStructureMap(pub AHashMap<crate::world::edge::EdgeKey, EdgeStructureEntry>);
+
+impl EdgeStructureMap {
+    /// Owner faction of a wall on `key`, if any (for faction-aware vision LOS).
+    pub fn wall_owner(&self, key: crate::world::edge::EdgeKey) -> Option<u32> {
+        self.0.get(&key).and_then(|e| e.wall).and_then(|w| w.owner_faction)
+    }
+
+    /// Faction of a door on `key`, if any (own-door vision transparency).
+    pub fn door_faction(&self, key: crate::world::edge::EdgeKey) -> Option<u32> {
+        self.0.get(&key).and_then(|e| e.door).map(|d| d.faction_id)
+    }
+}
+
+/// Stable identifier for one dwelling envelope (a hut/longhouse footprint of
+/// passable floor bounded by edge walls). Monotonic; never reused.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DwellingId(pub u32);
+
+/// Per-dwelling metadata: the floor tiles it owns and its bounding box. The
+/// whole footprint is passable floor now (walls live on edges), so placement
+/// systems consult this to keep roads/plants/wells out of living space — the
+/// thin-wall replacement for the old wall-tile-ring keep-out + `detect_dwellings`.
+#[derive(Clone, Debug)]
+pub struct DwellingInfo {
+    pub tiles: Vec<(i32, i32)>,
+    pub min: (i32, i32),
+    pub max: (i32, i32),
+}
+
+/// Marks every floor tile that belongs to a dwelling envelope, plus per-dwelling
+/// metadata. Maintained at construction/seed time alongside `EdgeStructureMap`.
+#[derive(Resource, Default)]
+pub struct DwellingEnvelopeMap {
+    pub by_tile: AHashMap<(i32, i32), DwellingId>,
+    pub dwellings: AHashMap<DwellingId, DwellingInfo>,
+    next_id: u32,
+}
+
+impl DwellingEnvelopeMap {
+    pub fn alloc_id(&mut self) -> DwellingId {
+        let id = DwellingId(self.next_id);
+        self.next_id += 1;
+        id
+    }
+
+    /// Register a dwelling footprint; stamps every tile into `by_tile`.
+    pub fn insert(&mut self, id: DwellingId, tiles: Vec<(i32, i32)>) {
+        if tiles.is_empty() {
+            return;
+        }
+        let mut min = tiles[0];
+        let mut max = tiles[0];
+        for &(x, y) in &tiles {
+            min.0 = min.0.min(x);
+            min.1 = min.1.min(y);
+            max.0 = max.0.max(x);
+            max.1 = max.1.max(y);
+            self.by_tile.insert((x, y), id);
+        }
+        self.dwellings.insert(id, DwellingInfo { tiles, min, max });
+    }
+
+    pub fn remove(&mut self, id: DwellingId) {
+        if let Some(info) = self.dwellings.remove(&id) {
+            for t in info.tiles {
+                if self.by_tile.get(&t) == Some(&id) {
+                    self.by_tile.remove(&t);
+                }
+            }
+        }
+    }
+
+    /// Is this tile inside any dwelling envelope (keep roads/plants/wells out)?
+    pub fn contains_tile(&self, tile: (i32, i32)) -> bool {
+        self.by_tile.contains_key(&tile)
+    }
+}
+
+/// Marker on the durable entity that renders a thin housing wall. Phase 5
+/// attaches the orientation-aware sprite; the entity exists from finalize so
+/// `EdgeStructureMap` can hold a stable handle for deconstruct/replication.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct EdgeWallVisual {
+    pub material: WallMaterial,
+    pub edge: crate::world::edge::EdgeKey,
+}
+
+/// Marker on the durable entity that renders a thin housing door.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct EdgeDoorVisual {
+    pub edge: crate::world::edge::EdgeKey,
+    pub dir: crate::simulation::land::TileEdge,
+    pub open: bool,
+}
+
+/// World-space midpoint of an edge — the render/transform anchor for an edge
+/// wall/door entity (halfway between the two flanking tile centres).
+pub fn edge_world_mid(edge: crate::world::edge::EdgeKey) -> Vec2 {
+    let (a, b) = edge.tiles();
+    let pa = tile_to_world(a.0, a.1);
+    let pb = tile_to_world(b.0, b.1);
+    (pa + pb) * 0.5
+}
+
 /// Semantic role of a hearth. Drives counting: `Civic` is the one public
 /// fire a settled village wants near its plaza, `Domestic` are the cooking
 /// fires inside individual dwellings (Longhouse interiors), `Camp` is the
@@ -442,6 +605,10 @@ pub struct FurnitureMaps<'w> {
     /// system that mutates the map fires the event.
     pub wall_constructed: bevy::ecs::event::EventWriter<'w, WallConstructed>,
     pub wall_map: ResMut<'w, WallMap>,
+    /// Housing thin-wall/door source of truth. Mutated by the `EdgeWall`/
+    /// `EdgeDoor` finalize arms (the dwelling-floor envelope is registered at
+    /// plan time, where the full footprint is known).
+    pub edge_structures: ResMut<'w, EdgeStructureMap>,
     pub campfire_map: ResMut<'w, CampfireMap>,
     pub door_map: ResMut<'w, DoorMap>,
     pub workbench_map: ResMut<'w, WorkbenchMap>,
@@ -899,6 +1066,24 @@ pub enum BuildSiteKind {
     /// `ShelterMap` + `StructureIndex` so it relieves the shelter need for
     /// agents standing under it. Not packable. No tech gate.
     LightShelter(LightShelterMaterial),
+    /// Thin housing wall sitting on a tile-boundary edge (not a whole tile).
+    /// The blueprint's `tile` is a flanking floor tile (build-stand anchor);
+    /// the targeted edge is `Blueprint.edge`. Finalises into `EdgeStructureMap`
+    /// + the per-chunk edge cache (no `TileKind::Wall` write, no `WallMap`
+    /// entry). Reuses the same recipe/tier ladder as `Wall(_)`. See `world::edge`.
+    EdgeWall(WallMaterial),
+    /// Thin housing door sitting on a tile-boundary edge. Passable (doors never
+    /// block movement) but opaque when shut. Reuses the `Door` recipe.
+    EdgeDoor,
+}
+
+impl BuildSiteKind {
+    /// True for housing structures that live on a tile *edge* rather than
+    /// occupying a whole tile (thin walls). Their blueprint `tile` is a
+    /// flanking floor anchor and `Blueprint.edge` carries the target edge.
+    pub fn is_edge_structure(self) -> bool {
+        matches!(self, BuildSiteKind::EdgeWall(_) | BuildSiteKind::EdgeDoor)
+    }
 }
 
 /// Material a `BuildSiteKind::SleepingMat` is woven from. Drives the recipe
@@ -1038,6 +1223,8 @@ impl BuildSiteKind {
         match self {
             BuildSiteKind::Wall(mat) => mat.label(),
             BuildSiteKind::Door => "Door",
+            BuildSiteKind::EdgeWall(mat) => mat.label(),
+            BuildSiteKind::EdgeDoor => "Door",
             BuildSiteKind::Bed => "Bed",
             BuildSiteKind::Bedroll => "Bedroll",
             BuildSiteKind::Campfire => "Campfire",
@@ -1134,6 +1321,10 @@ pub struct Blueprint {
     /// "manual/legacy site — default to `Civic` at finalize". Only
     /// meaningful for `BuildSiteKind::Campfire`.
     pub hearth_role: Option<HearthRole>,
+    /// Target tile-boundary edge for `EdgeWall`/`EdgeDoor` blueprints. `None`
+    /// for every whole-tile structure. `tile` is the build-stand flanking floor
+    /// tile; `edge` is what actually gets stamped at finalize.
+    pub edge: Option<crate::world::edge::EdgeKey>,
 }
 
 impl Blueprint {
@@ -1170,7 +1361,15 @@ impl Blueprint {
             posted_by: None,
             design_techs: FactionTechs::default(),
             hearth_role: None,
+            edge: None,
         }
+    }
+
+    /// Builder: target a tile-boundary edge (for `EdgeWall`/`EdgeDoor`). The
+    /// blueprint's `tile` should already be the build-stand flanking floor tile.
+    pub fn with_edge(mut self, edge: crate::world::edge::EdgeKey) -> Self {
+        self.edge = Some(edge);
+        self
     }
 
     /// Stamp the (entity, learned-bitset) of the poster onto an existing
@@ -2508,6 +2707,13 @@ pub fn recipe_for(kind: BuildSiteKind) -> &'static BuildRecipe {
         BuildSiteKind::Wall(WallMaterial::Mudbrick) => BuildRecipeIdx::Mudbrick,
         BuildSiteKind::Wall(WallMaterial::CutStone) => BuildRecipeIdx::CutStone,
         BuildSiteKind::Door => BuildRecipeIdx::Door,
+        // Thin housing walls/doors reuse the whole-tile Wall/Door recipes.
+        BuildSiteKind::EdgeWall(WallMaterial::Palisade) => BuildRecipeIdx::Palisade,
+        BuildSiteKind::EdgeWall(WallMaterial::WattleDaub) => BuildRecipeIdx::WattleDaub,
+        BuildSiteKind::EdgeWall(WallMaterial::Stone) => BuildRecipeIdx::StoneWall,
+        BuildSiteKind::EdgeWall(WallMaterial::Mudbrick) => BuildRecipeIdx::Mudbrick,
+        BuildSiteKind::EdgeWall(WallMaterial::CutStone) => BuildRecipeIdx::CutStone,
+        BuildSiteKind::EdgeDoor => BuildRecipeIdx::Door,
         BuildSiteKind::Bed => BuildRecipeIdx::Bed,
         BuildSiteKind::Bedroll => BuildRecipeIdx::Bedroll,
         BuildSiteKind::Tent => BuildRecipeIdx::Tent,
@@ -4190,6 +4396,34 @@ pub fn restamp_walls_on_chunk_load(
     }
 }
 
+/// Re-projects housing edge structures onto freshly-streamed chunks. The
+/// per-chunk `ChunkEdgeBits` cache is lost on chunk regen (like the `Wall`
+/// tile delta); `EdgeStructureMap` is the durable truth. Mirrors
+/// `restamp_walls_on_chunk_load`: for every edge whose owner tile lands in a
+/// just-loaded chunk, re-stamp the cache state. Chained in the FixedUpdate
+/// restamp batch beside the wall restamp.
+pub fn restamp_edge_structures_on_chunk_load(
+    mut events: EventReader<crate::world::chunk_streaming::ChunkLoadedEvent>,
+    mut chunk_map: ResMut<ChunkMap>,
+    edges: Res<EdgeStructureMap>,
+) {
+    let loaded: AHashSet<ChunkCoord> = events.read().map(|e| e.coord).collect();
+    if loaded.is_empty() || edges.0.is_empty() {
+        return;
+    }
+    for (&key, entry) in edges.0.iter() {
+        let (ox, oy) = key.owner_tile();
+        let coord = ChunkCoord(
+            ox.div_euclid(CHUNK_SIZE as i32),
+            oy.div_euclid(CHUNK_SIZE as i32),
+        );
+        if !loaded.contains(&coord) {
+            continue;
+        }
+        chunk_map.set_edge_state(key, entry.projected_state());
+    }
+}
+
 /// Despawns walls whose `Health` has reached zero: removes the `WallMap`
 /// entry, reverts the tile to passable `Grass` (mirroring the deconstruct
 /// path — `surface_z_at` reads the wall's own level), emits
@@ -5721,6 +5955,106 @@ pub fn construction_system(
                         faction: Some(bp.faction_id),
                     });
                     wall_entity
+                }
+                BuildSiteKind::EdgeWall(material) => {
+                    // Thin housing wall: no tile rewrite (the floor stays
+                    // passable). Stamp the durable `EdgeStructureMap` + the
+                    // per-chunk edge cache; the entity is the render handle.
+                    let Some(edge) = bp.edge else {
+                        warn!("EdgeWall blueprint at {:?} had no edge; skipping", tile);
+                        continue;
+                    };
+                    let mid = edge_world_mid(edge);
+                    let wall_entity = commands
+                        .spawn((
+                            EdgeWallVisual { material, edge },
+                            StructureLabel(material.label()),
+                            Transform::from_xyz(mid.x, mid.y, 0.4),
+                            GlobalTransform::default(),
+                            Visibility::Visible,
+                            InheritedVisibility::default(),
+                        ))
+                        .id();
+                    let entry = maps.edge_structures.0.entry(edge).or_default();
+                    entry.wall = Some(EdgeWall {
+                        material,
+                        owner_faction: Some(bp.faction_id),
+                        entity: wall_entity,
+                    });
+                    let state = entry.projected_state();
+                    chunk_map.set_edge_state(edge, state);
+                    // Reuse the wall-lifecycle vision-cache invalidation channel
+                    // (keyed on a flanking tile of the edge).
+                    maps.wall_constructed.send(WallConstructed {
+                        tile: edge.owner_tile(),
+                        faction: Some(bp.faction_id),
+                    });
+                    tile_changed
+                        .send(crate::world::chunk_streaming::TileChangedEvent { tx, ty });
+                    wall_entity
+                }
+                BuildSiteKind::EdgeDoor => {
+                    // Thin housing door on a tile edge. Passable; opaque when
+                    // shut. The doormat is the *exterior* flanking tile (the
+                    // edge tile that is not the interior build-stand `tile`).
+                    let Some(edge) = bp.edge else {
+                        warn!("EdgeDoor blueprint at {:?} had no edge; skipping", tile);
+                        continue;
+                    };
+                    let (ea, eb) = edge.tiles();
+                    let doormat_tile = if (tx, ty) == ea { eb } else { ea };
+                    let door_edge = bp
+                        .door_dir
+                        .unwrap_or_else(|| crate::simulation::land::TileEdge::toward(tile, doormat_tile));
+                    let mid = edge_world_mid(edge);
+                    let door_entity = commands
+                        .spawn((
+                            EdgeDoorVisual {
+                                edge,
+                                dir: door_edge,
+                                open: false,
+                            },
+                            StructureLabel("Door"),
+                            Transform::from_xyz(mid.x, mid.y, 0.4),
+                            GlobalTransform::default(),
+                            Visibility::Visible,
+                            InheritedVisibility::default(),
+                        ))
+                        .id();
+                    let entry = maps.edge_structures.0.entry(edge).or_default();
+                    entry.door = Some(EdgeDoorRef {
+                        entity: door_entity,
+                        open: false,
+                        faction_id: bp.faction_id,
+                        dir: door_edge,
+                    });
+                    let state = entry.projected_state();
+                    chunk_map.set_edge_state(edge, state);
+                    doormat_reservations.0.insert(
+                        doormat_tile,
+                        crate::simulation::doormat::DoormatEntry {
+                            owner_door: door_entity,
+                            door_tile: tile,
+                            dir: door_edge,
+                        },
+                    );
+                    write_road_tile(
+                        &mut *chunk_map,
+                        &maps.structure_index,
+                        &mut tile_changed,
+                        doormat_tile,
+                    );
+                    if let Some(home_tile) =
+                        registry.factions.get(&bp.faction_id).map(|f| f.home_tile)
+                    {
+                        queue_door_connector(
+                            &mut road_carve_queue,
+                            bp.faction_id,
+                            doormat_tile,
+                            home_tile,
+                        );
+                    }
+                    door_entity
                 }
                 BuildSiteKind::Bed => {
                     let bed = Bed {

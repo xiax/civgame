@@ -1,5 +1,6 @@
-use crate::simulation::construction::{DoorMap, Wall, WallMap};
+use crate::simulation::construction::{DoorMap, EdgeStructureMap, Wall, WallMap};
 use crate::world::chunk::ChunkMap;
+use crate::world::edge::EdgeKey;
 use bevy::prelude::Query;
 
 /// 3D voxel LOS from `from` to `to` (each is `(tx, ty, foot_z)`).
@@ -15,18 +16,25 @@ pub fn has_los(
     from: (i32, i32, i8),
     to: (i32, i32, i8),
 ) -> bool {
-    walk_ray(from, to, |(x, y, z)| {
-        let kind = chunk_map.tile_at(x, y, z as i32).kind;
-        if kind.is_opaque() {
-            return true;
-        }
-        if let Some(door) = door_map.0.get(&(x, y)) {
-            if !door.open {
+    walk_ray(
+        from,
+        to,
+        |(x, y, z)| {
+            let kind = chunk_map.tile_at(x, y, z as i32).kind;
+            if kind.is_opaque() {
                 return true;
             }
-        }
-        false
-    })
+            if let Some(door) = door_map.0.get(&(x, y)) {
+                if !door.open {
+                    return true;
+                }
+            }
+            false
+        },
+        // Combat/sound/projectile LOS: thin edge walls + shut edge doors block
+        // regardless of faction (own walls must actually defend).
+        |prev, cur| edge_sightline_blocks(chunk_map, None, prev, cur),
+    )
 }
 
 /// Faction-aware LOS for fog / resource vision. Same ray walk as `has_los`,
@@ -36,41 +44,96 @@ pub fn has_los(
 /// and enemy walls / closed enemy doors still block. Combat / sound /
 /// projectile LOS keep calling `has_los` — they MUST treat own walls as
 /// solid so a wall actually defends.
+#[allow(clippy::too_many_arguments)]
 pub fn has_vision_los(
     chunk_map: &ChunkMap,
     wall_map: &WallMap,
     door_map: &DoorMap,
+    edge_map: &EdgeStructureMap,
     wall_q: &Query<&Wall>,
     from: (i32, i32, i8),
     to: (i32, i32, i8),
     observer_faction: u32,
 ) -> bool {
-    walk_ray(from, to, |(x, y, z)| {
-        let kind = chunk_map.tile_at(x, y, z as i32).kind;
-        if kind.is_opaque() {
-            // Own constructed wall? Transparent to own vision.
-            if let Some(&wall_entity) = wall_map.0.get(&(x, y)) {
-                if let Ok(wall) = wall_q.get(wall_entity) {
-                    if wall.owner_faction == Some(observer_faction) {
-                        return false;
+    walk_ray(
+        from,
+        to,
+        |(x, y, z)| {
+            let kind = chunk_map.tile_at(x, y, z as i32).kind;
+            if kind.is_opaque() {
+                // Own constructed wall? Transparent to own vision.
+                if let Some(&wall_entity) = wall_map.0.get(&(x, y)) {
+                    if let Ok(wall) = wall_q.get(wall_entity) {
+                        if wall.owner_faction == Some(observer_faction) {
+                            return false;
+                        }
                     }
                 }
-            }
-            // Natural rock (no WallMap entry) or enemy wall blocks.
-            return true;
-        }
-        if let Some(door) = door_map.0.get(&(x, y)) {
-            // Own door is transparent regardless of open/closed state.
-            // Foreign closed door blocks; foreign open door is transparent.
-            if door.faction_id == observer_faction {
-                return false;
-            }
-            if !door.open {
+                // Natural rock (no WallMap entry) or enemy wall blocks.
                 return true;
             }
+            if let Some(door) = door_map.0.get(&(x, y)) {
+                // Own door is transparent regardless of open/closed state.
+                // Foreign closed door blocks; foreign open door is transparent.
+                if door.faction_id == observer_faction {
+                    return false;
+                }
+                if !door.open {
+                    return true;
+                }
+            }
+            false
+        },
+        // Edge walls/doors honour own-faction transparency just like full-tile
+        // walls: an observer sees through their own thin walls + own doors.
+        |prev, cur| edge_sightline_blocks(chunk_map, Some((edge_map, observer_faction)), prev, cur),
+    )
+}
+
+/// Does the housing-edge structure between two consecutive ray voxels block the
+/// sightline? Cardinal transitions test the single shared edge; diagonal
+/// transitions block only when *both* L-paths around the corner are obstructed
+/// (an open side lets sight through). When `faction_ctx` is `Some((edges, obs))`
+/// an opaque edge owned by `obs` is treated as transparent (own-wall/own-door
+/// vision); combat LOS passes `None` so own walls still block.
+fn edge_sightline_blocks(
+    chunk_map: &ChunkMap,
+    faction_ctx: Option<(&EdgeStructureMap, u32)>,
+    prev: (i32, i32),
+    cur: (i32, i32),
+) -> bool {
+    let opaque = |a: (i32, i32), b: (i32, i32)| -> bool {
+        let Some(key) = EdgeKey::between(a, b) else {
+            return false;
+        };
+        let st = chunk_map.edge_state(key);
+        if !st.blocks_los_opaque() {
+            return false;
         }
-        false
-    })
+        if let Some((edges, obs)) = faction_ctx {
+            if st.is_wall() {
+                if edges.wall_owner(key) == Some(obs) {
+                    return false; // own wall — transparent to own vision
+                }
+            } else if edges.door_faction(key) == Some(obs) {
+                return false; // own (shut) door — transparent to own vision
+            }
+        }
+        true
+    };
+
+    let dx = cur.0 - prev.0;
+    let dy = cur.1 - prev.1;
+    if dx != 0 && dy != 0 {
+        // Diagonal: corner point shared by prev, cur, and the two corner tiles.
+        let ca = (cur.0, prev.1);
+        let cb = (prev.0, cur.1);
+        let route_a_blocked = opaque(prev, ca) || opaque(ca, cur);
+        let route_b_blocked = opaque(prev, cb) || opaque(cb, cur);
+        route_a_blocked && route_b_blocked
+    } else {
+        opaque(prev, cur)
+    }
 }
 
 /// Shared inner walker. Calls `blocker((x, y, z))` at every non-endpoint
@@ -81,9 +144,12 @@ fn walk_ray(
     from: (i32, i32, i8),
     to: (i32, i32, i8),
     mut blocker: impl FnMut((i32, i32, i8)) -> bool,
+    mut transition: impl FnMut((i32, i32), (i32, i32)) -> bool,
 ) -> bool {
     let (mut x0, mut y0) = (from.0, from.1);
     let (x1, y1) = (to.0, to.1);
+    let from_xy = (from.0, from.1);
+    let to_xy = (to.0, to.1);
     // Eye height: ray walks 1 voxel above the standing tile at both endpoints,
     // so a 1-tile terrain rise doesn't read as below-surface Wall and block sight.
     // i32 widening keeps Z_MAX safely below i8::MAX after the +1 bump.
@@ -103,7 +169,7 @@ fn walk_ray(
         steps += 1;
 
         // Skip endpoint voxels (caller's tiles); only test voxels in between.
-        if (x0, y0) != (from.0, from.1) && (x0, y0) != (to.0, to.1) {
+        if (x0, y0) != from_xy && (x0, y0) != to_xy {
             let t = steps as f32 / total_dist;
             let ray_z = (from_z + t * (to_z - from_z)).round() as i32;
             let z_i8 = ray_z.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
@@ -116,6 +182,7 @@ fn walk_ray(
             break;
         }
 
+        let prev_xy = (x0, y0);
         let e2 = 2 * err;
         if e2 > -dy {
             err -= dy;
@@ -124,6 +191,12 @@ fn walk_ray(
         if e2 < dx {
             err += dx;
             y0 += sy;
+        }
+        // A wall/shut-door sitting on the boundary we just crossed blocks sight
+        // even when neither voxel tile is itself opaque. Tested for every step,
+        // including those touching the endpoints (your own edge wall blocks).
+        if transition(prev_xy, (x0, y0)) {
+            return false;
         }
     }
 
@@ -223,6 +296,35 @@ mod tests {
         );
         let d = DoorMap::default();
         assert!(!has_los(&m, &d, (0, 0, -4), (9, 0, -4)));
+    }
+
+    #[test]
+    fn edge_wall_blocks_los_open_door_does_not() {
+        use crate::world::edge::{EdgeKey, EdgeState};
+        let mut m = flat_chunk_map();
+        let d = DoorMap::default();
+        // Wall on the east edge of (5,0): the boundary between (5,0) and (6,0).
+        let key = EdgeKey::between((5, 0), (6, 0)).unwrap();
+        m.set_edge_state(key, EdgeState::Wall);
+        assert!(!has_los(&m, &d, (0, 0, 0), (10, 0, 0)));
+
+        // A closed door on the edge also blocks; an open door is transparent.
+        m.set_edge_state(key, EdgeState::ClosedDoor);
+        assert!(!has_los(&m, &d, (0, 0, 0), (10, 0, 0)));
+        m.set_edge_state(key, EdgeState::OpenDoor);
+        assert!(has_los(&m, &d, (0, 0, 0), (10, 0, 0)));
+    }
+
+    #[test]
+    fn edge_wall_parallel_to_ray_does_not_block() {
+        use crate::world::edge::{EdgeKey, EdgeState};
+        let mut m = flat_chunk_map();
+        let d = DoorMap::default();
+        // Wall on the NORTH edge of (5,0) — parallel to a horizontal east-west
+        // ray, never crossed by it.
+        let key = EdgeKey::between((5, 0), (5, 1)).unwrap();
+        m.set_edge_state(key, EdgeState::Wall);
+        assert!(has_los(&m, &d, (0, 0, 0), (10, 0, 0)));
     }
 
     #[test]

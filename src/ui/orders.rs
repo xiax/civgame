@@ -85,6 +85,8 @@ impl MenuAction {
                 BuildSiteKind::Wall(WallMaterial::Mudbrick) => "Build Mudbrick Wall",
                 BuildSiteKind::Wall(WallMaterial::CutStone) => "Build Cut Stone Wall",
                 BuildSiteKind::Door => "Build Door",
+                BuildSiteKind::EdgeWall(_) => "Build Wall",
+                BuildSiteKind::EdgeDoor => "Build Door",
                 BuildSiteKind::Bed => "Build Bed",
                 BuildSiteKind::Bedroll => "Build Bedroll",
                 BuildSiteKind::Tent => "Build Tent",

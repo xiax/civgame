@@ -137,11 +137,13 @@ pub fn effective_vision_radius(lookout: Option<&ActiveLookout>) -> u32 {
 /// Compute the visible-tile set for a static source. Pure helper: walks every
 /// candidate tile in the radius once, runs a faction-aware LOS check, and
 /// inserts the visible ones into `out`. Endpoint tile is always visible.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_vision_set(
     out: &mut AHashSet<(i32, i32)>,
     chunk_map: &ChunkMap,
     wall_map: &WallMap,
     door_map: &DoorMap,
+    edge_map: &crate::simulation::construction::EdgeStructureMap,
     wall_q: &Query<&Wall>,
     origin: (i32, i32, i8),
     radius: u32,
@@ -169,6 +171,7 @@ pub fn compute_vision_set(
                     chunk_map,
                     wall_map,
                     door_map,
+                    edge_map,
                     wall_q,
                     (ox, oy, oz),
                     (tx, ty, tz),
@@ -446,6 +449,7 @@ pub fn recompute_dirty_vision_sets_system(
     chunk_map: Res<ChunkMap>,
     wall_map: Res<WallMap>,
     door_map: Res<DoorMap>,
+    edge_map: Res<crate::simulation::construction::EdgeStructureMap>,
     wall_q: Query<&Wall>,
     registry: Res<FactionRegistry>,
     mut sources: Query<(
@@ -473,6 +477,7 @@ pub fn recompute_dirty_vision_sets_system(
             &chunk_map,
             &wall_map,
             &door_map,
+            &edge_map,
             &wall_q,
             origin,
             radius,
@@ -597,12 +602,14 @@ mod tests {
         let chunk_map = &*chunk_map;
         let wall_map = &*wall_map;
         let door_map = &*door_map;
+        let edge_map = crate::simulation::construction::EdgeStructureMap::default();
 
         // Own faction (1) sees through.
         assert!(has_vision_los(
             chunk_map,
             wall_map,
             door_map,
+            &edge_map,
             &wall_q_data,
             (0, 0, 0),
             (10, 0, 0),
@@ -613,6 +620,7 @@ mod tests {
             chunk_map,
             wall_map,
             door_map,
+            &edge_map,
             &wall_q_data,
             (0, 0, 0),
             (10, 0, 0),
@@ -637,6 +645,7 @@ mod tests {
             &chunk_map_natural,
             &empty_walls,
             door_map,
+            &edge_map,
             &wall_q_data,
             (0, 0, 0),
             (10, 0, 0),
@@ -676,12 +685,14 @@ mod tests {
         let chunk_map = &*chunk_map;
         let wall_map = &*wall_map;
         let door_map = &*door_map;
+        let edge_map = crate::simulation::construction::EdgeStructureMap::default();
 
         // Own faction sees through own closed door.
         assert!(has_vision_los(
             chunk_map,
             wall_map,
             door_map,
+            &edge_map,
             &wall_q_data,
             (0, 0, 0),
             (10, 0, 0),
@@ -692,6 +703,7 @@ mod tests {
             chunk_map,
             wall_map,
             door_map,
+            &edge_map,
             &wall_q_data,
             (0, 0, 0),
             (10, 0, 0),
@@ -719,6 +731,7 @@ mod tests {
         let chunk_map = &*chunk_map;
         let wall_map = &*wall_map;
         let door_map = &*door_map;
+        let edge_map = crate::simulation::construction::EdgeStructureMap::default();
 
         let mut out: AHashSet<(i32, i32)> = AHashSet::default();
         compute_vision_set(
@@ -726,6 +739,7 @@ mod tests {
             chunk_map,
             wall_map,
             door_map,
+            &edge_map,
             &wall_q_data,
             (10, 10, 0),
             5,

@@ -252,6 +252,8 @@ impl Plugin for SimulationPlugin {
             .insert_resource(animal_paths::HerdClusterCursor::default())
             .insert_resource(construction::BedMap::default())
             .insert_resource(construction::WallMap::default())
+            .insert_resource(construction::EdgeStructureMap::default())
+            .insert_resource(construction::DwellingEnvelopeMap::default())
             .insert_resource(construction::CampfireMap::default())
             .insert_resource(construction::ShelterMap::default())
             .insert_resource(construction::DoorMap::default())

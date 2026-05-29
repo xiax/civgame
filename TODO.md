@@ -197,6 +197,10 @@ We don't have enough building wall options for each era. It doesn't make sense t
 
 I want the plant and animal seeding to be more natural and realistic to real life.
 
+Tiles with stuff on it sometimes flash the underlying tile, especially in fog of war
+
+Some plants don't have sprites and are essentially invisible.
+
 
 /Users/xiao1/civgame/plans/sleep-arrival-panic.md
 task-outcome-feedback-contract.mddiplomacy-marriage.mddiplomacy-espionage.mddiplomacy-federations.md

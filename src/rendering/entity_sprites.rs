@@ -2492,6 +2492,14 @@ pub fn spawn_blueprint_sprites(
             BuildSiteKind::Wall(WallMaterial::Mudbrick) => textures.wall_mudbrick_ascii.clone(),
             BuildSiteKind::Wall(WallMaterial::CutStone) => textures.wall_cutstone_ascii.clone(),
             BuildSiteKind::Door => textures.door_ascii.clone(),
+            // Thin housing wall/door ghosts reuse the whole-tile art for now;
+            // Phase 5 ships edge-positioned, orientation-aware sprites.
+            BuildSiteKind::EdgeWall(WallMaterial::Palisade) => textures.wall_palisade_ascii.clone(),
+            BuildSiteKind::EdgeWall(WallMaterial::WattleDaub) => textures.wall_wattle_ascii.clone(),
+            BuildSiteKind::EdgeWall(WallMaterial::Stone) => textures.wall_stone_ascii.clone(),
+            BuildSiteKind::EdgeWall(WallMaterial::Mudbrick) => textures.wall_mudbrick_ascii.clone(),
+            BuildSiteKind::EdgeWall(WallMaterial::CutStone) => textures.wall_cutstone_ascii.clone(),
+            BuildSiteKind::EdgeDoor => textures.door_ascii.clone(),
             BuildSiteKind::Bed => textures.bed_ascii.clone(),
             // Bedroll reuses the bed sprite for now — Phase 9 ships proper
             // procedural pixel art for nomadic kit.

@@ -1,3 +1,4 @@
+use super::edge::{ChunkEdgeBits, EdgeAxis, EdgeKey, EdgeState};
 use super::tile::{TileData, TileKind};
 use ahash::AHashMap;
 use bevy::prelude::*;
@@ -65,6 +66,11 @@ pub struct Chunk {
     pub entities: Vec<Entity>,
     pub aggregate: ChunkAggregate,
     pub is_active: bool,
+    /// Lazily-allocated cache of edge-bound walls/doors (housing thin walls).
+    /// `None` until the chunk gains its first edge structure. A cache projection
+    /// of the durable `simulation::construction::EdgeStructureMap`, re-stamped on
+    /// chunk load by `restamp_edge_structures_on_chunk_load`. See `world::edge`.
+    pub edge_bits: Option<Box<ChunkEdgeBits>>,
 }
 
 /// Lightweight read-only view of a single water column.
@@ -145,6 +151,7 @@ impl Chunk {
             entities: Vec::new(),
             aggregate: ChunkAggregate::default(),
             is_active: true,
+            edge_bits: None,
         }
     }
 
@@ -319,6 +326,35 @@ impl Chunk {
         self.surface_kind[ly][lx] = TileKind::Water;
         changed
     }
+
+    /// Read the cached edge state for the owner-local `(lx, ly)` cell on `axis`
+    /// (Horizontal = North edge, Vertical = East edge). `Open` when no cache.
+    pub fn edge_state_local(&self, lx: usize, ly: usize, axis: EdgeAxis) -> EdgeState {
+        match self.edge_bits.as_ref() {
+            Some(bits) => match axis {
+                EdgeAxis::Horizontal => bits.north(lx, ly),
+                EdgeAxis::Vertical => bits.east(lx, ly),
+            },
+            None => EdgeState::Open,
+        }
+    }
+
+    /// Write the cached edge state for the owner-local `(lx, ly)` cell, lazily
+    /// allocating the cache. Setting `Open` on the last edge leaves the cache
+    /// allocated (cheap); callers that want it dropped check `edge_bits` empty.
+    pub fn set_edge_state_local(&mut self, lx: usize, ly: usize, axis: EdgeAxis, s: EdgeState) {
+        if self.edge_bits.is_none() {
+            if s == EdgeState::Open {
+                return; // nothing to clear
+            }
+            self.edge_bits = Some(Box::new(ChunkEdgeBits::new()));
+        }
+        let bits = self.edge_bits.as_mut().expect("just allocated");
+        match axis {
+            EdgeAxis::Horizontal => bits.set_north(lx, ly, s),
+            EdgeAxis::Vertical => bits.set_east(lx, ly, s),
+        }
+    }
 }
 
 #[derive(Resource, Default, Clone)]
@@ -428,6 +464,49 @@ impl ChunkMap {
         let (coord, lx, ly) = Self::coord_and_local(tile_x, tile_y);
         if let Some(chunk) = self.0.get_mut(&coord) {
             chunk.set_delta(lx, ly, tz, data);
+        }
+    }
+
+    /// Cached state of the boundary edge identified by `key`. `Open` when the
+    /// owner chunk is unloaded or carries no edge structure there.
+    pub fn edge_state(&self, key: EdgeKey) -> EdgeState {
+        let owner = key.owner_tile();
+        let (coord, lx, ly) = Self::coord_and_local(owner.0, owner.1);
+        self.0
+            .get(&coord)
+            .map(|c| c.edge_state_local(lx, ly, key.axis))
+            .unwrap_or(EdgeState::Open)
+    }
+
+    /// State of the boundary between two adjacent tiles, or `Open` when they are
+    /// not orthogonally adjacent.
+    pub fn edge_state_between(&self, a: (i32, i32), b: (i32, i32)) -> EdgeState {
+        match EdgeKey::between(a, b) {
+            Some(k) => self.edge_state(k),
+            None => EdgeState::Open,
+        }
+    }
+
+    /// Does a wall on the shared edge block an agent stepping `a → b`? Doors
+    /// (open or closed) never block movement.
+    pub fn edge_blocks_move(&self, a: (i32, i32), b: (i32, i32)) -> bool {
+        self.edge_state_between(a, b).blocks_move()
+    }
+
+    /// Is the shared edge opaque to line of sight (faction-agnostic)? Walls and
+    /// shut doors block; open doors and empty edges are clear. Faction-aware
+    /// own-wall transparency is resolved by the caller via `EdgeStructureMap`.
+    pub fn edge_blocks_los_opaque(&self, a: (i32, i32), b: (i32, i32)) -> bool {
+        self.edge_state_between(a, b).blocks_los_opaque()
+    }
+
+    /// Write the cached edge state for `key`, lazily allocating the owner
+    /// chunk's edge cache. No-op when the owner chunk is unloaded.
+    pub fn set_edge_state(&mut self, key: EdgeKey, s: EdgeState) {
+        let owner = key.owner_tile();
+        let (coord, lx, ly) = Self::coord_and_local(owner.0, owner.1);
+        if let Some(c) = self.0.get_mut(&coord) {
+            c.set_edge_state_local(lx, ly, key.axis, s);
         }
     }
 
@@ -561,6 +640,11 @@ impl ChunkMap {
         if sz < Z_MIN || sz > Z_MAX {
             return false;
         }
+        // Thin housing walls block at the tile boundary (cardinal steps only;
+        // diagonals are gated by the corner legs in `passable_diagonal_step`).
+        if self.edge_blocks_move((sx, sy), (dx, dy)) {
+            return false;
+        }
         self.passable_for(dx, dy, dz, profile)
     }
 
@@ -580,6 +664,11 @@ impl ChunkMap {
         }
         // Source sanity (skip when source is in unloaded chunk).
         if sz < Z_MIN || sz > Z_MAX {
+            return false;
+        }
+        // Thin housing walls block at the tile boundary (cardinal steps only;
+        // diagonals are gated by the corner legs in `passable_diagonal_step`).
+        if self.edge_blocks_move((sx, sy), (dx, dy)) {
             return false;
         }
         self.passable_at(dx, dy, dz)
@@ -630,6 +719,49 @@ mod tests {
 
         let coord = ChunkCoord::from_world(32.0 * 16.0, 0.0, 16.0);
         assert_eq!(coord, ChunkCoord(1, 0));
+    }
+
+    fn flat_map(z: i8) -> ChunkMap {
+        let mut m = ChunkMap::default();
+        m.0.insert(ChunkCoord(0, 0), make_chunk(z));
+        m
+    }
+
+    #[test]
+    fn edge_wall_blocks_cardinal_step_but_not_same_tile_or_parallel() {
+        let mut m = flat_map(0);
+        // Wall on the east edge of (5,5): the boundary between (5,5) and (6,5).
+        let key = EdgeKey::between((5, 5), (6, 5)).unwrap();
+        m.set_edge_state(key, EdgeState::Wall);
+
+        // Crossing the walled edge (both directions) fails.
+        assert!(!m.passable_step_3d((5, 5, 0), (6, 5, 0)));
+        assert!(!m.passable_step_3d((6, 5, 0), (5, 5, 0)));
+        // Stepping the other way (north) over the same tile is fine.
+        assert!(m.passable_step_3d((5, 5, 0), (5, 6, 0)));
+        // A parallel tile pair one row up is unaffected.
+        assert!(m.passable_step_3d((5, 6, 0), (6, 6, 0)));
+    }
+
+    #[test]
+    fn edge_door_does_not_block_movement() {
+        let mut m = flat_map(0);
+        let key = EdgeKey::between((5, 5), (6, 5)).unwrap();
+        m.set_edge_state(key, EdgeState::ClosedDoor);
+        // Doors never block movement (matching full-tile Door behaviour).
+        assert!(m.passable_step_3d((5, 5, 0), (6, 5, 0)));
+        m.set_edge_state(key, EdgeState::OpenDoor);
+        assert!(m.passable_step_3d((5, 5, 0), (6, 5, 0)));
+    }
+
+    #[test]
+    fn edge_state_survives_set_and_read_across_chunk_map() {
+        let mut m = flat_map(0);
+        let key = EdgeKey::between((5, 8), (5, 7)).unwrap(); // horizontal, owner (5,7)
+        m.set_edge_state(key, EdgeState::Wall);
+        assert_eq!(m.edge_state(key), EdgeState::Wall);
+        assert!(m.edge_blocks_move((5, 7), (5, 8)));
+        assert!(m.edge_blocks_los_opaque((5, 7), (5, 8)));
     }
 
     #[test]

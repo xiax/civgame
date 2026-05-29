@@ -197,6 +197,26 @@ fn classify_components(
                 if !chunk_map.passable_at(nx, ny, nz_i32) {
                     continue;
                 }
+                // Thin housing walls sever connectivity across the edge they sit
+                // on (the door edge stays passable, so interior↔exterior remain
+                // one component through the doorway — correct). Cardinal: gate
+                // the single shared edge; diagonal: require all four surrounding
+                // edges clear, mirroring `passable_diagonal_step`.
+                let from = (wx, wy);
+                let to = (nx, ny);
+                if dx != 0 && dy != 0 {
+                    let ca = (nx, wy);
+                    let cb = (wx, ny);
+                    if chunk_map.edge_blocks_move(from, ca)
+                        || chunk_map.edge_blocks_move(ca, to)
+                        || chunk_map.edge_blocks_move(from, cb)
+                        || chunk_map.edge_blocks_move(cb, to)
+                    {
+                        continue;
+                    }
+                } else if (dx != 0) != (dy != 0) && chunk_map.edge_blocks_move(from, to) {
+                    continue;
+                }
                 at.insert(key, cid);
                 queue.push_back(key);
             }
@@ -596,6 +616,11 @@ fn scan_edges_for_chunk(
                         continue;
                     }
                     if !chunk_map.passable_at(nb_tx, nb_ty, nz as i32) {
+                        continue;
+                    }
+                    // A housing wall sitting on the chunk-border edge severs the
+                    // crossing (cardinal border step).
+                    if chunk_map.edge_blocks_move((tx, ty), (nb_tx, nb_ty)) {
                         continue;
                     }
                     let to_component =
