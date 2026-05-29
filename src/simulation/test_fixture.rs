@@ -20021,6 +20021,66 @@ mod onenter_era_seeding {
         assert_perm_settlement_adopted(&sim, "BronzeAge");
     }
 
+    /// Door-to-road connectivity (cardinal). After a seeded Neolithic start,
+    /// every door's doormat must be a `Road` tile that joins the road graph
+    /// **cardinally** — never an isolated single Road tile and never a
+    /// diagonal-only touch. This is the regression the cardinal connector
+    /// search prevents: a doormat with no cardinal Road neighbour would read
+    /// as a broken road and leave an unpaved strip beside the house.
+    fn assert_doormats_cardinally_connected(sim: &mut TestSim, label: &str) {
+        // Scope to the player faction: its spawn window is fully pre-generated,
+        // so neighbour tiles resolve. Far AI-rival settlements may sit outside
+        // the loaded window (their connectors carve when chunks stream in).
+        let player_faction_id = sim
+            .app
+            .world()
+            .resource::<crate::simulation::faction::PlayerFaction>()
+            .faction_id;
+        let world = sim.app.world_mut();
+        let mut door_q = world.query::<&Door>();
+        let doormats: Vec<(i32, i32)> = door_q
+            .iter(world)
+            .filter(|d| d.faction_id == player_faction_id)
+            .map(|d| d.doormat_tile)
+            .collect();
+        let chunk_map = world.resource::<crate::world::chunk::ChunkMap>();
+        let mut checked = 0u32;
+        for d in doormats {
+            checked += 1;
+            assert_eq!(
+                chunk_map.tile_kind_at(d.0, d.1),
+                Some(TileKind::Road),
+                "{label}: doormat {:?} should be carved Road",
+                d
+            );
+            let cardinal_road = [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().any(|(dx, dy)| {
+                chunk_map.tile_kind_at(d.0 + dx, d.1 + dy) == Some(TileKind::Road)
+            });
+            assert!(
+                cardinal_road,
+                "{label}: doormat {:?} is isolated / diagonal-only — no cardinal Road neighbour",
+                d
+            );
+        }
+        assert!(checked >= 1, "{label}: expected at least one seeded door");
+    }
+
+    #[test]
+    fn neolithic_doormats_are_cardinally_road_connected() {
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        trigger_onenter(&mut sim);
+        assert_doormats_cardinally_connected(&mut sim, "Neolithic");
+    }
+
+    #[test]
+    fn bronze_doormats_are_cardinally_road_connected() {
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::BronzeAge);
+        trigger_onenter(&mut sim);
+        assert_doormats_cardinally_connected(&mut sim, "BronzeAge");
+    }
+
     #[test]
     fn bronze_start_seeds_growth_civics_despite_low_founder_population() {
         let mut sim = fixture_with_flat_world();

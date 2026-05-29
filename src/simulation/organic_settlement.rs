@@ -183,7 +183,7 @@ impl Parcel {
         }
     }
 
-    fn rect(&self) -> TileRect {
+    pub(crate) fn rect(&self) -> TileRect {
         match self.shape {
             ParcelShape::Rect(rect) => rect,
             ParcelShape::Shape { anchor, .. } => TileRect::new(anchor.0, anchor.1, 1, 1),
@@ -813,7 +813,7 @@ pub struct SettlementSurveyDiff {
     pub peak_population: u32,
     pub tick: u64,
     pub brain: SettlementBrain,
-    pub road_pushes: Vec<(u32, (i32, i32), (i32, i32))>,
+    pub road_pushes: Vec<crate::simulation::construction::RoadCarveJob>,
     pub snapshot_chunks: usize,
 }
 
@@ -930,7 +930,7 @@ pub fn survey_one_settlement(
         committed_ag_rects,
     );
     for road_push in &diff.road_pushes {
-        road_queue.0.push(*road_push);
+        road_queue.0.push(road_push.clone());
     }
     brains.0.insert(diff.settlement_id, diff.brain);
 }
@@ -2132,6 +2132,32 @@ pub(crate) fn road_widen_tile(
     default
 }
 
+/// Perpendicular widen tiles for a centerline cell at a given carved `width`.
+/// `width <= 1` → no widen (single-tile road); `width == 2` → one adaptive
+/// widen tile (the legacy 2-tile corridor, routed around `is_blocked`);
+/// `width >= 3` → both perpendicular neighbours (a wide artery). Shared by
+/// `road_carve_system` (carve) and `seed_reservation::rasterize_segment_into`
+/// (reserve) so plan/reserve/carve stay lock-step at every width.
+pub(crate) fn road_widen_tiles(
+    centerline: (i32, i32),
+    from: (i32, i32),
+    to: (i32, i32),
+    width: u8,
+    is_blocked: impl Fn((i32, i32)) -> bool,
+) -> Vec<(i32, i32)> {
+    match width {
+        0 | 1 => Vec::new(),
+        2 => vec![road_widen_tile(centerline, from, to, &is_blocked)],
+        _ => {
+            let (ox, oy) = road_widen_offset(from, to);
+            vec![
+                (centerline.0 + ox, centerline.1 + oy),
+                (centerline.0 - ox, centerline.1 - oy),
+            ]
+        }
+    }
+}
+
 /// Road corridor (centerline + perpendicular widening tile) for the given
 /// segments. Matches what `road_carve_system` actually stamps, so the planner
 /// can reject parcel rects that the carver would otherwise clip. The widening
@@ -2195,13 +2221,11 @@ fn queued_road_reservation_for_faction(
     faction_id: u32,
 ) -> crate::simulation::seed_reservation::SeedReservation {
     let mut queued = crate::simulation::seed_reservation::SeedReservation::default();
-    for &(fid, from, to) in road_queue.0.iter() {
-        if fid != faction_id {
+    for job in road_queue.0.iter() {
+        if job.faction_id() != faction_id {
             continue;
         }
-        crate::simulation::seed_reservation::rasterize_line_into(&mut queued, from, to, |t| {
-            structure_index.0.contains_key(&t)
-        });
+        job.reserve_into(&mut queued, |t| structure_index.0.contains_key(&t));
     }
     queued
 }
@@ -3965,25 +3989,51 @@ fn choose_residential_site(
                 score,
                 is_last_resort,
             };
-            let slot = if is_last_resort {
-                &mut last_resort
-            } else {
-                &mut best
-            };
-            *slot = match *slot {
-                None => Some(choice),
+            // Only the candidate that would actually win its slot pays for the
+            // connector preflight — keeps cost at "top option" per slot rather
+            // than one cardinal search per doorway.
+            let cur_slot = if is_last_resort { &last_resort } else { &best };
+            let replaces = match cur_slot {
+                None => true,
                 Some(cur) => {
-                    if score > cur.score + ROUTE_TIE_BREAK_EPSILON
+                    score > cur.score + ROUTE_TIE_BREAK_EPSILON
                         || ((score - cur.score).abs() <= ROUTE_TIE_BREAK_EPSILON
                             && (choice.tile, choice.door_dir as u8)
                                 < (cur.tile, cur.door_dir as u8))
-                    {
-                        Some(choice)
-                    } else {
-                        Some(cur)
-                    }
                 }
             };
+            if !replaces {
+                continue;
+            }
+            // Connector preflight: reject a doorway whose doormat can't carve a
+            // cardinal connector into the road graph (boxed in by structures or
+            // its own kitchen garden). Try the next doorway/axis instead.
+            let blocked = |t: (i32, i32)| {
+                bp_map.0.contains_key(&t)
+                    || maps.bed_map.0.contains_key(&t)
+                    || maps.structure_index.0.contains_key(&t)
+                    || crate::simulation::construction::tile_in_well_footprint(maps.well_map, t)
+            };
+            let plan = crate::simulation::construction::find_door_connector(
+                chunk_map,
+                Some(brain),
+                home,
+                doormat,
+                12,
+                blocked,
+            );
+            let connectable = !matches!(
+                plan,
+                crate::simulation::construction::DoorConnectorPlan::HomeFallback(p) if p.is_empty()
+            );
+            if !connectable {
+                continue;
+            }
+            if is_last_resort {
+                last_resort = Some(choice);
+            } else {
+                best = Some(choice);
+            }
         }
     }
     best.or(last_resort)
@@ -4978,7 +5028,7 @@ fn desire_path_push(
     faction_id: u32,
     tick: u64,
     chunk_map: &ChunkMap,
-) -> Option<(u32, (i32, i32), (i32, i32))> {
+) -> Option<crate::simulation::construction::RoadCarveJob> {
     if tick.saturating_sub(brain.last_path_carve_tick) < DESIRE_PATH_INTERVAL {
         return None;
     }
@@ -5005,7 +5055,12 @@ fn desire_path_push(
         return None;
     }
     brain.last_path_carve_tick = tick;
-    Some((faction_id, tile, home))
+    Some(crate::simulation::construction::RoadCarveJob::Segment {
+        faction_id,
+        from: tile,
+        to: home,
+        width: crate::simulation::construction::DEFAULT_ROAD_WIDTH,
+    })
 }
 
 fn road_near(chunk_map: &ChunkMap, tile: (i32, i32), radius: i32) -> bool {

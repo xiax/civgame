@@ -137,13 +137,100 @@ impl CampfireMap {
 #[derive(Resource, Default)]
 pub struct BlueprintMap(pub AHashMap<(i32, i32), Entity>);
 
-/// Queue of (faction_id, building_tile, home_tile) tuples populated by
-/// `construction_system` when a structure finalises and by the planner when a
-/// new road spine is laid out. `road_carve_system` drains it each tick and
-/// runs Bresenham from the building tile back to the home tile, marking each
-/// passable, non-Wall tile as `TileKind::Road`.
+/// Default carved road width: centreline + one adaptive widen tile — the
+/// historical 2-tile corridor every spine / desire path / building→home road
+/// used before tiered widths landed.
+pub const DEFAULT_ROAD_WIDTH: u8 = 2;
+
+/// One queued road-carving job, drained by `road_carve_system` each tick.
+///
+/// - `Segment` is the legacy Bresenham line (spines, desire paths,
+///   building→home connectors). It carves `width` tiles wide via the shared
+///   `road_widen_tiles` rule (1 = centreline only, 2 = legacy corridor,
+///   3 = wide artery), routing the widen side around standing structures.
+/// - `Connector` carries a precomputed **cardinal** (4-connected) `path` from a
+///   door's doormat to the spine. `road_carve_system` carves the path 1-wide
+///   (the guaranteed continuous backbone) and only widens to `width` where the
+///   perpendicular tile is free, so a door is never left diagonal-only or
+///   isolated from the road graph.
+#[derive(Clone, Debug)]
+pub enum RoadCarveJob {
+    Segment {
+        faction_id: u32,
+        from: (i32, i32),
+        to: (i32, i32),
+        width: u8,
+    },
+    Connector {
+        faction_id: u32,
+        doormat: (i32, i32),
+        home: (i32, i32),
+        width: u8,
+    },
+}
+
+impl RoadCarveJob {
+    pub fn faction_id(&self) -> u32 {
+        match self {
+            RoadCarveJob::Segment { faction_id, .. }
+            | RoadCarveJob::Connector { faction_id, .. } => *faction_id,
+        }
+    }
+
+    /// Reserve this job's footprint into `res`. `Segment` reserves its exact
+    /// carved corridor; `Connector` is planned at carve time (its cardinal path
+    /// isn't known until then), so it reserves a conservative 1-wide
+    /// doormat→home Bresenham estimate for the build-planner guard.
+    pub fn reserve_into(
+        &self,
+        res: &mut crate::simulation::seed_reservation::SeedReservation,
+        is_blocked: impl Fn((i32, i32)) -> bool,
+    ) {
+        match self {
+            RoadCarveJob::Segment {
+                from, to, width, ..
+            } => {
+                crate::simulation::seed_reservation::rasterize_segment_into(
+                    res, *from, *to, *width, is_blocked,
+                );
+            }
+            RoadCarveJob::Connector { doormat, home, .. } => {
+                crate::simulation::seed_reservation::rasterize_segment_into(
+                    res, *doormat, *home, 1, is_blocked,
+                );
+            }
+        }
+    }
+}
+
+/// Tier- and era-aware carved width for a planned street segment. Low-tier
+/// roads stay 1 tile (alleys) or the legacy 2 (secondary), while Primary
+/// arteries widen to 3 tiles in the Bronze Age when settlements are large
+/// enough to read as monumental thoroughfares.
+pub fn road_width_for(
+    tier: crate::simulation::settlement::StreetTier,
+    era: crate::simulation::technology::Era,
+) -> u8 {
+    use crate::simulation::settlement::StreetTier;
+    use crate::simulation::technology::Era;
+    match tier {
+        StreetTier::Alley => 1,
+        StreetTier::Secondary => DEFAULT_ROAD_WIDTH,
+        StreetTier::Primary => {
+            if (era as u8) >= (Era::BronzeAge as u8) {
+                3
+            } else {
+                DEFAULT_ROAD_WIDTH
+            }
+        }
+    }
+}
+
+/// Queue of `RoadCarveJob`s populated by `construction_system` (door connectors
+/// + building→home roads), the settlement planner (spine segments), and the
+/// survey (desire paths). `road_carve_system` drains it each tick.
 #[derive(Resource, Default)]
-pub struct RoadCarveQueue(pub Vec<(u32, (i32, i32), (i32, i32))>);
+pub struct RoadCarveQueue(pub Vec<RoadCarveJob>);
 
 /// Per-door tracking: stores the door entity and its current open state so
 /// `has_los` can query door state by tile without joining a Bevy query.
@@ -2891,17 +2978,15 @@ fn candidate_touches_reserved_road(
         return true;
     }
 
-    // (2) Queued-but-uncarved corridors for this faction. Rasterise each queued
-    // segment to its full 2-tile footprint with the same adaptive widen rule
-    // the carver uses, then test the candidate footprint against it.
+    // (2) Queued-but-uncarved corridors/connectors for this faction. Reserve
+    // each queued job's full carved footprint with the same widen rule the
+    // carver uses, then test the candidate footprint against it.
     let mut queued = crate::simulation::seed_reservation::SeedReservation::default();
-    for &(fid, from, to) in maps.road_queue.0.iter() {
-        if fid != faction_id {
+    for job in maps.road_queue.0.iter() {
+        if job.faction_id() != faction_id {
             continue;
         }
-        crate::simulation::seed_reservation::rasterize_line_into(&mut queued, from, to, |t| {
-            maps.structure_index.0.contains_key(&t)
-        });
+        job.reserve_into(&mut queued, |t| maps.structure_index.0.contains_key(&t));
     }
     footprint.iter().any(|t| queued.is_reserved(*t))
 }
@@ -4352,176 +4437,239 @@ where
         .map(|(e, off, dm, _)| (e, off, dm))
 }
 
-/// Settlement realism: where should a freshly-stamped door's connector
-/// carve toward? Each door places one `Road` doormat tile; if no street
-/// is adjacent, we used to draw a Bresenham line from the doormat back
-/// to `home`. With many doors that produced a wagon-wheel of radial
-/// spokes converging on the faction's home tile. The new policy aims
-/// every connector at the nearest reachable *spine* tile (carved or
-/// planned), collapsing the wagon-wheel into a short dogleg tree.
-#[derive(Debug)]
-pub enum DoorConnectorTarget {
-    /// Carve toward this road / planned-road tile. Bresenham endpoint.
-    Road((i32, i32)),
-    /// No road in radius — fall back to the legacy radial line toward
-    /// the faction's home tile (used at runtime when the spine layer
-    /// has not been planned yet).
-    HomeFallback,
-    /// A road already sits chebyshev-1 of the doormat. The doormat
-    /// itself is the connection — no extension carve needed.
-    None,
+/// Settlement realism: how should a freshly-stamped door's connector reach the
+/// road graph? Each door places one `Road` doormat tile. The connector must be
+/// **cardinally** (4-connected) continuous into the spine — a diagonal-only
+/// touch reads as a broken road and leaves an unpaved strip that grows weeds.
+/// `find_door_connector` runs one bounded cardinal search that returns the
+/// actual carvable path, so carving every tile guarantees an unbroken road
+/// that routes *around* structures and farm tiles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DoorConnectorPlan {
+    /// The doormat already shares a cardinal edge with a road tile on the
+    /// home-connected graph — no extension carve needed.
+    AlreadyConnected,
+    /// Carve these cardinally-chained, already-carvable tiles (doormat-
+    /// exclusive). The last tile is cardinally adjacent to the spine, so the
+    /// carved result joins the road graph with no diagonal break or gap.
+    Connector(Vec<(i32, i32)>),
+    /// No spine reachable within radius. The cardinal path toward `home_tile`
+    /// (carvable tiles only), or empty when even that is boxed in — callers may
+    /// then fall back to a legacy Bresenham `Segment` toward home.
+    HomeFallback(Vec<(i32, i32)>),
 }
 
-/// Find the nearest road target a fresh door at `doormat` should connect
-/// to. Walks chebyshev rings 1..=radius. Prefers carved `TileKind::Road`,
-/// falls back to `brain.road_tiles` (planned spine, populated at survey
-/// time before tiles are stamped). Skips tiles that are not walkable
-/// from `doormat` (uses `placement_reachability::path_exists` with a
-/// small cap so a far-but-sealed-off road can't win over a closer
-/// reachable one).
-///
-/// - `radius` defaults to 12 in callers — long enough to bridge a hut to
-///   the spine even when the hut sits at the outer edge of a residential
-///   parcel, short enough that the search is cheap.
-/// - At seed time pass `brain` so planned spine tiles are eligible
-///   targets; runtime call sites may pass `None` if they only care
-///   about carved roads.
-pub fn find_door_connector_target(
+/// True iff `road_carve_system` would flip `tile` to `Road` — i.e. the cardinal
+/// connector search may step here. Mirrors `try_write_road`'s tile-kind gate
+/// (Cropland is explicitly rejected before the soil-like check, so tilled farm
+/// land is avoided for free); `blocked` layers structure/bed/well/blueprint and
+/// planned-farm avoidance on top.
+fn connector_tile_carvable(
     chunk_map: &ChunkMap,
-    brain: Option<&crate::simulation::organic_settlement::SettlementBrain>,
+    tile: (i32, i32),
+    blocked: &impl Fn((i32, i32)) -> bool,
+) -> bool {
+    if blocked(tile) {
+        return false;
+    }
+    matches!(
+        chunk_map.tile_kind_at(tile.0, tile.1),
+        Some(TileKind::Grass) | Some(TileKind::Scrub) | Some(TileKind::Sand)
+    ) || chunk_map
+        .tile_kind_at(tile.0, tile.1)
+        .map(|k| k.is_soil_like() && k != TileKind::Cropland)
+        .unwrap_or(false)
+}
+
+const CONNECTOR_MAX_EXPANSIONS: usize = 1024;
+const CARDINAL_DIRS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+
+/// Bounded 4-connected BFS from `doormat` over carvable tiles, terminating at
+/// the first carvable tile cardinally adjacent to a `is_target` tile. Returns
+/// the path (doormat-exclusive) of carvable, cardinally-chained tiles, or
+/// `None` if no target is reachable within `radius` / `CONNECTOR_MAX_EXPANSIONS`.
+/// BFS gives the shortest off-road connector.
+fn cardinal_path_to_target(
+    chunk_map: &ChunkMap,
     doormat: (i32, i32),
     radius: i32,
-) -> DoorConnectorTarget {
-    // Fast adjacency check — if any neighbour is already a Road we're
-    // already connected.
-    for dy in -1..=1 {
-        for dx in -1..=1 {
-            if dx == 0 && dy == 0 {
+    blocked: &impl Fn((i32, i32)) -> bool,
+    is_target: &impl Fn((i32, i32)) -> bool,
+) -> Option<Vec<(i32, i32)>> {
+    use std::collections::VecDeque;
+    let mut came_from: ahash::AHashMap<(i32, i32), (i32, i32)> = ahash::AHashMap::new();
+    let mut visited: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::new();
+    let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
+    visited.insert(doormat);
+    queue.push_back(doormat);
+    let mut expansions = 0usize;
+    while let Some(cur) = queue.pop_front() {
+        expansions += 1;
+        if expansions > CONNECTOR_MAX_EXPANSIONS {
+            break;
+        }
+        for (dx, dy) in CARDINAL_DIRS {
+            let nbr = (cur.0 + dx, cur.1 + dy);
+            if visited.contains(&nbr) {
                 continue;
             }
-            if chunk_map.tile_kind_at(doormat.0 + dx, doormat.1 + dy) == Some(TileKind::Road) {
-                return DoorConnectorTarget::None;
+            if (nbr.0 - doormat.0).abs().max((nbr.1 - doormat.1).abs()) > radius {
+                continue;
             }
+            // Only step onto carvable tiles. (Targets that are already Road are
+            // not carvable, so we never step *onto* the spine — we stop one
+            // tile short, cardinally adjacent to it.)
+            if !connector_tile_carvable(chunk_map, nbr, blocked) {
+                continue;
+            }
+            visited.insert(nbr);
+            came_from.insert(nbr, cur);
+            // Reached a carvable tile that touches the spine cardinally → done.
+            if CARDINAL_DIRS
+                .iter()
+                .any(|(tx, ty)| is_target((nbr.0 + tx, nbr.1 + ty)))
+            {
+                let mut path = vec![nbr];
+                let mut t = nbr;
+                while let Some(&p) = came_from.get(&t) {
+                    if p == doormat {
+                        break;
+                    }
+                    path.push(p);
+                    t = p;
+                }
+                path.reverse();
+                return Some(path);
+            }
+            queue.push_back(nbr);
         }
     }
+    None
+}
 
-    let from3 = crate::simulation::placement_reachability::resolve3(chunk_map, doormat);
+/// A tile sits inside some well's 5×5 stepwell footprint iff its chebyshev
+/// distance to any registered well centre is ≤ 2. Shared by the connector
+/// search's `blocked` predicate and `road_carve_system`'s well detour.
+pub(crate) fn tile_in_well_footprint(well_map: &WellMap, tile: (i32, i32)) -> bool {
+    well_map
+        .0
+        .keys()
+        .any(|c| (c.0 - tile.0).abs() <= 2 && (c.1 - tile.1).abs() <= 2)
+}
 
-    let try_tile = |t: (i32, i32)| -> bool {
-        let to3 = crate::simulation::placement_reachability::resolve3(chunk_map, t);
-        crate::simulation::placement_reachability::path_exists(
-            chunk_map,
-            from3,
-            to3,
-            crate::simulation::placement_reachability::ReachOpts::seed()
-                .with_cap(crate::simulation::placement_reachability::DOORMAT_MAX_EXPANSIONS),
-        )
+/// Queue a door connector. The cardinal path is *planned at carve time* by
+/// `road_carve_system` (which holds the final structure + farm maps and the
+/// settlement brain), so a later-seeded house can't invalidate a path computed
+/// early. The queue carries only the doormat + home endpoints.
+fn queue_door_connector(
+    road_queue: &mut RoadCarveQueue,
+    faction_id: u32,
+    doormat: (i32, i32),
+    home_tile: (i32, i32),
+) {
+    road_queue.0.push(RoadCarveJob::Connector {
+        faction_id,
+        doormat,
+        home: home_tile,
+        width: 1,
+    });
+}
+
+/// Plan how a fresh door at `doormat` connects to the settlement road graph.
+///
+/// Runs a single bounded **cardinal** (4-connected) search over carvable tiles:
+/// - `AlreadyConnected` when the doormat already shares a cardinal edge with a
+///   home-connected road / planned-spine tile.
+/// - `Connector(path)` — the shortest carvable cardinal path ending one tile
+///   short of the spine. Every tile is carvable, so carving the whole path
+///   yields an unbroken road into the graph.
+/// - `HomeFallback(path)` when no spine is reachable within `radius`: a cardinal
+///   path toward `home_tile`, or empty if even that is boxed in.
+///
+/// `blocked(tile)` must report every tile the carver would refuse (finished
+/// structures, beds, wells, blueprints) so the returned path is guaranteed
+/// carvable. Planned Agricultural parcels (kitchen gardens) and tilled
+/// `Cropland` are avoided automatically — the search routes *around* farms.
+/// `radius` defaults to 12 in callers.
+pub fn find_door_connector(
+    chunk_map: &ChunkMap,
+    brain: Option<&crate::simulation::organic_settlement::SettlementBrain>,
+    home_tile: (i32, i32),
+    doormat: (i32, i32),
+    radius: i32,
+    blocked: impl Fn((i32, i32)) -> bool,
+) -> DoorConnectorPlan {
+    // Farm avoidance: never route a connector through a planned Agricultural
+    // parcel (kitchen garden) even before it's tilled. Tilled `Cropland` is
+    // already excluded by `connector_tile_carvable`.
+    let in_ag_parcel = |tile: (i32, i32)| -> bool {
+        brain
+            .map(|b| {
+                b.parcels
+                    .iter()
+                    .filter(|p| {
+                        p.district_hint
+                            == Some(crate::simulation::organic_settlement::DistrictKind::Agricultural)
+                    })
+                    .any(|p| p.rect().contains(tile.0, tile.1))
+            })
+            .unwrap_or(false)
+    };
+    let step_blocked = |tile: (i32, i32)| blocked(tile) || in_ag_parcel(tile);
+
+    // A tile is a connection target if it's a carved Road (≠ the doormat we just
+    // stamped) or a planned spine tile (centreline ∪ widened corridor). Both
+    // get carved before/with this connector, so terminating cardinally adjacent
+    // to one yields a continuous join.
+    let is_spine = |tile: (i32, i32)| -> bool {
+        if tile == doormat {
+            return false;
+        }
+        if chunk_map.tile_kind_at(tile.0, tile.1) == Some(TileKind::Road) {
+            return true;
+        }
+        brain
+            .map(|b| b.road_tiles.contains(&tile) || b.road_corridor_tiles.contains(&tile))
+            .unwrap_or(false)
     };
 
-    // Build a road field rooted at the doormat (closest carved/planned road
-    // to it). The connector should prefer a road tile that lies on the main
-    // flow back toward home — i.e. minimize
-    // `chebyshev(doormat→road) + road_steps_to_home[road]`.
-    let empty_planned: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::new();
-    let planned_for_field: &ahash::AHashSet<(i32, i32)> = brain
-        .map(|b| &b.road_tiles)
-        .unwrap_or(&empty_planned);
-    // Field rooted at the brain's home_tile (or doormat as proxy if no
-    // brain) — this is the "to home" direction.
-    let field_root = brain.map(|b| b.home_tile).unwrap_or(doormat);
-    let road_field_home = crate::simulation::placement_reachability::road_field_from_home(
-        chunk_map,
-        planned_for_field,
-        field_root,
-    );
-
-    // Walk rings; collect reachable carved roads, then pick the lowest
-    // `chebyshev(doormat→road) + road_steps_to_home[road]`. Falls back to
-    // first-found behaviour when the field is empty (no home road tile).
-    let mut best_carved: Option<(u32, (i32, i32))> = None;
-    for r in 1..=radius {
-        for dy in -r..=r {
-            for dx in -r..=r {
-                if dx.abs() != r && dy.abs() != r {
-                    continue;
-                }
-                let tile = (doormat.0 + dx, doormat.1 + dy);
-                if chunk_map.tile_kind_at(tile.0, tile.1) != Some(TileKind::Road) {
-                    continue;
-                }
-                if !try_tile(tile) {
-                    continue;
-                }
-                let on_road = road_field_home
-                    .road_steps_to_home
-                    .get(&tile)
-                    .copied()
-                    .unwrap_or(u16::MAX);
-                let off_road = (tile.0 - doormat.0).abs().max((tile.1 - doormat.1).abs()) as u32;
-                let cost = off_road.saturating_add(on_road as u32);
-                if best_carved.map_or(true, |(c, _)| cost < c) {
-                    best_carved = Some((cost, tile));
-                }
-            }
-        }
-        // Early-out at the first ring that yielded a reachable carved road
-        // (a road r tiles closer can't be beaten by one farther) — unless
-        // the road graph distance dominates, in which case we keep scanning
-        // up to `radius` to find a better-aligned road.
-        if let Some((c, _)) = best_carved {
-            if r as u32 + (c.saturating_sub(r as u32)) >= radius as u32 {
-                break;
-            }
-        }
-    }
-    if let Some((_, tile)) = best_carved {
-        return DoorConnectorTarget::Road(tile);
+    // Fast path: a cardinal neighbour that is an *already-carved* Road ⇒
+    // connected. A merely-planned spine tile doesn't count — it isn't Road yet,
+    // so we still emit a connector that carves the join (otherwise the doormat
+    // would sit isolated until the spine carves at runtime).
+    if CARDINAL_DIRS.iter().any(|(dx, dy)| {
+        chunk_map.tile_kind_at(doormat.0 + dx, doormat.1 + dy) == Some(TileKind::Road)
+    }) {
+        return DoorConnectorPlan::AlreadyConnected;
     }
 
-    // No carved road within radius. Fall back to the planned spine.
-    if let Some(b) = brain {
-        if !b.road_tiles.is_empty() {
-            // Walk rings again, this time matching planned-road tiles.
-            for r in 1..=radius {
-                for dy in -r..=r {
-                    for dx in -r..=r {
-                        if dx.abs() != r && dy.abs() != r {
-                            continue;
-                        }
-                        let tile = (doormat.0 + dx, doormat.1 + dy);
-                        if !b.road_tiles.contains(&tile) {
-                            continue;
-                        }
-                        if try_tile(tile) {
-                            return DoorConnectorTarget::Road(tile);
-                        }
-                    }
-                }
-            }
-            // Seed-mode policy: prefer planned spine *even if far* — pick
-            // the nearest planned tile by chebyshev that is reachable,
-            // ignoring the `radius` bound. The planned spine is the
-            // settlement's lived-in path; carving a long-but-aligned
-            // connector reads better than another radial spoke.
-            let mut candidates: Vec<(i32, (i32, i32))> = b
-                .road_tiles
-                .iter()
-                .copied()
-                .map(|t| {
-                    let d = (t.0 - doormat.0).abs().max((t.1 - doormat.1).abs());
-                    (d, t)
-                })
-                .collect();
-            candidates.sort_by_key(|&(d, t)| (d, t.0, t.1));
-            for (_, tile) in candidates.into_iter().take(6) {
-                if try_tile(tile) {
-                    return DoorConnectorTarget::Road(tile);
-                }
-            }
-        }
+    if let Some(path) = cardinal_path_to_target(chunk_map, doormat, radius, &step_blocked, &is_spine)
+    {
+        return DoorConnectorPlan::Connector(path);
     }
 
-    DoorConnectorTarget::HomeFallback
+    // No spine within radius — head for home over carvable tiles (continuous).
+    let near_home = |tile: (i32, i32)| -> bool {
+        tile == home_tile
+            || (tile.0 - home_tile.0).abs().max((tile.1 - home_tile.1).abs()) <= 1
+    };
+    if let Some(path) = cardinal_path_to_target(chunk_map, doormat, radius, &step_blocked, &near_home)
+    {
+        return DoorConnectorPlan::HomeFallback(path);
+    }
+    // Boxed in from both spine and home within `radius`: carve at least a single
+    // cardinal stub toward home so the doormat is never an isolated / diagonal-
+    // only Road tile. The runtime spine carve + desire paths complete the join
+    // later. Only truly empty when every cardinal neighbour is unbuildable.
+    let stub = CARDINAL_DIRS
+        .iter()
+        .map(|(dx, dy)| (doormat.0 + dx, doormat.1 + dy))
+        .filter(|&t| connector_tile_carvable(chunk_map, t, &step_blocked))
+        .min_by_key(|&t| (t.0 - home_tile.0).abs().max((t.1 - home_tile.1).abs()));
+    match stub {
+        Some(t) => DoorConnectorPlan::HomeFallback(vec![t]),
+        None => DoorConnectorPlan::HomeFallback(Vec::new()),
+    }
 }
 
 /// Is there any `TileKind::Road` tile within `radius` chebyshev of `from`?
@@ -4599,13 +4747,15 @@ pub fn road_carve_system(
     structure_index: Res<StructureIndex>,
     plot_index: Res<crate::simulation::land::PlotIndex>,
     plant_map: Res<crate::simulation::plants::PlantMap>,
+    brains: Res<crate::simulation::organic_settlement::SettlementBrains>,
+    settlement_map: Res<crate::simulation::settlement::SettlementMap>,
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
 ) {
     if queue.0.is_empty() {
         return;
     }
     // Drain — re-allocate a fresh empty Vec to release the lock on `queue`.
-    let drained: Vec<(u32, (i32, i32), (i32, i32))> = std::mem::take(&mut queue.0);
+    let drained: Vec<RoadCarveJob> = std::mem::take(&mut queue.0);
 
     // Helper: write a single tile as Road if it's writable + not blueprinted /
     // bedded / farm-protected. Returns true if the tile was actually flipped.
@@ -4667,51 +4817,114 @@ pub fn road_carve_system(
         };
 
     // Per-tile widen sign routes the corridor around standing structures
-    // (same `road_widen_tile` rule the planner's corridor cache uses).
+    // (same `road_widen_tiles` rule the planner's corridor cache uses).
     let widen_blocked = |t: (i32, i32)| structure_index.0.contains_key(&t);
-    for (_faction_id, from, to) in drained {
-        let mut x0 = from.0 as i32;
-        let mut y0 = from.1 as i32;
-        let x1 = to.0 as i32;
-        let y1 = to.1 as i32;
-        let dx_abs = (x1 - x0).abs();
-        let dy_abs = (y1 - y0).abs();
-        let dx = dx_abs;
-        let dy = -dy_abs;
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
+    for job in drained {
+        match job {
+            RoadCarveJob::Segment {
+                from, to, width, ..
+            } => {
+                let mut x0 = from.0;
+                let mut y0 = from.1;
+                let x1 = to.0;
+                let y1 = to.1;
+                let dx_abs = (x1 - x0).abs();
+                let dy_abs = (y1 - y0).abs();
+                let dx = dx_abs;
+                let dy = -dy_abs;
+                let sx = if x0 < x1 { 1 } else { -1 };
+                let sy = if y0 < y1 { 1 } else { -1 };
+                let mut err = dx + dy;
 
-        loop {
-            let is_endpoint =
-                (x0 == from.0 as i32 && y0 == from.1 as i32) || (x0 == x1 && y0 == y1);
-            if !is_endpoint {
-                let tile = (x0, y0);
-                try_write_road(&mut chunk_map, &mut tile_changed, tile);
-                // Widen to 2 tiles so the main artery actually fills the
-                // 2-tile gap between facing house frontages — single-tile
-                // Bresenham left a visible strip of unpaved ground next
-                // to every house, which then got wild plants. The widen side
-                // flips per tile to step around a structure on the default side.
-                let widen = crate::simulation::organic_settlement::road_widen_tile(
-                    tile,
-                    from,
-                    to,
-                    widen_blocked,
-                );
-                try_write_road(&mut chunk_map, &mut tile_changed, widen);
+                loop {
+                    let is_endpoint = (x0 == from.0 && y0 == from.1) || (x0 == x1 && y0 == y1);
+                    if !is_endpoint {
+                        let tile = (x0, y0);
+                        try_write_road(&mut chunk_map, &mut tile_changed, tile);
+                        // Widen per the segment's tier-driven `width` so the
+                        // artery fills the gap between facing house frontages.
+                        // The widen side flips per tile to step around a
+                        // structure on the default side.
+                        for widen in crate::simulation::organic_settlement::road_widen_tiles(
+                            tile,
+                            from,
+                            to,
+                            width,
+                            widen_blocked,
+                        ) {
+                            try_write_road(&mut chunk_map, &mut tile_changed, widen);
+                        }
+                    }
+                    if x0 == x1 && y0 == y1 {
+                        break;
+                    }
+                    let e2 = 2 * err;
+                    if e2 >= dy {
+                        err += dy;
+                        x0 += sx;
+                    }
+                    if e2 <= dx {
+                        err += dx;
+                        y0 += sy;
+                    }
+                }
             }
-            if x0 == x1 && y0 == y1 {
-                break;
-            }
-            let e2 = 2 * err;
-            if e2 >= dy {
-                err += dy;
-                x0 += sx;
-            }
-            if e2 <= dx {
-                err += dx;
-                y0 += sy;
+            RoadCarveJob::Connector {
+                faction_id,
+                doormat,
+                home,
+                width,
+            } => {
+                // Plan the cardinal path *now*, against the final structure +
+                // farm maps, so a later-seeded house can't have invalidated a
+                // path computed earlier. The `blocked` predicate mirrors
+                // `try_write_road` exactly (bp / bed / structure / well / farm),
+                // so every returned tile is guaranteed carvable → the carved
+                // road is cardinally continuous with no skipped gaps.
+                let brain = settlement_map
+                    .first_for_faction(faction_id)
+                    .and_then(|sid| brains.0.get(&sid));
+                let connector_blocked = |t: (i32, i32)| {
+                    bp_map.0.contains_key(&t)
+                        || bed_map.0.contains_key(&t)
+                        || structure_index.0.contains_key(&t)
+                        || in_well_footprint(t)
+                        || crate::simulation::land::tile_is_farm_protected(
+                            &plot_index,
+                            &plant_map,
+                            t,
+                        )
+                };
+                let path = match find_door_connector(
+                    &chunk_map,
+                    brain,
+                    home,
+                    doormat,
+                    12,
+                    connector_blocked,
+                ) {
+                    DoorConnectorPlan::AlreadyConnected => Vec::new(),
+                    DoorConnectorPlan::Connector(p) | DoorConnectorPlan::HomeFallback(p) => p,
+                };
+                // The 1-wide path is the guaranteed-continuous backbone; widen
+                // tiles for `width > 1` are best-effort cosmetics that never
+                // break it.
+                for (i, &tile) in path.iter().enumerate() {
+                    try_write_road(&mut chunk_map, &mut tile_changed, tile);
+                    if width > 1 {
+                        let prev = if i > 0 { path[i - 1] } else { tile };
+                        let next = if i + 1 < path.len() { path[i + 1] } else { tile };
+                        for widen in crate::simulation::organic_settlement::road_widen_tiles(
+                            tile,
+                            prev,
+                            next,
+                            width,
+                            widen_blocked,
+                        ) {
+                            try_write_road(&mut chunk_map, &mut tile_changed, widen);
+                        }
+                    }
+                }
             }
         }
     }
@@ -5437,37 +5650,27 @@ pub fn construction_system(
                         },
                     );
                     // Carve doormat to Road directly; road_carve_system
-                    // skips both endpoints. Connector target chosen by
-                    // `find_door_connector_target`: aim every connector at
-                    // the nearest carved or planned spine tile instead of
-                    // always at `home`, so eight doors don't fan eight
-                    // radial spokes into the base.
+                    // skips both endpoints. Connector chosen by
+                    // `find_door_connector`: a bounded cardinal search that
+                    // returns the carvable path joining the doormat to the
+                    // nearest carved/planned spine tile, routing around
+                    // structures and farms — no diagonal-only joins, no
+                    // radial wagon-wheel into the base.
                     write_road_tile(
                         &mut *chunk_map,
                         &maps.structure_index,
                         &mut tile_changed,
                         doormat_tile,
                     );
-                    let brain_ref = maps
-                        .settlement_map
-                        .first_for_faction(bp.faction_id)
-                        .and_then(|sid| maps.brains.0.get(&sid));
-                    match find_door_connector_target(&chunk_map, brain_ref, doormat_tile, 12) {
-                        DoorConnectorTarget::None => {}
-                        DoorConnectorTarget::Road(target) => {
-                            road_carve_queue
-                                .0
-                                .push((bp.faction_id, doormat_tile, target));
-                        }
-                        DoorConnectorTarget::HomeFallback => {
-                            if let Some(faction) = registry.factions.get(&bp.faction_id) {
-                                road_carve_queue.0.push((
-                                    bp.faction_id,
-                                    doormat_tile,
-                                    faction.home_tile,
-                                ));
-                            }
-                        }
+                    if let Some(home_tile) =
+                        registry.factions.get(&bp.faction_id).map(|f| f.home_tile)
+                    {
+                        queue_door_connector(
+                            &mut road_carve_queue,
+                            bp.faction_id,
+                            doormat_tile,
+                            home_tile,
+                        );
                     }
                     door_entity
                 }
@@ -5875,9 +6078,12 @@ pub fn construction_system(
                 }
                 // Queue a road carve from the new building back to home_tile so
                 // the settlement grows a connective road network organically.
-                road_carve_queue
-                    .0
-                    .push((bp.faction_id, tile, faction.home_tile));
+                road_carve_queue.0.push(RoadCarveJob::Segment {
+                    faction_id: bp.faction_id,
+                    from: tile,
+                    to: faction.home_tile,
+                    width: DEFAULT_ROAD_WIDTH,
+                });
             }
 
             let lead_actor = bp_workers
@@ -8010,27 +8216,18 @@ fn seed_walled_house_at(
                     },
                 );
                 // Carve doormat tile directly to Road; the Bresenham
-                // road_carve_system skips both endpoints. Connector target
-                // chosen by `find_door_connector_target`: every door aims
-                // at the nearest carved or planned spine tile, falling
-                // back to home only when no spine exists. Replaces the
-                // unconditional `(doormat → home)` push that produced the
-                // wagon-wheel layout.
+                // road_carve_system skips both endpoints. Connector chosen by
+                // `find_door_connector`: a bounded cardinal search returning
+                // the carvable path to the nearest carved/planned spine tile,
+                // routing around structures + farms. Replaces the unconditional
+                // `(doormat → home)` push that produced the wagon-wheel layout.
                 write_road_tile(
                     &mut *chunk_map,
                     &maps.structure_index,
                     tile_changed,
                     doormat_tile,
                 );
-                match find_door_connector_target(&*chunk_map, brain, doormat_tile, 12) {
-                    DoorConnectorTarget::None => {}
-                    DoorConnectorTarget::Road(target) => {
-                        road_carve.0.push((faction_id, doormat_tile, target));
-                    }
-                    DoorConnectorTarget::HomeFallback => {
-                        road_carve.0.push((faction_id, doormat_tile, home));
-                    }
-                }
+                queue_door_connector(road_carve, faction_id, doormat_tile, home);
             }
             BuildSiteKind::Wall(mat) => {
                 let surf_z = chunk_map.surface_z_at(tile.0, tile.1);
@@ -9053,50 +9250,109 @@ mod tests {
         );
     }
 
-    // ── Settlement realism: door connector helper ─────────────────────
+    // ── Settlement realism: door connector (cardinal) ─────────────────
 
-    #[test]
-    fn door_connector_returns_none_when_road_adjacent() {
+    fn flat_grass_map() -> ChunkMap {
         use crate::world::chunk::{Chunk, ChunkCoord, CHUNK_SIZE};
         let mut cm = ChunkMap::default();
-        let z = Box::new([[4i8; CHUNK_SIZE]; CHUNK_SIZE]);
-        let kind = Box::new([[TileKind::Grass; CHUNK_SIZE]; CHUNK_SIZE]);
-        let fert = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
-        cm.0.insert(ChunkCoord(0, 0), Chunk::new(z, kind, fert));
-        // Plant a Road tile chebyshev-1 from doormat=(5,5).
+        for cy in -1..=1 {
+            for cx in -1..=1 {
+                let z = Box::new([[4i8; CHUNK_SIZE]; CHUNK_SIZE]);
+                let kind = Box::new([[TileKind::Grass; CHUNK_SIZE]; CHUNK_SIZE]);
+                let fert = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
+                cm.0.insert(ChunkCoord(cx, cy), Chunk::new(z, kind, fert));
+            }
+        }
+        cm
+    }
+
+    fn set_tile_kind(cm: &mut ChunkMap, x: i32, y: i32, kind: TileKind) {
         cm.set_tile(
-            6,
-            5,
+            x,
+            y,
             4,
             TileData {
-                kind: TileKind::Road,
+                kind,
                 ..Default::default()
             },
-        );
-
-        let target = find_door_connector_target(&cm, None, (5, 5), 12);
-        assert!(
-            matches!(target, DoorConnectorTarget::None),
-            "road adjacent ⇒ no connector needed; got {:?}",
-            target
         );
     }
 
     #[test]
-    fn door_connector_falls_back_to_home_when_no_road() {
-        use crate::world::chunk::{Chunk, ChunkCoord, CHUNK_SIZE};
-        let mut cm = ChunkMap::default();
-        let z = Box::new([[4i8; CHUNK_SIZE]; CHUNK_SIZE]);
-        let kind = Box::new([[TileKind::Grass; CHUNK_SIZE]; CHUNK_SIZE]);
-        let fert = Box::new([[0u8; CHUNK_SIZE]; CHUNK_SIZE]);
-        cm.0.insert(ChunkCoord(0, 0), Chunk::new(z, kind, fert));
-        // No roads, no brain ⇒ HomeFallback.
-        let target = find_door_connector_target(&cm, None, (5, 5), 12);
-        assert!(
-            matches!(target, DoorConnectorTarget::HomeFallback),
-            "no road, no brain ⇒ fallback; got {:?}",
-            target
+    fn door_connector_already_connected_when_cardinal_road_adjacent() {
+        let mut cm = flat_grass_map();
+        // Road tile cardinally east of doormat=(5,5).
+        set_tile_kind(&mut cm, 6, 5, TileKind::Road);
+        let plan = find_door_connector(&cm, None, (0, 0), (5, 5), 12, |_| false);
+        assert_eq!(
+            plan,
+            DoorConnectorPlan::AlreadyConnected,
+            "a cardinal-adjacent road ⇒ already connected"
         );
+    }
+
+    #[test]
+    fn door_connector_diagonal_only_road_requires_connector() {
+        let mut cm = flat_grass_map();
+        // Road tile only diagonally adjacent to doormat=(5,5).
+        set_tile_kind(&mut cm, 6, 6, TileKind::Road);
+        let plan = find_door_connector(&cm, None, (0, 0), (5, 5), 12, |_| false);
+        match plan {
+            DoorConnectorPlan::Connector(path) => {
+                assert!(!path.is_empty(), "diagonal-only road ⇒ a real connector");
+                // The last carved tile must be cardinally adjacent to the road.
+                let last = *path.last().unwrap();
+                let cardinal_to_road = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                    .iter()
+                    .any(|(dx, dy)| {
+                        cm.tile_kind_at(last.0 + dx, last.1 + dy) == Some(TileKind::Road)
+                    });
+                assert!(cardinal_to_road, "connector must end cardinally on the road");
+            }
+            other => panic!("diagonal-only road should need a connector; got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn door_connector_routes_around_blocked_and_farm_tiles() {
+        let mut cm = flat_grass_map();
+        // Road to the north; a structure at (5,7) and Cropland at (5,8) sit on
+        // the straight-line path and must be routed around.
+        set_tile_kind(&mut cm, 5, 10, TileKind::Road);
+        set_tile_kind(&mut cm, 5, 8, TileKind::Cropland);
+        let blocked = |t: (i32, i32)| t == (5, 7);
+        let plan = find_door_connector(&cm, None, (0, 0), (5, 5), 12, blocked);
+        match plan {
+            DoorConnectorPlan::Connector(path) => {
+                assert!(!path.is_empty());
+                assert!(!path.contains(&(5, 7)), "must not carve the blocked tile");
+                assert!(!path.contains(&(5, 8)), "must not carve the Cropland tile");
+            }
+            other => panic!("expected a routed connector; got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn door_connector_falls_back_to_home_when_no_spine() {
+        let cm = flat_grass_map();
+        // No roads, no brain ⇒ HomeFallback toward a reachable home tile.
+        let plan = find_door_connector(&cm, None, (5, 0), (5, 5), 12, |_| false);
+        match plan {
+            DoorConnectorPlan::HomeFallback(path) => {
+                assert!(!path.is_empty(), "open grass ⇒ a cardinal path toward home");
+            }
+            other => panic!("no spine ⇒ home fallback; got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn road_width_is_tier_and_era_aware() {
+        use crate::simulation::settlement::StreetTier;
+        use crate::simulation::technology::Era;
+        assert_eq!(road_width_for(StreetTier::Alley, Era::BronzeAge), 1);
+        assert_eq!(road_width_for(StreetTier::Secondary, Era::BronzeAge), 2);
+        assert_eq!(road_width_for(StreetTier::Primary, Era::Neolithic), 2);
+        assert_eq!(road_width_for(StreetTier::Primary, Era::BronzeAge), 3);
     }
 
     // ── Settlement realism: civic-seeding maturity ────────────────────

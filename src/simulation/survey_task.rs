@@ -231,7 +231,7 @@ pub fn apply_survey_results_system(
             continue;
         }
         for road_push in &result.diff.road_pushes {
-            road_queue.0.push(*road_push);
+            road_queue.0.push(road_push.clone());
         }
         brains
             .0

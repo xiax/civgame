@@ -1148,12 +1148,20 @@ pub fn settlement_planner_system(
             continue;
         }
 
-        // Enqueue spine carving once per culture_hash bump. Reuses
-        // `RoadCarveQueue` (one Bresenham line per drained entry) — segments
-        // share the same Sequential drain cadence as building→home roads.
+        // Enqueue spine carving once per culture_hash bump. Each segment's
+        // carved width is tier- and era-aware (`road_width_for`): alleys 1,
+        // secondary 2, primary arteries up to 3 in the Bronze Age.
         if prev_hash != Some(new_hash) {
+            let era = crate::simulation::technology::current_era(&faction.techs);
             for seg in plan.spine.segments() {
-                road_queue.0.push((fid, seg.start, seg.end));
+                road_queue
+                    .0
+                    .push(crate::simulation::construction::RoadCarveJob::Segment {
+                        faction_id: fid,
+                        from: seg.start,
+                        to: seg.end,
+                        width: crate::simulation::construction::road_width_for(seg.tier, era),
+                    });
             }
         }
 

@@ -73,7 +73,29 @@ pub fn rasterize_line_into(
     to: (i32, i32),
     is_blocked: impl Fn((i32, i32)) -> bool,
 ) {
-    use crate::simulation::organic_settlement::road_widen_tile;
+    rasterize_segment_into(
+        reservation,
+        from,
+        to,
+        crate::simulation::construction::DEFAULT_ROAD_WIDTH,
+        is_blocked,
+    );
+}
+
+/// Width-aware Bresenham rasterisation. Reserves the centreline plus
+/// `road_widen_tiles(.., width, ..)` per cell, matching exactly what the
+/// `Segment` arm of `road_carve_system` stamps at the same `width`. `width <= 1`
+/// reserves the centreline only; `2` the legacy 2-tile corridor; `>= 3` a wide
+/// artery. The widen tiles route around `is_blocked` per the shared
+/// `road_widen_tile` rule so reservation and carve stay lock-step.
+pub fn rasterize_segment_into(
+    reservation: &mut SeedReservation,
+    from: (i32, i32),
+    to: (i32, i32),
+    width: u8,
+    is_blocked: impl Fn((i32, i32)) -> bool,
+) {
+    use crate::simulation::organic_settlement::road_widen_tiles;
     let mut x0 = from.0;
     let mut y0 = from.1;
     let x1 = to.0;
@@ -87,7 +109,9 @@ pub fn rasterize_line_into(
     let mut err = dx + dy;
     loop {
         reservation.reserve((x0, y0));
-        reservation.reserve(road_widen_tile((x0, y0), from, to, &is_blocked));
+        for w in road_widen_tiles((x0, y0), from, to, width, &is_blocked) {
+            reservation.reserve(w);
+        }
         if x0 == x1 && y0 == y1 {
             break;
         }
@@ -144,10 +168,8 @@ pub fn populate_seed_reservation_system(
         // routes around standing structures.
         reservation.reserve_iter(brain.road_corridor_tiles.iter().copied());
     }
-    for &(_faction_id, from, to) in road_queue.0.iter() {
-        rasterize_line_into(&mut reservation, from, to, |t| {
-            structure_index.0.contains_key(&t)
-        });
+    for job in road_queue.0.iter() {
+        job.reserve_into(&mut reservation, |t| structure_index.0.contains_key(&t));
     }
     // Every well owns a 5×5 stepwell footprint, but only the centre tile sits
     // in `StructureIndex` (the wellhead carries the `StructureLabel`). The
@@ -212,4 +234,27 @@ mod tests {
         assert!(r.is_reserved((0, 0)));
         assert!(r.is_reserved((3, 3)));
     }
+
+    #[test]
+    fn rasterise_width_three_reserves_both_perpendicular_sides() {
+        let mut r = SeedReservation::default();
+        rasterize_segment_into(&mut r, (0, 5), (3, 5), 3, |_| false);
+        for x in 0..=3 {
+            assert!(r.is_reserved((x, 5)), "centre ({x}, 5)");
+            assert!(r.is_reserved((x, 6)), "+Y side ({x}, 6)");
+            assert!(r.is_reserved((x, 4)), "-Y side ({x}, 4)");
+        }
+    }
+
+    #[test]
+    fn rasterise_width_one_is_centreline_only() {
+        let mut r = SeedReservation::default();
+        rasterize_segment_into(&mut r, (0, 5), (3, 5), 1, |_| false);
+        for x in 0..=3 {
+            assert!(r.is_reserved((x, 5)));
+        }
+        assert!(!r.is_reserved((0, 6)), "width 1 reserves no widen tile");
+        assert_eq!(r.len(), 4);
+    }
+
 }
