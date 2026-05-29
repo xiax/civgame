@@ -63,16 +63,23 @@ impl SeedReservation {
 /// Rasterise a Bresenham line from `from` to `to` (endpoints inclusive) into
 /// the reservation set. Matches the **2-tile-wide** carve in
 /// `road_carve_system` so queued-but-uncarved roads are reserved across
-/// their full footprint, not just the centreline.
-pub fn rasterize_line_into(reservation: &mut SeedReservation, from: (i32, i32), to: (i32, i32)) {
+/// their full footprint, not just the centreline. The widen side routes around
+/// `is_blocked` tiles per cell via the shared `road_widen_tile` rule, so the
+/// reservation stays lock-step with the carver's structure avoidance. Pass
+/// `|_| false` for the unconditional baseline.
+pub fn rasterize_line_into(
+    reservation: &mut SeedReservation,
+    from: (i32, i32),
+    to: (i32, i32),
+    is_blocked: impl Fn((i32, i32)) -> bool,
+) {
+    use crate::simulation::organic_settlement::road_widen_tile;
     let mut x0 = from.0;
     let mut y0 = from.1;
     let x1 = to.0;
     let y1 = to.1;
     let dx_abs = (x1 - x0).abs();
     let dy_abs = (y1 - y0).abs();
-    let widen_dx = if dy_abs > dx_abs { 1 } else { 0 };
-    let widen_dy = if dy_abs > dx_abs { 0 } else { 1 };
     let dx = dx_abs;
     let dy = -dy_abs;
     let sx = if x0 < x1 { 1 } else { -1 };
@@ -80,7 +87,7 @@ pub fn rasterize_line_into(reservation: &mut SeedReservation, from: (i32, i32), 
     let mut err = dx + dy;
     loop {
         reservation.reserve((x0, y0));
-        reservation.reserve((x0 + widen_dx, y0 + widen_dy));
+        reservation.reserve(road_widen_tile((x0, y0), from, to, &is_blocked));
         if x0 == x1 && y0 == y1 {
             break;
         }
@@ -132,10 +139,15 @@ pub fn populate_seed_reservation_system(
     reservation.reserve_iter(structure_index.0.keys().copied());
     reservation.reserve_iter(doormat.0.keys().copied());
     for brain in brains.0.values() {
-        reservation.reserve_iter(brain.road_tiles.iter().copied());
+        // Reserve the full widened corridor, not just the centreline — the
+        // carver stamps a 2-tile-wide road and the corridor cache already
+        // routes around standing structures.
+        reservation.reserve_iter(brain.road_corridor_tiles.iter().copied());
     }
     for &(_faction_id, from, to) in road_queue.0.iter() {
-        rasterize_line_into(&mut reservation, from, to);
+        rasterize_line_into(&mut reservation, from, to, |t| {
+            structure_index.0.contains_key(&t)
+        });
     }
     // Every well owns a 5×5 stepwell footprint, but only the centre tile sits
     // in `StructureIndex` (the wellhead carries the `StructureLabel`). The
@@ -172,7 +184,7 @@ mod tests {
     #[test]
     fn rasterise_horizontal_line_inclusive() {
         let mut r = SeedReservation::default();
-        rasterize_line_into(&mut r, (0, 5), (3, 5));
+        rasterize_line_into(&mut r, (0, 5), (3, 5), |_| false);
         // 2-tile-wide: centre row y=5 + widened row y=6 for each x in 0..=3.
         for x in 0..=3 {
             assert!(r.is_reserved((x, 5)), "missing centre ({x}, 5)");
@@ -182,9 +194,21 @@ mod tests {
     }
 
     #[test]
+    fn rasterise_routes_widen_around_blocked_tile() {
+        let mut r = SeedReservation::default();
+        // Block the default (+Y) widen side at x=1 only.
+        rasterize_line_into(&mut r, (0, 5), (3, 5), |p| p == (1, 6));
+        assert!(r.is_reserved((1, 5)), "centre still reserved");
+        assert!(!r.is_reserved((1, 6)), "blocked default side not reserved");
+        assert!(r.is_reserved((1, 4)), "widened to the clear side");
+        // Unblocked columns keep the default side.
+        assert!(r.is_reserved((2, 6)));
+    }
+
+    #[test]
     fn rasterise_diagonal_line_covers_endpoints() {
         let mut r = SeedReservation::default();
-        rasterize_line_into(&mut r, (0, 0), (3, 3));
+        rasterize_line_into(&mut r, (0, 0), (3, 3), |_| false);
         assert!(r.is_reserved((0, 0)));
         assert!(r.is_reserved((3, 3)));
     }

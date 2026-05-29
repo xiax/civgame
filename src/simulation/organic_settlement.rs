@@ -859,7 +859,13 @@ fn compute_settlement_survey_core<F: SurveyFactionView>(
     brain.districts = build_districts(faction, settlement, &brain);
     brain.road_segments = build_road_network(faction, &brain, chunk_map, member_offsets);
     brain.road_tiles = road_tiles_for_segments(&brain.road_segments);
-    brain.road_corridor_tiles = road_corridor_tiles_for_segments(&brain.road_segments);
+    // Route the widened corridor around standing structures captured in the
+    // survey snapshot so the planner never reserves (and the carver never
+    // tries to paint) a road tile under a finished building.
+    brain.road_corridor_tiles =
+        road_corridor_tiles_for_segments_with(&brain.road_segments, |t| {
+            maps.structures.contains(&t)
+        });
     brain.frontier = build_frontier(faction, &brain, chunk_map, maps);
     brain.parcels = build_parcels(faction, settlement, &brain, chunk_map, maps, committed_ag_rects);
     brain.layout_hash = layout_hash(faction, &brain);
@@ -1146,6 +1152,11 @@ pub fn settlement_project_selection_system(
     pending_footprints: Res<PendingFootprints>,
     plot_index: Res<PlotIndex>,
     plot_q: Query<&Plot>,
+    settlement_map: Res<crate::simulation::settlement::SettlementMap>,
+    brains: Res<SettlementBrains>,
+    road_queue: Res<RoadCarveQueue>,
+    structure_index: Res<crate::simulation::construction::StructureIndex>,
+    chunk_map: Res<ChunkMap>,
 ) {
     if clock.tick % PRESSURE_INTERVAL != 0 {
         return;
@@ -1166,11 +1177,27 @@ pub fn settlement_project_selection_system(
         if count >= concurrent_cap {
             continue;
         }
+        // Resolve this faction's settlement brain once for the reserved-road
+        // filter; absent brain (early survey) skips the road check entirely.
+        let brain = settlement_map
+            .first_for_faction(faction_id)
+            .and_then(|sid| brains.0.get(&sid));
+        // Build the queued-road reservation once per faction (not per candidate).
+        let queued = queued_road_reservation_for_faction(&road_queue, &structure_index, faction_id);
         let best = candidates
             .iter()
             .filter(|intent| {
                 tile_buildable_by(&plot_index, &plot_q, intent.tile, faction_id, None)
                     && intent_tech_allowed(intent.build_kind, faction)
+                    && brain.map_or(true, |b| {
+                        !intent_touches_reserved_road(
+                            intent.build_kind,
+                            intent.tile,
+                            b,
+                            &queued,
+                            &chunk_map,
+                        )
+                    })
             })
             .max_by(|a, b| {
                 let ascore = a.priority - material_scarcity_penalty(a.build_kind, faction);
@@ -2078,24 +2105,131 @@ pub(crate) fn road_widen_offset(from: (i32, i32), to: (i32, i32)) -> (i32, i32) 
     }
 }
 
+/// Resolve the actual widened tile for one centerline cell so the 2-tile road
+/// corridor *routes around* a standing structure instead of running through it.
+/// The widen **axis** is per-segment (`road_widen_offset`); only the **sign**
+/// is adaptive per tile: prefer the default side, flip to the opposite side
+/// when the default neighbour is blocked, and fall back to the default when
+/// both sides are blocked (the carver's `StructureIndex` backstop then skips
+/// that one tile rather than overwrite a building). Pass `|_| false` for the
+/// unconditional baseline used by tests/fixtures.
+#[inline]
+pub(crate) fn road_widen_tile(
+    centerline: (i32, i32),
+    from: (i32, i32),
+    to: (i32, i32),
+    is_blocked: impl Fn((i32, i32)) -> bool,
+) -> (i32, i32) {
+    let (ox, oy) = road_widen_offset(from, to);
+    let default = (centerline.0 + ox, centerline.1 + oy);
+    if !is_blocked(default) {
+        return default;
+    }
+    let opposite = (centerline.0 - ox, centerline.1 - oy);
+    if !is_blocked(opposite) {
+        return opposite;
+    }
+    default
+}
+
 /// Road corridor (centerline + perpendicular widening tile) for the given
 /// segments. Matches what `road_carve_system` actually stamps, so the planner
-/// can reject parcel rects that the carver would otherwise clip.
-pub(crate) fn road_corridor_tiles_for_segments(
+/// can reject parcel rects that the carver would otherwise clip. The widening
+/// routes around `is_blocked` tiles per cell (see `road_widen_tile`).
+pub(crate) fn road_corridor_tiles_for_segments_with(
     segments: &[StreetSegment],
+    is_blocked: impl Fn((i32, i32)) -> bool,
 ) -> AHashSet<(i32, i32)> {
     let mut tiles = AHashSet::default();
     for segment in segments {
-        let (wdx, wdy) = road_widen_offset(segment.start, segment.end);
         for tile in bresenham_tiles(segment.start, segment.end) {
             if tile == segment.start || tile == segment.end {
                 continue;
             }
             tiles.insert(tile);
-            tiles.insert((tile.0 + wdx, tile.1 + wdy));
+            tiles.insert(road_widen_tile(tile, segment.start, segment.end, &is_blocked));
         }
     }
     tiles
+}
+
+/// Unconditional baseline (default widen side, no structure avoidance).
+pub(crate) fn road_corridor_tiles_for_segments(
+    segments: &[StreetSegment],
+) -> AHashSet<(i32, i32)> {
+    road_corridor_tiles_for_segments_with(segments, |_| false)
+}
+
+/// Footprint tiles a `ConstructionIntent` would occupy — mirror of
+/// `construction::candidate_footprint_tiles` for the organic intent enum.
+fn organic_intent_footprint_tiles(kind: OrganicBuildKind, tile: (i32, i32)) -> Vec<(i32, i32)> {
+    match kind {
+        OrganicBuildKind::Single(_) | OrganicBuildKind::PalisadeSegment(_) => vec![tile],
+        OrganicBuildKind::Hut(_) => rect_tiles_inclusive(tile, 1, 1),
+        OrganicBuildKind::Longhouse { axis, .. } => {
+            let (hw, hh) = axis.longhouse_halves();
+            rect_tiles_inclusive(tile, hw, hh)
+        }
+        OrganicBuildKind::CompositeHouse {
+            shape, rotation, ..
+        } => crate::simulation::building_template::shape_tiles(shape, tile, rotation),
+    }
+}
+
+fn rect_tiles_inclusive(centre: (i32, i32), half_w: i32, half_h: i32) -> Vec<(i32, i32)> {
+    let mut out = Vec::new();
+    for dy in -half_h..=half_h {
+        for dx in -half_w..=half_w {
+            out.push((centre.0 + dx, centre.1 + dy));
+        }
+    }
+    out
+}
+
+/// Rasterise every queued-but-uncarved road segment for `faction_id` into a
+/// reservation set, using the same adaptive 2-tile widen the carver applies.
+/// Built once per faction so the per-candidate guard stays cheap.
+fn queued_road_reservation_for_faction(
+    road_queue: &RoadCarveQueue,
+    structure_index: &crate::simulation::construction::StructureIndex,
+    faction_id: u32,
+) -> crate::simulation::seed_reservation::SeedReservation {
+    let mut queued = crate::simulation::seed_reservation::SeedReservation::default();
+    for &(fid, from, to) in road_queue.0.iter() {
+        if fid != faction_id {
+            continue;
+        }
+        crate::simulation::seed_reservation::rasterize_line_into(&mut queued, from, to, |t| {
+            structure_index.0.contains_key(&t)
+        });
+    }
+    queued
+}
+
+/// Selection-time reserved-road guard: true when an intent's footprint touches
+/// the planned widened corridor, an already-carved road, or a queued-but-
+/// uncarved corridor (`queued`). Mirrors
+/// `construction::candidate_touches_reserved_road` so the planner never
+/// *selects* an intent the directive layer would then silently drop (which
+/// would starve every lower-priority intent that tick).
+fn intent_touches_reserved_road(
+    kind: OrganicBuildKind,
+    tile: (i32, i32),
+    brain: &SettlementBrain,
+    queued: &crate::simulation::seed_reservation::SeedReservation,
+    chunk_map: &ChunkMap,
+) -> bool {
+    let fp = organic_intent_footprint_tiles(kind, tile);
+    if fp.iter().any(|t| brain.road_corridor_tiles.contains(t)) {
+        return true;
+    }
+    if fp
+        .iter()
+        .any(|t| chunk_map.tile_kind_at(t.0, t.1) == Some(crate::world::tile::TileKind::Road))
+    {
+        return true;
+    }
+    fp.iter().any(|t| queued.is_reserved(*t))
 }
 
 fn bresenham_tiles(from: (i32, i32), to: (i32, i32)) -> Vec<(i32, i32)> {
@@ -6634,5 +6768,68 @@ mod dam_emitter_tests {
         assert_eq!(nearest_watercourse_tile(&cm, (20, 9), 4), Some((20, 9)));
         // No river within a tight radius from far away.
         assert_eq!(nearest_watercourse_tile(&cm, (0, 0), 3), None);
+    }
+
+    // ── Road-reservation: adaptive widen routes the corridor around structures ──
+
+    #[test]
+    fn widen_tile_prefers_default_side_when_clear() {
+        // Horizontal segment widens along +Y by default.
+        let t = road_widen_tile((5, 5), (0, 5), (10, 5), |_| false);
+        assert_eq!(t, (5, 6));
+    }
+
+    #[test]
+    fn widen_tile_flips_to_opposite_side_when_default_blocked() {
+        let blocked = |p: (i32, i32)| p == (5, 6);
+        let t = road_widen_tile((5, 5), (0, 5), (10, 5), blocked);
+        assert_eq!(t, (5, 4), "routes around the structure to the clear side");
+    }
+
+    #[test]
+    fn widen_tile_falls_back_to_default_when_both_sides_blocked() {
+        let blocked = |p: (i32, i32)| p == (5, 6) || p == (5, 4);
+        let t = road_widen_tile((5, 5), (0, 5), (10, 5), blocked);
+        assert_eq!(t, (5, 6), "both blocked → default; carver backstop skips it");
+    }
+
+    #[test]
+    fn corridor_routes_around_structure_on_default_side() {
+        use crate::simulation::settlement::{StreetSegment, StreetTier};
+        let segs = vec![StreetSegment {
+            start: (0, 5),
+            end: (4, 5),
+            tier: StreetTier::Primary,
+        }];
+        // Structure on the default widen side of interior centerline tile (2,5).
+        let blocked = |p: (i32, i32)| p == (2, 6);
+        let corridor = road_corridor_tiles_for_segments_with(&segs, blocked);
+        // Centerline interior tile still carves...
+        assert!(corridor.contains(&(2, 5)), "centerline preserved");
+        // ...but the corridor must never include the structure tile...
+        assert!(
+            !corridor.contains(&(2, 6)),
+            "corridor must route around the structure tile"
+        );
+        // ...it widened to the opposite (clear) side instead.
+        assert!(corridor.contains(&(2, 4)), "widened to the clear side");
+    }
+
+    #[test]
+    fn corridor_baseline_is_default_two_tile_widen() {
+        use crate::simulation::settlement::{StreetSegment, StreetTier};
+        let segs = vec![StreetSegment {
+            start: (0, 5),
+            end: (4, 5),
+            tier: StreetTier::Primary,
+        }];
+        let corridor = road_corridor_tiles_for_segments(&segs);
+        // Endpoints excluded; every interior centerline tile + its +Y neighbour.
+        for x in 1..=3 {
+            assert!(corridor.contains(&(x, 5)), "missing centre ({x},5)");
+            assert!(corridor.contains(&(x, 6)), "missing widened ({x},6)");
+        }
+        assert!(!corridor.contains(&(0, 5)), "start endpoint excluded");
+        assert!(!corridor.contains(&(4, 5)), "end endpoint excluded");
     }
 }

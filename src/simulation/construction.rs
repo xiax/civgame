@@ -333,6 +333,10 @@ pub struct FurnitureMaps<'w> {
     /// 16-param cap.
     pub settlement_map: Res<'w, crate::simulation::settlement::SettlementMap>,
     pub brains: Res<'w, crate::simulation::organic_settlement::SettlementBrains>,
+    /// Read-only structure occupancy. The doormat carve (`write_road_tile`)
+    /// consults it so a doormat never paints `Road` under a finished structure
+    /// — the same anti-corruption guard `road_carve_system` carries.
+    pub structure_index: Res<'w, StructureIndex>,
 }
 
 /// Bed construction tier. Tracks how the bed was built so the upgrade pipeline
@@ -2735,6 +2739,11 @@ pub struct BuildingMapsRO<'w> {
     // sleepy-dove Phase 4: bundled here so `chief_directive_system`
     // stays under Bevy's 16-param ceiling.
     pub poster_pool: Res<'w, ConstructionPosterPool>,
+    // Road-reservation guard inputs (bundled to stay under the param ceiling):
+    // `structure_index` for the adaptive widen + the carved-road check; the
+    // road queue so a queued-but-uncarved corridor reserves its widened lane.
+    pub structure_index: Res<'w, StructureIndex>,
+    pub road_queue: Res<'w, RoadCarveQueue>,
 }
 
 impl<'w> FurnitureMaps<'w> {
@@ -2846,21 +2855,55 @@ fn build_candidate_from_organic(
     }
 }
 
-fn candidate_touches_planned_road(
+/// True if any tile of `candidate`'s footprint touches a **reserved road** —
+/// the carve-faithful union of: the planned widened corridor
+/// (`brain.road_corridor_tiles`, already routed around structures), a
+/// queued-but-uncarved `RoadCarveQueue` segment rasterised to its full 2-tile
+/// corridor, or an already-carved `TileKind::Road` tile. Replaces the old
+/// centreline-only (`brain.road_tiles`) check so furniture can't land on the
+/// widened lane the carver will eventually fill.
+fn candidate_touches_reserved_road(
     candidate: &BuildCandidate,
     faction_id: u32,
     settlement_map: &crate::simulation::settlement::SettlementMap,
-    brains: &crate::simulation::organic_settlement::SettlementBrains,
+    maps: &BuildingMapsRO,
+    chunk_map: &ChunkMap,
 ) -> bool {
-    let Some(sid) = settlement_map.first_for_faction(faction_id) else {
-        return false;
-    };
-    let Some(brain) = brains.0.get(&sid) else {
-        return false;
-    };
-    candidate_footprint_tiles(candidate)
-        .into_iter()
-        .any(|tile| brain.road_tiles.contains(&tile))
+    let footprint = candidate_footprint_tiles(candidate);
+
+    // (1) Planned widened corridor for this faction's settlement.
+    if let Some(sid) = settlement_map.first_for_faction(faction_id) {
+        if let Some(brain) = maps.organic_brains.0.get(&sid) {
+            if footprint
+                .iter()
+                .any(|tile| brain.road_corridor_tiles.contains(tile))
+            {
+                return true;
+            }
+        }
+    }
+
+    // (3) Already-carved roads.
+    if footprint
+        .iter()
+        .any(|t| chunk_map.tile_kind_at(t.0, t.1) == Some(TileKind::Road))
+    {
+        return true;
+    }
+
+    // (2) Queued-but-uncarved corridors for this faction. Rasterise each queued
+    // segment to its full 2-tile footprint with the same adaptive widen rule
+    // the carver uses, then test the candidate footprint against it.
+    let mut queued = crate::simulation::seed_reservation::SeedReservation::default();
+    for &(fid, from, to) in maps.road_queue.0.iter() {
+        if fid != faction_id {
+            continue;
+        }
+        crate::simulation::seed_reservation::rasterize_line_into(&mut queued, from, to, |t| {
+            maps.structure_index.0.contains_key(&t)
+        });
+    }
+    footprint.iter().any(|t| queued.is_reserved(*t))
 }
 
 fn candidate_footprint_tiles(candidate: &BuildCandidate) -> Vec<(i32, i32)> {
@@ -3060,8 +3103,7 @@ pub fn chief_directive_system(
         ) {
             continue;
         }
-        if candidate_touches_planned_road(&best, faction_id, &settlement_map, &maps.organic_brains)
-        {
+        if candidate_touches_reserved_road(&best, faction_id, &settlement_map, &maps, &chunk_map) {
             continue;
         }
 
@@ -3301,8 +3343,15 @@ fn seed_single_tile_clear(
     maps: &FurnitureMaps,
     chunk_map: &ChunkMap,
     doormat: &crate::simulation::doormat::DoormatReservations,
+    // Planned widened road corridor for this settlement (None for fixtures /
+    // pre-survey). Seed placement must avoid it so roads stay first; the carved
+    // `TileKind::Road` check below only catches roads already stamped.
+    road_corridor: Option<&AHashSet<(i32, i32)>>,
 ) -> bool {
     if used.contains(&tile) || doormat.is_reserved(tile) {
+        return false;
+    }
+    if road_corridor.is_some_and(|c| c.contains(&tile)) {
         return false;
     }
     if !chunk_map.is_passable(tile.0, tile.1) {
@@ -3337,6 +3386,7 @@ fn find_clear_seed_single_tile(
     maps: &FurnitureMaps,
     chunk_map: &ChunkMap,
     doormat: &crate::simulation::doormat::DoormatReservations,
+    road_corridor: Option<&AHashSet<(i32, i32)>>,
     max_radius: i32,
 ) -> Option<(i32, i32)> {
     for ring in 0..=max_radius {
@@ -3346,7 +3396,7 @@ fn find_clear_seed_single_tile(
                     continue;
                 }
                 let tile = (anchor.0 + dx, anchor.1 + dy);
-                if seed_single_tile_clear(tile, used, maps, chunk_map, doormat) {
+                if seed_single_tile_clear(tile, used, maps, chunk_map, doormat, road_corridor) {
                     return Some(tile);
                 }
             }
@@ -3361,13 +3411,14 @@ fn seed_house_footprint_clear(
     maps: &FurnitureMaps,
     chunk_map: &ChunkMap,
     doormat: &crate::simulation::doormat::DoormatReservations,
+    road_corridor: Option<&AHashSet<(i32, i32)>>,
     half_w: i32,
     half_h: i32,
 ) -> bool {
     for dy in -half_h..=half_h {
         for dx in -half_w..=half_w {
             let tile = (anchor.0 + dx, anchor.1 + dy);
-            if !seed_single_tile_clear(tile, used, maps, chunk_map, doormat) {
+            if !seed_single_tile_clear(tile, used, maps, chunk_map, doormat, road_corridor) {
                 return false;
             }
         }
@@ -3458,7 +3509,14 @@ fn seed_walled_house_or_nearby(
                     }
                 }
                 if !seed_house_footprint_clear(
-                    candidate, used, maps, chunk_map, doormat, half_w, half_h,
+                    candidate,
+                    used,
+                    maps,
+                    chunk_map,
+                    doormat,
+                    brain.map(|b| &b.road_corridor_tiles),
+                    half_w,
+                    half_h,
                 ) {
                     continue;
                 }
@@ -3574,9 +3632,15 @@ fn seed_apply_intent(
             // freshly-stamped seed tile, nudge the single-tile structure to the
             // nearest valid neighbor instead of starving the rest of the seed
             // loop on the same high-score candidate.
-            let Some(place_tile) =
-                find_clear_seed_single_tile(tile, used, maps, chunk_map, doormat, 8)
-            else {
+            let Some(place_tile) = find_clear_seed_single_tile(
+                tile,
+                used,
+                maps,
+                chunk_map,
+                doormat,
+                brain.map(|b| &b.road_corridor_tiles),
+                8,
+            ) else {
                 return None;
             };
             spawn_seeded_structure_at_tile(
@@ -4481,9 +4545,16 @@ fn road_within(chunk_map: &ChunkMap, from: (i32, i32), radius: i32) -> bool {
 
 fn write_road_tile(
     chunk_map: &mut ChunkMap,
+    structure_index: &StructureIndex,
     tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
     tile: (i32, i32),
 ) {
+    // Anti-corruption guard: never paint Road under a finished structure (mirror
+    // of `road_carve_system`'s `StructureIndex` skip) so a doormat carve can't
+    // overwrite a building that already sits on the chosen tile.
+    if structure_index.0.contains_key(&tile) {
+        return;
+    }
     let cur = chunk_map.tile_kind_at(tile.0, tile.1);
     let writable = match cur {
         // Tilled farm soil is never paved — universal, streaming-safe guard
@@ -4525,6 +4596,7 @@ pub fn road_carve_system(
     bp_map: Res<BlueprintMap>,
     bed_map: Res<BedMap>,
     well_map: Res<WellMap>,
+    structure_index: Res<StructureIndex>,
     plot_index: Res<crate::simulation::land::PlotIndex>,
     plant_map: Res<crate::simulation::plants::PlantMap>,
     mut tile_changed: EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
@@ -4553,8 +4625,13 @@ pub fn road_carve_system(
          tile_changed: &mut EventWriter<crate::world::chunk_streaming::TileChangedEvent>,
          tile: (i32, i32)|
          -> bool {
+            // Anti-corruption backstop: never paint Road onto a tile that
+            // carries a finished structure. With the adaptive widen below this
+            // should essentially never fire; it guarantees the carver can't
+            // overwrite a building under any plan-vs-carve drift.
             if bp_map.0.contains_key(&tile)
                 || bed_map.0.contains_key(&tile)
+                || structure_index.0.contains_key(&tile)
                 || in_well_footprint(tile)
             {
                 return false;
@@ -4589,6 +4666,9 @@ pub fn road_carve_system(
             true
         };
 
+    // Per-tile widen sign routes the corridor around standing structures
+    // (same `road_widen_tile` rule the planner's corridor cache uses).
+    let widen_blocked = |t: (i32, i32)| structure_index.0.contains_key(&t);
     for (_faction_id, from, to) in drained {
         let mut x0 = from.0 as i32;
         let mut y0 = from.1 as i32;
@@ -4596,11 +4676,6 @@ pub fn road_carve_system(
         let y1 = to.1 as i32;
         let dx_abs = (x1 - x0).abs();
         let dy_abs = (y1 - y0).abs();
-        // Widen perpendicular to the dominant axis. Shared helper with the
-        // organic planner's `road_corridor_tiles_for_segments` so the planner
-        // reservation and physical carve stay in lock-step.
-        let (widen_dx, widen_dy) =
-            crate::simulation::organic_settlement::road_widen_offset(from, to);
         let dx = dx_abs;
         let dy = -dy_abs;
         let sx = if x0 < x1 { 1 } else { -1 };
@@ -4616,12 +4691,15 @@ pub fn road_carve_system(
                 // Widen to 2 tiles so the main artery actually fills the
                 // 2-tile gap between facing house frontages — single-tile
                 // Bresenham left a visible strip of unpaved ground next
-                // to every house, which then got wild plants.
-                try_write_road(
-                    &mut chunk_map,
-                    &mut tile_changed,
-                    (x0 + widen_dx, y0 + widen_dy),
+                // to every house, which then got wild plants. The widen side
+                // flips per tile to step around a structure on the default side.
+                let widen = crate::simulation::organic_settlement::road_widen_tile(
+                    tile,
+                    from,
+                    to,
+                    widen_blocked,
                 );
+                try_write_road(&mut chunk_map, &mut tile_changed, widen);
             }
             if x0 == x1 && y0 == y1 {
                 break;
@@ -5364,7 +5442,12 @@ pub fn construction_system(
                     // the nearest carved or planned spine tile instead of
                     // always at `home`, so eight doors don't fan eight
                     // radial spokes into the base.
-                    write_road_tile(&mut *chunk_map, &mut tile_changed, doormat_tile);
+                    write_road_tile(
+                        &mut *chunk_map,
+                        &maps.structure_index,
+                        &mut tile_changed,
+                        doormat_tile,
+                    );
                     let brain_ref = maps
                         .settlement_map
                         .first_for_faction(bp.faction_id)
@@ -7795,7 +7878,12 @@ fn seed_walled_house_at(
                 // back to home only when no spine exists. Replaces the
                 // unconditional `(doormat → home)` push that produced the
                 // wagon-wheel layout.
-                write_road_tile(&mut *chunk_map, tile_changed, doormat_tile);
+                write_road_tile(
+                    &mut *chunk_map,
+                    &maps.structure_index,
+                    tile_changed,
+                    doormat_tile,
+                );
                 match find_door_connector_target(&*chunk_map, brain, doormat_tile, 12) {
                     DoorConnectorTarget::None => {}
                     DoorConnectorTarget::Road(target) => {
