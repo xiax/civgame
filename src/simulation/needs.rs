@@ -166,6 +166,7 @@ pub fn tick_needs_system(
     clock: Res<SimClock>,
     chunk_map: Res<ChunkMap>,
     campfire_map: Res<CampfireMap>,
+    shelter_map: Res<crate::simulation::construction::ShelterMap>,
     table_map: Res<TableMap>,
     chair_map: Res<ChairMap>,
     mut query: Query<(
@@ -214,6 +215,15 @@ pub fn tick_needs_system(
             let enc = enclosure_score(&chunk_map, cur_tx, cur_ty) as f32;
             let shelter_fill = enc * SHELTER_FILL_PER_SCORE * dt;
             needs.shelter = (needs.shelter + SHELTER_RATE * dt - shelter_fill).clamp(0.0, 255.0);
+
+            // Lightweight-shelter relief (lean-to / tent / yurt). Take only the
+            // strongest shelter covering this tile — no stacking — and apply
+            // its per-tier relief. Every tier stays below one enclosure point
+            // so a walled house remains strictly better.
+            if let Some(tier) = shelter_map.strongest_covering((cur_tx, cur_ty)) {
+                let relief = per_game_day_rate(tier.relief_per_day()) * dt;
+                needs.shelter = (needs.shelter - relief).clamp(0.0, 255.0);
+            }
 
             // Campfire warmth: agents within 3 Manhattan tiles of a campfire
             // gain shelter and safety relief — fire keeps the cold and predators away.

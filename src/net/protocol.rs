@@ -23,7 +23,10 @@ use crate::world::water_runtime::RuntimeWaterCell;
 /// Wire protocol version negotiated at connect time. Bump whenever the
 /// shape of any wire message in this module changes; mismatched clients
 /// are rejected by `accept_connections_system` before any state transfer.
-pub const PROTOCOL_VERSION: u32 = 8;
+// v9: added `BuildSiteKind::{SleepingMat, LightShelter}` (new serialized enum
+// discriminants ride `PlayerCommand::Build` / blueprint frames) — poor-housing
+// primitives. See plans/realistic-poor-shelter.md.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// One UI- (or remote-client-)issued command, scoped to the faction that
 /// claims to be sending it. The loopback validates `sender_faction_id`

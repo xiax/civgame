@@ -799,7 +799,7 @@ fn plant_stage_to_wire(
 fn structure_kind_wire_from_label(label: &'static str) -> crate::net::protocol::StructureKindWire {
     use crate::net::protocol::StructureKindWire;
     match label {
-        "Bed" | "Bedroll" | "Tent" | "Yurt" => StructureKindWire::Bed,
+        "Bed" | "Bedroll" | "Tent" | "Yurt" | "Sleeping Mat" | "Lean-To" => StructureKindWire::Bed,
         "Campfire" => StructureKindWire::Campfire,
         "Granary" => StructureKindWire::Storage,
         "Workbench" | "Loom" | "Table" | "Chair" | "Pen" | "Stable"

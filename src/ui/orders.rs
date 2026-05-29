@@ -108,6 +108,8 @@ impl MenuAction {
                 BuildSiteKind::FeedTrough => "Build Feed Trough",
                 BuildSiteKind::HitchingPost => "Build Hitching Post",
                 BuildSiteKind::VehicleYard => "Build Vehicle Yard",
+                BuildSiteKind::SleepingMat(_) => "Build Sleeping Mat",
+                BuildSiteKind::LightShelter(_) => "Build Lean-To",
             },
             MenuAction::DigDown => "Dig Down",
             MenuAction::Deconstruct => "Deconstruct",

@@ -50,6 +50,10 @@ pub fn sleep_task_system(
     time: Res<Time>,
     clock: Res<SimClock>,
     bed_map: Res<BedMap>,
+    // Read-only Bed lookup for tier-aware recovery. Bed entities are disjoint
+    // from the Person entities `query` iterates, so this composes with
+    // `par_iter_mut` without an access conflict.
+    beds: Query<&crate::simulation::construction::Bed>,
     mut query: Query<(
         &mut PersonAI,
         &mut ActionQueue,
@@ -118,9 +122,13 @@ pub fn sleep_task_system(
             }
             let cur_tx = (transform.translation.x / TILE_SIZE).floor() as i32;
             let cur_ty = (transform.translation.y / TILE_SIZE).floor() as i32;
-            // Double recovery when resting on a bed.
-            let on_bed = bed_map.0.contains_key(&(cur_tx, cur_ty));
-            let mult = if on_bed { 2.0 } else { 1.0 };
+            // Tier-aware recovery: a framed bed doubles the rate (2.0×), a
+            // poor-housing sleeping mat gives 1.25×, bare ground 1.0×.
+            let mult = bed_map
+                .0
+                .get(&(cur_tx, cur_ty))
+                .and_then(|&e| beds.get(e).ok())
+                .map_or(1.0, |bed| bed.tier.sleep_recovery_mult());
             needs.sleep = (needs.sleep - SLEEP_RECOVER_RATE * mult * dt).clamp(0.0, 255.0);
             needs.willpower =
                 (needs.willpower + WILLPOWER_SLEEP_RECOVER * mult * dt).clamp(0.0, 255.0);

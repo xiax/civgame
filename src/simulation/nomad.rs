@@ -3350,6 +3350,9 @@ pub fn nomad_chief_directive_system(
             match shelter.tier {
                 ShelterTier::Tent => tent_built += 1,
                 ShelterTier::Yurt => yurt_built += 1,
+                // Settled poor-housing lean-tos never appear in a nomad camp;
+                // ignore them in the nomadic shelter-repair tally.
+                ShelterTier::LeanTo => {}
             }
         }
 

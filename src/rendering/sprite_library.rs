@@ -388,6 +388,67 @@ const BUILDING_TENT: &[&str] = &[
     ".XdSSSSSSSSSdX..",
     ".XSSSSSSSSSSSX..",
 ];
+// Poor-housing sleeping mat: a flat woven mat lying on the ground (no bed
+// frame). Low, occupying only the bottom rows so it reads as a surface, not
+// furniture. Anchored bottom-center like every plant/structure sprite.
+const BUILDING_SLEEPING_MAT: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "...dtTtTtTtTd...",
+    "..dTtTtTtTtTtd..",
+    "..dtTtTtTtTtTd..",
+    "..dTtTtTtTtTtd..",
+    "..dSSSSSSSSSSd..",
+];
+// Poor-housing lean-to: a single slanted windbreak (open on one side), lower
+// and flimsier than a tent. Brush/thatch shades leaning to the right.
+const BUILDING_LEAN_TO: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    ".........X......",
+    "........XB......",
+    ".......XBb......",
+    "......XBbD......",
+    ".....XBbDD......",
+    "....XBbDDD......",
+    "...XBbDDDD......",
+    "..XBbDDDDD......",
+    "..XbDDDDDD......",
+    "..XdDDDDDD......",
+    "..XSSSSSSS......",
+    "................",
+    "................",
+];
+// Felt-and-lattice yurt: a rounded domed tent, broader and squatter than the
+// pointed `BUILDING_TENT`, with a banded felt body and a low door.
+const BUILDING_YURT: &[&str] = &[
+    "................",
+    "................",
+    "................",
+    ".....XXXXXX.....",
+    "...XXBBBBBBXX...",
+    "..XBBbBBBbBBBX..",
+    ".XBBBBBBBBBBBBX.",
+    ".XBbBBBBBBBBbBX.",
+    "XBBBBBBBBBBBBBBX",
+    "XBdBBBBBBBBBBdBX",
+    "XBBBBBXXXXBBBBBX",
+    "XBbBBBXDDXBBBBbX",
+    "XBBBBBXDDXBBBBBX",
+    "XBdBBBXDDXBBBdBX",
+    "XBBBBBXDDXBBBBBX",
+    "XdSSSSSSSSSSSSdX",
+];
 const BUILDING_HUT: &[&str] = &[
     "................",
     "......XXXX......",
@@ -5253,6 +5314,9 @@ pub fn setup_sprite_library(mut commands: Commands, mut images: ResMut<Assets<Im
 
     // --- Buildings (17) ---
     add!("building_tent", BUILDING_TENT);
+    add!("building_yurt", BUILDING_YURT);
+    add!("building_sleeping_mat", BUILDING_SLEEPING_MAT);
+    add!("building_lean_to", BUILDING_LEAN_TO);
     add!("building_hut", BUILDING_HUT);
     add!("building_longhouse", BUILDING_LONGHOUSE);
     add!("building_farm", BUILDING_FARM);

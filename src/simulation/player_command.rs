@@ -1789,7 +1789,7 @@ fn dispatch_one(
                 routing.bp_map.0.insert(tile, bp_e);
                 Some(bp_e)
             };
-            let task_kind = if matches!(kind, BuildSiteKind::Bed) {
+            let task_kind = if matches!(kind, BuildSiteKind::Bed | BuildSiteKind::SleepingMat(_)) {
                 TaskKind::ConstructBed
             } else {
                 TaskKind::Construct
@@ -1827,7 +1827,7 @@ fn dispatch_one(
                 return DispatchOutcome::Failed(CommandFailure::Unreachable);
             }
             if let Some(bp) = bp_entity {
-                if matches!(kind, BuildSiteKind::Bed) {
+                if matches!(kind, BuildSiteKind::Bed | BuildSiteKind::SleepingMat(_)) {
                     aq.dispatch(Task::ConstructBed { blueprint: bp });
                 } else {
                     aq.dispatch(Task::Construct { blueprint: bp });

@@ -133,6 +133,48 @@ impl CampfireMap {
     }
 }
 
+/// Value stored in `ShelterMap`. Carries the tier so `needs::tick_needs_system`
+/// can apply the right per-day relief + radius without a component lookup.
+#[derive(Clone, Copy, Debug)]
+pub struct ShelterEntry {
+    pub entity: Entity,
+    pub tier: ShelterTier,
+}
+
+/// Tile-keyed index of lightweight shelters (`LightShelter` lean-tos, `Tent`s,
+/// `Yurt`s). Populated at finalize + seed time, cleared on despawn/pack. Read
+/// by `needs::tick_needs_system` to relieve `needs.shelter` for agents the
+/// shelter covers. Mirrors `CampfireMap`'s warmth-lookup pattern.
+#[derive(Resource, Default)]
+pub struct ShelterMap(pub AHashMap<(i32, i32), ShelterEntry>);
+
+impl ShelterMap {
+    /// Strongest shelter (highest `relief_per_day`) whose `relief_radius`
+    /// covers `tile`, scanning the small chebyshev neighbourhood. Returns the
+    /// covering tier so the caller applies a single relief (no stacking).
+    pub fn strongest_covering(&self, tile: (i32, i32)) -> Option<ShelterTier> {
+        // Max shelter radius today is 1, so a 3×3 probe suffices. Kept as a
+        // const so a future larger-radius shelter only changes one line.
+        const MAX_SHELTER_RADIUS: i32 = 1;
+        let mut best: Option<ShelterTier> = None;
+        for dx in -MAX_SHELTER_RADIUS..=MAX_SHELTER_RADIUS {
+            for dy in -MAX_SHELTER_RADIUS..=MAX_SHELTER_RADIUS {
+                let Some(entry) = self.0.get(&(tile.0 + dx, tile.1 + dy)) else {
+                    continue;
+                };
+                let r = entry.tier.relief_radius() as i32;
+                if dx.abs().max(dy.abs()) > r {
+                    continue;
+                }
+                if best.map_or(true, |b| entry.tier.relief_per_day() > b.relief_per_day()) {
+                    best = Some(entry.tier);
+                }
+            }
+        }
+        best
+    }
+}
+
 /// Maps tile positions to active Blueprint entities (faction build reservations).
 #[derive(Resource, Default)]
 pub struct BlueprintMap(pub AHashMap<(i32, i32), Entity>);
@@ -391,6 +433,10 @@ pub fn on_structure_label_remove(
 #[derive(bevy::ecs::system::SystemParam)]
 pub struct FurnitureMaps<'w> {
     pub bed_map: ResMut<'w, BedMap>,
+    /// Read-only lightweight-shelter index, needed only to build the
+    /// `organic_view` for the seed pipeline's poor-shelter placement. Mutation
+    /// is owned by the `TentShelter` on_add/on_remove hooks, not this system.
+    pub shelter_map: Res<'w, ShelterMap>,
     /// `WallConstructed` writer. Bundled here so `construction_system` stays
     /// under Bevy's 16-param ceiling. Lives next to `WallMap` since the same
     /// system that mutates the map fires the event.
@@ -430,6 +476,12 @@ pub struct FurnitureMaps<'w> {
 /// can replace older tiers when the faction unlocks better tools.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BedTier {
+    /// Woven mat / hide on bare ground — the poor-housing sleep surface. Set
+    /// explicitly when a `BuildSiteKind::SleepingMat` finalises; `best_bed_for`
+    /// never returns it (it is an emergency-only tier, not a tech rung). Gives
+    /// `1.25×` sleep recovery in `sleep::sleep_task_system` — better than bare
+    /// ground (`1.0×`), worse than any framed bed (`2.0×`).
+    SleepingMat,
     /// Pile of leaves / hide. No tech required.
     #[default]
     Crude,
@@ -442,6 +494,7 @@ pub enum BedTier {
 impl BedTier {
     pub fn label(self) -> &'static str {
         match self {
+            BedTier::SleepingMat => "Sleeping Mat",
             BedTier::Crude => "Crude Bed",
             BedTier::Framed => "Framed Bed",
             BedTier::Carved => "Carved Bed",
@@ -449,9 +502,20 @@ impl BedTier {
     }
     pub fn rank(self) -> u8 {
         match self {
-            BedTier::Crude => 0,
-            BedTier::Framed => 1,
-            BedTier::Carved => 2,
+            BedTier::SleepingMat => 0,
+            BedTier::Crude => 1,
+            BedTier::Framed => 2,
+            BedTier::Carved => 3,
+        }
+    }
+
+    /// Sleep-recovery multiplier applied in `sleep::sleep_task_system`. A
+    /// sleeping mat is a partial comfort tier; every framed bed gives the full
+    /// historical `2.0×`.
+    pub fn sleep_recovery_mult(self) -> f32 {
+        match self {
+            BedTier::SleepingMat => 1.25,
+            BedTier::Crude | BedTier::Framed | BedTier::Carved => 2.0,
         }
     }
 }
@@ -823,18 +887,117 @@ pub enum BuildSiteKind {
     /// Finalises to a `vehicle::VehicleYard` entity. Tech-gated on
     /// `ANIMAL_HUSBANDRY`. See `plans/vehicle-system.md`.
     VehicleYard,
+    /// Poor-housing sleep surface: a woven mat or hide laid on the ground.
+    /// Finalises to a `Bed { tier: BedTier::SleepingMat }` so `HomeBed`
+    /// assignment + the sleep dispatcher treat it like any other bed, but it
+    /// only grants `1.25×` recovery. The emergency replacement for a bare
+    /// `Bed` blueprint in a settled village that can't procure wall material.
+    /// No tech gate. See `plans/realistic-poor-shelter.md`.
+    SleepingMat(SleepingMatMaterial),
+    /// Poor-housing lightweight shelter: a reed screen or thatch/brush lean-to.
+    /// Finalises to a `TentShelter { tier: ShelterTier::LeanTo }` registered in
+    /// `ShelterMap` + `StructureIndex` so it relieves the shelter need for
+    /// agents standing under it. Not packable. No tech gate.
+    LightShelter(LightShelterMaterial),
 }
 
-/// Marker component on tile entities representing portable shelter.
-/// Auras / sleep-comfort buffs land in a follow-on; for now this just
-/// tags the entity for inspector hover and pack/deploy filtering.
+/// Material a `BuildSiteKind::SleepingMat` is woven from. Drives the recipe
+/// (and therefore which scarce input the chief must procure) but every variant
+/// finalises to the same `BedTier::SleepingMat`. Selected by
+/// `organic_settlement::select_poor_shelter_material`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SleepingMatMaterial {
+    /// Absolute last resort — no materials, just a cleared patch of ground.
+    BareGround,
+    /// Woven from marsh reeds.
+    Reed,
+    /// Woven from grain-harvest thatch.
+    Thatch,
+    /// A laid-out animal hide.
+    Hide,
+}
+
+impl SleepingMatMaterial {
+    pub fn label(self) -> &'static str {
+        match self {
+            SleepingMatMaterial::BareGround => "Sleeping Spot",
+            SleepingMatMaterial::Reed => "Reed Mat",
+            SleepingMatMaterial::Thatch => "Thatch Mat",
+            SleepingMatMaterial::Hide => "Hide Mat",
+        }
+    }
+}
+
+/// Material a `BuildSiteKind::LightShelter` is built from. Every variant
+/// finalises to the same `ShelterTier::LeanTo`. Selected by
+/// `organic_settlement::select_poor_shelter_material`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LightShelterMaterial {
+    /// Woven reed windbreak.
+    ReedScreen,
+    /// Thatched lean-to on a light timber frame.
+    ThatchLeanTo,
+    /// Brush-and-branch lean-to.
+    BrushLeanTo,
+}
+
+impl LightShelterMaterial {
+    pub fn label(self) -> &'static str {
+        match self {
+            LightShelterMaterial::ReedScreen => "Reed Screen",
+            LightShelterMaterial::ThatchLeanTo => "Thatch Lean-To",
+            LightShelterMaterial::BrushLeanTo => "Brush Lean-To",
+        }
+    }
+}
+
+/// Marker component on tile entities representing a lightweight shelter
+/// (lean-to / tent / yurt). The `on_add` / `on_remove` hooks keep `ShelterMap`
+/// in sync across every spawn site (runtime finalize, seed pass, nomad camp,
+/// pitch labor) and every despawn/pack — the same pattern `StructureLabel`
+/// uses for `StructureIndex`. `needs::tick_needs_system` reads `ShelterMap` to
+/// relieve `needs.shelter` for agents the shelter covers.
 #[derive(Component, Clone, Copy, Debug)]
+#[component(on_add = on_tent_shelter_add, on_remove = on_tent_shelter_remove)]
 pub struct TentShelter {
     pub tier: ShelterTier,
 }
 
+fn on_tent_shelter_add(
+    mut world: bevy::ecs::world::DeferredWorld<'_>,
+    entity: Entity,
+    _: bevy::ecs::component::ComponentId,
+) {
+    let Some(transform) = world.get::<Transform>(entity).copied() else {
+        return;
+    };
+    let Some(tier) = world.get::<TentShelter>(entity).map(|s| s.tier) else {
+        return;
+    };
+    let tile = crate::world::terrain::world_to_tile(transform.translation.truncate());
+    let mut map = world.resource_mut::<ShelterMap>();
+    map.0.insert(tile, ShelterEntry { entity, tier });
+}
+
+fn on_tent_shelter_remove(
+    mut world: bevy::ecs::world::DeferredWorld<'_>,
+    entity: Entity,
+    _: bevy::ecs::component::ComponentId,
+) {
+    let Some(transform) = world.get::<Transform>(entity).copied() else {
+        return;
+    };
+    let tile = crate::world::terrain::world_to_tile(transform.translation.truncate());
+    let mut map = world.resource_mut::<ShelterMap>();
+    if map.0.get(&tile).map(|e| e.entity) == Some(entity) {
+        map.0.remove(&tile);
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ShelterTier {
+    /// Reed screen / thatch / brush lean-to — the settled poor-housing shelter.
+    LeanTo,
     Tent,
     Yurt,
 }
@@ -842,8 +1005,30 @@ pub enum ShelterTier {
 impl ShelterTier {
     pub fn label(self) -> &'static str {
         match self {
+            ShelterTier::LeanTo => "Lean-To",
             ShelterTier::Tent => "Tent",
             ShelterTier::Yurt => "Yurt",
+        }
+    }
+
+    /// Per-game-day `needs.shelter` relief granted to an agent the shelter
+    /// covers (consumed by `needs::tick_needs_system`). All tiers stay below
+    /// `SHELTER_FILL_PER_SCORE_PER_DAY` (one enclosure point) so a walled
+    /// house is always strictly better than the best lightweight shelter.
+    pub fn relief_per_day(self) -> f32 {
+        match self {
+            ShelterTier::LeanTo => 20.0,
+            ShelterTier::Tent => 24.0,
+            ShelterTier::Yurt => 26.0,
+        }
+    }
+
+    /// Chebyshev radius the shelter's relief reaches. A lean-to only shelters
+    /// its own tile; tents/yurts cover one ring (you can sit just outside).
+    pub fn relief_radius(self) -> u8 {
+        match self {
+            ShelterTier::LeanTo => 0,
+            ShelterTier::Tent | ShelterTier::Yurt => 1,
         }
     }
 }
@@ -876,6 +1061,8 @@ impl BuildSiteKind {
             BuildSiteKind::FeedTrough => "Feed Trough",
             BuildSiteKind::HitchingPost => "Hitching Post",
             BuildSiteKind::VehicleYard => "Vehicle Yard",
+            BuildSiteKind::SleepingMat(m) => m.label(),
+            BuildSiteKind::LightShelter(m) => m.label(),
         }
     }
 
@@ -1146,6 +1333,15 @@ enum BuildRecipeIdx {
     FeedTrough,
     HitchingPost,
     VehicleYard,
+    // Poor-housing primitives — appended last so existing discriminants stay
+    // stable. One recipe per material variant.
+    SleepingMatBareGround,
+    SleepingMatReed,
+    SleepingMatThatch,
+    SleepingMatHide,
+    LightShelterReedScreen,
+    LightShelterThatchLeanTo,
+    LightShelterBrushLeanTo,
 }
 
 fn build_recipes_table() -> Vec<BuildRecipe> {
@@ -1411,6 +1607,59 @@ fn build_recipes_table() -> Vec<BuildRecipe> {
             work_ticks: 120,
             tech_gate: Some(ANIMAL_HUSBANDRY),
             deconstruct_refund: vec![(wood, 6), (stone, 3)],
+        },
+        // --- Poor-housing primitives (see plans/realistic-poor-shelter.md) ---
+        // Sleeping mats: cheap, fast, no tech. BareGround is the free last
+        // resort; the woven tiers consume one cheap fibre.
+        BuildRecipe {
+            name: "Sleeping Spot",
+            inputs: vec![],
+            work_ticks: 15,
+            tech_gate: None,
+            deconstruct_refund: vec![],
+        },
+        BuildRecipe {
+            name: "Reed Mat",
+            inputs: vec![(reeds, 2)],
+            work_ticks: 20,
+            tech_gate: None,
+            deconstruct_refund: vec![],
+        },
+        BuildRecipe {
+            name: "Thatch Mat",
+            inputs: vec![(thatch, 2)],
+            work_ticks: 20,
+            tech_gate: None,
+            deconstruct_refund: vec![],
+        },
+        BuildRecipe {
+            name: "Hide Mat",
+            inputs: vec![(skin, 1)],
+            work_ticks: 20,
+            tech_gate: None,
+            deconstruct_refund: vec![(skin, 1)],
+        },
+        // Lightweight shelters: a reed screen, or a thatch/brush lean-to.
+        BuildRecipe {
+            name: "Reed Screen",
+            inputs: vec![(reeds, 3)],
+            work_ticks: 40,
+            tech_gate: None,
+            deconstruct_refund: vec![(reeds, 1)],
+        },
+        BuildRecipe {
+            name: "Thatch Lean-To",
+            inputs: vec![(thatch, 3), (wood, 1)],
+            work_ticks: 45,
+            tech_gate: None,
+            deconstruct_refund: vec![(wood, 1)],
+        },
+        BuildRecipe {
+            name: "Brush Lean-To",
+            inputs: vec![(wood, 2)],
+            work_ticks: 40,
+            tech_gate: None,
+            deconstruct_refund: vec![(wood, 1)],
         },
     ]
 }
@@ -1681,6 +1930,70 @@ pub fn select_wall_material(
     WallSelection::EmergencyShelter
 }
 
+/// What poor-housing materials a settled village in emergency shelter can
+/// build, picked from the cheap-fibre ladder against the same scarcity view
+/// the wall selector uses. `shelter` is the lightweight-shelter material to
+/// prefer (or `None` when not even brush is procurable); `mat` is the
+/// sleeping-mat surface (always resolvable — `BareGround` is the free floor).
+/// Returned by `select_poor_shelter_material`. See
+/// `plans/realistic-poor-shelter.md`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PoorShelterSelection {
+    pub shelter: Option<LightShelterMaterial>,
+    pub mat: SleepingMatMaterial,
+}
+
+/// Pick poor-housing materials from the reed → thatch → brush ladder. Mirrors
+/// `select_wall_material`'s scarcity walk: a `None` view (cold-start / seed)
+/// treats every input as gatherable; otherwise an input is "buildable" unless
+/// it is `Scarcity::Unavailable` (Available / Tight / Scarce all pass — Scarce
+/// is market-procurable). Includes no pending-blueprint accounting itself; the
+/// one-bp-per-window chief cadence plus the site picker's pending-aware spacing
+/// keep the chief from over-queueing one scarce input.
+pub fn select_poor_shelter_material(
+    avail: Option<&MaterialAvailabilityView>,
+) -> PoorShelterSelection {
+    use crate::economy::core_ids;
+    let reeds = core_ids::Reeds.get().copied();
+    let thatch = core_ids::Thatch.get().copied();
+    let wood = core_ids::wood();
+    let skin = core_ids::skin();
+
+    // An input is buildable unless the classifier has marked it Unavailable.
+    // A `None` id (catalog not initialised) reads as not-buildable.
+    let buildable = |rid: Option<crate::economy::resource_catalog::ResourceId>| -> bool {
+        let Some(rid) = rid else {
+            return false;
+        };
+        match avail {
+            None => true,
+            Some(v) => !matches!(v.scarcity_of(rid), Scarcity::Unavailable),
+        }
+    };
+
+    let shelter = if buildable(reeds) {
+        Some(LightShelterMaterial::ReedScreen)
+    } else if buildable(thatch) && buildable(Some(wood)) {
+        Some(LightShelterMaterial::ThatchLeanTo)
+    } else if buildable(Some(wood)) {
+        Some(LightShelterMaterial::BrushLeanTo)
+    } else {
+        None
+    };
+
+    let mat = if buildable(reeds) {
+        SleepingMatMaterial::Reed
+    } else if buildable(thatch) {
+        SleepingMatMaterial::Thatch
+    } else if buildable(Some(skin)) {
+        SleepingMatMaterial::Hide
+    } else {
+        SleepingMatMaterial::BareGround
+    };
+
+    PoorShelterSelection { shelter, mat }
+}
+
 /// Best bed tier the faction's tech bitset allows.
 pub fn best_bed_for(techs: &FactionTechs) -> BedTier {
     if techs.has(COPPER_TOOLS) {
@@ -1866,8 +2179,11 @@ pub fn gating_techs_for_completed_blueprint(bp: &Blueprint) -> Vec<TechId> {
         BuildSiteKind::Bed => match best_bed_for(techs) {
             BedTier::Carved => out.push(COPPER_TOOLS),
             BedTier::Framed => out.push(FLINT_KNAPPING),
-            BedTier::Crude => {}
+            BedTier::Crude | BedTier::SleepingMat => {}
         },
+        // Poor-housing primitives carry no tech gate — they are the emergency
+        // fallback when no wall material is procurable.
+        BuildSiteKind::SleepingMat(_) | BuildSiteKind::LightShelter(_) => {}
         BuildSiteKind::Door => match best_door_for(techs) {
             DoorTier::Reinforced => out.push(BRONZE_TOOLS),
             DoorTier::Plank => out.push(FLINT_KNAPPING),
@@ -2215,6 +2531,23 @@ pub fn recipe_for(kind: BuildSiteKind) -> &'static BuildRecipe {
         BuildSiteKind::FeedTrough => BuildRecipeIdx::FeedTrough,
         BuildSiteKind::HitchingPost => BuildRecipeIdx::HitchingPost,
         BuildSiteKind::VehicleYard => BuildRecipeIdx::VehicleYard,
+        BuildSiteKind::SleepingMat(SleepingMatMaterial::BareGround) => {
+            BuildRecipeIdx::SleepingMatBareGround
+        }
+        BuildSiteKind::SleepingMat(SleepingMatMaterial::Reed) => BuildRecipeIdx::SleepingMatReed,
+        BuildSiteKind::SleepingMat(SleepingMatMaterial::Thatch) => {
+            BuildRecipeIdx::SleepingMatThatch
+        }
+        BuildSiteKind::SleepingMat(SleepingMatMaterial::Hide) => BuildRecipeIdx::SleepingMatHide,
+        BuildSiteKind::LightShelter(LightShelterMaterial::ReedScreen) => {
+            BuildRecipeIdx::LightShelterReedScreen
+        }
+        BuildSiteKind::LightShelter(LightShelterMaterial::ThatchLeanTo) => {
+            BuildRecipeIdx::LightShelterThatchLeanTo
+        }
+        BuildSiteKind::LightShelter(LightShelterMaterial::BrushLeanTo) => {
+            BuildRecipeIdx::LightShelterBrushLeanTo
+        }
     };
     &build_recipes()[idx as usize]
 }
@@ -2414,90 +2747,6 @@ fn footprint_z_stats(chunk_map: &ChunkMap, cx: i32, cy: i32, half_w: i32, half_h
     let spread = (max_z - min_z).max(0).min(255) as u8;
     (mean.clamp(i8::MIN as i32, i8::MAX as i32) as i8, spread)
 }
-
-/// Returns true if every tile in the half_w × half_h footprint centred at (cx,cy)
-/// is passable, not a wall, and not reserved by an existing bed or blueprint.
-fn is_clear_footprint(
-    chunk_map: &ChunkMap,
-    bed_map: &BedMap,
-    bp_map: &BlueprintMap,
-    doormat: &crate::simulation::doormat::DoormatReservations,
-    cx: i32,
-    cy: i32,
-    half_w: i32,
-    half_h: i32,
-) -> bool {
-    for dy in -half_h..=half_h {
-        for dx in -half_w..=half_w {
-            let pos = ((cx + dx) as i32, (cy + dy) as i32);
-            if bp_map.0.contains_key(&pos) {
-                return false;
-            }
-            if bed_map.0.contains_key(&pos) {
-                return false;
-            }
-            if doormat.is_reserved(pos) {
-                return false;
-            }
-            let Some(kind) = chunk_map.tile_kind_at(cx + dx, cy + dy) else {
-                return false;
-            };
-            // Buildings never land on existing Roads — main thoroughfares
-            // must stay open. Without this gate a hut can plant its wall
-            // straight across a carved street, severing the network.
-            if !kind.is_passable() || kind == TileKind::Wall || kind == TileKind::Road {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-/// Step 7: emergency-shelter bed placement when every wall ladder rung is
-/// unobtainable (`select_wall_material → EmergencyShelter`). Picks a single
-/// clear tile on a deterministic outward sweep through an **era-keyed
-/// annulus** around `home` — Neolithic flings emergency beds to the
-/// outskirts/slum fringe, Chalcolithic packs work-yard bunk rows mid-ring,
-/// Bronze packs civic-overflow rows nearer the core. One era-parameterised
-/// finder rather than three near-duplicates (the annulus *is* the era
-/// distinction). Reuses `is_clear_footprint` (1×1) so it rejects roads,
-/// walls, water, blueprints, beds, and doormats exactly like every other
-/// placement helper. Determinism: the angular phase is seeded from the
-/// faction layout seed XOR `bed_count`, so successive emergency beds form a
-/// loose row instead of stacking on one bearing.
-pub(crate) fn find_emergency_bed_tile(
-    chunk_map: &ChunkMap,
-    bed_map: &BedMap,
-    bp_map: &BlueprintMap,
-    doormat: &crate::simulation::doormat::DoormatReservations,
-    home: (i32, i32),
-    era: Era,
-    layout_seed: u64,
-    bed_count: i32,
-) -> Option<(i32, i32)> {
-    let (inner, outer) = match era {
-        Era::Neolithic => (12, 32),   // outskirts / slum rows
-        Era::Chalcolithic => (8, 22), // work-yard bunk rows
-        _ => (6, 18),                 // Bronze: civic-overflow rows
-    };
-    let mut rng =
-        fastrand::Rng::with_seed(layout_seed ^ (bed_count as u64).wrapping_mul(0x9E37_79B9));
-    let base_ang = rng.f32() * std::f32::consts::TAU;
-    for r in inner..=outer {
-        let steps = (r * 6).max(8);
-        for s in 0..steps {
-            let ang = base_ang + (s as f32 / steps as f32) * std::f32::consts::TAU;
-            let tx = home.0 + (ang.cos() * r as f32).round() as i32;
-            let ty = home.1 + (ang.sin() * r as f32).round() as i32;
-            if is_clear_footprint(chunk_map, bed_map, bp_map, doormat, tx, ty, 0, 0) {
-                return Some((tx, ty));
-            }
-        }
-    }
-    None
-}
-
-
 
 /// Returns true if the footprint would straddle either cardinal corridor from the
 /// faction center — i.e. any tile in the footprint lies on `x = home.x` (N-S axis)
@@ -2848,6 +3097,7 @@ impl<'w> FurnitureMaps<'w> {
             bed_map: &*self.bed_map,
             wall_map: &*self.wall_map,
             campfire_map: &*self.campfire_map,
+            shelter_map: &*self.shelter_map,
             door_map: &*self.door_map,
             workbench_map: &*self.workbench_map,
             loom_map: &*self.loom_map,
@@ -5571,6 +5821,51 @@ pub fn construction_system(
                         .id();
                     e
                 }
+                // Poor-housing sleeping mat: a Bed at the SleepingMat tier so
+                // HomeBed assignment + sleep dispatch treat it like any bed,
+                // but it only grants 1.25× recovery. The label carries the
+                // material name (e.g. "Reed Mat") for hover/activity log.
+                BuildSiteKind::SleepingMat(mat) => {
+                    let bed = Bed {
+                        owner: None,
+                        tier: BedTier::SleepingMat,
+                        owning_faction: Some(bp.faction_id),
+                    };
+                    let _ = mat;
+                    let bed_entity = commands
+                        .spawn((
+                            bed,
+                            StructureLabel("Sleeping Mat"),
+                            Transform::from_xyz(world_pos.x, world_pos.y, 0.32),
+                            GlobalTransform::default(),
+                            Visibility::Visible,
+                            InheritedVisibility::default(),
+                            crate::world::spatial::Indexed::new(
+                                crate::world::spatial::IndexedKind::Bed,
+                            ),
+                        ))
+                        .id();
+                    maps.bed_map.0.insert(tile, bed_entity);
+                    bed_entity
+                }
+                // Poor-housing lightweight shelter: a LeanTo-tier TentShelter
+                // registered in ShelterMap (relief) + StructureIndex (via the
+                // StructureLabel hook, for MP replication). Not packable.
+                BuildSiteKind::LightShelter(_mat) => {
+                    let e = commands
+                        .spawn((
+                            TentShelter {
+                                tier: ShelterTier::LeanTo,
+                            },
+                            StructureLabel("Lean-To"),
+                            Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                            GlobalTransform::default(),
+                            Visibility::Visible,
+                            InheritedVisibility::default(),
+                        ))
+                        .id();
+                    e
+                }
                 BuildSiteKind::Campfire => {
                     // Manual / chief / autonomous Campfire finalize. Role
                     // comes from the blueprint (organic civic pressure +
@@ -7531,6 +7826,7 @@ fn spawn_seeded_structure_at_tile(
             maps.bed_map.0.insert(tile, e);
         }
         BuildSiteKind::Tent => {
+            // ShelterMap registration handled by the TentShelter on_add hook.
             commands.spawn((
                 TentShelter {
                     tier: ShelterTier::Tent,
@@ -7548,6 +7844,7 @@ fn spawn_seeded_structure_at_tile(
             ));
         }
         BuildSiteKind::Yurt => {
+            // ShelterMap registration handled by the TentShelter on_add hook.
             commands.spawn((
                 TentShelter {
                     tier: ShelterTier::Yurt,
@@ -7556,6 +7853,40 @@ fn spawn_seeded_structure_at_tile(
                     crate::economy::core_ids::packed_yurt(),
                 ),
                 StructureLabel("Yurt"),
+                Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                InheritedVisibility::default(),
+            ));
+        }
+        // Poor-housing primitives at seed time (emergency shelter pressure in
+        // an Established/Developed start that can't procure wall material).
+        BuildSiteKind::SleepingMat(_) => {
+            let bed = Bed {
+                owner: None,
+                tier: BedTier::SleepingMat,
+                owning_faction: Some(faction_id),
+            };
+            let e = commands
+                .spawn((
+                    bed,
+                    StructureLabel("Sleeping Mat"),
+                    Transform::from_xyz(world_pos.x, world_pos.y, 0.32),
+                    GlobalTransform::default(),
+                    Visibility::Visible,
+                    InheritedVisibility::default(),
+                    crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Bed),
+                ))
+                .id();
+            maps.bed_map.0.insert(tile, e);
+        }
+        BuildSiteKind::LightShelter(_) => {
+            // ShelterMap registration handled by the TentShelter on_add hook.
+            commands.spawn((
+                TentShelter {
+                    tier: ShelterTier::LeanTo,
+                },
+                StructureLabel("Lean-To"),
                 Transform::from_xyz(world_pos.x, world_pos.y, 0.4),
                 GlobalTransform::default(),
                 Visibility::Visible,
@@ -8639,6 +8970,13 @@ fn seed_yurts_around_hearth(
     }
 }
 
+/// Lay an **open forager-camp** bedding ring around a Paleolithic/Mesolithic
+/// band-camp hearth: a concentric Chebyshev ring of `Bed { tier: Crude }`s.
+/// This is the historically-appropriate mobile-band sleeping arrangement and
+/// is **distinct from the settled poor-housing path** — it deliberately does
+/// NOT route through `organic_settlement::poor_shelter_intent` (lean-tos /
+/// sleeping mats), which is reserved for Neolithic+ villages that can't
+/// procure wall material. Open camps never emit settled poor shelters.
 fn seed_paleo_beds_around_hearth(
     commands: &mut Commands,
     maps: &mut FurnitureMaps,
@@ -9248,6 +9586,131 @@ mod tests {
             select_wall_material(&t, Some(&v)),
             WallSelection::EmergencyShelter
         );
+    }
+
+    // ── Poor-housing (plans/realistic-poor-shelter.md) ───────────────────
+
+    fn poor_ids() -> (
+        crate::economy::resource_catalog::ResourceId,
+        crate::economy::resource_catalog::ResourceId,
+        crate::economy::resource_catalog::ResourceId,
+        crate::economy::resource_catalog::ResourceId,
+    ) {
+        let _ = core_ids::catalog();
+        (
+            *core_ids::Reeds.get().expect("reeds"),
+            *core_ids::Thatch.get().expect("thatch"),
+            core_ids::wood(),
+            core_ids::skin(),
+        )
+    }
+
+    #[test]
+    fn poor_shelter_material_ladder_reed_thatch_brush_bareground() {
+        let (reeds, thatch, wood, skin) = poor_ids();
+
+        // Reeds available → reed screen + reed mat.
+        let v = view_with(&[(reeds, Scarcity::Available)]);
+        let s = select_poor_shelter_material(Some(&v));
+        assert_eq!(s.shelter, Some(LightShelterMaterial::ReedScreen));
+        assert_eq!(s.mat, SleepingMatMaterial::Reed);
+
+        // Reeds gone, thatch + wood available → thatch lean-to + thatch mat.
+        let v = view_with(&[(thatch, Scarcity::Available), (wood, Scarcity::Available)]);
+        let s = select_poor_shelter_material(Some(&v));
+        assert_eq!(s.shelter, Some(LightShelterMaterial::ThatchLeanTo));
+        assert_eq!(s.mat, SleepingMatMaterial::Thatch);
+
+        // Only wood → brush lean-to; no fibre → hide if available else bare.
+        let v = view_with(&[(wood, Scarcity::Available), (skin, Scarcity::Available)]);
+        let s = select_poor_shelter_material(Some(&v));
+        assert_eq!(s.shelter, Some(LightShelterMaterial::BrushLeanTo));
+        assert_eq!(s.mat, SleepingMatMaterial::Hide);
+
+        // Everything unavailable → no shelter, bare-ground mat (last resort).
+        let v = MaterialAvailabilityView::default();
+        let s = select_poor_shelter_material(Some(&v));
+        assert_eq!(s.shelter, None);
+        assert_eq!(s.mat, SleepingMatMaterial::BareGround);
+    }
+
+    #[test]
+    fn poor_shelter_scarce_input_still_buildable() {
+        // A `Scarce` (market-procurable) input must still count as buildable —
+        // mirrors `select_wall_material` treating Scarce as not-Unavailable.
+        let (reeds, ..) = poor_ids();
+        let v = view_with(&[(reeds, Scarcity::Scarce)]);
+        let s = select_poor_shelter_material(Some(&v));
+        assert_eq!(s.shelter, Some(LightShelterMaterial::ReedScreen));
+    }
+
+    #[test]
+    fn sleeping_mat_recovery_mult_is_graduated() {
+        assert_eq!(BedTier::SleepingMat.sleep_recovery_mult(), 1.25);
+        assert_eq!(BedTier::Crude.sleep_recovery_mult(), 2.0);
+        assert_eq!(BedTier::Framed.sleep_recovery_mult(), 2.0);
+        assert_eq!(BedTier::Carved.sleep_recovery_mult(), 2.0);
+    }
+
+    #[test]
+    fn best_bed_never_returns_sleeping_mat() {
+        // SleepingMat is emergency-only; the tech-driven picker must never
+        // resolve to it regardless of tech level.
+        for era in [
+            Era::Paleolithic,
+            Era::Mesolithic,
+            Era::Neolithic,
+            Era::Chalcolithic,
+            Era::BronzeAge,
+        ] {
+            assert_ne!(best_bed_for(&techs_through_era(era)), BedTier::SleepingMat);
+        }
+    }
+
+    #[test]
+    fn shelter_tier_relief_below_one_enclosure_point() {
+        // Every lightweight shelter must give less relief than a single
+        // enclosure point so a walled house stays strictly better.
+        for tier in [ShelterTier::LeanTo, ShelterTier::Tent, ShelterTier::Yurt] {
+            assert!(tier.relief_per_day() < 27.0, "{:?}", tier);
+        }
+        // Ordering: lean-to < tent < yurt.
+        assert!(ShelterTier::LeanTo.relief_per_day() < ShelterTier::Tent.relief_per_day());
+        assert!(ShelterTier::Tent.relief_per_day() < ShelterTier::Yurt.relief_per_day());
+    }
+
+    #[test]
+    fn shelter_map_strongest_covering_picks_strongest_in_radius() {
+        let mut m = ShelterMap::default();
+        // Lean-to directly under the agent (radius 0).
+        m.0.insert(
+            (0, 0),
+            ShelterEntry {
+                entity: Entity::from_raw(1),
+                tier: ShelterTier::LeanTo,
+            },
+        );
+        assert_eq!(m.strongest_covering((0, 0)), Some(ShelterTier::LeanTo));
+        // A yurt one tile away (radius 1) covers the agent and outranks the
+        // lean-to.
+        m.0.insert(
+            (1, 0),
+            ShelterEntry {
+                entity: Entity::from_raw(2),
+                tier: ShelterTier::Yurt,
+            },
+        );
+        assert_eq!(m.strongest_covering((0, 0)), Some(ShelterTier::Yurt));
+        // A lean-to (radius 0) two tiles away does NOT cover the agent.
+        let mut m2 = ShelterMap::default();
+        m2.0.insert(
+            (2, 0),
+            ShelterEntry {
+                entity: Entity::from_raw(3),
+                tier: ShelterTier::LeanTo,
+            },
+        );
+        assert_eq!(m2.strongest_covering((0, 0)), None);
     }
 
     // ── Settlement realism: door connector (cardinal) ─────────────────

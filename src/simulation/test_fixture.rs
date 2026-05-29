@@ -20435,53 +20435,52 @@ mod onenter_era_seeding {
         (pid, home)
     }
 
-    /// Step 7 end-to-end: a Neolithic band with a runtime shelter deficit and
-    /// **no obtainable wall material** (flat grass → nothing gatherable, no
-    /// market stock, empty treasury) must emit an era-appropriate emergency
-    /// `Bed` blueprint on the outskirts annulus (r≈12..32) — never a Paleo
-    /// crescent bed (r≈2..6) and never an indefinite stall.
+    /// Poor-housing end-to-end (`plans/realistic-poor-shelter.md`): a Neolithic
+    /// band with a runtime shelter deficit and **no obtainable wall material**
+    /// (flat grass → nothing gatherable, no market stock, empty treasury) must
+    /// emit poor-housing primitives (`SleepingMat` / `LightShelter`) — NOT a
+    /// bare exposed `Bed` blueprint (the old unrealistic fallback), and never
+    /// an indefinite stall. On bare flat grass even brush/fibre is Unavailable,
+    /// so the floor is a bare-ground `SleepingMat`.
     #[test]
-    fn neolithic_emergency_outskirts_bed_when_no_materials() {
+    fn neolithic_emergency_poor_shelter_when_no_materials() {
         use crate::simulation::construction::{Blueprint, BuildSiteKind};
 
         let mut sim = fixture_with_flat_world();
         configure_start(&mut sim, Era::Neolithic);
         trigger_onenter(&mut sim);
-        let (_pid, home) = open_runtime_bed_deficit(&mut sim);
+        let (_pid, _home) = open_runtime_bed_deficit(&mut sim);
 
-        let mut saw_outskirts_bed = false;
-        let mut saw_crescent_bed = false;
+        let mut saw_poor_shelter = false;
+        let mut saw_bare_bed = false;
         // Past several classifier (60) + chief-directive (60) windows; the
         // organic pressure→intent→spawn chain needs the survey-paced cadence.
-        // Bumped to 2400 post-volume-overhaul (capacity-driven haul qty
-        // shifts settlement workforce balance + classifier timing).
         for _ in 0..2400 {
             sim.tick();
             let w = sim.app.world_mut();
             for bp in w.query::<&Blueprint>().iter(w) {
-                if bp.kind != BuildSiteKind::Bed {
-                    continue;
-                }
-                let dx = (bp.tile.0 - home.0) as f32;
-                let dy = (bp.tile.1 - home.1) as f32;
-                let d = (dx * dx + dy * dy).sqrt();
-                if d <= 8.0 {
-                    saw_crescent_bed = true;
-                } else if (10.0..=34.0).contains(&d) {
-                    saw_outskirts_bed = true;
+                match bp.kind {
+                    BuildSiteKind::SleepingMat(_) | BuildSiteKind::LightShelter(_) => {
+                        saw_poor_shelter = true;
+                    }
+                    // A bare `Bed` is the old emergency fallback — must never
+                    // be the emergency-shelter intent for a settled village.
+                    BuildSiteKind::Bed => saw_bare_bed = true,
+                    _ => {}
                 }
             }
         }
 
         assert!(
-            !saw_crescent_bed,
-            "Neolithic emergency must NOT use the Paleo crescent (r≈2..6) — \
-             that branch is era-gated off and would be a regression."
+            !saw_bare_bed,
+            "Neolithic emergency shelter must NOT emit a bare exposed Bed \
+             blueprint — that was the unrealistic fallback being replaced."
         );
         assert!(
-            saw_outskirts_bed,
-            "Neolithic band with a runtime bed deficit and no obtainable wall \
-             material must emit an emergency outskirts Bed (r≈12..32); none seen."
+            saw_poor_shelter,
+            "Neolithic band with a runtime shelter deficit and no obtainable \
+             wall material must emit poor-housing primitives (SleepingMat / \
+             LightShelter); none seen."
         );
     }
 

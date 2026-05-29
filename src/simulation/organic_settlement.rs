@@ -15,7 +15,7 @@ use crate::game_state::StartSettlementMaturity;
 use crate::simulation::building_template::{FootprintShape, Rotation};
 use crate::simulation::civic_milestones::{civic_milestone_allows, should_seed_civic, CivicKind};
 use crate::simulation::construction::{
-    best_wall_material, faction_can_build, find_emergency_bed_tile, recipe_for,
+    best_wall_material, faction_can_build, recipe_for,
     select_wall_material, BarracksMap, BedMap, Blueprint, BlueprintMap, BuildSiteKind, CampfireMap,
     DamMap, DoorMap, GranaryMap, LoomMap, MarketMap, MonumentMap, RoadCarveQueue, ShrineMap,
     StructureIndex, TableMap, WallMap, WallMaterial, WallSelection, WellMap, WorkbenchMap,
@@ -575,6 +575,7 @@ pub struct OrganicStructureMapsParam<'w> {
     pub bed_map: Res<'w, BedMap>,
     pub wall_map: Res<'w, WallMap>,
     pub campfire_map: Res<'w, CampfireMap>,
+    pub shelter_map: Res<'w, crate::simulation::construction::ShelterMap>,
     pub door_map: Res<'w, DoorMap>,
     pub workbench_map: Res<'w, WorkbenchMap>,
     pub loom_map: Res<'w, LoomMap>,
@@ -596,6 +597,7 @@ impl<'w> OrganicStructureMapsParam<'w> {
             bed_map: &*self.bed_map,
             wall_map: &*self.wall_map,
             campfire_map: &*self.campfire_map,
+            shelter_map: &*self.shelter_map,
             door_map: &*self.door_map,
             workbench_map: &*self.workbench_map,
             loom_map: &*self.loom_map,
@@ -620,6 +622,7 @@ pub struct OrganicStructureMaps<'a> {
     pub bed_map: &'a BedMap,
     pub wall_map: &'a WallMap,
     pub campfire_map: &'a CampfireMap,
+    pub shelter_map: &'a crate::simulation::construction::ShelterMap,
     pub door_map: &'a DoorMap,
     pub workbench_map: &'a WorkbenchMap,
     pub loom_map: &'a LoomMap,
@@ -3549,6 +3552,249 @@ pub(crate) fn append_pressures_for_faction(
     }
 }
 
+/// Maximum sleeping mats clustered around one lean-to before the chief starts
+/// a fresh lean-to elsewhere — the emergent poor-housing cluster shape (see
+/// `plans/realistic-poor-shelter.md`).
+const MATS_PER_LEANTO: usize = 2;
+/// Chebyshev radius around `home_tile` treated as "this village" when scanning
+/// existing lean-tos / mats / pending blueprints for the cluster + spacing.
+const POOR_SHELTER_VILLAGE_RADIUS: i32 = 64;
+
+/// Per-era preferred chebyshev spacing between poor-shelter sleep spots on the
+/// annulus fallback. Relaxed one step at a time down to 1 if no site fits.
+fn poor_shelter_era_spacing(era: Era) -> i32 {
+    match era {
+        Era::Neolithic => 5,
+        Era::Chalcolithic => 4,
+        _ => 3,
+    }
+}
+
+/// Era-keyed emergency-housing annulus (inner, outer) around home — wider for
+/// Neolithic (slum fringe), tighter for Bronze (civic-overflow rows). Mirrors
+/// the legacy `find_emergency_bed_tile` radii.
+fn poor_shelter_annulus(era: Era) -> (i32, i32) {
+    match era {
+        Era::Neolithic => (12, 32),
+        Era::Chalcolithic => (8, 22),
+        _ => (6, 18),
+    }
+}
+
+/// Spacing anchors for poor-shelter placement: every built lean-to, every bed
+/// (built mats included), and every pending blueprint within
+/// `POOR_SHELTER_VILLAGE_RADIUS` of home. Pending blueprints are folded in so
+/// successive queued shelters spread out before any finishes.
+fn poor_shelter_anchors(
+    maps: &OrganicStructureMaps,
+    bp_map: &BlueprintMap,
+    home: (i32, i32),
+) -> Vec<(i32, i32)> {
+    let mut v: Vec<(i32, i32)> = Vec::new();
+    for (t, e) in maps.shelter_map.0.iter() {
+        if e.tier == crate::simulation::construction::ShelterTier::LeanTo
+            && cheb(*t, home) <= POOR_SHELTER_VILLAGE_RADIUS
+        {
+            v.push(*t);
+        }
+    }
+    for t in maps.bed_map.0.keys() {
+        if cheb(*t, home) <= POOR_SHELTER_VILLAGE_RADIUS {
+            v.push(*t);
+        }
+    }
+    for t in bp_map.0.keys() {
+        if cheb(*t, home) <= POOR_SHELTER_VILLAGE_RADIUS {
+            v.push(*t);
+        }
+    }
+    v
+}
+
+/// Annulus fallback for poor-shelter placement when no residential parcel fits.
+/// Deterministic angular sweep (phase seeded from layout hash XOR `salt`) over
+/// the era-keyed annulus, enforcing pending-aware spacing relaxed one step at a
+/// time from the era preference down to 1.
+#[allow(clippy::too_many_arguments)]
+fn find_poor_shelter_annulus(
+    chunk_map: &ChunkMap,
+    brain: &SettlementBrain,
+    maps: &OrganicStructureMaps,
+    bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
+    occupied: &AHashSet<(i32, i32)>,
+    build_kind: OrganicBuildKind,
+    home: (i32, i32),
+    era: Era,
+    layout_seed: u64,
+    salt: u64,
+    anchors: &[(i32, i32)],
+) -> Option<(i32, i32)> {
+    use std::f32::consts::TAU;
+    let (inner, outer) = poor_shelter_annulus(era);
+    let base_spacing = poor_shelter_era_spacing(era);
+    let mut rng = fastrand::Rng::with_seed(layout_seed ^ salt.wrapping_mul(0x9E37_79B9));
+    let base_ang = rng.f32() * TAU;
+    for spacing in (1..=base_spacing).rev() {
+        for r in inner..=outer {
+            let steps = (r * 6).max(8);
+            for s in 0..steps {
+                let ang = base_ang + (s as f32 / steps as f32) * TAU;
+                let tx = home.0 + (ang.cos() * r as f32).round() as i32;
+                let ty = home.1 + (ang.sin() * r as f32).round() as i32;
+                let t = (tx, ty);
+                if occupied.contains(&t) {
+                    continue;
+                }
+                if !intent_site_clear(build_kind, t, chunk_map, maps, bp_map, doormat, brain) {
+                    continue;
+                }
+                if anchors.iter().any(|a| cheb(t, *a) < spacing) {
+                    continue;
+                }
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
+/// Pick a placement tile for a poor-housing primitive. Residential parcels
+/// first (commons / road / distance-band / reachability all honoured by
+/// `choose_site_for_intent`, and parcels are inter-spaced so successive
+/// lean-tos land on distinct lots), then an era annulus with pending-aware
+/// spacing.
+#[allow(clippy::too_many_arguments)]
+fn find_poor_shelter_site(
+    faction: &FactionData,
+    brain: &SettlementBrain,
+    district: DistrictKind,
+    build_kind: OrganicBuildKind,
+    chunk_map: &ChunkMap,
+    maps: &OrganicStructureMaps,
+    bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
+    occupied: &AHashSet<(i32, i32)>,
+    road_field: &crate::simulation::placement_reachability::RoadField,
+    era: Era,
+    seed_mode: bool,
+    salt: u64,
+) -> Option<(i32, i32)> {
+    if let Some(tile) = choose_site_for_intent(
+        faction, brain, district, build_kind, chunk_map, maps, bp_map, doormat, occupied, seed_mode,
+        road_field,
+    ) {
+        return Some(tile);
+    }
+    let anchors = poor_shelter_anchors(maps, bp_map, faction.home_tile);
+    find_poor_shelter_annulus(
+        chunk_map,
+        brain,
+        maps,
+        bp_map,
+        doormat,
+        occupied,
+        build_kind,
+        faction.home_tile,
+        era,
+        brain.layout_hash,
+        salt,
+        &anchors,
+    )
+}
+
+/// Emergent poor-housing intent for a settled village that can't procure wall
+/// material. Fills an existing lean-to with up to `MATS_PER_LEANTO` adjacent
+/// sleeping mats before starting a fresh lean-to; only lays a bare mat when no
+/// shelter material is procurable. Returns the `(build_kind, tile)` to emit.
+#[allow(clippy::too_many_arguments)]
+fn poor_shelter_intent(
+    faction: &FactionData,
+    brain: &SettlementBrain,
+    chunk_map: &ChunkMap,
+    maps: &OrganicStructureMaps,
+    bp_map: &BlueprintMap,
+    doormat: &crate::simulation::doormat::DoormatReservations,
+    occupied: &mut AHashSet<(i32, i32)>,
+    district: DistrictKind,
+    road_field: &crate::simulation::placement_reachability::RoadField,
+    era: Era,
+    selection: crate::simulation::construction::PoorShelterSelection,
+    seed_mode: bool,
+) -> Option<(OrganicBuildKind, (i32, i32))> {
+    let home = faction.home_tile;
+    let mat_kind = OrganicBuildKind::Single(BuildSiteKind::SleepingMat(selection.mat));
+
+    // 1. Fill an existing lean-to that has fewer than MATS_PER_LEANTO mats
+    //    (approximated as beds within chebyshev 1). Deterministic order.
+    let mut leantos: Vec<(i32, i32)> = maps
+        .shelter_map
+        .0
+        .iter()
+        .filter(|(t, e)| {
+            e.tier == crate::simulation::construction::ShelterTier::LeanTo
+                && cheb(**t, home) <= POOR_SHELTER_VILLAGE_RADIUS
+        })
+        .map(|(t, _)| *t)
+        .collect();
+    leantos.sort_unstable();
+    for lt in &leantos {
+        let mats_here = (-1..=1)
+            .flat_map(|dx| (-1..=1).map(move |dy| (dx, dy)))
+            .filter(|(dx, dy)| !(*dx == 0 && *dy == 0))
+            .filter(|(dx, dy)| maps.bed_map.0.contains_key(&(lt.0 + dx, lt.1 + dy)))
+            .count();
+        if mats_here >= MATS_PER_LEANTO {
+            continue;
+        }
+        // Adjacent clear tile for the mat, cardinal first.
+        const RING: [(i32, i32); 8] = [
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (1, -1),
+            (-1, 1),
+            (-1, -1),
+        ];
+        for (dx, dy) in RING {
+            let t = (lt.0 + dx, lt.1 + dy);
+            if occupied.contains(&t) {
+                continue;
+            }
+            if intent_site_clear(mat_kind, t, chunk_map, maps, bp_map, doormat, brain) {
+                occupied.insert(t);
+                return Some((mat_kind, t));
+            }
+        }
+    }
+
+    // 2. No lean-to needs filling. If shelter material is procurable, start a
+    //    fresh lean-to at a residential site spaced from existing/pending ones.
+    if let Some(shelter_mat) = selection.shelter {
+        let shelter_kind = OrganicBuildKind::Single(BuildSiteKind::LightShelter(shelter_mat));
+        if let Some(tile) = find_poor_shelter_site(
+            faction, brain, district, shelter_kind, chunk_map, maps, bp_map, doormat, occupied,
+            road_field, era, seed_mode, 0x5EED,
+        ) {
+            occupied.insert(tile);
+            return Some((shelter_kind, tile));
+        }
+    }
+
+    // 3. Last resort: a (possibly bare-ground) sleeping mat on a fresh spaced
+    //    site — better than a bare exposed bed in a field.
+    if let Some(tile) = find_poor_shelter_site(
+        faction, brain, district, mat_kind, chunk_map, maps, bp_map, doormat, occupied, road_field,
+        era, seed_mode, 0x0A7,
+    ) {
+        occupied.insert(tile);
+        return Some((mat_kind, tile));
+    }
+    None
+}
+
 pub(crate) fn pressure_to_intent(
     faction: &FactionData,
     brain: &SettlementBrain,
@@ -3600,13 +3846,38 @@ pub(crate) fn pressure_to_intent(
     let shelter_emergency = matches!(pressure.kind, SettlementPressureKind::Shelter)
         && community_techs.has(PERM_SETTLEMENT)
         && matches!(wall_sel, WallSelection::EmergencyShelter);
+    // Emergency settled shelter no longer drops a bare exposed `Bed`. Resolve
+    // the poor-housing primitive (lean-to / sleeping mat) and its tile together
+    // via the emergent-cluster picker, then fall through to the shared intent
+    // tail. `None` here (no procurable material AND no site) defers the intent.
+    let emergency_poor = if shelter_emergency {
+        let selection = crate::simulation::construction::select_poor_shelter_material(view_opt);
+        Some(poor_shelter_intent(
+            faction,
+            brain,
+            chunk_map,
+            maps,
+            bp_map,
+            doormat,
+            occupied,
+            district_for_pressure(SettlementPressureKind::Shelter),
+            road_field,
+            era,
+            selection,
+            seed_mode,
+        )?)
+    } else {
+        None
+    };
     let build_kind = match pressure.kind {
         SettlementPressureKind::Hearth => OrganicBuildKind::Single(BuildSiteKind::Campfire),
         SettlementPressureKind::Shelter if !community_techs.has(PERM_SETTLEMENT) => {
             OrganicBuildKind::Single(BuildSiteKind::Bed)
         }
         SettlementPressureKind::Shelter if shelter_emergency => {
-            OrganicBuildKind::Single(BuildSiteKind::Bed)
+            // Safe: emergency_poor is Some whenever shelter_emergency holds
+            // (the `?` above returned early otherwise).
+            emergency_poor.expect("emergency_poor set when shelter_emergency").0
         }
         SettlementPressureKind::Shelter => {
             shelter_kind(
@@ -3656,17 +3927,8 @@ pub(crate) fn pressure_to_intent(
         }
     } else {
         let tile = if shelter_emergency {
-            let bed_count = count_near(&maps.bed_map.0, faction.home_tile, 32) as i32;
-            find_emergency_bed_tile(
-                chunk_map,
-                &maps.bed_map,
-                bp_map,
-                doormat,
-                faction.home_tile,
-                era,
-                brain.layout_hash,
-                bed_count,
-            )
+            // Tile already resolved by the emergent-cluster picker above.
+            Some(emergency_poor.expect("emergency_poor set when shelter_emergency").1)
         } else if matches!(pressure.kind, SettlementPressureKind::Defense) {
             organic_palisade_site(chunk_map, maps, bp_map, doormat, brain, faction.home_tile)
         } else {

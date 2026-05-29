@@ -193,6 +193,8 @@ I want to add a lot more plant varieties to the game, plants that would be nativ
 
 I want to add a lot more animal varieties to the game, animals that would be native to different biomes and were historically useful for human development. I want every biome to have at least a few unique native animals, so there is more incentive for exploration.
 
+We don't have enough building wall options for each era. It doesn't make sense to only have wattle and daub for paleolithic when a lot of places don't even have reeds.
+
 I want the plant and animal seeding to be more natural and realistic to real life.
 
 

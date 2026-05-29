@@ -253,6 +253,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(construction::BedMap::default())
             .insert_resource(construction::WallMap::default())
             .insert_resource(construction::CampfireMap::default())
+            .insert_resource(construction::ShelterMap::default())
             .insert_resource(construction::DoorMap::default())
             .insert_resource(capital::WorkshopOwnership::default())
             .insert_resource(sanitation::SanitationMap::default())

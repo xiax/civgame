@@ -6,8 +6,8 @@ use crate::simulation::vehicle::{
     Vehicle, VehicleData, VehicleDesign, VehicleDesignRegistry, VehiclePartKind, VehicleVisual,
 };
 use crate::simulation::construction::{
-    Bed, Blueprint, BuildSiteKind, Campfire, Chair, Door, Loom, Table, Wall, WallMaterial, Well,
-    Workbench,
+    Bed, Blueprint, BuildSiteKind, Campfire, Chair, Door, Loom, ShelterTier, Table, TentShelter,
+    Wall, WallMaterial, Well, Workbench,
 };
 use crate::simulation::faction::{
     FactionCenter, FactionMember, PlayerFaction, PlayerFactionMarker,
@@ -112,6 +112,9 @@ pub struct LoomVisual;
 
 #[derive(Component)]
 pub struct WellVisual;
+
+#[derive(Component)]
+pub struct TentShelterVisual;
 
 #[derive(Component)]
 pub struct GroundItemVisual;
@@ -225,11 +228,21 @@ impl FacingDirection {
 
 pub fn spawn_bed_sprites(
     mut commands: Commands,
-    query: Query<Entity, (With<Bed>, Without<BedVisual>)>,
+    query: Query<(Entity, &Bed), Without<BedVisual>>,
     textures: Res<EntityTextures>,
+    sprite_lib: Res<SpriteLibrary>,
 ) {
-    for entity in query.iter() {
-        let img = textures.bed_ascii.clone();
+    for (entity, bed) in query.iter() {
+        // A poor-housing sleeping mat finalises as a Bed at the SleepingMat
+        // tier; render it as a flat woven mat, not a bed frame.
+        let img = if bed.tier == crate::simulation::construction::BedTier::SleepingMat {
+            sprite_lib
+                .get("building_sleeping_mat")
+                .cloned()
+                .unwrap_or_else(|| textures.bed_ascii.clone())
+        } else {
+            textures.bed_ascii.clone()
+        };
 
         let mut sprite = Sprite::from_image(img);
         sprite.anchor = Anchor::BottomCenter;
@@ -994,6 +1007,43 @@ pub fn spawn_well_sprites(
         commands
             .entity(entity)
             .insert((WellVisual, EntityFogState::default(), FogPersistent));
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                VisualChild,
+                sprite,
+                Transform::from_xyz(0.0, -8.0, 0.1),
+                GlobalTransform::default(),
+                Visibility::Inherited,
+                InheritedVisibility::default(),
+            ));
+        });
+    }
+}
+
+/// Render finished lightweight shelters (lean-to / tent / yurt). Each
+/// `ShelterTier` maps to its own procedural pixel sprite; falls back to the
+/// palisade-wall sprite only if the art isn't registered.
+pub fn spawn_tent_shelter_sprites(
+    mut commands: Commands,
+    query: Query<(Entity, &TentShelter), Without<TentShelterVisual>>,
+    textures: Res<EntityTextures>,
+    sprite_lib: Res<SpriteLibrary>,
+) {
+    for (entity, shelter) in query.iter() {
+        let key = match shelter.tier {
+            ShelterTier::LeanTo => "building_lean_to",
+            ShelterTier::Tent => "building_tent",
+            ShelterTier::Yurt => "building_yurt",
+        };
+        let img = sprite_lib
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| textures.wall_palisade_ascii.clone());
+        let mut sprite = Sprite::from_image(img);
+        sprite.anchor = Anchor::BottomCenter;
+        commands
+            .entity(entity)
+            .insert((TentShelterVisual, EntityFogState::default(), FogPersistent));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 VisualChild,
@@ -2446,8 +2496,14 @@ pub fn spawn_blueprint_sprites(
             // Bedroll reuses the bed sprite for now — Phase 9 ships proper
             // procedural pixel art for nomadic kit.
             BuildSiteKind::Bedroll => textures.bed_ascii.clone(),
-            // Stub: Tent + Yurt reuse a wall sprite until proper art ships.
-            BuildSiteKind::Tent | BuildSiteKind::Yurt => textures.wall_palisade_ascii.clone(),
+            BuildSiteKind::Tent => sprite_lib
+                .get("building_tent")
+                .cloned()
+                .unwrap_or_else(|| textures.wall_palisade_ascii.clone()),
+            BuildSiteKind::Yurt => sprite_lib
+                .get("building_yurt")
+                .cloned()
+                .unwrap_or_else(|| textures.wall_palisade_ascii.clone()),
             BuildSiteKind::Campfire => textures.campfire_ascii.clone(),
             BuildSiteKind::Workbench => textures.workbench_ascii.clone(),
             BuildSiteKind::Loom => textures.loom_ascii.clone(),
@@ -2479,6 +2535,17 @@ pub fn spawn_blueprint_sprites(
             // Stub: a vehicle yard reads as a timber work-area — reuse the
             // workbench sprite until dedicated art ships.
             BuildSiteKind::VehicleYard => textures.workbench_ascii.clone(),
+            // Poor-housing primitives: a flat mat (not a bed frame) and a
+            // lean-to windbreak (not a wall). Fall back to the closest legacy
+            // sprite if the procedural art isn't registered.
+            BuildSiteKind::SleepingMat(_) => sprite_lib
+                .get("building_sleeping_mat")
+                .cloned()
+                .unwrap_or_else(|| textures.bed_ascii.clone()),
+            BuildSiteKind::LightShelter(_) => sprite_lib
+                .get("building_lean_to")
+                .cloned()
+                .unwrap_or_else(|| textures.wall_palisade_ascii.clone()),
         };
 
         let mut ghost_sprite = Sprite::from_image(ghost_img);
