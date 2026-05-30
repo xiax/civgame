@@ -1,0 +1,36 @@
+{
+  "group_id": null,
+  "states": [
+    {
+      "character": {
+        "id": "012623cb-83e1-48d1-99d4-8558a85d240b",
+        "name": "rabbit with long ears and bun tail",
+        "prompt": "rabbit with long ears and bun tail",
+        "size": {
+          "width": 36,
+          "height": 36
+        },
+        "template_id": "cat",
+        "directions": 8,
+        "view": "side",
+        "created_at": "2026-05-30T02:28:38.693773+00:00"
+      },
+      "folder": "rabbit_with_long_ears_and_bun_tail",
+      "frames": {
+        "rotations": {
+          "south": "rabbit_with_long_ears_and_bun_tail/rotations/south.png",
+          "south-east": "rabbit_with_long_ears_and_bun_tail/rotations/south-east.png",
+          "east": "rabbit_with_long_ears_and_bun_tail/rotations/east.png",
+          "north-east": "rabbit_with_long_ears_and_bun_tail/rotations/north-east.png",
+          "north": "rabbit_with_long_ears_and_bun_tail/rotations/north.png",
+          "north-west": "rabbit_with_long_ears_and_bun_tail/rotations/north-west.png",
+          "west": "rabbit_with_long_ears_and_bun_tail/rotations/west.png",
+          "south-west": "rabbit_with_long_ears_and_bun_tail/rotations/south-west.png"
+        },
+        "animations": {}
+      }
+    }
+  ],
+  "export_version": "3.0",
+  "export_date": "2026-05-30T02:32:33.171255"
+}

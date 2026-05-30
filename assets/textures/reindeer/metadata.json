@@ -1,0 +1,36 @@
+{
+  "group_id": null,
+  "states": [
+    {
+      "character": {
+        "id": "7e36a225-565f-4d32-a3d4-c9443f8b3063",
+        "name": "reindeer, with large antlers",
+        "prompt": "reindeer, with large antlers",
+        "size": {
+          "width": 80,
+          "height": 80
+        },
+        "template_id": "horse",
+        "directions": 8,
+        "view": "low top-down",
+        "created_at": "2026-05-28T18:58:02.887632+00:00"
+      },
+      "folder": "reindeer_with_large_antlers",
+      "frames": {
+        "rotations": {
+          "south": "reindeer_with_large_antlers/rotations/south.png",
+          "south-east": "reindeer_with_large_antlers/rotations/south-east.png",
+          "east": "reindeer_with_large_antlers/rotations/east.png",
+          "north-east": "reindeer_with_large_antlers/rotations/north-east.png",
+          "north": "reindeer_with_large_antlers/rotations/north.png",
+          "north-west": "reindeer_with_large_antlers/rotations/north-west.png",
+          "west": "reindeer_with_large_antlers/rotations/west.png",
+          "south-west": "reindeer_with_large_antlers/rotations/south-west.png"
+        },
+        "animations": {}
+      }
+    }
+  ],
+  "export_version": "3.0",
+  "export_date": "2026-05-28T20:32:50.589514"
+}

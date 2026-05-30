@@ -1,0 +1,36 @@
+{
+  "group_id": null,
+  "states": [
+    {
+      "character": {
+        "id": "bd7b18b9-df9f-49d6-a11b-d28082cc787e",
+        "name": "fox",
+        "prompt": "fox",
+        "size": {
+          "width": 36,
+          "height": 36
+        },
+        "template_id": "dog",
+        "directions": 8,
+        "view": "side",
+        "created_at": "2026-05-30T02:27:29.110776+00:00"
+      },
+      "folder": "bd7b18b9",
+      "frames": {
+        "rotations": {
+          "south": "bd7b18b9/rotations/south.png",
+          "south-east": "bd7b18b9/rotations/south-east.png",
+          "east": "bd7b18b9/rotations/east.png",
+          "north-east": "bd7b18b9/rotations/north-east.png",
+          "north": "bd7b18b9/rotations/north.png",
+          "north-west": "bd7b18b9/rotations/north-west.png",
+          "west": "bd7b18b9/rotations/west.png",
+          "south-west": "bd7b18b9/rotations/south-west.png"
+        },
+        "animations": {}
+      }
+    }
+  ],
+  "export_version": "3.0",
+  "export_date": "2026-05-30T02:28:44.380276"
+}
