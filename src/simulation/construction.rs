@@ -8101,6 +8101,7 @@ pub fn deconstruct_system(
                             item,
                             qty: after_inv,
                             owner_household: None,
+                            spawned_tick: 0,
                         },
                         Transform::from_xyz(pos.x, pos.y, 0.3),
                         GlobalTransform::default(),

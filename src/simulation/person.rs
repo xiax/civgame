@@ -993,6 +993,7 @@ pub(crate) fn spawn_faction_band(
                     RelationshipMemory::default(),
                     MethodHistory::default(),
                     crate::simulation::memory::CurrentVision::default(),
+                    crate::simulation::memory::AgentVisionCache::default(),
                     Name::new(generate_person_name(sex)),
                     PathFollow::default(),
                     Carrier::default(),

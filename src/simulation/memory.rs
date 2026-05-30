@@ -178,6 +178,33 @@ pub struct CurrentVision {
     pub entries: Vec<VisionEntry>,
 }
 
+/// Per-agent vision cache — the agent-side counterpart of the static
+/// `CachedVisionSet` (lookouts/settlements/camps in `vision.rs`). A
+/// stationary agent (Working / Sleeping / Idle for many recomputes) has a
+/// constant visible-tile set and constant static (stone/marsh) sightings, so
+/// `vision_system` raycasts + re-reports those only when the agent moves, its
+/// radius changes, or a terrain/wall change inside the disc marks the cache
+/// `dirty` (`agent_vision_invalidate_system`). Ephemeral sightings (plants
+/// whose stage drifts, GroundItems, prey) are re-scanned every recompute over
+/// `visible_tiles` — cheap (no LOS raycast), and bounded now that ground
+/// items decay.
+#[derive(Component, Clone, Default)]
+pub struct AgentVisionCache {
+    /// Agent tile + z the cache was built around; `None` until first build.
+    pub origin: Option<(i32, i32, i8)>,
+    /// Radius the cache was built at (an `ActiveLookout` widens it).
+    pub radius: u32,
+    /// LOS-filtered visible tiles — the expensive raycast result, reused
+    /// while the agent is stationary.
+    pub visible_tiles: Vec<(i32, i32)>,
+    /// Static terrain sightings (stone / marsh) inside the disc. Re-reported
+    /// to `SharedKnowledge` only on a full recompute.
+    pub static_entries: Vec<VisionEntry>,
+    /// Set by `agent_vision_invalidate_system` when a tile/wall change lands
+    /// inside the cached disc; forces a full recompute next pass.
+    pub dirty: bool,
+}
+
 impl CurrentVision {
     pub fn iter_kind(&self, kind: MemoryKind) -> impl Iterator<Item = &VisionEntry> + '_ {
         self.entries.iter().filter(move |v| v.kind == kind)
@@ -402,6 +429,7 @@ pub fn vision_system(
             Option<&crate::simulation::reproduction::HouseholdMember>,
             Option<&crate::simulation::vision::ActiveLookout>,
             &mut CurrentVision,
+            &mut AgentVisionCache,
         ),
         With<Person>,
     >,
@@ -422,7 +450,7 @@ pub fn vision_system(
     // cursor pivot, take cap. Pure round-robin with no per-tick gap.
     let cap = budget.vision_recomputes_per_tick.max(1);
     let mut eligible: Vec<Entity> = Vec::new();
-    for (entity, _, slot, lod, _, _, _, _, _) in query.iter() {
+    for (entity, _, slot, lod, _, _, _, _, _, _) in query.iter() {
         if *lod == LodLevel::Dormant || !clock.is_active(slot.0) {
             continue;
         }
@@ -449,7 +477,8 @@ pub fn vision_system(
         slice
     };
 
-    for (entity, transform, slot, lod, ai, faction_member, household_member, active_lookout, mut current_vision) in
+    let catalog = core_ids::catalog();
+    for (entity, transform, slot, lod, ai, faction_member, household_member, active_lookout, mut current_vision, mut cache) in
         query.iter_mut()
     {
         let view_radius = crate::simulation::vision::effective_vision_radius(active_lookout) as i32;
@@ -459,10 +488,6 @@ pub fn vision_system(
         if !allowed.contains(&entity) {
             continue;
         }
-        // Refresh the per-agent buffer every time the bucket fires. Dispatchers
-        // read this slot in the same tick (ParallelB after vision's pass) and
-        // short-circuit `SharedKnowledge` when a matching entry exists.
-        current_vision.entries.clear();
 
         // The agent writes to its *finest* tier — Household if a member,
         // otherwise Faction. Settlement and faction-wide knowledge are
@@ -480,204 +505,252 @@ pub fn vision_system(
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
         let from_z = ai.current_z;
+        let radius_u32 = view_radius.max(0) as u32;
 
-        for dy in -view_radius..=view_radius {
-            for dx in -view_radius..=view_radius {
-                if dx * dx + dy * dy > view_radius * view_radius {
-                    continue;
-                }
-
-                let ntx = tx + dx;
-                let nty = ty + dy;
-                let to_z = chunk_map.surface_z_at(ntx, nty) as i8;
-
-                if !crate::simulation::line_of_sight::has_los(
-                    &chunk_map,
-                    &door_map,
-                    (tx, ty, from_z),
-                    (ntx, nty, to_z),
-                ) {
-                    continue;
-                }
-
-                if let Some(&entity) = plant_map.0.get(&(ntx, nty)) {
-                    if let Ok((plant, land_claim, species_opt)) = plant_query.get(entity) {
-                        if plant.stage == crate::simulation::plants::GrowthStage::Mature {
-                            let owner = land_claim
-                                .map(|lc| lc.owner)
-                                .unwrap_or(ResourceOwner::Public);
-                            // Phase 3 (biome-native plants): seed every
-                            // memory channel the plant's harvest profiles
-                            // produce — fiber/medicine/dye/resin/latex/
-                            // oilseed in addition to the legacy
-                            // AnyEdible/wood lenses. Multi-profile species
-                            // (e.g. oak: fruit + wood) tag both channels in
-                            // one sweep so independent HTN gather methods
-                            // can find the same plant.
-                            let kinds = crate::simulation::plants::plant_memory_kinds(
-                                species_opt.map(|s| s.id()),
-                                plant.kind,
-                            );
-                            for k in kinds {
-                                shared.report_sighting(
-                                    write_tier,
-                                    (ntx, nty),
-                                    k,
-                                    owner,
-                                    now,
-                                );
-                                current_vision.entries.push(VisionEntry {
-                                    kind: k,
-                                    tile: (ntx, nty),
-                                    entity: None,
-                                    owner,
-                                });
-                            }
-                        }
+        // ── Full recompute: LOS raycast + static (stone/marsh) sightings ──
+        // Only when the agent moved, its radius changed, or a terrain/wall
+        // change inside the disc marked the cache dirty. A stationary agent
+        // (the common case — Working / Sleeping / Idle) skips this entirely:
+        // the ~700-tile raycast + stone re-report was the dominant cost.
+        let need_full = cache.dirty
+            || cache.origin != Some((tx, ty, from_z))
+            || cache.radius != radius_u32;
+        if need_full {
+            cache.visible_tiles.clear();
+            cache.static_entries.clear();
+            for dy in -view_radius..=view_radius {
+                for dx in -view_radius..=view_radius {
+                    if dx * dx + dy * dy > view_radius * view_radius {
+                        continue;
                     }
-                }
+                    let ntx = tx + dx;
+                    let nty = ty + dy;
+                    let to_z = chunk_map.surface_z_at(ntx, nty) as i8;
+                    if !crate::simulation::line_of_sight::has_los(
+                        &chunk_map,
+                        &door_map,
+                        (tx, ty, from_z),
+                        (ntx, nty, to_z),
+                    ) {
+                        continue;
+                    }
+                    cache.visible_tiles.push((ntx, nty));
 
-                let catalog = core_ids::catalog();
-                for &entity in spatial.get(ntx, nty) {
-                    if let Ok(item) = item_query.get(entity) {
-                        let resource_id = item.item.resource_id;
-                        // SharedKnowledge keeps the legacy class filter (Food
-                        // canonicalises to AnyEdible; Material/Seed clusters
-                        // by Resource(rid); other classes don't seed
-                        // clusters). CurrentVision is broader — every visible
-                        // GroundItem the agent could harvest under a chief
-                        // Stockpile{rid} posting goes in by Resource(rid),
-                        // matching the old in-dispatcher SpatialIndex scan
-                        // that filtered on `gi.item.resource_id == target_rid`
-                        // regardless of class.
-                        let shared_kind =
-                            catalog.get(resource_id).and_then(|def| match def.class {
-                                crate::economy::resource_catalog::ResourceClass::Food => {
-                                    Some(MemoryKind::AnyEdible)
-                                }
-                                crate::economy::resource_catalog::ResourceClass::Material
-                                | crate::economy::resource_catalog::ResourceClass::Seed => {
-                                    Some(MemoryKind::Resource(resource_id))
-                                }
-                                _ => None,
-                            });
-                        if let Some(k) = shared_kind {
-                            // Loose ground items belong to no one — Public.
+                    // Static terrain sightings (stone outcrops, marsh reed
+                    // beds) — re-reported only here, not every recompute.
+                    // Vision is additive only — it never depletes (stone
+                    // cluster shrinkage fires on gather-arrival in
+                    // `gather.rs`, never here).
+                    if let Some(tile_kind) = chunk_map.tile_kind_at(ntx, nty) {
+                        if tile_kind == crate::world::tile::TileKind::Stone {
                             shared.report_sighting(
                                 write_tier,
                                 (ntx, nty),
-                                k,
+                                MemoryKind::stone(),
                                 ResourceOwner::Public,
                                 now,
                             );
-                        }
-                        // Vision-first: dispatchers look up entries by
-                        // MemoryKind. Push Resource(rid) for every item, plus
-                        // an extra AnyEdible row for foods so the food
-                        // dispatchers can iterate them by class without
-                        // knowing the specific resource id.
-                        current_vision.entries.push(VisionEntry {
-                            kind: MemoryKind::Resource(resource_id),
-                            tile: (ntx, nty),
-                            entity: Some(entity),
-                            owner: ResourceOwner::Public,
-                        });
-                        if shared_kind == Some(MemoryKind::AnyEdible) {
-                            current_vision.entries.push(VisionEntry {
-                                kind: MemoryKind::AnyEdible,
+                            cache.static_entries.push(VisionEntry {
+                                kind: MemoryKind::stone(),
                                 tile: (ntx, nty),
-                                entity: Some(entity),
+                                entity: None,
                                 owner: ResourceOwner::Public,
                             });
                         }
-                    } else if let Ok((_, health, is_wolf, is_deer, is_horse, is_cow)) =
-                        prey_query.get(entity)
-                    {
-                        if !health.is_dead() {
-                            // Prey: predators + game (Wolf / Deer) — feeds the
-                            // hunting pipeline.
-                            if is_wolf || is_deer {
-                                shared.report_sighting(
-                                    write_tier,
-                                    (ntx, nty),
-                                    MemoryKind::Prey,
-                                    ResourceOwner::Public,
-                                    now,
-                                );
-                                current_vision.entries.push(VisionEntry {
-                                    kind: MemoryKind::Prey,
-                                    tile: (ntx, nty),
-                                    entity: Some(entity),
-                                    owner: ResourceOwner::Public,
-                                });
-                            }
-                            // Herd sighting: knowledge-gated grazing signal for
-                            // nomad migration scoring (Deer / Horse / Cattle).
-                            if is_deer || is_horse || is_cow {
-                                shared.report_sighting(
-                                    write_tier,
-                                    (ntx, nty),
-                                    MemoryKind::HerdSighting,
-                                    ResourceOwner::Public,
-                                    now,
-                                );
-                                current_vision.entries.push(VisionEntry {
-                                    kind: MemoryKind::HerdSighting,
-                                    tile: (ntx, nty),
-                                    entity: Some(entity),
-                                    owner: ResourceOwner::Public,
-                                });
-                            }
+                        // Phase F.2 — Marsh tiles carry harvestable reed beds.
+                        // Report as `MemoryKind::reeds()` so the standard
+                        // AcquireGood / Stockpile gather chain routes a worker
+                        // without bespoke dispatch infrastructure.
+                        if tile_kind == crate::world::tile::TileKind::Marsh {
+                            shared.report_sighting(
+                                write_tier,
+                                (ntx, nty),
+                                MemoryKind::reeds(),
+                                ResourceOwner::Public,
+                                now,
+                            );
+                            cache.static_entries.push(VisionEntry {
+                                kind: MemoryKind::reeds(),
+                                tile: (ntx, nty),
+                                entity: None,
+                                owner: ResourceOwner::Public,
+                            });
                         }
                     }
                 }
+            }
+            cache.origin = Some((tx, ty, from_z));
+            cache.radius = radius_u32;
+            cache.dirty = false;
+        }
 
-                if let Some(tile_kind) = chunk_map.tile_kind_at(ntx, nty) {
-                    if tile_kind == crate::world::tile::TileKind::Stone {
-                        shared.report_sighting(
-                            write_tier,
-                            (ntx, nty),
-                            MemoryKind::stone(),
-                            ResourceOwner::Public,
-                            now,
+        // ── Ephemeral pass (every recompute, no LOS raycast) ──
+        // Rebuild `CurrentVision` from the cached static entries plus a fresh
+        // scan of mobile/short-lived sightings (plants whose stage drifts,
+        // GroundItems, prey) over the cached visible tiles. Dispatchers read
+        // this slot the same tick (ParallelB after vision) and short-circuit
+        // `SharedKnowledge` when a matching entry exists.
+        current_vision.entries.clear();
+        current_vision
+            .entries
+            .extend_from_slice(&cache.static_entries);
+        for &(ntx, nty) in &cache.visible_tiles {
+            if let Some(&plant_entity) = plant_map.0.get(&(ntx, nty)) {
+                if let Ok((plant, land_claim, species_opt)) = plant_query.get(plant_entity) {
+                    if plant.stage == crate::simulation::plants::GrowthStage::Mature {
+                        let owner = land_claim
+                            .map(|lc| lc.owner)
+                            .unwrap_or(ResourceOwner::Public);
+                        // Phase 3 (biome-native plants): seed every memory
+                        // channel the plant's harvest profiles produce so
+                        // multi-profile species (e.g. oak: fruit + wood) tag
+                        // both channels in one sweep.
+                        let kinds = crate::simulation::plants::plant_memory_kinds(
+                            species_opt.map(|s| s.id()),
+                            plant.kind,
                         );
-                        current_vision.entries.push(VisionEntry {
-                            kind: MemoryKind::stone(),
-                            tile: (ntx, nty),
-                            entity: None,
-                            owner: ResourceOwner::Public,
-                        });
-                    }
-                    // Vision is additive only — it never depletes. Stone
-                    // cluster shrinkage fires on gather-arrival
-                    // (`gather.rs` `invalidate_tile_across_tier_set`), never
-                    // here. The old `else { report_depleted(stone) }` ran an
-                    // O(local-cluster-count) `cluster_at` scan on ~every
-                    // non-Stone tile in the view disc — the dominant
-                    // (cluster-density-scaling) cost of `vision_system`.
-                    // Phase F.2 — Marsh tiles carry harvestable reed beds.
-                    // Report as `MemoryKind::reeds()` so the standard
-                    // AcquireGood / Stockpile gather chain (
-                    // `GatherFromKnownMethod` → `htn_acquire_good_dispatch_system`
-                    // → `Task::Gather { tile }` → `gather_system` Marsh
-                    // branch) can route a worker without bespoke
-                    // dispatch infrastructure.
-                    if tile_kind == crate::world::tile::TileKind::Marsh {
-                        shared.report_sighting(
-                            write_tier,
-                            (ntx, nty),
-                            MemoryKind::reeds(),
-                            ResourceOwner::Public,
-                            now,
-                        );
-                        current_vision.entries.push(VisionEntry {
-                            kind: MemoryKind::reeds(),
-                            tile: (ntx, nty),
-                            entity: None,
-                            owner: ResourceOwner::Public,
-                        });
+                        for k in kinds {
+                            shared.report_sighting(write_tier, (ntx, nty), k, owner, now);
+                            current_vision.entries.push(VisionEntry {
+                                kind: k,
+                                tile: (ntx, nty),
+                                entity: None,
+                                owner,
+                            });
+                        }
                     }
                 }
+            }
+
+            for &item_entity in spatial.get(ntx, nty) {
+                if let Ok(item) = item_query.get(item_entity) {
+                    let resource_id = item.item.resource_id;
+                    // SharedKnowledge keeps the legacy class filter (Food →
+                    // AnyEdible; Material/Seed → Resource(rid); other classes
+                    // don't seed clusters). CurrentVision is broader — every
+                    // visible GroundItem the agent could harvest under a chief
+                    // Stockpile{rid} posting goes in by Resource(rid).
+                    let shared_kind =
+                        catalog.get(resource_id).and_then(|def| match def.class {
+                            crate::economy::resource_catalog::ResourceClass::Food => {
+                                Some(MemoryKind::AnyEdible)
+                            }
+                            crate::economy::resource_catalog::ResourceClass::Material
+                            | crate::economy::resource_catalog::ResourceClass::Seed => {
+                                Some(MemoryKind::Resource(resource_id))
+                            }
+                            _ => None,
+                        });
+                    if let Some(k) = shared_kind {
+                        // Loose ground items belong to no one — Public.
+                        shared.report_sighting(
+                            write_tier,
+                            (ntx, nty),
+                            k,
+                            ResourceOwner::Public,
+                            now,
+                        );
+                    }
+                    current_vision.entries.push(VisionEntry {
+                        kind: MemoryKind::Resource(resource_id),
+                        tile: (ntx, nty),
+                        entity: Some(item_entity),
+                        owner: ResourceOwner::Public,
+                    });
+                    if shared_kind == Some(MemoryKind::AnyEdible) {
+                        current_vision.entries.push(VisionEntry {
+                            kind: MemoryKind::AnyEdible,
+                            tile: (ntx, nty),
+                            entity: Some(item_entity),
+                            owner: ResourceOwner::Public,
+                        });
+                    }
+                } else if let Ok((_, health, is_wolf, is_deer, is_horse, is_cow)) =
+                    prey_query.get(item_entity)
+                {
+                    if !health.is_dead() {
+                        // Prey: predators + game (Wolf / Deer) — feeds hunting.
+                        if is_wolf || is_deer {
+                            shared.report_sighting(
+                                write_tier,
+                                (ntx, nty),
+                                MemoryKind::Prey,
+                                ResourceOwner::Public,
+                                now,
+                            );
+                            current_vision.entries.push(VisionEntry {
+                                kind: MemoryKind::Prey,
+                                tile: (ntx, nty),
+                                entity: Some(item_entity),
+                                owner: ResourceOwner::Public,
+                            });
+                        }
+                        // Herd sighting: knowledge-gated grazing signal for
+                        // nomad migration scoring (Deer / Horse / Cattle).
+                        if is_deer || is_horse || is_cow {
+                            shared.report_sighting(
+                                write_tier,
+                                (ntx, nty),
+                                MemoryKind::HerdSighting,
+                                ResourceOwner::Public,
+                                now,
+                            );
+                            current_vision.entries.push(VisionEntry {
+                                kind: MemoryKind::HerdSighting,
+                                tile: (ntx, nty),
+                                entity: Some(item_entity),
+                                owner: ResourceOwner::Public,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Mark per-agent vision caches dirty when terrain/walls change inside their
+/// disc, so a *stationary* agent still picks up a felled tree / mined stone /
+/// built wall without waiting to move. Mirrors `invalidate_vision_caches_system`
+/// (the static-source equivalent in `vision.rs`). Early-outs when no relevant
+/// events fired (the common case), so it's free on quiet ticks and O(agents)
+/// only on construction/mining/harvest ticks. Runs in `Sequential` before
+/// `vision_system`.
+///
+/// Plant *stage* changes (seedling→mature, harvest despawn) don't emit a
+/// `TileChangedEvent`, so they aren't caught here — but plants are re-scanned
+/// every recompute in the ephemeral pass, so they're never cached stale.
+pub fn agent_vision_invalidate_system(
+    mut tile_changes: EventReader<crate::world::chunk_streaming::TileChangedEvent>,
+    mut walls_built: EventReader<crate::simulation::construction::WallConstructed>,
+    mut walls_destroyed: EventReader<crate::simulation::construction::WallDestroyed>,
+    mut caches: Query<&mut AgentVisionCache>,
+) {
+    let mut dirty_tiles: Vec<(i32, i32)> = Vec::new();
+    for ev in tile_changes.read() {
+        dirty_tiles.push((ev.tx, ev.ty));
+    }
+    for ev in walls_built.read() {
+        dirty_tiles.push(ev.tile);
+    }
+    for ev in walls_destroyed.read() {
+        dirty_tiles.push(ev.tile);
+    }
+    if dirty_tiles.is_empty() {
+        return;
+    }
+    for mut cache in caches.iter_mut() {
+        if cache.dirty {
+            continue;
+        }
+        let Some((ox, oy, _)) = cache.origin else {
+            continue;
+        };
+        let r = cache.radius as i32;
+        for &(tx, ty) in &dirty_tiles {
+            if (tx - ox).abs() <= r && (ty - oy).abs() <= r {
+                cache.dirty = true;
+                break;
             }
         }
     }

@@ -36,6 +36,11 @@ pub struct PerfWorkBudget {
     /// Round-robined by `AnimalReplanCursor` so no animal starves. Flow-field
     /// (HERD) replans are not counted (cheap).
     pub animal_replans_per_tick: usize,
+    /// Per-tick cap on loose `GroundItem`s scanned for TTL expiry by
+    /// `ground_item_decay_system`. Round-robined by `GroundItemDecayCursor`
+    /// so every item is revisited within `ceil(N / cap)` ticks — far inside
+    /// the shortest (2-day) TTL. No `tick % N` cadence.
+    pub ground_item_decay_scans_per_tick: usize,
 }
 
 impl Default for PerfWorkBudget {
@@ -61,6 +66,7 @@ impl Default for PerfWorkBudget {
             gossip_agents_per_tick: 64,
             vision_recomputes_per_tick: 32,
             animal_replans_per_tick: 64,
+            ground_item_decay_scans_per_tick: 512,
         }
     }
 }

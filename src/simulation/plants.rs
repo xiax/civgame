@@ -1510,6 +1510,7 @@ pub fn deer_graze_system(
                         item: Item::new_commodity(crate::economy::core_ids::berry_seed()),
                         qty: 1,
                         owner_household: None,
+                        spawned_tick: 0,
                     },
                     Transform::from_xyz(pos.x, pos.y, 0.3),
                     GlobalTransform::default(),

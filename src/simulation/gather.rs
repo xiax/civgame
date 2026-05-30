@@ -1522,7 +1522,7 @@ pub fn gather_system(
 fn route_yield(
     commands: &mut Commands,
     carrier: &mut Carrier,
-    _agent: &mut EconomicAgent,
+    agent: &mut EconomicAgent,
     resource_id: ResourceId,
     qty: u32,
     tx: i32,
@@ -1533,7 +1533,15 @@ fn route_yield(
         return;
     }
     let item = Item::new_commodity(resource_id);
-    let leftover = carrier.try_pick_up(item, qty);
+    let mut leftover = carrier.try_pick_up(item, qty);
+    if leftover > 0 {
+        // Hands full — route the remainder into the agent's own inventory
+        // before spilling to the ground, so routine harvest overflow doesn't
+        // litter the world. The decay net (`ground_item_decay_system`) then
+        // only has to reclaim genuinely-unrecoverable spill. Mirrors the
+        // hands→inventory→ground cascade in production/crafting.
+        leftover = agent.add_item(item, leftover);
+    }
     if leftover > 0 {
         let pos = tile_to_world(tx, ty);
         commands.spawn((
@@ -1541,6 +1549,8 @@ fn route_yield(
                 item,
                 qty: leftover,
                 owner_household,
+                // Stamped by the `on_ground_item_add` hook from SimClock.
+                spawned_tick: 0,
             },
             Transform::from_xyz(pos.x, pos.y, 0.3),
             GlobalTransform::default(),
@@ -1585,6 +1595,7 @@ pub(crate) fn spawn_ground_drop(
             item: Item::new_commodity(resource_id),
             qty,
             owner_household: None,
+            spawned_tick: 0,
         },
         Transform::from_xyz(pos.x, pos.y, 0.3),
         GlobalTransform::default(),

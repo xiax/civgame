@@ -496,7 +496,7 @@ pub fn enforce_hand_state_system(
             &mut Carrier,
             &Transform,
             &crate::simulation::lod::LodLevel,
-            &crate::economy::agent::EconomicAgent,
+            &mut crate::economy::agent::EconomicAgent,
         ),
         With<crate::simulation::person::Person>,
     >,
@@ -507,7 +507,7 @@ pub fn enforce_hand_state_system(
     use crate::simulation::tasks::{task_drops_hand_load, task_requires_free_hands};
     use crate::world::terrain::world_to_tile;
 
-    for (ai, aq, mut carrier, transform, lod, agent) in agents.iter_mut() {
+    for (ai, aq, mut carrier, transform, lod, mut agent) in agents.iter_mut() {
         if *lod == LodLevel::Dormant {
             continue;
         }
@@ -524,7 +524,7 @@ pub fn enforce_hand_state_system(
         // `try_pick_up` will spill the yield to ground.
         let mut need_free = task_requires_free_hands(aq.current_task_kind());
         if matches!(
-            gather_target_yield_bulk(ai, aq, agent, &plant_map, &plant_query, &chunk_map),
+            gather_target_yield_bulk(ai, aq, &agent, &plant_map, &plant_query, &chunk_map),
             Some(Bulk::TwoHand)
         ) {
             need_free = 2;
@@ -549,15 +549,22 @@ pub fn enforce_hand_state_system(
             // Drop one hand at a time until we have enough free, or hands are empty.
             while carrier.free_hands() < need_free {
                 if let Some(stack) = carrier.drop_one_hand() {
-                    crate::simulation::items::spawn_or_merge_ground_item(
-                        &mut commands,
-                        &spatial,
-                        &mut item_query,
-                        tx,
-                        ty,
-                        stack.item.resource_id,
-                        stack.qty,
-                    );
+                    // Route into the agent's own inventory first; only spill the
+                    // true overflow to the ground. Keeps routine "free a hand"
+                    // churn from littering the world (the decay net then only
+                    // reclaims genuinely-unrecoverable spill).
+                    let leftover = agent.add_item(stack.item, stack.qty);
+                    if leftover > 0 {
+                        crate::simulation::items::spawn_or_merge_ground_item(
+                            &mut commands,
+                            &spatial,
+                            &mut item_query,
+                            tx,
+                            ty,
+                            stack.item.resource_id,
+                            leftover,
+                        );
+                    }
                 } else {
                     break;
                 }

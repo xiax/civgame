@@ -441,6 +441,7 @@ fn spill_ground(commands: &mut Commands, tx: i32, ty: i32, item: Item, qty: u32)
             item,
             qty,
             owner_household: None,
+            spawned_tick: 0,
         },
         Transform::from_xyz(pos.x, pos.y, 0.3),
         GlobalTransform::default(),

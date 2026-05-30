@@ -272,6 +272,12 @@ pub struct KnowledgeMap {
     pub clusters: AHashMap<ClusterId, ResourceCluster>,
     pub by_kind: AHashMap<MemoryKind, AHashSet<ClusterId>>,
     pub by_chunk: AHashMap<ChunkCoord, AHashSet<ClusterId>>,
+    /// `(chunk, kind)`-keyed index. Lets `find_mergeable` / `cluster_at`
+    /// scan only the clusters of the *matching kind* in a chunk instead of
+    /// every cluster there — the dominant cost when one chunk holds many
+    /// clusters (e.g. a cluster-dense base area). Maintained in lock-step
+    /// with `by_chunk`.
+    pub by_chunk_kind: AHashMap<(ChunkCoord, MemoryKind), AHashSet<ClusterId>>,
 }
 
 impl KnowledgeMap {
@@ -279,6 +285,10 @@ impl KnowledgeMap {
         self.by_kind.entry(c.kind).or_default().insert(c.id);
         for ch in c.chunk_footprint() {
             self.by_chunk.entry(ch).or_default().insert(c.id);
+            self.by_chunk_kind
+                .entry((ch, c.kind))
+                .or_default()
+                .insert(c.id);
         }
     }
 
@@ -296,6 +306,12 @@ impl KnowledgeMap {
                     self.by_chunk.remove(&ch);
                 }
             }
+            if let Some(s) = self.by_chunk_kind.get_mut(&(ch, c.kind)) {
+                s.remove(&c.id);
+                if s.is_empty() {
+                    self.by_chunk_kind.remove(&(ch, c.kind));
+                }
+            }
         }
     }
 
@@ -309,19 +325,21 @@ impl KnowledgeMap {
     ) -> Option<ClusterId> {
         let chunk = ResourceCluster::chunk_of(tile);
         // Scan the 3×3 chunk neighbourhood (CLUSTER_MERGE_RADIUS=8 ≤ CHUNK_SIZE=32,
-        // so candidate centers always fall within ±1 chunk).
+        // so candidate centers always fall within ±1 chunk). The `by_chunk_kind`
+        // index restricts each chunk's candidate set to the matching `kind`, so
+        // a cluster-dense chunk holding many other-kind clusters costs nothing.
         let mut best: Option<(ClusterId, i32)> = None;
         for dx in -1..=1 {
             for dy in -1..=1 {
                 let ch = ChunkCoord(chunk.0 + dx, chunk.1 + dy);
-                let Some(set) = self.by_chunk.get(&ch) else {
+                let Some(set) = self.by_chunk_kind.get(&(ch, kind)) else {
                     continue;
                 };
                 for &cid in set {
                     let Some(c) = self.clusters.get(&cid) else {
                         continue;
                     };
-                    if c.kind != kind || c.owner != owner {
+                    if c.owner != owner {
                         continue;
                     }
                     let d = (c.center.0 - tile.0).abs().max((c.center.1 - tile.1).abs());
@@ -342,16 +360,13 @@ impl KnowledgeMap {
         for dx in -1..=1 {
             for dy in -1..=1 {
                 let ch = ChunkCoord(chunk.0 + dx, chunk.1 + dy);
-                let Some(set) = self.by_chunk.get(&ch) else {
+                let Some(set) = self.by_chunk_kind.get(&(ch, kind)) else {
                     continue;
                 };
                 for &cid in set {
                     let Some(c) = self.clusters.get(&cid) else {
                         continue;
                     };
-                    if c.kind != kind {
-                        continue;
-                    }
                     let d = (c.center.0 - tile.0).abs().max((c.center.1 - tile.1).abs());
                     if d <= c.radius as i32 && best.map_or(true, |(_, bd)| d < bd) {
                         best = Some((cid, d));
@@ -419,14 +434,14 @@ impl KnowledgeMap {
                         continue;
                     }
                     let ch = ChunkCoord(origin.0 + dx, origin.1 + dy);
-                    let Some(set) = self.by_chunk.get(&ch) else {
+                    let Some(set) = self.by_chunk_kind.get(&(ch, kind)) else {
                         continue;
                     };
                     for &cid in set {
                         let Some(c) = self.clusters.get(&cid) else {
                             continue;
                         };
-                        if c.kind != kind || !owner_filter(c.owner) {
+                        if !owner_filter(c.owner) {
                             continue;
                         }
                         if !cluster_filter(c) {
@@ -557,9 +572,16 @@ impl SharedKnowledge {
                             m.by_chunk.remove(ch);
                         }
                     }
+                    if let Some(s) = m.by_chunk_kind.get_mut(&(*ch, kind)) {
+                        s.remove(&cid);
+                        if s.is_empty() {
+                            m.by_chunk_kind.remove(&(*ch, kind));
+                        }
+                    }
                 }
                 for ch in &new_footprint {
                     m.by_chunk.entry(*ch).or_default().insert(cid);
+                    m.by_chunk_kind.entry((*ch, kind)).or_default().insert(cid);
                 }
             }
             cid
@@ -1177,6 +1199,7 @@ mod tests {
         assert!(m.clusters.is_empty(), "cluster should despawn at count 0");
         assert!(m.by_kind.is_empty());
         assert!(m.by_chunk.is_empty());
+        assert!(m.by_chunk_kind.is_empty());
     }
 
     #[test]

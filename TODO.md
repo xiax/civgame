@@ -199,7 +199,7 @@ I want the plant and animal seeding to be more natural and realistic to real lif
 
 Tiles with stuff on it sometimes flash the underlying tile, especially in fog of war
 
-Some plants don't have sprites and are essentially invisible.
+X - Some plants don't have sprites and are essentially invisible.
 
 
 /Users/xiao1/civgame/plans/sleep-arrival-panic.md

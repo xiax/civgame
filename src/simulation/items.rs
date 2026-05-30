@@ -20,6 +20,7 @@ use bevy::prelude::*;
 pub struct TargetItem(pub Option<Entity>);
 
 #[derive(Component, Clone, Copy)]
+#[component(on_add = on_ground_item_add)]
 pub struct GroundItem {
     pub item: Item,
     pub qty: u32,
@@ -29,11 +30,58 @@ pub struct GroundItem {
     /// matching-owner stacks and are skipped by the faction-level
     /// `chief_job_posting_system` loose-cleanup pass.
     pub owner_household: Option<u32>,
+    /// Tick this stack was dropped. Stamped by the `on_add` hook
+    /// (`on_ground_item_add`) from `SimClock` so spawn call sites don't have
+    /// to thread the clock. Drives `ground_item_decay_system`: a loose spill
+    /// older than `ground_item_ttl(item)` is despawned unless it sits on a
+    /// storage tile. Merge (`spawn_or_merge_ground_item_owned`) only bumps
+    /// `qty`, not this field — a continually-topped-up *non-storage* pile
+    /// decays on its oldest stack's clock (acceptable: real stockpiles live
+    /// on storage tiles and are exempt; loose spills *should* age out).
+    pub spawned_tick: u64,
 }
 
 impl GroundItem {
     pub fn is_public(&self) -> bool {
         self.owner_household.is_none()
+    }
+}
+
+/// Stamp `GroundItem.spawned_tick` from `SimClock` at insert time. Mirrors the
+/// `TentShelter` / `Indexed` hook pattern so every spawn site (gather/farm/
+/// combat/craft/deposit/…) gets a correct timestamp without threading the
+/// tick through ~30 call sites (several of which carry a truncated `u32` clock
+/// that would silently corrupt a `u64` tick).
+fn on_ground_item_add(
+    mut world: bevy::ecs::world::DeferredWorld<'_>,
+    entity: Entity,
+    _: bevy::ecs::component::ComponentId,
+) {
+    let now = world
+        .get_resource::<SimClock>()
+        .map(|c| c.tick)
+        .unwrap_or(0);
+    if let Some(mut gi) = world.get_mut::<GroundItem>(entity) {
+        gi.spawned_tick = now;
+    }
+}
+
+/// Perishable food rots within two game-days; preserved rations and durable
+/// goods (wood/stone/tools/weapons/…) persist ten. Derived from
+/// `TICKS_PER_DAY` so the lifespan is invariant under game-speed presets.
+/// Real stockpiles never reach these limits — they live on storage tiles,
+/// which `ground_item_decay_system` exempts.
+pub const FOOD_ROT_TICKS: u64 = crate::world::seasons::ticks_per_days_u64(2);
+pub const DURABLE_DECAY_TICKS: u64 = crate::world::seasons::ticks_per_days_u64(10);
+
+/// Per-class loose-item lifespan. Fresh edibles spoil fast; everything else
+/// (including preserved rations) persists at the durable rate.
+pub fn ground_item_ttl(item: &Item) -> u64 {
+    let rid = item.resource_id;
+    if rid.is_edible() && !rid.is_preserved_ration() {
+        FOOD_ROT_TICKS
+    } else {
+        DURABLE_DECAY_TICKS
     }
 }
 
@@ -136,6 +184,8 @@ pub fn spawn_or_merge_ground_item_owned(
             item,
             qty,
             owner_household,
+            // Stamped by the `on_ground_item_add` hook from SimClock.
+            spawned_tick: 0,
         },
         Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
         GlobalTransform::default(),
@@ -143,6 +193,68 @@ pub fn spawn_or_merge_ground_item_owned(
         InheritedVisibility::default(),
         crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::GroundItem),
     ));
+}
+
+/// Rolling cursor over `GroundItem` entities for `ground_item_decay_system`.
+/// Bounds the per-tick decay scan (`PerfWorkBudget::ground_item_decay_scans_per_tick`)
+/// without a `tick % N` cadence — every item is revisited within
+/// `ceil(N / budget)` ticks, well inside the shortest (2-day) TTL.
+#[derive(Resource, Default)]
+pub struct GroundItemDecayCursor {
+    pub next: usize,
+}
+
+/// Despawn loose ground items past their per-class TTL so spilled yields,
+/// combat/butcher drops, and abandoned hauls can't accumulate without bound
+/// (the leak that drove the knowledge-cluster explosion + vision cost).
+///
+/// Storage piles are exempt: a faction's stockpile *is* `GroundItem`s sitting
+/// on `StorageTileMap` tiles, so a tile in the storage map is never decayed.
+/// Merge-refresh (`spawn_or_merge_ground_item_owned`) plus this exemption
+/// protect real stockpiles two ways.
+///
+/// Economy set, `.after(compute_faction_storage_system)` so it reads the
+/// same-tick storage map. Despawn drops the `Indexed` component, whose
+/// `on_remove` hook clears `SpatialIndex`; `compute_faction_storage_system`
+/// self-corrects via `RemovedComponents<GroundItem>` (and totals don't change
+/// anyway — decayed items are off-storage-tile).
+pub fn ground_item_decay_system(
+    mut commands: Commands,
+    clock: Res<SimClock>,
+    budget: Res<crate::simulation::perf::PerfWorkBudget>,
+    storage_tiles: Res<crate::simulation::faction::StorageTileMap>,
+    mut cursor: ResMut<GroundItemDecayCursor>,
+    items: Query<(Entity, &Transform, &GroundItem)>,
+) {
+    let total = items.iter().len();
+    if total == 0 {
+        cursor.next = 0;
+        return;
+    }
+    let now = clock.tick;
+    let cap = budget.ground_item_decay_scans_per_tick.max(1).min(total);
+    // Collect a stable, deterministic ordering so the cursor walks the same
+    // ring every tick (Query iteration order is archetype-stable but we sort
+    // by entity bits to be robust against archetype moves).
+    let mut all: Vec<(Entity, (i32, i32), u64, Item)> = items
+        .iter()
+        .map(|(e, t, gi)| {
+            let tile = world_to_tile(t.translation.truncate());
+            (e, tile, gi.spawned_tick, gi.item)
+        })
+        .collect();
+    all.sort_unstable_by_key(|(e, ..)| e.to_bits());
+    let start = cursor.next % total;
+    for offset in 0..cap {
+        let (entity, tile, spawned_tick, item) = all[(start + offset) % total];
+        if storage_tiles.tiles.contains_key(&tile) {
+            continue;
+        }
+        if now.saturating_sub(spawned_tick) >= ground_item_ttl(&item) {
+            commands.entity(entity).despawn_recursive();
+        }
+    }
+    cursor.next = (start + cap) % total;
 }
 
 /// Returns the equipment slots that the resource identified by `id` can be

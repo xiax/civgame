@@ -336,6 +336,7 @@ impl TestSim {
                     item: Item::new_commodity(resource.into()),
                     qty,
                     owner_household: None,
+                    spawned_tick: 0,
                 },
                 Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
                 GlobalTransform::default(),
@@ -365,6 +366,7 @@ impl TestSim {
                     item: Item::new_commodity(resource.into()),
                     qty,
                     owner_household: Some(household_id),
+                    spawned_tick: 0,
                 },
                 Transform::from_xyz(world_pos.x, world_pos.y, 0.3),
                 GlobalTransform::default(),
@@ -591,6 +593,7 @@ impl PersonBuilder {
                     RelationshipMemory::default(),
                     MethodHistory::default(),
                     crate::simulation::memory::CurrentVision::default(),
+                    crate::simulation::memory::AgentVisionCache::default(),
                     Name::new("TestPerson"),
                     PathFollow::default(),
                     Carrier::default(),
@@ -9012,6 +9015,7 @@ mod smoke {
                     item: stone_axe,
                     qty: 1,
                     owner_household: None,
+                    spawned_tick: 0,
                 },
                 Transform::from_xyz(axe_world.x, axe_world.y, 0.4),
                 GlobalTransform::default(),
@@ -13138,6 +13142,7 @@ mod baseline_behaviour {
                 item: Item::new_commodity(weapon_id),
                 qty: 1,
                 owner_household: None,
+                spawned_tick: 0,
             },
             Transform::from_xyz(weapon_world.x, weapon_world.y, 0.4),
             GlobalTransform::default(),
@@ -22661,5 +22666,197 @@ mod loose_resource_cleanup {
             .expect("relation exists");
         assert!(r.reputation.grievance >= 30, "grievance bump on Raid");
         assert!(r.reputation.trust <= 0, "trust drops on Raid");
+    }
+
+    // ── Ground-item decay + incremental vision ──────────────────────────
+
+    use crate::simulation::items::{ground_item_ttl, DURABLE_DECAY_TICKS, FOOD_ROT_TICKS};
+    use crate::simulation::memory::AgentVisionCache;
+
+    /// Advance `SimClock.tick` directly so a decay test doesn't have to run
+    /// `FOOD_ROT_TICKS` real updates.
+    fn set_clock(sim: &mut TestSim, t: u64) {
+        sim.app
+            .world_mut()
+            .resource_mut::<SimClock>()
+            .tick = t;
+    }
+
+    #[test]
+    fn ground_item_food_decays_off_storage() {
+        let mut sim = TestSim::new(1);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let e = sim.spawn_ground_item((5, 5), crate::economy::core_ids::fruit(), 4);
+        // Jump past the perishable TTL, then run an Economy decay pass. (Two
+        // ticks: the fixture's first `app.update()` doesn't run FixedUpdate.)
+        set_clock(&mut sim, FOOD_ROT_TICKS + 1_000);
+        sim.tick_n(2);
+        assert!(
+            sim.app.world().get::<GroundItem>(e).is_none(),
+            "loose food should rot away past FOOD_ROT_TICKS"
+        );
+        // And it must be out of the SpatialIndex (Indexed on_remove hook).
+        let found = sim
+            .app
+            .world()
+            .resource::<crate::world::spatial::SpatialIndex>()
+            .get(5, 5)
+            .iter()
+            .any(|&x| x == e);
+        assert!(!found, "decayed item must leave the SpatialIndex");
+    }
+
+    #[test]
+    fn ground_item_durable_outlives_food_window_then_decays() {
+        let mut sim = TestSim::new(2);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let e = sim.spawn_ground_item((5, 5), crate::economy::core_ids::wood(), 3);
+        assert!(DURABLE_DECAY_TICKS > FOOD_ROT_TICKS);
+        // Past the food window but inside the durable window — wood survives
+        // even with the decay pass actually running (tick twice).
+        set_clock(&mut sim, FOOD_ROT_TICKS + 1_000);
+        sim.tick_n(2);
+        assert!(
+            sim.app.world().get::<GroundItem>(e).is_some(),
+            "wood should outlive the food rot window"
+        );
+        // Past the durable window — now it decays.
+        set_clock(&mut sim, DURABLE_DECAY_TICKS + 1_000);
+        sim.tick_n(2);
+        assert!(
+            sim.app.world().get::<GroundItem>(e).is_none(),
+            "wood should decay past DURABLE_DECAY_TICKS"
+        );
+    }
+
+    #[test]
+    fn storage_pile_never_decays() {
+        let mut sim = TestSim::new(3);
+        sim.flat_world(2, 0, TileKind::Grass);
+        // Spawn a real storage-tile entity at (0,0) for the player faction so
+        // `update_storage_tile_map_system` keeps it in `StorageTileMap`.
+        let fid = sim.player_faction_id;
+        let storage_pos = tile_to_world(0, 0);
+        sim.app.world_mut().spawn((
+            crate::simulation::faction::FactionStorageTile { faction_id: fid },
+            Transform::from_xyz(storage_pos.x, storage_pos.y, 0.0),
+            GlobalTransform::default(),
+        ));
+        let e = sim.spawn_ground_item((0, 0), crate::economy::core_ids::fruit(), 10);
+        // Way past every TTL — the storage exemption must keep it alive.
+        set_clock(&mut sim, DURABLE_DECAY_TICKS * 3);
+        sim.tick_n(2);
+        assert!(
+            sim.app.world().get::<GroundItem>(e).is_some(),
+            "items on storage tiles are exempt from decay"
+        );
+    }
+
+    #[test]
+    fn decay_cursor_amortizes_over_many_items() {
+        let mut sim = TestSim::new(4);
+        sim.flat_world(3, 0, TileKind::Grass);
+        // Tiny scan budget so the cursor must take several ticks.
+        sim.app
+            .world_mut()
+            .resource_mut::<crate::simulation::perf::PerfWorkBudget>()
+            .ground_item_decay_scans_per_tick = 2;
+        let mut items = Vec::new();
+        for i in 0..5 {
+            items.push(sim.spawn_ground_item((10 + i, 10), crate::economy::core_ids::fruit(), 1));
+        }
+        set_clock(&mut sim, FOOD_ROT_TICKS + 1_000);
+        // ceil(5/2) = 3 passes minimum; tick a few extra for safety.
+        sim.tick_n(6);
+        for e in items {
+            assert!(
+                sim.app.world().get::<GroundItem>(e).is_none(),
+                "every aged item should be reclaimed within ceil(N/cap) ticks"
+            );
+        }
+    }
+
+    #[test]
+    fn ground_item_ttl_is_class_keyed() {
+        // Pure-fn sanity: food short, durable long.
+        let fruit = crate::economy::item::Item::new_commodity(crate::economy::core_ids::fruit());
+        let wood = crate::economy::item::Item::new_commodity(crate::economy::core_ids::wood());
+        assert_eq!(ground_item_ttl(&fruit), FOOD_ROT_TICKS);
+        assert_eq!(ground_item_ttl(&wood), DURABLE_DECAY_TICKS);
+    }
+
+    #[test]
+    fn agent_vision_cache_builds_and_tracks_position() {
+        let mut sim = TestSim::new(5);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let p = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        // Vision builds the cache around the agent's tile.
+        sim.tick_n(5);
+        let c = sim.app.world().get::<AgentVisionCache>(p).unwrap();
+        assert!(c.origin.is_some(), "cache should be built");
+        assert!(
+            !c.visible_tiles.is_empty(),
+            "built cache holds the LOS disc"
+        );
+        // Teleport far away; the cache must rebuild around the new tile
+        // (origin tracks position — tolerate ±1 tile of self-wander).
+        {
+            let world_pos = tile_to_world(8, 0);
+            let mut tf = sim.app.world_mut().get_mut::<Transform>(p).unwrap();
+            tf.translation.x = world_pos.x;
+            tf.translation.y = world_pos.y;
+        }
+        sim.tick_n(5);
+        let origin = sim
+            .app
+            .world()
+            .get::<AgentVisionCache>(p)
+            .and_then(|c| c.origin)
+            .expect("origin set");
+        assert!(
+            (origin.0 - 8).abs() <= 1,
+            "cache origin tracks the moved agent (got {origin:?})"
+        );
+    }
+
+    #[test]
+    fn tile_change_recomputes_stationary_agent_vision() {
+        let mut sim = TestSim::new(6);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let p = sim.spawn_person(sim.player_faction_id, (0, 0), |_| {});
+        sim.tick_n(4);
+        // No stone in view yet.
+        let has_stone = |sim: &TestSim| {
+            sim.app
+                .world()
+                .get::<AgentVisionCache>(p)
+                .map(|c| {
+                    c.static_entries
+                        .iter()
+                        .any(|v| v.tile == (3, 0) && v.kind == crate::simulation::memory::MemoryKind::stone())
+                })
+                .unwrap_or(false)
+        };
+        assert!(!has_stone(&sim), "grass world has no stone sighting");
+        // Turn a nearby in-disc tile to Stone and fire the change event — the
+        // stationary agent must re-scan via the dirty path (no move).
+        sim.app
+            .world_mut()
+            .resource_mut::<ChunkMap>()
+            .set_tile(3, 0, 0, crate::world::tile::TileData {
+                kind: TileKind::Stone,
+                elevation: 0,
+                fertility: 0,
+                flags: 0,
+                ore: 0,
+            });
+        sim.app
+            .world_mut()
+            .send_event(crate::world::chunk_streaming::TileChangedEvent { tx: 3, ty: 0 });
+        sim.tick_n(2);
+        assert!(
+            has_stone(&sim),
+            "tile-change invalidation must re-report stone for a stationary agent"
+        );
     }
 }

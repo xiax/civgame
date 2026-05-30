@@ -268,6 +268,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(knowledge::GossipCursor::default())
             .insert_resource(jobs::WageGossipCursor::default())
             .insert_resource(memory::VisionCursor::default())
+            .insert_resource(items::GroundItemDecayCursor::default())
             .insert_resource(cohort::CohortRegistry::default())
             .insert_resource(construction::WorkbenchMap::default())
             .insert_resource(construction::LoomMap::default())
@@ -1114,7 +1115,14 @@ impl Plugin for SimulationPlugin {
                         .after(movement::dismount_system)
                         .after(movement::sync_indexed_after_move_system),
                     movement::horse_position_sync_system.after(movement::mount_check_system),
-                    memory::vision_system.after(movement::sync_indexed_after_move_system),
+                    (
+                        // Mark stationary agents' vision caches dirty on
+                        // terrain/wall change so they re-scan; must run before
+                        // vision consumes the dirty flag.
+                        memory::agent_vision_invalidate_system
+                            .before(memory::vision_system),
+                        memory::vision_system.after(movement::sync_indexed_after_move_system),
+                    ),
                     combat::combat_system.after(movement::sync_indexed_after_move_system),
                     combat::distress_emit_system.after(combat::combat_system),
                     combat::death_system.after(combat::distress_emit_system),
@@ -1291,8 +1299,16 @@ impl Plugin for SimulationPlugin {
                     faction::drop_items_at_destination_system,
                     htn::htn_method_completion_system
                         .after(faction::drop_items_at_destination_system),
-                    faction::compute_faction_storage_system
-                        .after(faction::drop_items_at_destination_system),
+                    (
+                        faction::compute_faction_storage_system
+                            .after(faction::drop_items_at_destination_system),
+                        // Bound the loose ground-item population: despawn spills
+                        // past their per-class TTL (rolling cursor, storage tiles
+                        // exempt). After storage rollup so it reads the same-tick
+                        // StorageTileMap.
+                        items::ground_item_decay_system
+                            .after(faction::compute_faction_storage_system),
+                    ),
                     reproduction::pregnancy_system,
                     reproduction::household_formation_system,
                     animals::animal_reproduction_cooldown_system,
