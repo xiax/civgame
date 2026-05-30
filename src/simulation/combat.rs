@@ -1,5 +1,6 @@
 use crate::economy::item::{armor_coverage, Item};
 use crate::simulation::animals::{AnimalAI, AnimalNeeds, AnimalState, Deer, Wolf};
+use crate::simulation::sim_rng::{RngSite, SimRng};
 use crate::simulation::construction::{Bed, HomeBed};
 use crate::simulation::corpse::{Corpse, CorpseMap, CorpseSpecies, CORPSE_FRESHNESS_TICKS};
 use crate::simulation::faction::{FactionMember, FactionRegistry, SOLO};
@@ -53,8 +54,11 @@ impl BodyPart {
         BodyPart::LeftLeg,
         BodyPart::RightLeg,
     ];
-    pub fn random() -> Self {
-        let r = fastrand::u8(0..100);
+    /// Deterministic hit-location pick from a caller-supplied local RNG.
+    /// Combat systems build it from [`super::sim_rng::SimRng`] keyed on the
+    /// acting entity + tick.
+    pub fn random_from(rng: &mut fastrand::Rng) -> Self {
+        let r = rng.u8(0..100);
         if r < 10 {
             BodyPart::Head
         } else if r < 50 {
@@ -68,6 +72,12 @@ impl BodyPart {
         } else {
             BodyPart::RightLeg
         }
+    }
+
+    /// Dev/test convenience (no `SimRng` in scope). Production combat MUST use
+    /// [`random_from`](Self::random_from).
+    pub fn random() -> Self {
+        Self::random_from(&mut fastrand::Rng::new())
     }
 
     /// Maps a body part to the matching `armor_coverage` flag used by
@@ -219,6 +229,9 @@ pub struct CombatEventWriters<'w> {
     /// Per-suspect Sequential-set timing, folded here so `combat_system` stays
     /// under Bevy's 16-param ceiling. Read once via `events.timings.guard(..)`.
     pub timings: Res<'w, crate::simulation::speed::SuspectSystemTimings>,
+    /// Deterministic sim RNG, folded here for the same 16-param-ceiling reason.
+    /// Build local draws via `events.sim_rng.for_entity(..)`.
+    pub sim_rng: Res<'w, SimRng>,
 }
 
 pub fn combat_system(
@@ -434,7 +447,11 @@ pub fn combat_system(
                 0.0
             };
             let hit_chance = (base_hit - cover_pct).clamp(0.2, 0.95);
-            let attack_lands = fastrand::f32() < hit_chance;
+            let attack_lands = events
+                .sim_rng
+                .for_entity(attacker, clock.tick, RngSite::CombatHitRoll)
+                .f32()
+                < hit_chance;
 
             let mut damage = ATTACK_DAMAGE;
             let mut attack_speed_bonus = 1.0;
@@ -495,7 +512,11 @@ pub fn combat_system(
                 continue;
             }
 
-            let target_part = BodyPart::random();
+            let mut hit_rng =
+                events
+                    .sim_rng
+                    .for_entity(attacker, clock.tick, RngSite::CombatArmorCoverage);
+            let target_part = BodyPart::random_from(&mut hit_rng);
 
             if body_query.contains(target) {
                 let mut mitigated_damage = damage;
@@ -508,7 +529,7 @@ pub fn combat_system(
                         if !a_stats.covers(part_bit) {
                             continue;
                         }
-                        let roll = fastrand::u8(0..100);
+                        let roll = hit_rng.u8(0..100);
                         if roll < a_stats.coverage_pct {
                             mitigated_damage =
                                 mitigated_damage.saturating_sub(a_stats.damage_reduction);
@@ -706,6 +727,8 @@ pub fn projectile_system(
         &mut crate::simulation::vehicle::Vehicle,
         &mut crate::simulation::vehicle::VehicleHealth,
     )>,
+    clock: Res<SimClock>,
+    sim_rng: Res<SimRng>,
 ) {
     for (proj_e, mut proj, mut tf) in projectiles.iter_mut() {
         proj.progress = (proj.progress + proj.step).min(1.0);
@@ -731,8 +754,9 @@ pub fn projectile_system(
         if on_tile {
             // Bodiless `Vehicle` target → per-cell damage.
             if let Ok((mut v, mut vhealth)) = vehicles.get_mut(proj.target) {
+                let mut hit_cell_rng = sim_rng.for_entity(proj_e, clock.tick, RngSite::CombatMiscRoll);
                 if let Some(hit) =
-                    crate::simulation::vehicle::pick_hit_cell(&vhealth)
+                    crate::simulation::vehicle::pick_hit_cell(&vhealth, &mut hit_cell_rng)
                 {
                     if let Some(design) = registry.get(v.design_id).cloned() {
                         let out = crate::simulation::vehicle::apply_vehicle_cell_damage(
@@ -752,13 +776,16 @@ pub fn projectile_system(
                     }
                 }
             } else if body_query.contains(proj.target) {
-                let part = BodyPart::random();
+                // Keyed on the (unique) projectile entity + tick.
+                let mut hit_rng =
+                    sim_rng.for_entity(proj_e, clock.tick, RngSite::CombatArmorCoverage);
+                let part = BodyPart::random_from(&mut hit_rng);
                 let mut dmg = proj.damage;
                 if let Ok(eq) = equipment_query.get(proj.target) {
                     let bit = part.coverage_bit();
                     for armor in eq.items.values() {
                         let Some(a) = armor.armor_stats else { continue };
-                        if a.covers(bit) && fastrand::u8(0..100) < a.coverage_pct {
+                        if a.covers(bit) && hit_rng.u8(0..100) < a.coverage_pct {
                             dmg = dmg.saturating_sub(a.damage_reduction);
                         }
                     }

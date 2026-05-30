@@ -1588,7 +1588,13 @@ pub(crate) fn spawn_ground_drop(
     resource_id: ResourceId,
     qty: u32,
 ) {
-    let (dx, dy) = adjacent_offset();
+    // Deterministic drop-offset keyed on the drop tile + resource (reproducible
+    // from world state; no per-call clock available across the ~9 callers).
+    let key = crate::simulation::sim_rng::mix(
+        ((tx as u32 as u64) << 32) | (ty as u32 as u64),
+        resource_id.0 as u64,
+    );
+    let (dx, dy) = adjacent_offset(key);
     let pos = tile_to_world(tx + dx, ty + dy);
     commands.spawn((
         GroundItem {
@@ -1608,8 +1614,8 @@ pub(crate) fn spawn_ground_drop(
     ));
 }
 
-fn adjacent_offset() -> (i32, i32) {
-    match fastrand::u8(..4) {
+fn adjacent_offset(key: u64) -> (i32, i32) {
+    match fastrand::Rng::with_seed(key).u8(..4) {
         0 => (1, 0),
         1 => (-1, 0),
         2 => (0, 1),

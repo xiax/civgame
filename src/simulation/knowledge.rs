@@ -14,6 +14,8 @@
 //! chief's `aware` bitset (see `faction::sync_faction_techs_from_chief_system`).
 use bevy::prelude::*;
 
+use crate::simulation::sim_rng::{RngSite, SimRng};
+
 use super::knowledge_bits::KnowledgeBits;
 use super::skills::{SkillKind, Skills};
 use super::stats::{modifier, Stats};
@@ -533,6 +535,7 @@ pub fn try_discover_from_action(
     skills: &Skills,
     activity: ActivityKind,
     now: u32,
+    rng: &mut fastrand::Rng,
 ) -> Option<TechId> {
     let _ = now;
     let int_mod = modifier(stats.intelligence) as f32;
@@ -560,7 +563,7 @@ pub fn try_discover_from_action(
             continue;
         }
         let chance = (trigger_chance * int_scale * skill_scale).min(0.5);
-        if fastrand::f32() < chance {
+        if rng.f32() < chance {
             knowledge.aware.set(def.id);
             let threshold = study_threshold(def.id);
             let bump = complexity(def.id) as u32 * INSIGHT_PROGRESS_PER_COMPLEXITY;
@@ -994,6 +997,7 @@ pub fn cluster_tier_promotion_system(
 pub fn tech_teaching_system(
     spatial: Res<crate::world::spatial::SpatialIndex>,
     clock: Res<crate::simulation::schedule::SimClock>,
+    sim_rng: Res<SimRng>,
     player: Res<crate::simulation::faction::PlayerFaction>,
     mut activity_log: EventWriter<crate::ui::activity_log::ActivityLogEvent>,
     name_query: Query<&Name>,
@@ -1075,7 +1079,11 @@ pub fn tech_teaching_system(
         let int_scale = 1.0 + (modifier(stats.intelligence) as f32 * 0.15).max(-0.5);
         let slowdown = learning_slowdown(stats, &knowledge);
         let chance = 0.004f32 * int_scale / slowdown;
-        if fastrand::f32() >= chance {
+        if sim_rng
+            .for_entity(entity, clock.tick, RngSite::KnowledgeTeaching)
+            .f32()
+            >= chance
+        {
             continue;
         }
 
@@ -1121,6 +1129,7 @@ const TILE_SIZE_LOCAL: f32 = crate::world::terrain::TILE_SIZE;
 pub fn discovery_system(
     mut events: EventReader<DiscoveryActionEvent>,
     clock: Res<crate::simulation::schedule::SimClock>,
+    sim_rng: Res<SimRng>,
     player: Res<crate::simulation::faction::PlayerFaction>,
     mut activity_log: EventWriter<crate::ui::activity_log::ActivityLogEvent>,
     mut q: Query<(
@@ -1141,6 +1150,7 @@ pub fn discovery_system(
             skills,
             ev.activity,
             clock.tick as u32,
+            &mut sim_rng.for_entity(entity, clock.tick, RngSite::KnowledgeDiscovery),
         ) {
             if let Some(fm) = fm {
                 if fm.faction_id == player.faction_id {

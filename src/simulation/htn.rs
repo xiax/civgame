@@ -3587,10 +3587,11 @@ fn pick_explore_tile(
     chunk_map: &ChunkMap,
     chunk_graph: &ChunkGraph,
     chunk_connectivity: &ChunkConnectivity,
+    rng: &mut fastrand::Rng,
 ) -> Option<(i32, i32)> {
     for _ in 0..8 {
-        let dx = fastrand::i32(-96..=96);
-        let dy = fastrand::i32(-96..=96);
+        let dx = rng.i32(-96..=96);
+        let dy = rng.i32(-96..=96);
         let tx = (home.0 + dx).max(0);
         let ty = (home.1 + dy).max(0);
         let to_z = chunk_map.surface_z_at(tx, ty) as i8;
@@ -4501,6 +4502,7 @@ pub fn htn_acquire_food_dispatch_system(
                     &chunk_map,
                     &chunk_graph,
                     &chunk_connectivity,
+                    &mut routing_stand.sim_rng.for_entity(actor, now, crate::simulation::sim_rng::RngSite::HtnExploreOffsetA),
                 ) {
                     let dispatched = assign_task_with_routing(
                         &mut ai,
@@ -4649,6 +4651,7 @@ pub fn htn_acquire_food_dispatch_system(
                         &chunk_map,
                         &chunk_graph,
                         &chunk_connectivity,
+                        &mut routing_stand.sim_rng.for_entity(actor, now, crate::simulation::sim_rng::RngSite::HtnExploreOffsetA),
                     ) else {
                         ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
@@ -5295,6 +5298,7 @@ pub fn htn_acquire_good_dispatch_system(
                             &chunk_map,
                             &chunk_graph,
                             &chunk_connectivity,
+                            &mut routing_stand.sim_rng.for_entity(actor, now, crate::simulation::sim_rng::RngSite::HtnExploreOffsetA),
                         ) else {
                             ai.active_method = None;
                             history.push(chosen_id, MethodOutcome::FailedRouting, now);
@@ -5705,6 +5709,7 @@ pub fn htn_stockpile_food_dispatch_system(
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
     clock: Res<SimClock>,
+    sim_rng: Res<crate::simulation::sim_rng::SimRng>,
     calendar: Res<Calendar>,
     gather_claims: Res<GatherClaims>,
     gk: crate::simulation::shared_knowledge::GatherKnowledge,
@@ -6091,6 +6096,7 @@ pub fn htn_stockpile_food_dispatch_system(
                     &chunk_map,
                     &chunk_graph,
                     &chunk_connectivity,
+                    &mut sim_rng.for_entity(actor, now, crate::simulation::sim_rng::RngSite::HtnExploreOffsetA),
                 ) {
                     let dispatched = assign_task_with_routing(
                         &mut ai,
@@ -6184,6 +6190,7 @@ pub fn htn_stockpile_food_dispatch_system(
                         &chunk_map,
                         &chunk_graph,
                         &chunk_connectivity,
+                        &mut sim_rng.for_entity(actor, now, crate::simulation::sim_rng::RngSite::HtnExploreOffsetA),
                     ) else {
                         ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);
@@ -6616,6 +6623,7 @@ pub fn htn_scout_dispatch_system(
     faction_registry: Res<FactionRegistry>,
     method_registry: Res<MethodRegistry>,
     clock: Res<SimClock>,
+    sim_rng: Res<crate::simulation::sim_rng::SimRng>,
     mut query: Query<
         (
             Entity,
@@ -6753,6 +6761,7 @@ pub fn htn_scout_dispatch_system(
                         &chunk_map,
                         &chunk_graph,
                         &chunk_connectivity,
+                        &mut sim_rng.for_entity(actor, now, crate::simulation::sim_rng::RngSite::HtnExploreOffsetA),
                     ) else {
                         ai.active_method = None;
                         history.push(chosen_id, MethodOutcome::FailedRouting, now);

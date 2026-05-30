@@ -9,6 +9,7 @@ use crate::simulation::items::GroundItem;
 use crate::simulation::lod::LodLevel;
 use crate::simulation::memory::MemoryKind;
 use crate::simulation::schedule::{BucketSlot, SimClock};
+use crate::simulation::sim_rng::{RngSite, SimRng};
 use crate::simulation::skills::SkillKind;
 use crate::simulation::technology::ActivityKind;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
@@ -608,6 +609,8 @@ mod tests {
         install_catalog();
         let mut app = App::new();
         app.insert_resource(Calendar::default());
+        app.insert_resource(SimClock::default());
+        app.insert_resource(SimRng::from_world_seed(1));
         app.insert_resource(PlantMap::default());
         app.insert_resource(PlantSpriteIndex::default());
         app.insert_resource(ChunkMap::default());
@@ -774,8 +777,12 @@ mod tests {
     fn sprout_chance_is_about_twenty_percent() {
         const TRIALS: u32 = 4_000;
         let mut sprouts = 0u32;
-        for _ in 0..TRIALS {
+        for trial in 0..TRIALS {
             let mut app = build_lifecycle_app();
+            // Vary the world seed per trial so the deterministic per-tile sprout
+            // roll samples the 20% chance across the seed space (rather than
+            // repeating one fixed (seed, tile, tick) draw 4000×).
+            app.insert_resource(SimRng::from_world_seed(trial as u64));
             let e = spawn_lifecycle_plant(&mut app, (0, 0), PlantKind::Tree, GrowthStage::Seed, 12);
             app.update(); // prime
             set_season(&mut app, Season::Summer);
@@ -1179,12 +1186,17 @@ fn try_scatter_seed(
     _cultivated_parent: bool,
     chance: f32,
     radius: i32,
+    rng: &SimRng,
+    tick: u64,
 ) {
-    if fastrand::f32() >= chance {
+    // Keyed on the parent tile + season-transition tick so each plant's scatter
+    // roll is independent of iteration order over the plant set.
+    let mut r = rng.for_tile(parent_tile, tick, RngSite::PlantScatterChance);
+    if r.f32() >= chance {
         return;
     }
-    let dx = fastrand::i32(-radius..=radius);
-    let dy = fastrand::i32(-radius..=radius);
+    let dx = r.i32(-radius..=radius);
+    let dy = r.i32(-radius..=radius);
     if dx == 0 && dy == 0 {
         return;
     }
@@ -1235,6 +1247,8 @@ fn try_scatter_seed(
 pub fn plant_lifecycle_system(
     mut commands: Commands,
     calendar: Res<Calendar>,
+    clock: Res<SimClock>,
+    sim_rng: Res<SimRng>,
     chunk_map: Res<ChunkMap>,
     // Optional so headless test fixtures (which don't build a `Globe`) keep
     // running. When `None`, scatter falls back to legacy surface-only gates;
@@ -1324,7 +1338,10 @@ pub fn plant_lifecycle_system(
                     // `wild_sprout_chance` (legacy 20%) before despawning.
                     let sprout_chance_pct = profile.map(|p| p.wild_sprout_chance).unwrap_or(20);
                     let sprouts = cultivated.is_some()
-                        || fastrand::u8(0..100) < sprout_chance_pct;
+                        || sim_rng
+                            .for_tile(plant.tile_pos, clock.tick, RngSite::PlantSproutRoll)
+                            .u8(0..100)
+                            < sprout_chance_pct;
                     if sprouts {
                         plant.growth = 0;
                         plant.stage = GrowthStage::Seedling;
@@ -1406,6 +1423,8 @@ pub fn plant_lifecycle_system(
             cultivated_parent,
             chance,
             radius,
+            &sim_rng,
+            clock.tick,
         );
     }
 
@@ -1426,6 +1445,8 @@ pub fn plant_lifecycle_system(
                 cultivated_parent,
                 0.20,
                 2,
+                &sim_rng,
+                clock.tick,
             );
         }
         if plant_map.0.get(&tile) == Some(&entity) {
@@ -1444,6 +1465,7 @@ pub fn plant_lifecycle_system(
 pub fn deer_graze_system(
     mut commands: Commands,
     clock: Res<SimClock>,
+    sim_rng: Res<SimRng>,
     plant_map: Res<PlantMap>,
     _plant_sprite_index: Res<PlantSpriteIndex>,
     mut plant_query: Query<&mut Plant>,
@@ -1499,9 +1521,10 @@ pub fn deer_graze_system(
                     .max(0.0);
             }
 
-            let count = 1 + fastrand::u8(..2);
+            let mut grng = sim_rng.for_tile((tx, ty), clock.tick, RngSite::PlantScatterOffset);
+            let count = 1 + grng.u8(..2);
             for _ in 0..count {
-                let (dx, dy) = adjacent_offset();
+                let (dx, dy) = adjacent_offset(&mut grng);
                 let sx = tx + dx;
                 let sy = ty + dy;
                 let pos = tile_to_world(sx, sy);
@@ -1527,8 +1550,8 @@ pub fn deer_graze_system(
     }
 }
 
-fn adjacent_offset() -> (i32, i32) {
-    match fastrand::u8(..4) {
+fn adjacent_offset(rng: &mut fastrand::Rng) -> (i32, i32) {
+    match rng.u8(..4) {
         0 => (1, 0),
         1 => (-1, 0),
         2 => (0, 1),

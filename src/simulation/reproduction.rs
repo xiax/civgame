@@ -10,9 +10,10 @@ use super::mood::Mood;
 use super::movement::MovementState;
 use super::needs::Needs;
 use super::person::{
-    generate_person_name, AiState, HairColor, Person, PersonAI, Profession, SkinTone,
+    generate_person_name_from, AiState, HairColor, Person, PersonAI, Profession, SkinTone,
 };
 use super::schedule::{BucketSlot, SimClock};
+use super::sim_rng::{RngSite, SimRng};
 use super::skills::{SkillPeaks, SkillUseTicks, Skills, SkillsLastSeen};
 use super::stats::Stats;
 use crate::economy::agent::EconomicAgent;
@@ -32,12 +33,23 @@ pub enum BiologicalSex {
 }
 
 impl BiologicalSex {
-    pub fn random() -> Self {
-        if fastrand::bool() {
+    /// Deterministic coin-flip from a caller-supplied local RNG. Production-sim
+    /// callers build the local RNG from [`super::sim_rng::SimRng`] keyed on a
+    /// stable id (spawn slot / mother entity) so the sex is reproducible.
+    pub fn random_from(rng: &mut fastrand::Rng) -> Self {
+        if rng.bool() {
             BiologicalSex::Male
         } else {
             BiologicalSex::Female
         }
+    }
+
+    /// Convenience for dev/test paths (sandbox, fixtures) that don't carry a
+    /// `SimRng`. Uses a fresh local `fastrand::Rng` (entropy-seeded in
+    /// production; deterministic in tests where the fixture seeds the global).
+    /// Production simulation MUST use [`random_from`](Self::random_from).
+    pub fn random() -> Self {
+        Self::random_from(&mut fastrand::Rng::new())
     }
 
     pub fn name(self) -> &'static str {
@@ -243,6 +255,8 @@ pub fn cosleep_observation_system(
 /// male-side mutations don't claim &mut Needs concurrently.
 pub fn wake_up_conception_system(
     mut commands: Commands,
+    clock: Res<SimClock>,
+    sim_rng: Res<SimRng>,
     name_query: Query<&Name>,
     pregnancy_query: Query<(), With<Pregnancy>>,
     mut params: ParamSet<(
@@ -356,7 +370,11 @@ pub fn wake_up_conception_system(
             }
 
             let female_pregnant = pregnancy_query.get(entity).is_ok();
-            let success = !female_pregnant && fastrand::u32(..2) == 0;
+            let success = !female_pregnant
+                && sim_rng
+                    .for_entity(entity, clock.tick, RngSite::ReproConception)
+                    .u32(..2)
+                    == 0;
 
             // Reset female's reproduction need on every attempt (success or fail,
             // pregnant or not).
@@ -433,6 +451,7 @@ pub fn wake_up_conception_system(
 pub fn pregnancy_system(
     mut commands: Commands,
     mut clock: ResMut<SimClock>,
+    sim_rng: Res<SimRng>,
     mut registry: ResMut<FactionRegistry>,
     chunk_map: Res<crate::world::chunk::ChunkMap>,
     name_query: Query<&Name>,
@@ -480,10 +499,11 @@ pub fn pregnancy_system(
         if preg.ticks_remaining > 0 {
             continue;
         }
+        let mut stats_rng = sim_rng.for_entity(mother, clock.tick, RngSite::StatsRoll);
         let child_stats = match (mother_stats, preg.father_stats.as_ref()) {
-            (Some(m), Some(f)) => Stats::inherit(m, f),
-            (Some(p), None) | (None, Some(p)) => Stats::inherit(p, p),
-            (None, None) => Stats::roll_3d6(),
+            (Some(m), Some(f)) => Stats::inherit_from(m, f, &mut stats_rng),
+            (Some(p), None) | (None, Some(p)) => Stats::inherit_from(p, p, &mut stats_rng),
+            (None, None) => Stats::roll_3d6_from(&mut stats_rng),
         };
         let mother_known = mother_knowledge
             .map(|k| k.awareness_snapshot())
@@ -532,8 +552,17 @@ pub fn pregnancy_system(
         };
 
         registry.add_member(faction_id);
-        let sex = BiologicalSex::random();
-        let child_name = child_name_for(faction_id, sex, &registry);
+        let sex = BiologicalSex::random_from(&mut sim_rng.for_entity(
+            mother,
+            clock.tick,
+            RngSite::ReproSex,
+        ));
+        let child_name = child_name_for(
+            faction_id,
+            sex,
+            &registry,
+            &mut sim_rng.for_entity(mother, clock.tick, RngSite::PersonNamePick),
+        );
         let mother_name = name_query
             .get(mother)
             .map(|n| n.as_str().to_string())
@@ -573,9 +602,21 @@ pub fn pregnancy_system(
                     BucketSlot(new_slot),
                     MovementState::default(),
                     sex,
-                    SkinTone::random(),
-                    HairColor::random(),
-                    Personality::random(),
+                    SkinTone::random_from(&mut sim_rng.for_key(
+                        new_slot as u64,
+                        0,
+                        RngSite::PersonSkinTone,
+                    )),
+                    HairColor::random_from(&mut sim_rng.for_key(
+                        new_slot as u64,
+                        0,
+                        RngSite::PersonHairColor,
+                    )),
+                    Personality::random_from(&mut sim_rng.for_key(
+                        new_slot as u64,
+                        0,
+                        RngSite::PersonPersonality,
+                    )),
                     AgentGoal::default(),
                     Profession::None,
                     FactionMember {
@@ -644,8 +685,13 @@ pub fn pregnancy_system(
 /// Build a name for a freshly-born child. Children of bonded factions take
 /// "<First> of <LineageRoot>" so the dynasty is visible in the inspector;
 /// SOLO births fall back to the generic name pool.
-fn child_name_for(faction_id: u32, sex: BiologicalSex, registry: &FactionRegistry) -> String {
-    let base = generate_person_name(sex);
+fn child_name_for(
+    faction_id: u32,
+    sex: BiologicalSex,
+    registry: &FactionRegistry,
+    rng: &mut fastrand::Rng,
+) -> String {
+    let base = generate_person_name_from(sex, rng);
     let root = registry
         .factions
         .get(&faction_id)

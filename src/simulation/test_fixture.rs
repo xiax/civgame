@@ -115,6 +115,9 @@ impl TestSim {
         // the fixture skips GameStatePlugin, so tests that need a custom
         // megachunk still write PendingSpawn directly.
         app.insert_resource(crate::game_state::WorldSeed(seed));
+        // NOTE: `SimRng` is inserted AFTER `add_plugins(SimulationPlugin)` below,
+        // because the plugin's `build` installs a placeholder that would
+        // otherwise overwrite an insert made here.
         // GameStartOptions is consumed by `bonding_system` (to apply
         // the world's `EconomyPreset` to bonding-formed factions) in
         // addition to spawn_population. Tests that want non-default
@@ -171,6 +174,13 @@ impl TestSim {
         app.add_plugins(crate::pathfinding::PathfindingPlugin);
         app.add_plugins(crate::economy::EconomyPlugin);
         app.add_plugins(crate::simulation::SimulationPlugin);
+
+        // Seed the deterministic sim RNG AFTER plugins: `SimulationPlugin::build`
+        // inserts a `WorldSeed::default()` placeholder `SimRng` (production
+        // overrides it via the OnEnter `reseed_sim_rng_system`, which fixtures —
+        // staying in SpawnSelect — never run). Re-insert here so fixtures are
+        // genuinely keyed on the test seed.
+        app.insert_resource(crate::simulation::sim_rng::SimRng::from_world_seed(seed));
 
         // Determinism: run every schedule single-threaded. The sim has ~73
         // global `fastrand::` call sites (combat rolls, reproduction, plant
@@ -22978,6 +22988,97 @@ mod loose_resource_cleanup {
                 .iter()
                 .any(|v| v.tile == (4, 4) && v.kind == MemoryKind::AnyEdible),
             "edible ground item dual-pushes AnyEdible into CurrentVision"
+        );
+    }
+}
+
+
+/// Determinism test for the seeded per-World `sim_rng::SimRng`.
+///
+/// The migration's guarantee: **every sim-affecting random draw is a pure
+/// function of `WorldSeed`** (via `SimRng`), independent of the process/thread
+/// `fastrand` global. This is what makes production reproducible — production
+/// never calls `fastrand::seed`, so before the migration the global was
+/// effectively random there.
+///
+/// We prove it by running the *same* `WorldSeed` twice while deliberately
+/// scrambling the global `fastrand` state differently between runs: the hashed
+/// sim outcome (agent positions / explore targets, all driven by `SimRng`) must
+/// be identical. A different `WorldSeed` must diverge.
+///
+/// (Note: this runs under the fixture's deterministic single-threaded schedule.
+/// Full *parallel* bit-determinism additionally requires order-independent
+/// shared-state mutation — reservations, `par_iter` contention, async path
+/// results — which is a separate concern from routing randomness and is why the
+/// fixture pins the executor.)
+mod determinism {
+    use super::*;
+
+    fn run(world_seed: u64, global_perturb: u64) -> u64 {
+        // `par_iter` systems need ComputeTaskPool even under the single-threaded
+        // executor; initialise it so this test passes in isolation (the full
+        // suite gets it from whichever test runs first).
+        bevy::tasks::ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        let mut sim = TestSim::new(world_seed);
+        // Scramble the thread-local `fastrand` global AFTER setup. If any
+        // hashed outcome depended on it (rather than on `SimRng`), the two
+        // same-`world_seed` runs would diverge.
+        fastrand::seed(global_perturb);
+        sim.flat_world(40, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        // Plain low-need agents stay `AiState::Idle` and wander via the
+        // seed-keyed `RngSite::MovementNudge` draws — so positions diverge by
+        // WorldSeed but not by the global fastrand state.
+        for i in 0..12i32 {
+            let tile = (i % 4 + 5, i / 4 + 5);
+            sim.spawn_person(fid, tile, |_b| {});
+        }
+        sim.tick_n(300);
+
+        use crate::simulation::sim_rng::{RngSite, SimRng};
+        let world = sim.app.world_mut();
+        // Snapshot the live SimRng resource — it must be seeded from WorldSeed
+        // (independent of the global fastrand we scrambled), so a per-agent draw
+        // is reproducible for a given WorldSeed and diverges across WorldSeeds.
+        let sim_rng = *world.resource::<SimRng>();
+        let mut q = world.query_filtered::<(Entity, &Transform, &PersonAI), With<Person>>();
+        let mut rows: Vec<[i64; 7]> = q
+            .iter(world)
+            .map(|(e, t, ai)| {
+                [
+                    e.to_bits() as i64,
+                    (t.translation.x / crate::world::terrain::TILE_SIZE).floor() as i64,
+                    (t.translation.y / crate::world::terrain::TILE_SIZE).floor() as i64,
+                    ai.current_z as i64,
+                    ai.dest_tile.0 as i64,
+                    ai.dest_tile.1 as i64,
+                    sim_rng.for_entity(e, 0, RngSite::CombatHitRoll).u64(..) as i64,
+                ]
+            })
+            .collect();
+        // Sort by stable key so query iteration order can't leak into the hash.
+        rows.sort();
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for row in rows {
+            for v in row {
+                h ^= v as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    #[test]
+    fn outcome_depends_only_on_world_seed_not_global_fastrand() {
+        assert_eq!(
+            run(12345, 1),
+            run(12345, 9_999),
+            "same WorldSeed must reproduce identically regardless of the global fastrand state"
+        );
+        assert_ne!(
+            run(12345, 1),
+            run(54321, 1),
+            "different WorldSeed should diverge"
         );
     }
 }

@@ -43,6 +43,10 @@ pub struct StandRouting<'w> {
     pub spatial_index: Res<'w, crate::world::spatial::SpatialIndex>,
     pub stand_reservations: Res<'w, StandTileReservations>,
     pub clock: Res<'w, SimClock>,
+    /// Deterministic sim RNG, bundled here so the HTN dispatchers that already
+    /// take `StandRouting` can build keyed local RNGs (e.g. for explore-tile
+    /// jitter) inside their `par_iter` closures without an extra param.
+    pub sim_rng: Res<'w, crate::simulation::sim_rng::SimRng>,
 }
 
 /// Per-tile worker entry recorded by `StandTileReservations`.

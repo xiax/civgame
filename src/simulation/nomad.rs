@@ -271,6 +271,9 @@ pub fn nomad_migration_system(world: &mut World) {
         return;
     }
     let now = tick as u32;
+    // SimRng is Copy — pull it out so the SystemState mutable borrow below is
+    // unaffected. Scout-jitter draws key on the scout entity + tick.
+    let sim_rng = *world.resource::<crate::simulation::sim_rng::SimRng>();
 
     // Snapshot the factions that should enter Surveying this tick.
     struct Trigger {
@@ -390,7 +393,11 @@ pub fn nomad_migration_system(world: &mut World) {
                 continue;
             };
             for &(e, quadrant) in picks.iter() {
-                let target = quadrant_target_tile(trig.home, quadrant);
+                let target = quadrant_target_tile(
+                    trig.home,
+                    quadrant,
+                    &mut sim_rng.for_entity(e, tick, crate::simulation::sim_rng::RngSite::NomadJitter),
+                );
                 if let Ok((_, mut goal, mut ai, mut aq)) = q.get_mut(e) {
                     *goal = crate::simulation::goals::AgentGoal::Scout;
                     aq.cancel();
@@ -443,9 +450,9 @@ pub fn nomad_migration_system(world: &mut World) {
 /// (0=NE, 1=NW, 2=SW, 3=SE), at chebyshev radius
 /// `SURVEY_SCOUT_RADIUS` from `home`. Adds a small per-quadrant jitter
 /// so successive surveys don't always probe identical tiles.
-fn quadrant_target_tile(home: (i32, i32), quadrant: u8) -> (i32, i32) {
+fn quadrant_target_tile(home: (i32, i32), quadrant: u8, rng: &mut fastrand::Rng) -> (i32, i32) {
     let r = SURVEY_SCOUT_RADIUS;
-    let jitter = fastrand::i32(-12..=12);
+    let jitter = rng.i32(-12..=12);
     let (dx, dy) = match quadrant {
         0 => (r + jitter, r + jitter),
         1 => (-r + jitter, r + jitter),

@@ -4459,7 +4459,7 @@ pub struct VehicleHitOutcome {
 /// is **height-weighted toward the low cells** — a foot soldier's spear, axe
 /// or club reaches the wheels and axles far more readily than a high crew
 /// platform. Returns `None` only when every cell is already destroyed.
-pub fn pick_hit_cell(health: &VehicleHealth) -> Option<IVec3> {
+pub fn pick_hit_cell(health: &VehicleHealth, rng: &mut fastrand::Rng) -> Option<IVec3> {
     let live: Vec<IVec3> = health
         .cells
         .iter()
@@ -4473,7 +4473,7 @@ pub fn pick_hit_cell(health: &VehicleHealth) -> Option<IVec3> {
     // Weight = (max_z - z + 1): the bottom row outweighs the top.
     let weights: Vec<u32> = live.iter().map(|p| (max_z - p.z + 1) as u32).collect();
     let total: u32 = weights.iter().sum();
-    let mut roll = fastrand::u32(0..total.max(1));
+    let mut roll = rng.u32(0..total.max(1));
     for (i, &w) in weights.iter().enumerate() {
         if roll < w {
             return Some(live[i]);
@@ -4620,7 +4620,13 @@ pub fn vehicle_combat_system(
             cd.0 = VEHICLE_ATTACK_COOLDOWN;
         }
 
-        let Some(hit) = pick_hit_cell(&health) else {
+        // Deterministic hit-cell pick keyed on the vehicle + its current total
+        // HP (which decreases each hit, so successive hits vary).
+        let mut hit_rng = fastrand::Rng::with_seed(crate::simulation::sim_rng::mix(
+            target_e.to_bits(),
+            health.cells.iter().map(|(_, h)| *h as u64).sum(),
+        ));
+        let Some(hit) = pick_hit_cell(&health, &mut hit_rng) else {
             continue;
         };
         let outcome = apply_vehicle_cell_damage(&mut health, &design, hit, dmg);
@@ -5651,8 +5657,9 @@ mod tests {
             disabled: VehicleDisableFlags::default(),
         };
         let mut low = 0;
+        let mut rng = fastrand::Rng::with_seed(0x5EED_F00D);
         for _ in 0..600 {
-            if pick_hit_cell(&health).unwrap().z == 0 {
+            if pick_hit_cell(&health, &mut rng).unwrap().z == 0 {
                 low += 1;
             }
         }

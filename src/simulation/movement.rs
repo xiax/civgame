@@ -111,6 +111,9 @@ pub struct MovementStandRouting<'w> {
     pub chunk_graph: Res<'w, ChunkGraph>,
     pub chunk_connectivity: Res<'w, ChunkConnectivity>,
     pub stand_reservations: Res<'w, StandTileReservations>,
+    /// Deterministic sim RNG, bundled here so `movement_system` stays under
+    /// Bevy's 16-param ceiling. Keyed on the moving agent + tick for wander.
+    pub sim_rng: Res<'w, crate::simulation::sim_rng::SimRng>,
 }
 
 pub fn movement_system(
@@ -749,8 +752,10 @@ pub fn movement_system(
                             (-1, 1),
                             (1, 1),
                         ];
-                        let mut rng = rand::thread_rng();
-                        let start = rng.gen_range(0..8);
+                        let start = stand_routing
+                            .sim_rng
+                            .for_entity(entity, now, crate::simulation::sim_rng::RngSite::MovementNudgeA)
+                            .usize(0..8);
                         let mut found = false;
                         for i in 0..8usize {
                             let (dx, dy) = dirs[(start + i) % 8];
@@ -843,7 +848,12 @@ pub fn movement_system(
                     // Try to step toward a liked friend (35% chance per wander tick).
                     let mut drifted = false;
                     if let Some(rel) = rel_opt {
-                        if fastrand::f32() < 0.35 {
+                        if stand_routing
+                            .sim_rng
+                            .for_entity(entity, now, crate::simulation::sim_rng::RngSite::MovementNudgeB)
+                            .f32()
+                            < 0.35
+                        {
                             let mut best_aff: i8 = 0;
                             let mut best_dir: Option<(i32, i32)> = None;
                             for slot in &rel.entries {
@@ -886,7 +896,6 @@ pub fn movement_system(
                     }
 
                     if !drifted {
-                        let mut rng = rand::thread_rng();
                         let dirs: [(i32, i32); 8] = [
                             (-1, 0),
                             (1, 0),
@@ -898,7 +907,10 @@ pub fn movement_system(
                             (1, 1),
                         ];
                         let candidates: Vec<_> = dirs.iter().collect();
-                        let start = rng.gen_range(0..8);
+                        let start = stand_routing
+                            .sim_rng
+                            .for_entity(entity, now, crate::simulation::sim_rng::RngSite::MovementNudgeA)
+                            .usize(0..8);
                         let (left, right) = candidates.split_at(start);
                         let shuffled: Vec<_> = right.iter().chain(left.iter()).collect();
 

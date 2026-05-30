@@ -3,6 +3,7 @@ use super::lod::LodLevel;
 use super::person::Person;
 use super::reproduction::BiologicalSex;
 use super::schedule::{BucketSlot, SimClock};
+use super::sim_rng::{mix, RngSite, SimRng};
 use crate::simulation::line_of_sight::has_los;
 use crate::world::chunk::{ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::TICKS_PER_SEASON;
@@ -604,6 +605,7 @@ fn cluster_spawn_tiles(
     pattern: SocialPattern,
     count: u32,
     next_cluster_id: &mut u32,
+    rng: &SimRng,
 ) -> Vec<((i32, i32), u32)> {
     let mut out: Vec<((i32, i32), u32)> = Vec::with_capacity(count as usize);
     let mut remaining = count;
@@ -614,21 +616,30 @@ fn cluster_spawn_tiles(
         };
         let cluster_id = *next_cluster_id;
         *next_cluster_id = next_cluster_id.wrapping_add(1);
+        // Per-cluster local stream keyed on the monotonic cluster id, so a
+        // cluster's group size + member offsets are independent of how many
+        // animals spawned before it (no global stream ordering).
         let group_size = if pattern.group_min >= pattern.group_max {
             pattern.group_min
         } else {
-            fastrand::u32(pattern.group_min..=pattern.group_max)
+            rng.for_key(cluster_id as u64, 0, RngSite::AnimalClusterGroupSize)
+                .u32(pattern.group_min..=pattern.group_max)
         }
         .min(remaining);
         out.push((center, cluster_id));
         let mut used: Vec<(i32, i32)> = Vec::with_capacity(group_size as usize);
         used.push(center);
-        for _ in 1..group_size {
+        for member_idx in 1..group_size {
             let mut placed = center;
             if pattern.cluster_radius > 0 {
+                let mut mrng = rng.for_key(
+                    mix(cluster_id as u64, member_idx as u64),
+                    0,
+                    RngSite::AnimalClusterMemberOffset,
+                );
                 for _ in 0..16 {
-                    let dx = fastrand::i32(-pattern.cluster_radius..=pattern.cluster_radius);
-                    let dy = fastrand::i32(-pattern.cluster_radius..=pattern.cluster_radius);
+                    let dx = mrng.i32(-pattern.cluster_radius..=pattern.cluster_radius);
+                    let dy = mrng.i32(-pattern.cluster_radius..=pattern.cluster_radius);
                     let candidate = (center.0 + dx, center.1 + dy);
                     if biome_set.contains(&candidate) && !used.contains(&candidate) {
                         placed = candidate;
@@ -644,11 +655,26 @@ fn cluster_spawn_tiles(
     out
 }
 
+/// Randomised initial needs for a freshly spawned animal, keyed on its unique
+/// monotonic `slot` (`BucketSlot`) so the values are reproducible regardless of
+/// spawn-loop order or thread.
+fn random_animal_needs(rng: &SimRng, slot: u32) -> AnimalNeeds {
+    let mut r = rng.for_key(slot as u64, 0, RngSite::AnimalSpawnNeeds);
+    AnimalNeeds {
+        hunger: r.f32() * 60.0,
+        sleep: r.f32() * 40.0,
+        reproduction: r.f32() * 80.0,
+        thirst: r.f32() * 50.0,
+        sickness: 0.0,
+    }
+}
+
 pub fn spawn_animals(
     mut commands: Commands,
     chunk_map: Res<ChunkMap>,
     mut clock: ResMut<SimClock>,
     mut herd_gen: ResMut<HerdClusterGen>,
+    sim_rng: Res<SimRng>,
 ) {
     let now = Instant::now();
 
@@ -688,8 +714,14 @@ pub fn spawn_animals(
     let forest_set: AHashSet<(i32, i32)> = forest_tiles.iter().copied().collect();
     let grass_set: AHashSet<(i32, i32)> = grass_tiles.iter().copied().collect();
 
-    fastrand::shuffle(&mut forest_tiles);
-    fastrand::shuffle(&mut grass_tiles);
+    // Deterministic shuffle of the candidate-tile pools, keyed on a fixed pool
+    // id so cluster centres are reproducible from the world seed.
+    sim_rng
+        .for_key(0, 0, RngSite::AnimalClusterCenterShuffle)
+        .shuffle(&mut forest_tiles);
+    sim_rng
+        .for_key(1, 0, RngSite::AnimalClusterCenterShuffle)
+        .shuffle(&mut grass_tiles);
 
     let mut slot = clock.population;
 
@@ -700,6 +732,7 @@ pub fn spawn_animals(
         PACK,
         count_of(AnimalKind::Wolf),
         &mut herd_gen.next,
+        &sim_rng,
     );
     for (i, &((tx, ty), _cid)) in wolf_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
@@ -719,15 +752,9 @@ pub fn spawn_animals(
             CombatCooldown::default(),
             LodLevel::Full,
             BucketSlot(slot),
-            AnimalNeeds {
-                hunger: fastrand::f32() * 60.0,
-                sleep: fastrand::f32() * 40.0,
-                reproduction: fastrand::f32() * 80.0,
-                thirst: fastrand::f32() * 50.0,
-                sickness: 0.0,
-            },
+            random_animal_needs(&sim_rng, slot),
             AnimalReproductionCooldown(0),
-            BiologicalSex::random(),
+            BiologicalSex::random_from(&mut sim_rng.for_key(slot as u64, 0, RngSite::ReproSex)),
             crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Wolf),
         ));
         slot += 1;
@@ -740,6 +767,7 @@ pub fn spawn_animals(
         HERD,
         count_of(AnimalKind::Deer),
         &mut herd_gen.next,
+        &sim_rng,
     );
     for (i, &((tx, ty), cluster_id)) in deer_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
@@ -761,17 +789,13 @@ pub fn spawn_animals(
                 LodLevel::Full,
                 BucketSlot(slot),
                 crate::simulation::plants::DeerGrazer {
-                    graze_timer: fastrand::u16(0..120),
+                    graze_timer: sim_rng
+                        .for_key(slot as u64, 0, RngSite::AnimalSpawnGrazeTimer)
+                        .u16(0..120),
                 },
-                AnimalNeeds {
-                    hunger: fastrand::f32() * 60.0,
-                    sleep: fastrand::f32() * 40.0,
-                    reproduction: fastrand::f32() * 80.0,
-                    thirst: fastrand::f32() * 50.0,
-                    sickness: 0.0,
-                },
+                random_animal_needs(&sim_rng, slot),
                 AnimalReproductionCooldown(0),
-                BiologicalSex::random(),
+                BiologicalSex::random_from(&mut sim_rng.for_key(slot as u64, 0, RngSite::ReproSex)),
             ),
             crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Deer),
         ));
@@ -785,6 +809,7 @@ pub fn spawn_animals(
         HERD,
         count_of(AnimalKind::Horse),
         &mut herd_gen.next,
+        &sim_rng,
     );
     for (i, &((tx, ty), cluster_id)) in horse_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
@@ -804,15 +829,9 @@ pub fn spawn_animals(
             CombatCooldown::default(),
             LodLevel::Full,
             BucketSlot(slot),
-            AnimalNeeds {
-                hunger: fastrand::f32() * 60.0,
-                sleep: fastrand::f32() * 40.0,
-                reproduction: fastrand::f32() * 80.0,
-                thirst: fastrand::f32() * 50.0,
-                sickness: 0.0,
-            },
+            random_animal_needs(&sim_rng, slot),
             AnimalReproductionCooldown(0),
-            BiologicalSex::random(),
+            BiologicalSex::random_from(&mut sim_rng.for_key(slot as u64, 0, RngSite::ReproSex)),
             crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Horse),
         ));
         slot += 1;
@@ -825,6 +844,7 @@ pub fn spawn_animals(
         HERD,
         count_of(AnimalKind::Cow),
         &mut herd_gen.next,
+        &sim_rng,
     );
     for (i, &((tx, ty), cluster_id)) in cow_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
@@ -844,15 +864,9 @@ pub fn spawn_animals(
             CombatCooldown::default(),
             LodLevel::Full,
             BucketSlot(slot),
-            AnimalNeeds {
-                hunger: fastrand::f32() * 60.0,
-                sleep: fastrand::f32() * 40.0,
-                reproduction: fastrand::f32() * 80.0,
-                thirst: fastrand::f32() * 50.0,
-                sickness: 0.0,
-            },
+            random_animal_needs(&sim_rng, slot),
             AnimalReproductionCooldown(0),
-            BiologicalSex::random(),
+            BiologicalSex::random_from(&mut sim_rng.for_key(slot as u64, 0, RngSite::ReproSex)),
             crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Cow),
         ));
         slot += 1;
@@ -865,6 +879,7 @@ pub fn spawn_animals(
         PACK,
         count_of(AnimalKind::Rabbit),
         &mut herd_gen.next,
+        &sim_rng,
     );
     for (i, &((tx, ty), _cid)) in rabbit_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
@@ -884,15 +899,9 @@ pub fn spawn_animals(
             CombatCooldown::default(),
             LodLevel::Full,
             BucketSlot(slot),
-            AnimalNeeds {
-                hunger: fastrand::f32() * 60.0,
-                sleep: fastrand::f32() * 40.0,
-                reproduction: fastrand::f32() * 80.0,
-                thirst: fastrand::f32() * 50.0,
-                sickness: 0.0,
-            },
+            random_animal_needs(&sim_rng, slot),
             AnimalReproductionCooldown(0),
-            BiologicalSex::random(),
+            BiologicalSex::random_from(&mut sim_rng.for_key(slot as u64, 0, RngSite::ReproSex)),
             crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Rabbit),
         ));
         slot += 1;
@@ -905,6 +914,7 @@ pub fn spawn_animals(
         PACK,
         count_of(AnimalKind::Pig),
         &mut herd_gen.next,
+        &sim_rng,
     );
     for (i, &((tx, ty), _cid)) in pig_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
@@ -924,15 +934,9 @@ pub fn spawn_animals(
             CombatCooldown::default(),
             LodLevel::Full,
             BucketSlot(slot),
-            AnimalNeeds {
-                hunger: fastrand::f32() * 60.0,
-                sleep: fastrand::f32() * 40.0,
-                reproduction: fastrand::f32() * 80.0,
-                thirst: fastrand::f32() * 50.0,
-                sickness: 0.0,
-            },
+            random_animal_needs(&sim_rng, slot),
             AnimalReproductionCooldown(0),
-            BiologicalSex::random(),
+            BiologicalSex::random_from(&mut sim_rng.for_key(slot as u64, 0, RngSite::ReproSex)),
             crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Pig),
         ));
         slot += 1;
@@ -945,6 +949,7 @@ pub fn spawn_animals(
         PACK,
         count_of(AnimalKind::Fox),
         &mut herd_gen.next,
+        &sim_rng,
     );
     for (i, &((tx, ty), _cid)) in fox_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
@@ -964,15 +969,9 @@ pub fn spawn_animals(
             CombatCooldown::default(),
             LodLevel::Full,
             BucketSlot(slot),
-            AnimalNeeds {
-                hunger: fastrand::f32() * 60.0,
-                sleep: fastrand::f32() * 40.0,
-                reproduction: fastrand::f32() * 80.0,
-                thirst: fastrand::f32() * 50.0,
-                sickness: 0.0,
-            },
+            random_animal_needs(&sim_rng, slot),
             AnimalReproductionCooldown(0),
-            BiologicalSex::random(),
+            BiologicalSex::random_from(&mut sim_rng.for_key(slot as u64, 0, RngSite::ReproSex)),
             crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Fox),
         ));
         slot += 1;
@@ -985,6 +984,7 @@ pub fn spawn_animals(
         SOLITARY,
         count_of(AnimalKind::Cat),
         &mut herd_gen.next,
+        &sim_rng,
     );
     for (i, &((tx, ty), _cid)) in cat_tiles.iter().enumerate() {
         let pos = tile_to_world(tx, ty);
@@ -1004,15 +1004,9 @@ pub fn spawn_animals(
             CombatCooldown::default(),
             LodLevel::Full,
             BucketSlot(slot),
-            AnimalNeeds {
-                hunger: fastrand::f32() * 60.0,
-                sleep: fastrand::f32() * 40.0,
-                reproduction: fastrand::f32() * 80.0,
-                thirst: fastrand::f32() * 50.0,
-                sickness: 0.0,
-            },
+            random_animal_needs(&sim_rng, slot),
             AnimalReproductionCooldown(0),
-            BiologicalSex::random(),
+            BiologicalSex::random_from(&mut sim_rng.for_key(slot as u64, 0, RngSite::ReproSex)),
             crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Cat),
         ));
         slot += 1;
@@ -1044,6 +1038,7 @@ pub fn animal_movement_system(
         Without<Person>,
     >,
     clock: Res<SimClock>,
+    sim_rng: Res<SimRng>,
     timings: Res<crate::simulation::speed::SuspectSystemTimings>,
     budget: Res<crate::simulation::perf::PerfWorkBudget>,
     mut replan_cursor: ResMut<crate::simulation::animal_paths::AnimalReplanCursor>,
@@ -1197,7 +1192,9 @@ pub fn animal_movement_system(
                             (-1, 1),
                             (1, 1),
                         ];
-                        let start = fastrand::usize(..8);
+                        let start = sim_rng
+                            .for_entity(entity, clock.tick, RngSite::AnimalMisc)
+                            .usize(..8);
                         for i in 0..8 {
                             let (dx, dy) = dirs[(start + i) % 8];
                             let ntx = cur_tx + dx;
@@ -2087,6 +2084,7 @@ pub fn animal_reproduction_system(
     mut commands: Commands,
     spatial: Res<SpatialIndex>,
     mut clock: ResMut<SimClock>,
+    sim_rng: Res<SimRng>,
     wolf_count: Query<(), With<Wolf>>,
     deer_count: Query<(), With<Deer>>,
     horse_count: Query<(), With<Horse>>,
@@ -2259,7 +2257,11 @@ pub fn animal_reproduction_system(
             needs.reproduction = 0.0;
             cooldown.0 = ANIMAL_BIRTH_COOLDOWN;
         }
-        if fastrand::u32(..10_000) < ANIMAL_BIRTH_CHANCE {
+        if sim_rng
+            .for_entity(female_ent, clock.tick, RngSite::AnimalReproductionBirth)
+            .u32(..10_000)
+            < ANIMAL_BIRTH_CHANCE
+        {
             let herd_cid = herd_query.get(female_ent).ok().map(|h| h.cluster_id);
             births.push((birth_pos, species, herd_cid));
         }
@@ -2273,7 +2275,11 @@ pub fn animal_reproduction_system(
         let tx = (pos.x / TILE_SIZE).floor() as i32;
         let ty = (pos.y / TILE_SIZE).floor() as i32;
         let world_pos = tile_to_world(tx, ty);
-        let sex = BiologicalSex::random();
+        let sex = BiologicalSex::random_from(&mut sim_rng.for_key(
+            slot as u64,
+            0,
+            RngSite::ReproSex,
+        ));
         let transform = Transform::from_xyz(world_pos.x, world_pos.y, 1.0);
         let ai = AnimalAI {
             target_tile: (tx as i32, ty as i32),
@@ -2315,7 +2321,9 @@ pub fn animal_reproduction_system(
                         LodLevel::Full,
                         BucketSlot(slot),
                         crate::simulation::plants::DeerGrazer {
-                            graze_timer: fastrand::u16(0..120),
+                            graze_timer: sim_rng
+                                .for_key(slot as u64, 0, RngSite::AnimalSpawnGrazeTimer)
+                                .u16(0..120),
                         },
                         AnimalNeeds::default(),
                         AnimalReproductionCooldown(0),
@@ -2654,6 +2662,7 @@ pub fn animal_drink_system(
 pub fn seed_starting_tamed_animals_system(
     mut commands: Commands,
     mut clock: ResMut<SimClock>,
+    sim_rng: Res<SimRng>,
     chunk_map: Res<crate::world::chunk::ChunkMap>,
     faction_registry: Res<crate::simulation::faction::FactionRegistry>,
 ) {
@@ -2715,7 +2724,11 @@ pub fn seed_starting_tamed_animals_system(
                         BiologicalSex::Female
                     }
                 } else {
-                    BiologicalSex::random()
+                    BiologicalSex::random_from(&mut sim_rng.for_key(
+                        mix(fid as u64, mix(species as u64, i as u64)),
+                        0,
+                        RngSite::ReproSex,
+                    ))
                 };
                 spawn_seeded_domestic_animal(
                     &mut commands,

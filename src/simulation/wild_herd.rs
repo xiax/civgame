@@ -19,6 +19,7 @@ use crate::collections::AHashSet;
 use bevy::prelude::*;
 
 use crate::simulation::animals::{AnimalAI, AnimalNeeds, AnimalReproductionCooldown, Cow, Horse};
+use crate::simulation::sim_rng::{mix, RngSite, SimRng};
 use crate::simulation::combat::CombatTarget;
 
 /// Subset of grazer species that wild herds spawn at v1. Horse / Cow only
@@ -414,6 +415,7 @@ pub fn wild_herd_bloom_system(
     mut registry: ResMut<WildHerdRegistry>,
     member_q: Query<&WildHerdMember>,
     mut bucket_slot: Local<u32>,
+    sim_rng: Res<SimRng>,
 ) {
     // Pull the camera focus tile (unique). Other focus points are settled-
     // region centres; we only bloom against the player camera so off-screen
@@ -444,6 +446,7 @@ pub fn wild_herd_bloom_system(
                 herd.leader_tile,
                 target_count as u32,
                 &mut bucket_slot,
+                &sim_rng,
             );
             herd.aggregate_count = herd.aggregate_count.saturating_sub(spawned.len() as u16);
             herd.members = spawned;
@@ -501,6 +504,7 @@ fn spawn_herd_members(
     centre: (i32, i32),
     count: u32,
     bucket_slot: &mut u32,
+    sim_rng: &SimRng,
 ) -> Vec<Entity> {
     use crate::simulation::animals::HerdMember;
     use crate::world::tile::TileKind;
@@ -551,12 +555,15 @@ fn spawn_herd_members(
             wander_timer: (i % 60) as f32 * 0.05,
             ..Default::default()
         };
-        let needs = AnimalNeeds {
-            hunger: fastrand::f32() * 60.0,
-            sleep: fastrand::f32() * 40.0,
-            reproduction: fastrand::f32() * 80.0,
-            thirst: fastrand::f32() * 50.0,
-            sickness: 0.0,
+        let needs = {
+            let mut r = sim_rng.for_key(mix(cluster_id as u64, i as u64), 0, RngSite::WildHerdNeeds);
+            AnimalNeeds {
+                hunger: r.f32() * 60.0,
+                sleep: r.f32() * 40.0,
+                reproduction: r.f32() * 80.0,
+                thirst: r.f32() * 50.0,
+                sickness: 0.0,
+            }
         };
 
         // Bevy bundles cap at 15 elements in a single tuple. Group the
@@ -578,7 +585,11 @@ fn spawn_herd_members(
                     BucketSlot(slot),
                     needs,
                     AnimalReproductionCooldown(0),
-                    BiologicalSex::random(),
+                    BiologicalSex::random_from(&mut sim_rng.for_key(
+                        mix(cluster_id as u64, i as u64),
+                        1,
+                        RngSite::WildHerdNeeds,
+                    )),
                     crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Horse),
                 ))
                 .id(),
@@ -597,7 +608,11 @@ fn spawn_herd_members(
                     BucketSlot(slot),
                     needs,
                     AnimalReproductionCooldown(0),
-                    BiologicalSex::random(),
+                    BiologicalSex::random_from(&mut sim_rng.for_key(
+                        mix(cluster_id as u64, i as u64),
+                        1,
+                        RngSite::WildHerdNeeds,
+                    )),
                     crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Cow),
                 ))
                 .id(),

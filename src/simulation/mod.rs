@@ -84,6 +84,7 @@ pub mod sedentary_collapse;
 pub mod seed_reservation;
 pub mod settlement;
 pub mod settlement_bootstrap;
+pub mod sim_rng;
 pub mod stand_reservation;
 pub mod shared_knowledge;
 pub mod skills;
@@ -132,6 +133,19 @@ pub enum SimulationSet {
 /// idle gap on game start.
 fn mark_warmup_complete_system(mut next: ResMut<NextState<crate::SimulationState>>) {
     next.set(crate::SimulationState::Active);
+}
+
+/// Re-seed [`sim_rng::SimRng`] from the live `WorldSeed` at game start, before
+/// any RNG consumer runs. Ordered `.before(person::spawn_population)` in the
+/// `OnEnter(Playing)` chain. The reroll path (spawn-select) only mutates
+/// `WorldSeed` while still in `SpawnSelect`, so this commit-time reseed picks
+/// the chosen seed up; clients re-derive identically from the replicated
+/// `world_seed`. See `sim_rng.rs`.
+fn reseed_sim_rng_system(
+    seed: Res<crate::game_state::WorldSeed>,
+    mut rng: ResMut<sim_rng::SimRng>,
+) {
+    *rng = sim_rng::SimRng::from_world_seed(seed.0);
 }
 
 pub struct SimulationPlugin;
@@ -214,6 +228,13 @@ impl Plugin for SimulationPlugin {
             .insert_resource(player_command::PlayerCommandIdGen::default())
             .insert_resource(nomad::PendingCampOps::default())
             .insert_resource(SimClock::default())
+            // Placeholder so the resource always exists (fixtures, sandbox,
+            // pre-Playing UI). Reseeded from the live `WorldSeed` at
+            // `OnEnter(Playing)` by `reseed_sim_rng_system`, before any RNG
+            // consumer (notably `spawn_population`).
+            .insert_resource(sim_rng::SimRng::from_world_seed(
+                crate::game_state::WorldSeed::default().0,
+            ))
             .insert_resource(survey_task::SurveyCursor::default())
             .insert_resource(survey_task::SettlementSurveyTaskState::default())
             .insert_resource(speed::GameSpeed::default())
@@ -402,6 +423,11 @@ impl Plugin for SimulationPlugin {
                     // Nested tuple: keeps the outer `OnEnter` tuple within
                     // Bevy's 20-element arity limit.
                     (
+                        // Seed the deterministic sim RNG from the chosen
+                        // WorldSeed before any consumer (spawn_population scatters
+                        // Dispositions, etc.). Runs in sandbox too — cheap, and
+                        // sandbox skips spawn_population but other RNG sites fire.
+                        reseed_sim_rng_system.before(person::spawn_population),
                         person::spawn_population
                             .after(crate::world::terrain::spawn_world_system)
                             .run_if(not(resource_exists::<crate::sandbox::SandboxMode>)),

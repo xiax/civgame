@@ -150,18 +150,27 @@ impl Personality {
         }
     }
 
-    pub fn random() -> Self {
+    /// Deterministic personality pick from a caller-supplied local RNG.
+    /// Production-sim callers build it from [`super::sim_rng::SimRng`] keyed on
+    /// the spawned person entity / spawn slot.
+    pub fn random_from(rng: &mut fastrand::Rng) -> Self {
         // 10% Loner; rest split evenly across the original four.
-        let r = fastrand::u8(..10);
+        let r = rng.u8(..10);
         if r == 0 {
             return Personality::Loner;
         }
-        match fastrand::u8(..4) {
+        match rng.u8(..4) {
             0 => Personality::Gatherer,
             1 => Personality::Socialite,
             2 => Personality::Explorer,
             _ => Personality::Nurturer,
         }
+    }
+
+    /// Dev/test convenience. Production simulation MUST use
+    /// [`random_from`](Self::random_from).
+    pub fn random() -> Self {
+        Self::random_from(&mut fastrand::Rng::new())
     }
 }
 

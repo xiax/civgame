@@ -1,8 +1,8 @@
 use bevy::prelude::*;
-use rand::Rng;
 use std::time::Instant;
 
 use crate::economy::agent::EconomicAgent;
+use crate::simulation::sim_rng::{RngSite, SimRng};
 use crate::world::chunk::{ChunkMap, CHUNK_SIZE};
 use crate::world::spatial::{Indexed, IndexedKind};
 use crate::world::terrain::{tile_to_world, WORLD_CHUNKS_X, WORLD_CHUNKS_Y};
@@ -139,12 +139,19 @@ pub enum SkinTone {
 }
 
 impl SkinTone {
-    pub fn random() -> Self {
-        match fastrand::u8(0..3) {
+    /// Deterministic pick from a caller-supplied local RNG. Production-sim
+    /// callers build it from [`super::sim_rng::SimRng`] keyed on a stable id.
+    pub fn random_from(rng: &mut fastrand::Rng) -> Self {
+        match rng.u8(0..3) {
             0 => Self::Pale,
             1 => Self::Dark,
             _ => Self::Tan,
         }
+    }
+    /// Dev/test convenience; production simulation uses
+    /// [`random_from`](Self::random_from).
+    pub fn random() -> Self {
+        Self::random_from(&mut fastrand::Rng::new())
     }
     pub fn as_str(self) -> &'static str {
         match self {
@@ -164,13 +171,19 @@ pub enum HairColor {
 }
 
 impl HairColor {
-    pub fn random() -> Self {
-        match fastrand::u8(0..4) {
+    /// Deterministic pick from a caller-supplied local RNG.
+    pub fn random_from(rng: &mut fastrand::Rng) -> Self {
+        match rng.u8(0..4) {
             0 => Self::Black,
             1 => Self::Blonde,
             2 => Self::White,
             _ => Self::Brown,
         }
+    }
+    /// Dev/test convenience; production simulation uses
+    /// [`random_from`](Self::random_from).
+    pub fn random() -> Self {
+        Self::random_from(&mut fastrand::Rng::new())
     }
     pub fn as_str(self) -> &'static str {
         match self {
@@ -193,12 +206,18 @@ const FEMALE_NAMES: &[&str] = &[
     "Yara", "Zola",
 ];
 
-pub fn generate_person_name(sex: BiologicalSex) -> &'static str {
+pub fn generate_person_name_from(sex: BiologicalSex, rng: &mut fastrand::Rng) -> &'static str {
     let list = match sex {
         BiologicalSex::Male => MALE_NAMES,
         BiologicalSex::Female => FEMALE_NAMES,
     };
-    list[fastrand::usize(..list.len())]
+    list[rng.usize(..list.len())]
+}
+
+/// Dev/test convenience; production simulation uses
+/// [`generate_person_name_from`].
+pub fn generate_person_name(sex: BiologicalSex) -> &'static str {
+    generate_person_name_from(sex, &mut fastrand::Rng::new())
 }
 
 /// Core person AI component.
@@ -412,6 +431,10 @@ pub fn spawn_population(
     archetype_registry: Res<crate::simulation::archetype::FactionArchetypeRegistry>,
 ) {
     let now = Instant::now();
+    // Local SimRng identical to the resource reseeded by `reseed_sim_rng_system`
+    // (`.before(spawn_population)`) — both derive from the same `WorldSeed`.
+    // Built locally to avoid pushing `spawn_population` over the param ceiling.
+    let sim_rng = SimRng::from_world_seed(world_seed.0);
     use crate::simulation::region::MegaChunkCoord;
     use crate::world::globe::{
         GLOBE_CELL_CHUNKS, GLOBE_HEIGHT, GLOBE_WIDTH, MEGACHUNK_SIZE_CHUNKS,
@@ -467,7 +490,7 @@ pub fn spawn_population(
     let start_cx = center_cx - (WORLD_CHUNKS_X / 2);
     let start_cy = center_cy - (WORLD_CHUNKS_Y / 2);
 
-    let mut rng = rand::thread_rng();
+    let mut rng = sim_rng.for_key(0xA1_5EED, 0, RngSite::PersonSpawnHelperB);
     let total_tiles_x = WORLD_CHUNKS_X * CHUNK_SIZE as i32;
     let total_tiles_y = WORLD_CHUNKS_Y * CHUNK_SIZE as i32;
 
@@ -528,12 +551,12 @@ pub fn spawn_population(
     // Search for an AI rival home inside the pre-gen window. Shared between
     // the "no-megachunk human fallback" and the AI rival loop.
     let mut pick_ai_rival_home = |spawned_homes: &[(i32, i32)],
-                                  rng: &mut rand::rngs::ThreadRng|
+                                  rng: &mut fastrand::Rng|
      -> Option<(i32, i32)> {
         let mut best: Option<((i32, i32), i32)> = None;
         for _ in 0..200 {
-            let tx = start_tx + rng.gen_range(0..total_tiles_x);
-            let ty = start_ty + rng.gen_range(0..total_tiles_y);
+            let tx = start_tx + rng.i32(0..total_tiles_x);
+            let ty = start_ty + rng.i32(0..total_tiles_y);
             if !chunk_map.is_passable(tx, ty)
                 || matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone))
                 || !tile_landform_ok(tx, ty)
@@ -548,8 +571,8 @@ pub fn spawn_population(
         best.map(|(t, _)| t).or_else(|| {
             let mut result = None;
             for _ in 0..500 {
-                let tx = start_tx + rng.gen_range(0..total_tiles_x);
-                let ty = start_ty + rng.gen_range(0..total_tiles_y);
+                let tx = start_tx + rng.i32(0..total_tiles_x);
+                let ty = start_ty + rng.i32(0..total_tiles_y);
                 if chunk_map.is_passable(tx, ty)
                     && !matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone))
                     && tile_landform_ok(tx, ty)
@@ -702,6 +725,7 @@ pub fn spawn_population(
             (home_tx, home_ty),
             group_size,
             options.era,
+            &sim_rng,
         );
         total_factions += 1;
         let n = band.members.len() as u32;
@@ -816,14 +840,14 @@ pub(crate) fn pair_chief_sex(faction_id: u32, home_tile: (i32, i32)) -> Biologic
 /// Fallback member-spawn tile: a passable non-stone tile within `SPAWN_RADIUS`
 /// of `(cx, cy)`. Used only when the reachable flood pool is exhausted.
 fn fallback_member_tile(
-    rng: &mut rand::rngs::ThreadRng,
+    rng: &mut fastrand::Rng,
     chunk_map: &ChunkMap,
     cx: i32,
     cy: i32,
 ) -> Option<(i32, i32)> {
     for _ in 0..200 {
-        let tx = cx + rng.gen_range(-SPAWN_RADIUS..=SPAWN_RADIUS);
-        let ty = cy + rng.gen_range(-SPAWN_RADIUS..=SPAWN_RADIUS);
+        let tx = cx + rng.i32(-SPAWN_RADIUS..=SPAWN_RADIUS);
+        let ty = cy + rng.i32(-SPAWN_RADIUS..=SPAWN_RADIUS);
         if chunk_map.is_passable(tx, ty)
             && !matches!(chunk_map.tile_kind_at(tx, ty), Some(TileKind::Stone))
         {
@@ -852,6 +876,7 @@ pub(crate) fn spawn_faction_band(
     home_tile: (i32, i32),
     group_size: u32,
     era: crate::simulation::technology::Era,
+    sim_rng: &SimRng,
 ) -> FactionBandSpawn {
     let (home_tx, home_ty) = home_tile;
     let home_world = tile_to_world(home_tx, home_ty);
@@ -878,7 +903,9 @@ pub(crate) fn spawn_faction_band(
         ));
     }
 
-    let mut rng = rand::thread_rng();
+    // Per-band fallback-tile RNG, keyed on the faction id so member placement
+    // is reproducible from the world seed.
+    let mut rng = sim_rng.for_key(faction_id as u64, 0, RngSite::PersonSpawnHelperA);
     let mut members: Vec<Entity> = Vec::with_capacity(group_size as usize);
     let mut first_member: Option<Entity> = None;
     // Draw member spawn tiles from a flood outward from the home tile, so
@@ -954,7 +981,11 @@ pub(crate) fn spawn_faction_band(
                     SkillPeaks::default(),
                     SkillUseTicks::default(),
                     SkillsLastSeen::default(),
-                    Stats::roll_3d6(),
+                    Stats::roll_3d6_from(&mut sim_rng.for_key(
+                        slot as u64,
+                        0,
+                        RngSite::StatsRoll,
+                    )),
                     PersonAI {
                         state: AiState::Idle,
                         target_tile: (tx as i32, ty as i32),
@@ -973,9 +1004,21 @@ pub(crate) fn spawn_faction_band(
                         ..Default::default()
                     },
                     sex,
-                    SkinTone::random(),
-                    HairColor::random(),
-                    Personality::random(),
+                    SkinTone::random_from(&mut sim_rng.for_key(
+                        slot as u64,
+                        0,
+                        RngSite::PersonSkinTone,
+                    )),
+                    HairColor::random_from(&mut sim_rng.for_key(
+                        slot as u64,
+                        0,
+                        RngSite::PersonHairColor,
+                    )),
+                    Personality::random_from(&mut sim_rng.for_key(
+                        slot as u64,
+                        0,
+                        RngSite::PersonPersonality,
+                    )),
                     AgentGoal::default(),
                     Profession::None,
                     FactionMember {
@@ -994,7 +1037,10 @@ pub(crate) fn spawn_faction_band(
                     MethodHistory::default(),
                     crate::simulation::memory::CurrentVision::default(),
                     crate::simulation::memory::AgentVisionCache::default(),
-                    Name::new(generate_person_name(sex)),
+                    Name::new(generate_person_name_from(
+                        sex,
+                        &mut sim_rng.for_key(slot as u64, 0, RngSite::PersonNamePick),
+                    )),
                     PathFollow::default(),
                     Carrier::default(),
                     crate::simulation::reproduction::CoSleepTracker::default(),
@@ -1008,13 +1054,17 @@ pub(crate) fn spawn_faction_band(
                     crate::simulation::typed_task::ActionQueue::idle(),
                     crate::simulation::goal_scorers::AgentDecisionState::default(),
                     // Phase 6 of wage-aware-labor-market-v2: per-agent
-                    // psychological profile. Scattered by fastrand at spawn so
-                    // populations have heterogeneous goal preferences.
-                    crate::simulation::goal_scorers::Disposition {
-                        entrepreneurial: fastrand::u8(..),
-                        gregariousness: fastrand::u8(..),
-                        curiosity: fastrand::u8(..),
-                        martial: fastrand::u8(..),
+                    // psychological profile. Scattered deterministically (keyed
+                    // on the spawn slot) so populations have heterogeneous goal
+                    // preferences reproducible from the world seed.
+                    {
+                        let mut d = sim_rng.for_key(slot as u64, 0, RngSite::PersonDisposition);
+                        crate::simulation::goal_scorers::Disposition {
+                            entrepreneurial: d.u8(..),
+                            gregariousness: d.u8(..),
+                            curiosity: d.u8(..),
+                            martial: d.u8(..),
+                        }
                     },
                 ),
                 // Always-present (never insert/removed at runtime — see

@@ -278,6 +278,7 @@ pub fn materialize_abstract_faction_system(
     options: Res<crate::GameStartOptions>,
     mut abstract_factions: ResMut<AbstractFactions>,
     mut pending_kin: ResMut<PendingMaterializationKinSeed>,
+    sim_rng: Res<crate::simulation::sim_rng::SimRng>,
 ) {
     // Match loaded chunks against abstract faction home tiles.
     let mut to_materialize: Vec<AbstractFaction> = Vec::new();
@@ -327,6 +328,7 @@ pub fn materialize_abstract_faction_system(
             anchor,
             member_count,
             options.era,
+            &sim_rng,
         );
 
         if let Some(fd) = registry.factions.get_mut(&af.faction_id) {
