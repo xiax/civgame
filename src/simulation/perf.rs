@@ -41,6 +41,17 @@ pub struct PerfWorkBudget {
     /// so every item is revisited within `ceil(N / cap)` ticks — far inside
     /// the shortest (2-day) TTL. No `tick % N` cadence.
     pub ground_item_decay_scans_per_tick: usize,
+    /// Per-tick cap on officials (bureaucrats / chiefs) processed by
+    /// `cluster_tier_promotion_system`'s neighbour scan + cluster copy.
+    /// Round-robined by `ClusterPromotionCursor` — replaces the former
+    /// `tick % 200` burst that copied every source cluster in one tick.
+    pub cluster_promotions_per_tick: usize,
+    /// Per-tick cap on `PathRequest`s drained by `drain_path_requests_system`.
+    /// A tunable knob over the historical `PATH_BUDGET_PER_TICK` (192) — this
+    /// is a *drain capacity*, not a CPU cap; FixedUpdate frequency already
+    /// scales the effective rate with game speed. Lower only after the path
+    /// worker's `worker_us_per_tick` telemetry shows the drain is the spike.
+    pub path_requests_per_tick: usize,
 }
 
 impl Default for PerfWorkBudget {
@@ -67,6 +78,8 @@ impl Default for PerfWorkBudget {
             vision_recomputes_per_tick: 32,
             animal_replans_per_tick: 64,
             ground_item_decay_scans_per_tick: 512,
+            cluster_promotions_per_tick: 64,
+            path_requests_per_tick: crate::pathfinding::worker::PATH_BUDGET_PER_TICK,
         }
     }
 }

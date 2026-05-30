@@ -606,6 +606,41 @@ pub struct GossipCursor {
     pub next_entity_bits: u64,
 }
 
+/// Round-robin cursor over officials (bureaucrats / chiefs) for the per-tick
+/// `cluster_tier_promotion_system` neighbour scan + cluster copy. Keyed on
+/// official entity bits; advanced past the last-served official each tick so
+/// every official is revisited within `ceil(N / cap)` ticks — far inside the
+/// cluster TTL, and re-promotion is idempotent. No `tick % N` burst.
+#[derive(Resource, Default)]
+pub struct ClusterPromotionCursor {
+    pub next_bits: u64,
+}
+
+/// Pick at most `cap` officials to process this tick, starting at the first
+/// entity whose bits are `>= cursor_bits` (wrapping). Returns the set to
+/// process plus the next cursor value (one past the last served). Pure —
+/// unit-tested without an `App`. Mirrors `animal_paths::select_replan_slice`.
+pub fn select_promotion_slice(
+    officials: &mut Vec<Entity>,
+    cap: usize,
+    cursor_bits: u64,
+) -> (ahash::AHashSet<Entity>, u64) {
+    if officials.is_empty() {
+        return (ahash::AHashSet::default(), cursor_bits);
+    }
+    officials.sort_unstable_by_key(|e| e.to_bits());
+    let pivot = officials
+        .iter()
+        .position(|e| e.to_bits() >= cursor_bits)
+        .unwrap_or(0);
+    let take = cap.max(1).min(officials.len());
+    let slice: ahash::AHashSet<Entity> = (0..take)
+        .map(|off| officials[(pivot + off) % officials.len()])
+        .collect();
+    let last = officials[(pivot + take - 1) % officials.len()];
+    (slice, last.to_bits().wrapping_add(1))
+}
+
 /// Tech-awareness gossip between agents within 3 tiles whose goal is
 /// `Socialize`. Awareness is free (single bit) and propagates only between
 /// socializing agents; mastery (Learned) only spreads via the explicit
@@ -746,13 +781,17 @@ pub fn awareness_gossip_system(
 /// cross-settlement chiefs see arbitrage geography even from settlements
 /// they've never visited.
 ///
-/// Runs every `TIER_PROMOTION_CADENCE` ticks to bound cost. Reads positions,
+/// Runs every tick with a per-tick cursor over officials (no `tick % N`
+/// burst — see `PerfWorkBudget::cluster_promotions_per_tick`). Reads positions,
 /// professions, household / faction membership; mutates `SharedKnowledge`.
 pub fn cluster_tier_promotion_system(
     spatial: Res<crate::world::spatial::SpatialIndex>,
     clock: Res<crate::simulation::schedule::SimClock>,
     settlement_map: Res<crate::simulation::settlement::SettlementMap>,
     faction_registry: Res<crate::simulation::faction::FactionRegistry>,
+    budget: Res<crate::simulation::perf::PerfWorkBudget>,
+    timings: Res<crate::simulation::speed::SuspectSystemTimings>,
+    mut cursor: ResMut<ClusterPromotionCursor>,
     mut shared: ResMut<crate::simulation::shared_knowledge::SharedKnowledge>,
     q: Query<(
         Entity,
@@ -770,10 +809,7 @@ pub fn cluster_tier_promotion_system(
     use crate::simulation::shared_knowledge::KnowledgeTier;
     use crate::simulation::social_contact::is_social_contact;
 
-    const TIER_PROMOTION_CADENCE: u64 = 200; // 10s game-time
-    if clock.tick % TIER_PROMOTION_CADENCE != 0 {
-        return;
-    }
+    let _t = timings.guard(crate::simulation::speed::suspect::CLUSTER_TIER_PROMOTION);
     let now_contact = clock.tick as u32;
 
     // Snapshot socializing agents with their faction / household / official
@@ -809,6 +845,28 @@ pub fn cluster_tier_promotion_system(
         return;
     }
 
+    // O(1) entity → snap-index map so the 7×7 neighbour scan below is
+    // O(officials × 49) instead of O(officials × 49 × snaps).
+    let snap_index: ahash::AHashMap<Entity, usize> = snaps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.entity, i))
+        .collect();
+
+    // Cursor over officials: process at most `cap` per tick (the snapshot
+    // pass above stays full-population — cheap — like the gossip systems).
+    let mut officials: Vec<Entity> = snaps
+        .iter()
+        .filter(|s| s.is_bureaucrat || s.is_chief)
+        .map(|s| s.entity)
+        .collect();
+    let cap = budget.cluster_promotions_per_tick.max(1);
+    let (process, next_cursor) = select_promotion_slice(&mut officials, cap, cursor.next_bits);
+    cursor.next_bits = next_cursor;
+    if process.is_empty() {
+        return;
+    }
+
     // Pass 1: identify (household_id, settlement_id) pairs to promote.
     // The bureaucrat's faction's *first settlement* is the target tier
     // (mirrors `SettlementMap::first_for_faction` semantics elsewhere in
@@ -826,6 +884,9 @@ pub fn cluster_tier_promotion_system(
         if !(s.is_bureaucrat || s.is_chief) {
             continue;
         }
+        if !process.contains(&s.entity) {
+            continue;
+        }
         // This snap is an official. Find their settlement.
         let Some(official_settlement) = settlement_map.first_for_faction(s.faction_id) else {
             continue;
@@ -837,7 +898,7 @@ pub fn cluster_tier_promotion_system(
                     if other == s.entity {
                         continue;
                     }
-                    let Some(o) = snaps.iter().find(|x| x.entity == other) else {
+                    let Some(o) = snap_index.get(&other).map(|&i| &snaps[i]) else {
                         continue;
                     };
                     // Same-faction-root check: the other agent's faction
@@ -1190,5 +1251,59 @@ mod mastery_belief_tests {
             .unwrap();
         assert_eq!(cosmo.accepted, 10);
         assert_eq!(disease.accepted, 20);
+    }
+}
+
+#[cfg(test)]
+mod promotion_slice_tests {
+    use super::select_promotion_slice;
+    use bevy::prelude::Entity;
+
+    fn ent(i: u32) -> Entity {
+        Entity::from_raw(i)
+    }
+
+    #[test]
+    fn empty_returns_cursor_unchanged() {
+        let mut v: Vec<Entity> = Vec::new();
+        let (slice, next) = select_promotion_slice(&mut v, 4, 42);
+        assert!(slice.is_empty());
+        assert_eq!(next, 42);
+    }
+
+    #[test]
+    fn takes_cap_from_pivot_and_advances() {
+        let mut v = vec![ent(0), ent(1), ent(2), ent(3)];
+        let (slice, next) = select_promotion_slice(&mut v, 2, 0);
+        assert_eq!(slice.len(), 2);
+        assert!(slice.contains(&ent(0)) && slice.contains(&ent(1)));
+        // Next cursor is one past the last served (ent(1)).
+        assert_eq!(next, ent(1).to_bits().wrapping_add(1));
+    }
+
+    #[test]
+    fn wraps_around_and_revisits_all() {
+        // cap=2 over 5 officials: three ticks cover everyone at least once.
+        let officials = [ent(10), ent(11), ent(12), ent(13), ent(14)];
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = 0u64;
+        for _ in 0..3 {
+            let mut v = officials.to_vec();
+            let (slice, next) = select_promotion_slice(&mut v, 2, cursor);
+            for e in slice {
+                seen.insert(e);
+            }
+            cursor = next;
+        }
+        for e in officials {
+            assert!(seen.contains(&e), "official {e:?} never revisited");
+        }
+    }
+
+    #[test]
+    fn cap_larger_than_len_takes_all() {
+        let mut v = vec![ent(7), ent(8)];
+        let (slice, _next) = select_promotion_slice(&mut v, 99, 0);
+        assert_eq!(slice.len(), 2);
     }
 }

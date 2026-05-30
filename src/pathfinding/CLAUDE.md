@@ -49,7 +49,7 @@ Internally: per-(chunk, ComponentId) → inter-chunk CC id (`tile_reachable` / `
 
 ## Worker (`worker.rs`)
 
-`drain_path_requests_system` drains up to `PATH_BUDGET_PER_TICK = 64` per tick. Per request:
+`drain_path_requests_system` runs on **FixedUpdate before `SimulationSet::Sequential`** (not PreUpdate) and drains up to `PerfWorkBudget::path_requests_per_tick` per tick (default = `PATH_BUDGET_PER_TICK = 192`, a tunable knob — it's a *drain capacity*, not a CPU cap; FixedUpdate frequency already scales the effective rate with game speed). Per-tick telemetry (`worker_us_per_tick` / `paths_dispatched_per_tick` / `queue_len`) surfaces in the debug panel "Performance" header — read it before lowering the knob. Per request:
 
 1. Reject if `goal` not standable.
 2. Look up start/goal components via `graph.component_for_tile`. Misses bump `component_lookup_failed_at_{start,goal}`.

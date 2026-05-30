@@ -113,6 +113,7 @@ pub struct PerfPanelParams<'w> {
     pub chunk_map: Res<'w, crate::world::chunk::ChunkMap>,
     pub shared: Res<'w, crate::simulation::shared_knowledge::SharedKnowledge>,
     pub settings: ResMut<'w, crate::simulation::perf::PerformanceSettings>,
+    pub pathfinding: Res<'w, PathfindingDiagnostics>,
 }
 
 pub fn debug_panel_system(
@@ -1094,6 +1095,25 @@ fn render_performance_section(ui: &mut egui::Ui, perf: &mut PerfPanelParams) {
                 );
             }
         }
+
+        // Path worker: runs on FixedUpdate before Sequential, so it isn't in
+        // the suspect array. Surface its own per-tick telemetry here.
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new("Path worker")
+                .strong()
+                .size(11.0),
+        );
+        ui.label(
+            egui::RichText::new(format!(
+                "  {:.0} µs/tick · {} dispatched · {} queued",
+                perf.pathfinding.worker_us_per_tick as f32,
+                perf.pathfinding.paths_dispatched_per_tick,
+                perf.pathfinding.queue_len,
+            ))
+            .color(egui::Color32::GRAY)
+            .size(11.0),
+        );
 
         // Growth-watch counters: current value, delta over the retained
         // window, and a sparkline. A persistently-positive delta is the

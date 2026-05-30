@@ -266,6 +266,7 @@ impl Plugin for SimulationPlugin {
             .insert_resource(opportunity::OpportunityDirty::default())
             .insert_resource(trader::TraderCursor::default())
             .insert_resource(knowledge::GossipCursor::default())
+            .insert_resource(knowledge::ClusterPromotionCursor::default())
             .insert_resource(jobs::WageGossipCursor::default())
             .insert_resource(memory::VisionCursor::default())
             .insert_resource(items::GroundItemDecayCursor::default())

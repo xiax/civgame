@@ -318,6 +318,24 @@ impl TestSim {
             .id()
     }
 
+    /// Register a settlement for `faction_id` so `SettlementMap::first_for_faction`
+    /// resolves — used by vision-tier tests that need a Settlement tier to
+    /// exist as the write target for public sightings. Spawns a placeholder
+    /// entity; the vision write path reads only `SettlementMap`, never the
+    /// entity itself.
+    pub fn register_settlement(
+        &mut self,
+        faction_id: u32,
+        market_tile: (i32, i32),
+    ) -> crate::simulation::settlement::SettlementId {
+        use crate::simulation::settlement::SettlementMap;
+        let entity = self.app.world_mut().spawn_empty().id();
+        let mut map = self.app.world_mut().resource_mut::<SettlementMap>();
+        let id = map.alloc_id();
+        map.register(id, entity, (0, 0), faction_id);
+        id
+    }
+
     /// Drop a stack of `good` × `qty` directly on `(tx, ty)`. Spawned as
     /// a `GroundItem` with the standard `Indexed` hook so spatial-index
     /// queries find it on the next sync.
@@ -22857,6 +22875,79 @@ mod loose_resource_cleanup {
         assert!(
             has_stone(&sim),
             "tile-change invalidation must re-report stone for a stationary agent"
+        );
+    }
+
+    // ─── Day-one 5× perf fix: vision write-tier by owner (plans/improve-performance.md) ───
+
+    #[test]
+    fn public_sighting_writes_to_settlement_tier_not_faction() {
+        use crate::simulation::shared_knowledge::{KnowledgeTier, SharedKnowledge};
+        let mut sim = TestSim::new(7);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        let sid = sim.register_settlement(fid, (0, 0));
+        // Settled agent (no household) near a public (unclaimed) mature plant.
+        let _p = sim.spawn_person(fid, (0, 0), |_| {});
+        sim.spawn_mature_plant((5, 5), crate::simulation::plants::PlantKind::Grain);
+        sim.tick_n(5);
+        let shared = sim.app.world().resource::<SharedKnowledge>();
+        let settlement_clusters = shared
+            .tiers
+            .get(&KnowledgeTier::Settlement(sid))
+            .map(|m| m.clusters.len())
+            .unwrap_or(0);
+        let faction_clusters = shared
+            .tiers
+            .get(&KnowledgeTier::Faction(fid))
+            .map(|m| m.clusters.len())
+            .unwrap_or(0);
+        assert!(
+            settlement_clusters > 0,
+            "public plant sighting must land in the settlement tier (shared surface)"
+        );
+        assert_eq!(
+            faction_clusters, 0,
+            "public sighting must NOT duplicate into the faction tier"
+        );
+    }
+
+    #[test]
+    fn ground_item_not_written_to_shared_knowledge_but_live_visible() {
+        use crate::simulation::memory::{CurrentVision, MemoryKind};
+        use crate::simulation::shared_knowledge::{KnowledgeTier, SharedKnowledge};
+        let mut sim = TestSim::new(8);
+        sim.flat_world(2, 0, TileKind::Grass);
+        let fid = sim.player_faction_id;
+        let sid = sim.register_settlement(fid, (0, 0));
+        let p = sim.spawn_person(fid, (0, 0), |_| {});
+        // Loose edible on the ground within view radius.
+        sim.spawn_ground_item((4, 4), crate::economy::core_ids::fruit(), 10);
+        sim.tick_n(5);
+        // No SharedKnowledge cluster from the ground item, in any tier.
+        let shared = sim.app.world().resource::<SharedKnowledge>();
+        let total_clusters: usize = [KnowledgeTier::Settlement(sid), KnowledgeTier::Faction(fid)]
+            .iter()
+            .filter_map(|t| shared.tiers.get(t))
+            .map(|m| m.clusters.len())
+            .sum();
+        assert_eq!(
+            total_clusters, 0,
+            "ground items must not create SharedKnowledge clusters (live-only)"
+        );
+        // But CurrentVision sees it live (entity-anchored) and dual-pushes AnyEdible.
+        let cv = sim.app.world().get::<CurrentVision>(p).unwrap();
+        assert!(
+            cv.entries
+                .iter()
+                .any(|v| v.tile == (4, 4) && v.entity.is_some()),
+            "ground item must be live-visible via CurrentVision"
+        );
+        assert!(
+            cv.entries
+                .iter()
+                .any(|v| v.tile == (4, 4) && v.kind == MemoryKind::AnyEdible),
+            "edible ground item dual-pushes AnyEdible into CurrentVision"
         );
     }
 }

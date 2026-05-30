@@ -338,7 +338,10 @@ pub mod suspect {
     pub const MOVEMENT: usize = 5;
     pub const GATHER: usize = 6;
     pub const COMBAT: usize = 7;
-    pub const COUNT: usize = 8;
+    // Economy-set attribution: the household→settlement→faction cluster
+    // promotion pass (de-bursted to a per-tick cursor — see knowledge.rs).
+    pub const CLUSTER_TIER_PROMOTION: usize = 8;
+    pub const COUNT: usize = 9;
     pub const LABELS: [&str; COUNT] = [
         "ambient_social_pairing",
         "awareness_gossip",
@@ -348,6 +351,7 @@ pub mod suspect {
         "movement",
         "gather",
         "combat",
+        "cluster_tier_promotion",
     ];
 }
 

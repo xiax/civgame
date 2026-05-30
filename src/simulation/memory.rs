@@ -391,6 +391,7 @@ pub fn vision_system(
     spatial: Res<SpatialIndex>,
     clock: Res<SimClock>,
     budget: Res<crate::simulation::perf::PerfWorkBudget>,
+    settlement_map: Res<crate::simulation::settlement::SettlementMap>,
     mut cursor: ResMut<VisionCursor>,
     chunk_map: Res<ChunkMap>,
     door_map: Res<crate::simulation::construction::DoorMap>,
@@ -489,17 +490,32 @@ pub fn vision_system(
             continue;
         }
 
-        // The agent writes to its *finest* tier — Household if a member,
-        // otherwise Faction. Settlement and faction-wide knowledge are
-        // populated through `cluster_tier_promotion_system` when officials
-        // socialise. SOLO agents (faction 0) write to and read from the
-        // SOLO faction tier.
-        let write_tier = if let Some(hm) = household_member {
-            KnowledgeTier::Household(hm.household_id)
-        } else if let Some(fm) = faction_member {
-            KnowledgeTier::Faction(fm.faction_id)
-        } else {
-            KnowledgeTier::Faction(0)
+        // Per-sighting tier selection keyed on the sighting's `ResourceOwner`.
+        // *Public* resources (stone, reeds, wild plants, prey, herds) write to
+        // the agent's settlement tier when resolvable, else its faction tier —
+        // so one shared surface serves every household instead of N duplicate
+        // per-household clusters. Genuinely private resources keep their owning
+        // tier; observer-private `Person` picks stay on the finest tier.
+        // Readers consult all tiers finest-first (`TierSet::tiers`), so a
+        // household member still sees settlement-tier public sightings with no
+        // promotion hop. SOLO / unsettled agents fall back to `Faction(0)`.
+        let home_household = household_member.map(|h| h.household_id);
+        let home_settlement =
+            faction_member.and_then(|fm| settlement_map.first_for_faction(fm.faction_id));
+        let home_faction = faction_member.map(|fm| fm.faction_id).unwrap_or(0);
+        let tier_for = |owner: crate::simulation::shared_knowledge::ResourceOwner| -> KnowledgeTier {
+            use crate::simulation::shared_knowledge::ResourceOwner;
+            match owner {
+                ResourceOwner::Household(hid) => KnowledgeTier::Household(hid),
+                ResourceOwner::Settlement(sid) => KnowledgeTier::Settlement(sid),
+                ResourceOwner::Faction(fid) => KnowledgeTier::Faction(fid),
+                ResourceOwner::Person(_) => home_household
+                    .map(KnowledgeTier::Household)
+                    .unwrap_or(KnowledgeTier::Faction(home_faction)),
+                ResourceOwner::Public => home_settlement
+                    .map(KnowledgeTier::Settlement)
+                    .unwrap_or(KnowledgeTier::Faction(home_faction)),
+            }
         };
 
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
@@ -544,7 +560,7 @@ pub fn vision_system(
                     if let Some(tile_kind) = chunk_map.tile_kind_at(ntx, nty) {
                         if tile_kind == crate::world::tile::TileKind::Stone {
                             shared.report_sighting(
-                                write_tier,
+                                tier_for(ResourceOwner::Public),
                                 (ntx, nty),
                                 MemoryKind::stone(),
                                 ResourceOwner::Public,
@@ -563,7 +579,7 @@ pub fn vision_system(
                         // without bespoke dispatch infrastructure.
                         if tile_kind == crate::world::tile::TileKind::Marsh {
                             shared.report_sighting(
-                                write_tier,
+                                tier_for(ResourceOwner::Public),
                                 (ntx, nty),
                                 MemoryKind::reeds(),
                                 ResourceOwner::Public,
@@ -610,7 +626,7 @@ pub fn vision_system(
                             plant.kind,
                         );
                         for k in kinds {
-                            shared.report_sighting(write_tier, (ntx, nty), k, owner, now);
+                            shared.report_sighting(tier_for(owner), (ntx, nty), k, owner, now);
                             current_vision.entries.push(VisionEntry {
                                 kind: k,
                                 tile: (ntx, nty),
@@ -625,39 +641,26 @@ pub fn vision_system(
             for &item_entity in spatial.get(ntx, nty) {
                 if let Ok(item) = item_query.get(item_entity) {
                     let resource_id = item.item.resource_id;
-                    // SharedKnowledge keeps the legacy class filter (Food →
-                    // AnyEdible; Material/Seed → Resource(rid); other classes
-                    // don't seed clusters). CurrentVision is broader — every
-                    // visible GroundItem the agent could harvest under a chief
-                    // Stockpile{rid} posting goes in by Resource(rid).
-                    let shared_kind =
-                        catalog.get(resource_id).and_then(|def| match def.class {
-                            crate::economy::resource_catalog::ResourceClass::Food => {
-                                Some(MemoryKind::AnyEdible)
-                            }
-                            crate::economy::resource_catalog::ResourceClass::Material
-                            | crate::economy::resource_catalog::ResourceClass::Seed => {
-                                Some(MemoryKind::Resource(resource_id))
-                            }
-                            _ => None,
-                        });
-                    if let Some(k) = shared_kind {
-                        // Loose ground items belong to no one — Public.
-                        shared.report_sighting(
-                            write_tier,
-                            (ntx, nty),
-                            k,
-                            ResourceOwner::Public,
-                            now,
-                        );
-                    }
+                    // Ground items are NOT written to SharedKnowledge — they
+                    // decay (TTL), so persistent clusters would just produce
+                    // stale gather/scavenge targets and failed paths. They stay
+                    // live-only via CurrentVision (entity-anchored) + the live
+                    // SpatialIndex scavenge fallback in `htn.rs`. The forage
+                    // `AnyEdible` SharedKnowledge fallback re-validates against
+                    // PlantMap, so it never surfaced ground items anyway; loose
+                    // food/material collection is owned by
+                    // `chief_loose_stockpile_posting_system` (direct SpatialIndex
+                    // scan). `is_edible` only drives the AnyEdible dual-push below.
+                    let is_edible = catalog.get(resource_id).is_some_and(|def| {
+                        matches!(def.class, crate::economy::resource_catalog::ResourceClass::Food)
+                    });
                     current_vision.entries.push(VisionEntry {
                         kind: MemoryKind::Resource(resource_id),
                         tile: (ntx, nty),
                         entity: Some(item_entity),
                         owner: ResourceOwner::Public,
                     });
-                    if shared_kind == Some(MemoryKind::AnyEdible) {
+                    if is_edible {
                         current_vision.entries.push(VisionEntry {
                             kind: MemoryKind::AnyEdible,
                             tile: (ntx, nty),
@@ -672,7 +675,7 @@ pub fn vision_system(
                         // Prey: predators + game (Wolf / Deer) — feeds hunting.
                         if is_wolf || is_deer {
                             shared.report_sighting(
-                                write_tier,
+                                tier_for(ResourceOwner::Public),
                                 (ntx, nty),
                                 MemoryKind::Prey,
                                 ResourceOwner::Public,
@@ -689,7 +692,7 @@ pub fn vision_system(
                         // nomad migration scoring (Deer / Horse / Cattle).
                         if is_deer || is_horse || is_cow {
                             shared.report_sighting(
-                                write_tier,
+                                tier_for(ResourceOwner::Public),
                                 (ntx, nty),
                                 MemoryKind::HerdSighting,
                                 ResourceOwner::Public,

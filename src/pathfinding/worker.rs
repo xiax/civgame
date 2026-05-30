@@ -17,13 +17,15 @@ use crate::pathfinding::tile_cost::{TraversalProfile, BASE_STEP_COST};
 use crate::simulation::tasks::task_kind_label;
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 
-/// Maximum number of `PathRequest`s the worker drains in one tick. Sized
-/// for the FixedUpdate-resident drain — at 20 Hz baseline this is
-/// 192 × 20 ≈ 3840 req/s (parity with the previous PreUpdate 64/frame
-/// budget at 60 fps). Higher game speeds run FixedUpdate more often via
-/// `Time<Virtual>::set_relative_speed`, so the budget scales with sim
-/// demand without further tuning. At ~50 µs per A* segment worst case
-/// that's ~10 ms/tick, well inside the 5× speed budget of 10 ms.
+/// Default for `PerfWorkBudget::path_requests_per_tick` — the maximum number
+/// of `PathRequest`s the worker drains in one tick. Sized for the
+/// FixedUpdate-resident drain — at 20 Hz baseline this is 192 × 20 ≈ 3840
+/// req/s. Higher game speeds run FixedUpdate more often via
+/// `Time<Virtual>::set_relative_speed`, so the budget scales with sim demand
+/// without further tuning. At ~50 µs per A* segment worst case that's
+/// ~10 ms/tick, at the edge of the 5× speed budget of 10 ms. This is a
+/// *drain capacity*, not a CPU cap — the runtime cap reads
+/// `PerfWorkBudget::path_requests_per_tick` (this value is its default).
 pub const PATH_BUDGET_PER_TICK: usize = 192;
 
 /// Per-tick pathfinding telemetry, surfaced in the debug panel.
@@ -259,10 +261,11 @@ fn fail_outcome_with_metrics(
     }
 }
 
-/// Drains up to `PATH_BUDGET_PER_TICK` requests from the queue and writes
-/// `PathFollow` for the requesting agents. Runs in `PreUpdate` — that way
-/// any system that consumes `PathFollow` later in the same tick (movement
-/// after step (f)) sees the freshly-computed result.
+/// Drains up to `PerfWorkBudget::path_requests_per_tick` requests from the
+/// queue and writes `PathFollow` for the requesting agents. Runs on
+/// FixedUpdate before `SimulationSet::Sequential` (see `pathfinding/mod.rs`)
+/// so movement consuming `PathFollow` later in the same tick sees the
+/// freshly-computed result.
 ///
 /// A* searches run in parallel on the Bevy compute task pool. Component
 /// writes, event emission, and diagnostic counters are folded back in
@@ -275,6 +278,7 @@ pub fn drain_path_requests_system(
     conn: Res<ChunkConnectivity>,
     mut hotspots: ResMut<HotspotFlowFields>,
     flags: Res<PathDebugFlags>,
+    budget: Res<crate::simulation::perf::PerfWorkBudget>,
     mut pool: ResMut<AStarPool>,
     mut diag: ResMut<PathfindingDiagnostics>,
     mut failure_log: ResMut<FailureLog>,
@@ -292,9 +296,10 @@ pub fn drain_path_requests_system(
     let conn_generation = conn.generation;
     let now_tick = tick.elapsed().as_millis() as u64;
 
-    // Drain a batch from the queue.
-    let mut requests: Vec<PathRequest> = Vec::with_capacity(PATH_BUDGET_PER_TICK);
-    while requests.len() < PATH_BUDGET_PER_TICK {
+    // Drain a batch from the queue (tunable knob; default == PATH_BUDGET_PER_TICK).
+    let drain_cap = budget.path_requests_per_tick.max(1);
+    let mut requests: Vec<PathRequest> = Vec::with_capacity(drain_cap);
+    while requests.len() < drain_cap {
         let Some(req) = queue.pop() else { break };
         requests.push(req);
     }
