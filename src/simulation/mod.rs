@@ -3,6 +3,7 @@ use bevy::prelude::*;
 pub mod abstract_faction;
 pub mod animal_paths;
 pub mod animals;
+pub mod animal_catalog;
 pub mod apprenticeship;
 pub mod archetype;
 pub mod building_template;

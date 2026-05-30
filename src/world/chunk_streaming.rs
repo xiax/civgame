@@ -328,6 +328,237 @@ fn patch_hash(gx: i32, gy: i32, cell: i32, seed: u32) -> u32 {
         ^ seed as i32) as u32
 }
 
+// ---------------------------------------------------------------------------
+// Phase 1 — plant community / stratum seeder (see `spawn_chunk_plants`).
+// ---------------------------------------------------------------------------
+
+/// Active path for wild-plant seeding. `true` = community/stratum model
+/// (`community_pick_species`); `false` = legacy per-tile EMPTY_BIAS lottery
+/// (`legacy_pick_species`).
+///
+/// **Defaults `false` (legacy) pending in-game density calibration.** The
+/// community model is fully wired and deterministic, but its per-biome
+/// `biome_stratum_targets` need eyeballing in a running game — at the current
+/// targets temperate/taiga forests produce noticeably more trees (wood) than
+/// the legacy lottery, which trips wood-scarcity assumptions elsewhere (e.g.
+/// the `market_procurement_preserves_currency_invariant` fixture). Flip to
+/// `true`, run the game, and tune `biome_stratum_targets` to taste.
+const USE_COMMUNITY_SEEDER: bool = false;
+
+/// Tiles per community density cell — the denominator for per-stratum density
+/// targets. Reuses the coarse patch cell so a "target N per cell" reads as a
+/// per-tile probability `N / COMMUNITY_CELL_AREA`.
+const COMMUNITY_CELL_AREA: f32 = (PATCH_CELL_SIZE * PATCH_CELL_SIZE) as f32;
+
+/// Independent hash salts per stratum so Canopy/Understory/GroundCover rolls
+/// don't correlate on the same tile.
+const STRATUM_SALT: [u32; 3] = [0xA1CE_7701, 0xB2DF_8802, 0xC3E0_9903];
+
+/// Per-biome density targets (plants per `COMMUNITY_CELL_AREA` tiles) for
+/// `[Canopy, Understory, GroundCover]` — the ecological knob for vegetation
+/// structure. Forest biomes carry a real canopy; grassland/steppe are
+/// canopy-free with dense ground cover; desert/badlands are sparse across all
+/// strata. Tune these to taste in-game.
+fn biome_stratum_targets(biome: crate::world::globe::Biome) -> [u8; 3] {
+    use crate::world::globe::Biome;
+    match biome {
+        Biome::Temperate | Biome::Taiga => [8, 6, 6],
+        Biome::Tropical => [9, 6, 6],
+        Biome::Grassland => [0, 2, 10],
+        Biome::Steppe => [0, 2, 6],
+        Biome::Wetland => [2, 4, 10],
+        Biome::Tundra => [0, 3, 3],
+        Biome::Desert => [1, 2, 3],
+        Biome::Badlands => [0, 1, 2],
+        Biome::Mountain => [1, 2, 2],
+        Biome::Ocean => [0, 0, 0],
+    }
+}
+
+/// Soft `[0,1]` suitability multiplier from local relief. Canopy trees thin out
+/// on steep slopes, exposed ridges (high TPI) and arid ground (high aquifer
+/// depth); ground cover is hardy and gets a small lift in mesic valleys.
+fn stratum_suitability(
+    stratum: crate::simulation::plant_catalog::Stratum,
+    relief: &crate::world::geomorph::ReliefSample,
+) -> f32 {
+    use crate::simulation::plant_catalog::Stratum;
+    let arid = relief.aquifer_depth_norm.clamp(0.0, 1.0);
+    match stratum {
+        Stratum::Canopy => {
+            let slope_pen = 1.0 - relief.slope.clamp(0.0, 1.0) * 0.6;
+            let ridge_pen = if relief.topographic_position > 0.3 { 0.7 } else { 1.0 };
+            let moist = 1.0 - arid * 0.6;
+            (slope_pen * ridge_pen * moist).clamp(0.0, 1.0)
+        }
+        Stratum::Understory => {
+            let slope_pen = 1.0 - relief.slope.clamp(0.0, 1.0) * 0.3;
+            let moist = 1.0 - arid * 0.4;
+            (slope_pen * moist).clamp(0.0, 1.0)
+        }
+        Stratum::GroundCover => {
+            let valley_lift: f32 = if relief.topographic_position < -0.3 { 1.1 } else { 1.0 };
+            (0.85_f32 * valley_lift).clamp(0.0, 1.0)
+        }
+    }
+}
+
+/// Deterministic per-tile, per-stratum hash (splitmix64 finalizer). Pure in
+/// `(tx, ty, salt)` so seeding is independent of chunk load order.
+fn tile_roll_hash(tx: i32, ty: i32, salt: u32) -> u32 {
+    let mut x = (tx as i64).wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64) as u64;
+    x ^= (ty as i64).wrapping_mul(0xC2B2_AE3D_27D4_EB4Fu64 as i64) as u64;
+    x ^= salt as u64;
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (x ^ (x >> 31)) as u32
+}
+
+/// Community/stratum species pick for one tile. Walks strata in fill priority;
+/// the first stratum that both wins its density roll and has a gate-passing
+/// candidate claims the tile. Returns `None` (empty tile) otherwise.
+#[allow(clippy::too_many_arguments)]
+fn community_pick_species(
+    catalog: &crate::simulation::plant_catalog::PlantCatalog,
+    pool: &[crate::simulation::plant_catalog::PlantSpeciesId],
+    tile: &crate::world::tile::TileData,
+    coastal: bool,
+    chunk_map: &ChunkMap,
+    globe: &Globe,
+    tx: i32,
+    ty: i32,
+    biome: crate::world::globe::Biome,
+) -> Option<crate::simulation::plant_catalog::PlantSpeciesId> {
+    use crate::simulation::plant_catalog::{PlantSpeciesId, Stratum};
+    if pool.is_empty() {
+        return None;
+    }
+    let relief = globe.sample_relief(tx, ty);
+    let targets = biome_stratum_targets(biome);
+    let river_d = chunk_map.river_distance_at(tx, ty);
+    for (si, stratum) in Stratum::ORDER.iter().enumerate() {
+        let target = targets[si];
+        if target == 0 {
+            continue;
+        }
+        let prob = (target as f32 / COMMUNITY_CELL_AREA) * stratum_suitability(*stratum, &relief);
+        if prob <= 0.0 {
+            continue;
+        }
+        let roll = tile_roll_hash(tx, ty, STRATUM_SALT[si]);
+        if (roll % 10_000) as f32 / 10_000.0 >= prob.min(1.0) {
+            continue;
+        }
+        // Build the weighted candidate list for this stratum, applying the same
+        // per-tile gates the legacy seeder used.
+        let mut candidates: Vec<(PlantSpeciesId, u32)> = Vec::with_capacity(6);
+        let mut total: u32 = 0;
+        for &sid in pool {
+            let Some(def) = catalog.def(sid) else { continue };
+            if def.form.stratum() != *stratum {
+                continue;
+            }
+            if !def.spawn.surface_tiles.iter().any(|s| s.matches(tile.kind)) {
+                continue;
+            }
+            if !def.spawn.fertility.contains(tile.fertility) {
+                continue;
+            }
+            if def.spawn.requires_coastal && !coastal {
+                continue;
+            }
+            if !def.spawn.river_distance.contains(river_d) {
+                continue;
+            }
+            let w = def.spawn.base_weight as u32;
+            if w == 0 {
+                continue;
+            }
+            // Patch-noise still clusters species within a stratum.
+            if def.spawn.patch_noise.wavelength_tiles > 0 {
+                let cell = (def.spawn.patch_noise.wavelength_tiles as i32).max(1);
+                let ph = patch_hash(tx, ty, cell, PLANT_HASH_SEED.wrapping_add(def.id.raw() as u32));
+                if (ph % 100) as u8 >= def.spawn.patch_noise.threshold {
+                    continue;
+                }
+            }
+            total = total.saturating_add(w);
+            candidates.push((def.id, total));
+        }
+        if candidates.is_empty() || total == 0 {
+            continue;
+        }
+        let pick = tile_roll_hash(tx, ty, STRATUM_SALT[si].wrapping_add(0x6855)) % total;
+        if let Some((id, _)) = candidates.iter().find(|(_, cum)| pick < *cum) {
+            return Some(*id);
+        }
+    }
+    None
+}
+
+/// Legacy per-tile EMPTY_BIAS weighted lottery (pre-Phase-1). Retained behind
+/// `USE_COMMUNITY_SEEDER` for quick comparison / fallback.
+#[allow(clippy::too_many_arguments)]
+fn legacy_pick_species(
+    catalog: &crate::simulation::plant_catalog::PlantCatalog,
+    pool: &[crate::simulation::plant_catalog::PlantSpeciesId],
+    tile: &crate::world::tile::TileData,
+    coastal: bool,
+    chunk_map: &ChunkMap,
+    tx: i32,
+    ty: i32,
+    h: u32,
+) -> Option<crate::simulation::plant_catalog::PlantSpeciesId> {
+    use crate::simulation::plant_catalog::PlantSpeciesId;
+    let mut candidates: Vec<(PlantSpeciesId, u32)> = Vec::with_capacity(8);
+    let mut total_weight: u32 = 0;
+    for &sid in pool {
+        let Some(def) = catalog.def(sid) else { continue };
+        if !def.spawn.surface_tiles.iter().any(|s| s.matches(tile.kind)) {
+            continue;
+        }
+        if !def.spawn.fertility.contains(tile.fertility) {
+            continue;
+        }
+        if def.spawn.requires_coastal && !coastal {
+            continue;
+        }
+        if !def.spawn.river_distance.contains(chunk_map.river_distance_at(tx, ty)) {
+            continue;
+        }
+        let w = def.spawn.base_weight as u32;
+        if def.spawn.patch_noise.wavelength_tiles > 0 {
+            let cell = (def.spawn.patch_noise.wavelength_tiles as i32).max(1);
+            let ph = patch_hash(tx, ty, cell, PLANT_HASH_SEED.wrapping_add(def.id.raw() as u32));
+            if (ph % 100) as u8 >= def.spawn.patch_noise.threshold {
+                continue;
+            }
+        }
+        if w == 0 {
+            continue;
+        }
+        total_weight = total_weight.saturating_add(w);
+        candidates.push((def.id, total_weight));
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    const EMPTY_BIAS_GRASS: u32 = 1200;
+    const EMPTY_BIAS_FOREST: u32 = 220;
+    const EMPTY_BIAS_OTHER: u32 = 320;
+    let empty_bias = match tile.kind {
+        TileKind::Forest => EMPTY_BIAS_FOREST,
+        TileKind::Grass => EMPTY_BIAS_GRASS,
+        _ => EMPTY_BIAS_OTHER,
+    };
+    let denom = total_weight + empty_bias;
+    let r = h % denom.max(1);
+    if r >= total_weight {
+        return None;
+    }
+    candidates.iter().find(|(_, cum)| r < *cum).map(|(id, _)| *id)
+}
+
 /// One ColorMaterial per (TileKind, OreKind, z_bucket) tuple.
 /// `OreKind` is `None` (0) for non-ore tiles. `TileKind::Ore` fans out into one
 /// material per non-None OreKind so per-ore colors render distinctly.
@@ -882,82 +1113,26 @@ pub fn spawn_chunk_plants(
             // Per-tile gates (surface, fertility, coastal, patch-noise)
             // still apply.
             let pool = catalog.native_pool_for(realm, biome);
-            let mut candidates: Vec<(
-                crate::simulation::plant_catalog::PlantSpeciesId,
-                u32,
-            )> = Vec::with_capacity(8);
-            let mut total_weight: u32 = 0;
-            for &sid in pool {
-                let Some(def) = catalog.def(sid) else { continue };
-                if !def
-                    .spawn
-                    .surface_tiles
-                    .iter()
-                    .any(|s| s.matches(tile.kind))
-                {
-                    continue;
-                }
-                if !def.spawn.fertility.contains(tile.fertility) {
-                    continue;
-                }
-                if def.spawn.requires_coastal && !coastal {
-                    continue;
-                }
-                // Riparian-only species (willow/date/papyrus etc.) declare a
-                // `river_distance` band. `river_distance_at` returns u8::MAX
-                // for far/unloaded, which falls outside any species range, so
-                // unloaded neighbours correctly suppress riparian spawns.
-                if !def
-                    .spawn
-                    .river_distance
-                    .contains(chunk_map.river_distance_at(global_tx, global_ty))
-                {
-                    continue;
-                }
-                let mut w = def.spawn.base_weight as u32;
-                // Patch-noise gate. Wavelength 0 disables.
-                if def.spawn.patch_noise.wavelength_tiles > 0 {
-                    let cell = (def.spawn.patch_noise.wavelength_tiles as i32).max(1);
-                    let ph = patch_hash(
-                        global_tx,
-                        global_ty,
-                        cell,
-                        PLANT_HASH_SEED.wrapping_add(def.id.raw() as u32),
-                    );
-                    if (ph % 100) as u8 >= def.spawn.patch_noise.threshold {
-                        continue;
-                    }
-                }
-                if w == 0 {
-                    continue;
-                }
-                total_weight = total_weight.saturating_add(w);
-                candidates.push((def.id, total_weight));
-            }
-            if candidates.is_empty() {
-                continue;
-            }
-            // EMPTY_BIAS keeps the tile undecided on most rolls so density
-            // tracks legacy chunk-gen — bumped up so every grass tile
-            // isn't blanketed in plants.
-            const EMPTY_BIAS_GRASS: u32 = 1200;
-            const EMPTY_BIAS_FOREST: u32 = 220;
-            const EMPTY_BIAS_OTHER: u32 = 320;
-            let empty_bias = match tile.kind {
-                TileKind::Forest => EMPTY_BIAS_FOREST,
-                TileKind::Grass => EMPTY_BIAS_GRASS,
-                _ => EMPTY_BIAS_OTHER,
+            // Phase 1 (ecology seeding): the "community" for a tile is its
+            // native pool, structured into vertical strata (Canopy/Understory/
+            // GroundCover via `PlantForm::stratum`). Each biome sets per-stratum
+            // density targets; a tile fills the highest stratum that wins its
+            // independent, deterministic per-tile roll. This yields realistic
+            // structure (sparse canopy + understory + ground cover) rather than
+            // an undifferentiated lottery, while reusing every existing per-tile
+            // gate (surface/fertility/coastal/river/patch-noise). Each tile is
+            // pure in `(tx, ty, seed)`, so chunk load order can't change it.
+            // Flip `USE_COMMUNITY_SEEDER` to fall back to the legacy lottery.
+            let species = if USE_COMMUNITY_SEEDER {
+                community_pick_species(
+                    catalog, pool, &tile, coastal, chunk_map, globe, global_tx, global_ty, biome,
+                )
+            } else {
+                legacy_pick_species(
+                    catalog, pool, &tile, coastal, chunk_map, global_tx, global_ty, h,
+                )
             };
-            let denom = total_weight + empty_bias;
-            let r = h % denom.max(1);
-            if r >= total_weight {
-                continue;
-            }
-            let pick = candidates
-                .iter()
-                .find(|(_, cum)| r < *cum)
-                .map(|(id, _)| *id);
-            let Some(species) = pick else { continue };
+            let Some(species) = species else { continue };
             crate::simulation::plants::spawn_plant_at_species(
                 commands,
                 plant_map,

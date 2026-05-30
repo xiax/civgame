@@ -92,6 +92,40 @@ impl PlantForm {
             PlantForm::Tree => PlantKind::Tree,
         }
     }
+
+    /// Vertical vegetation layer this form occupies in a plant community.
+    /// Fill priority is `Canopy` → `Understory` → `GroundCover`, so a forest
+    /// reads as scattered canopy trees with shrubs + grass filling between —
+    /// one `Plant` per tile. Aquatic keeps its existing coastal/river gating
+    /// and is classed GroundCover (it never competes with trees for a land tile).
+    pub fn stratum(self) -> Stratum {
+        match self {
+            PlantForm::Tree => Stratum::Canopy,
+            PlantForm::Shrub | PlantForm::Vine => Stratum::Understory,
+            PlantForm::Grass
+            | PlantForm::Forb
+            | PlantForm::Tuber
+            | PlantForm::Cactus
+            | PlantForm::Aquatic => Stratum::GroundCover,
+        }
+    }
+}
+
+/// Vertical layer of a plant community (`chunk_streaming::spawn_chunk_plants`).
+/// A tile fills the highest stratum that wins its independent per-tile roll;
+/// claiming it for a higher stratum removes it from lower strata, preserving
+/// the one-`Plant`-per-tile invariant.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Stratum {
+    Canopy,
+    Understory,
+    GroundCover,
+}
+
+impl Stratum {
+    /// Fill order — lower index fills first. Index aligns with the
+    /// `[canopy, understory, ground]` arrays in the seeder.
+    pub const ORDER: [Stratum; 3] = [Stratum::Canopy, Stratum::Understory, Stratum::GroundCover];
 }
 
 /// Functional uses — used for memory tagging, recipe matching, UI display.

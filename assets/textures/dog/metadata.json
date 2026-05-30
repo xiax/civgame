@@ -1,0 +1,36 @@
+{
+  "group_id": null,
+  "states": [
+    {
+      "character": {
+        "id": "979e9c3a-dcbf-4ae2-90f3-534c60b13d71",
+        "name": "dog",
+        "prompt": "dog",
+        "size": {
+          "width": 36,
+          "height": 36
+        },
+        "template_id": "cat",
+        "directions": 8,
+        "view": "side",
+        "created_at": "2026-05-22T15:45:47.78275+00:00"
+      },
+      "folder": "979e9c3a",
+      "frames": {
+        "rotations": {
+          "south": "979e9c3a/rotations/south.png",
+          "south-east": "979e9c3a/rotations/south-east.png",
+          "east": "979e9c3a/rotations/east.png",
+          "north-east": "979e9c3a/rotations/north-east.png",
+          "north": "979e9c3a/rotations/north.png",
+          "north-west": "979e9c3a/rotations/north-west.png",
+          "west": "979e9c3a/rotations/west.png",
+          "south-west": "979e9c3a/rotations/south-west.png"
+        },
+        "animations": {}
+      }
+    }
+  ],
+  "export_version": "3.0",
+  "export_date": "2026-05-30T02:31:20.689089"
+}

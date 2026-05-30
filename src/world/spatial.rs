@@ -31,6 +31,11 @@ pub enum IndexedKind {
     /// Cats (SOLITARY). Indexed so seeded companion-tier animals participate in
     /// spatial scans (e.g. the taming dispatcher's species candidate sweep).
     Cat,
+    /// Rabbits (PACK prey). Indexed so predator forage scans + hunt orders can
+    /// see them — previously spawned without any `Indexed`, invisible to the index.
+    Rabbit,
+    /// Foxes (PACK predator). Indexed for the same reason as Rabbit.
+    Fox,
     Plant,
     GroundItem,
     Bed,
@@ -48,6 +53,8 @@ impl IndexedKind {
                 | Self::Cow
                 | Self::Pig
                 | Self::Cat
+                | Self::Rabbit
+                | Self::Fox
         )
     }
 }

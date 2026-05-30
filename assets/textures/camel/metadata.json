@@ -1,0 +1,36 @@
+{
+  "group_id": null,
+  "states": [
+    {
+      "character": {
+        "id": "47a3d402-ff63-4655-81df-451754a9a2e7",
+        "name": "Camel with two humps",
+        "prompt": "Camel with two humps",
+        "size": {
+          "width": 68,
+          "height": 68
+        },
+        "template_id": "horse",
+        "directions": 8,
+        "view": "low top-down",
+        "created_at": "2026-05-28T20:35:34.897083+00:00"
+      },
+      "folder": "Camel_with_two_humps",
+      "frames": {
+        "rotations": {
+          "south": "Camel_with_two_humps/rotations/south.png",
+          "south-east": "Camel_with_two_humps/rotations/south-east.png",
+          "east": "Camel_with_two_humps/rotations/east.png",
+          "north-east": "Camel_with_two_humps/rotations/north-east.png",
+          "north": "Camel_with_two_humps/rotations/north.png",
+          "north-west": "Camel_with_two_humps/rotations/north-west.png",
+          "west": "Camel_with_two_humps/rotations/west.png",
+          "south-west": "Camel_with_two_humps/rotations/south-west.png"
+        },
+        "animations": {}
+      }
+    }
+  ],
+  "export_version": "3.0",
+  "export_date": "2026-05-30T02:31:06.607573"
+}

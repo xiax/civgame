@@ -1,5 +1,24 @@
 # Realistic Ecology Seeding, Territories, and Migration
 
+## Progress (verified: compiles + 1459 tests pass)
+- **Step 0 — Rabbit/Fox `IndexedKind` fix: DONE.** Added `Rabbit`/`Fox` to `IndexedKind` +
+  `is_mobile_agent`; `Indexed::new(...)` on wild + reproduction spawns (they had none → were
+  invisible to `SpatialIndex`).
+- **Phase 1 — plant community/stratum seeder: DONE, default-OFF (`USE_COMMUNITY_SEEDER=false`).**
+  `Stratum` + `PlantForm::stratum()`; two-pass `spawn_chunk_plants` (per-biome stratum density
+  targets × relief suitability, deterministic per-tile, legacy lottery retained as fallback).
+  Ships behind the flag because at current `biome_stratum_targets` forests over-produce trees
+  (wood) vs. legacy — which trips a wood-scarcity test fixture. **To finish Phase 1: flip the
+  flag, run the game, tune `biome_stratum_targets` until forest density looks right + the
+  `market_procurement_preserves_currency_invariant` fixture passes, then default it on.**
+- **Phase 2 — animal catalog foundation: DONE.** `animal_catalog.rs` (8 species: hp/social/diet/
+  biomes/target_count/territory/migration + `habitat_suitability`, unit-tested) + new `AnimalKind`
+  enum; `spawn_animals` sources counts + HP from it (hard-coded `*_COUNT` gone). Runtime animal
+  behavior unchanged (same values).
+- **REMAINING (not yet done):** Phase 2 aggregate-LOD generalization (the 1,490-entity→aggregate
+  startup change) and all of Phase 3 (territories, globe-A* migration, foraging + ForagePressureMap).
+  These are the highest-risk pieces and need in-game LOD/combat verification.
+
 ## Goal
 Seed wild plants by ecological community + density targets driven by terrain/soil/moisture/
 relief, and wild animals by habitat suitability + territories + migration — replacing

@@ -13,14 +13,20 @@ use ahash::AHashSet;
 use bevy::prelude::*;
 use std::time::Instant;
 
-const WOLF_COUNT: u32 = 150;
-const DEER_COUNT: u32 = 400;
-const HORSE_COUNT: u32 = 200;
-const COW_COUNT: u32 = 80;
-const RABBIT_COUNT: u32 = 500;
-const PIG_COUNT: u32 = 120;
-const FOX_COUNT: u32 = 80;
-const CAT_COUNT: u32 = 60;
+use crate::simulation::animal_catalog;
+
+/// Initial wild population target for a species (from `animal_catalog`).
+fn count_of(kind: AnimalKind) -> u32 {
+    animal_catalog::count_for(kind)
+}
+/// Hit points for a species (from `animal_catalog`).
+fn hp_of(kind: AnimalKind) -> u8 {
+    animal_catalog::hp_for(kind)
+}
+
+// Wild population targets + per-wild-species HP moved to `animal_catalog`
+// (sourced via `count_of` / `hp_of`). Tamed-animal HP still uses the consts
+// below (consumed at `domestic_species_hp`).
 const HORSE_POP_CAP: usize = 300;
 const HORSE_HP: u8 = 40;
 const COW_HP: u8 = 35;
@@ -120,6 +126,21 @@ pub struct Fox;
 
 #[derive(Component)]
 pub struct Cat;
+
+/// Enumerated wild-animal species — the key into `animal_catalog`. Each maps
+/// 1:1 to a Bevy marker component (`Wolf`/`Deer`/…). Added in Phase 2 of the
+/// ecology overhaul so counts + HP + habitat are data-driven from one table.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum AnimalKind {
+    Wolf,
+    Deer,
+    Horse,
+    Cow,
+    Pig,
+    Fox,
+    Rabbit,
+    Cat,
+}
 
 /// Placed on an animal once tamed by a faction.
 /// The animal stops fleeing from owner-faction persons and (for horses) can be
@@ -677,7 +698,7 @@ pub fn spawn_animals(
         &mut forest_tiles,
         &forest_set,
         PACK,
-        WOLF_COUNT,
+        count_of(AnimalKind::Wolf),
         &mut herd_gen.next,
     );
     for (i, &((tx, ty), _cid)) in wolf_tiles.iter().enumerate() {
@@ -693,7 +714,7 @@ pub fn spawn_animals(
                 wander_timer: i as f32 * 0.05,
                 ..Default::default()
             },
-            Health::new(30),
+            Health::new(hp_of(AnimalKind::Wolf)),
             CombatTarget::default(),
             CombatCooldown::default(),
             LodLevel::Full,
@@ -717,7 +738,7 @@ pub fn spawn_animals(
         &mut grass_tiles,
         &grass_set,
         HERD,
-        DEER_COUNT,
+        count_of(AnimalKind::Deer),
         &mut herd_gen.next,
     );
     for (i, &((tx, ty), cluster_id)) in deer_tiles.iter().enumerate() {
@@ -734,7 +755,7 @@ pub fn spawn_animals(
                     wander_timer: i as f32 * 0.02,
                     ..Default::default()
                 },
-                Health::new(20),
+                Health::new(hp_of(AnimalKind::Deer)),
                 CombatTarget::default(),
                 CombatCooldown::default(),
                 LodLevel::Full,
@@ -762,7 +783,7 @@ pub fn spawn_animals(
         &mut grass_tiles,
         &grass_set,
         HERD,
-        HORSE_COUNT,
+        count_of(AnimalKind::Horse),
         &mut herd_gen.next,
     );
     for (i, &((tx, ty), cluster_id)) in horse_tiles.iter().enumerate() {
@@ -778,7 +799,7 @@ pub fn spawn_animals(
                 wander_timer: i as f32 * 0.03,
                 ..Default::default()
             },
-            Health::new(HORSE_HP),
+            Health::new(hp_of(AnimalKind::Horse)),
             CombatTarget::default(),
             CombatCooldown::default(),
             LodLevel::Full,
@@ -802,7 +823,7 @@ pub fn spawn_animals(
         &mut grass_tiles,
         &grass_set,
         HERD,
-        COW_COUNT,
+        count_of(AnimalKind::Cow),
         &mut herd_gen.next,
     );
     for (i, &((tx, ty), cluster_id)) in cow_tiles.iter().enumerate() {
@@ -818,7 +839,7 @@ pub fn spawn_animals(
                 wander_timer: i as f32 * 0.04,
                 ..Default::default()
             },
-            Health::new(COW_HP),
+            Health::new(hp_of(AnimalKind::Cow)),
             CombatTarget::default(),
             CombatCooldown::default(),
             LodLevel::Full,
@@ -842,7 +863,7 @@ pub fn spawn_animals(
         &mut grass_tiles,
         &grass_set,
         PACK,
-        RABBIT_COUNT,
+        count_of(AnimalKind::Rabbit),
         &mut herd_gen.next,
     );
     for (i, &((tx, ty), _cid)) in rabbit_tiles.iter().enumerate() {
@@ -858,7 +879,7 @@ pub fn spawn_animals(
                 wander_timer: i as f32 * 0.01,
                 ..Default::default()
             },
-            Health::new(RABBIT_HP),
+            Health::new(hp_of(AnimalKind::Rabbit)),
             CombatTarget::default(),
             CombatCooldown::default(),
             LodLevel::Full,
@@ -872,6 +893,7 @@ pub fn spawn_animals(
             },
             AnimalReproductionCooldown(0),
             BiologicalSex::random(),
+            crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Rabbit),
         ));
         slot += 1;
     }
@@ -881,7 +903,7 @@ pub fn spawn_animals(
         &mut forest_tiles,
         &forest_set,
         PACK,
-        PIG_COUNT,
+        count_of(AnimalKind::Pig),
         &mut herd_gen.next,
     );
     for (i, &((tx, ty), _cid)) in pig_tiles.iter().enumerate() {
@@ -897,7 +919,7 @@ pub fn spawn_animals(
                 wander_timer: i as f32 * 0.04,
                 ..Default::default()
             },
-            Health::new(PIG_HP),
+            Health::new(hp_of(AnimalKind::Pig)),
             CombatTarget::default(),
             CombatCooldown::default(),
             LodLevel::Full,
@@ -921,7 +943,7 @@ pub fn spawn_animals(
         &mut forest_tiles,
         &forest_set,
         PACK,
-        FOX_COUNT,
+        count_of(AnimalKind::Fox),
         &mut herd_gen.next,
     );
     for (i, &((tx, ty), _cid)) in fox_tiles.iter().enumerate() {
@@ -937,7 +959,7 @@ pub fn spawn_animals(
                 wander_timer: i as f32 * 0.03,
                 ..Default::default()
             },
-            Health::new(FOX_HP),
+            Health::new(hp_of(AnimalKind::Fox)),
             CombatTarget::default(),
             CombatCooldown::default(),
             LodLevel::Full,
@@ -951,6 +973,7 @@ pub fn spawn_animals(
             },
             AnimalReproductionCooldown(0),
             BiologicalSex::random(),
+            crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Fox),
         ));
         slot += 1;
     }
@@ -960,7 +983,7 @@ pub fn spawn_animals(
         &mut forest_tiles,
         &forest_set,
         SOLITARY,
-        CAT_COUNT,
+        count_of(AnimalKind::Cat),
         &mut herd_gen.next,
     );
     for (i, &((tx, ty), _cid)) in cat_tiles.iter().enumerate() {
@@ -976,7 +999,7 @@ pub fn spawn_animals(
                 wander_timer: i as f32 * 0.03,
                 ..Default::default()
             },
-            Health::new(CAT_HP),
+            Health::new(hp_of(AnimalKind::Cat)),
             CombatTarget::default(),
             CombatCooldown::default(),
             LodLevel::Full,
@@ -2266,7 +2289,7 @@ pub fn animal_reproduction_system(
                     Visibility::Visible,
                     InheritedVisibility::default(),
                     ai,
-                    Health::new(30),
+                    Health::new(hp_of(AnimalKind::Wolf)),
                     CombatTarget::default(),
                     CombatCooldown::default(),
                     LodLevel::Full,
@@ -2286,7 +2309,7 @@ pub fn animal_reproduction_system(
                         Visibility::Visible,
                         InheritedVisibility::default(),
                         ai,
-                        Health::new(20),
+                        Health::new(hp_of(AnimalKind::Deer)),
                         CombatTarget::default(),
                         CombatCooldown::default(),
                         LodLevel::Full,
@@ -2312,7 +2335,7 @@ pub fn animal_reproduction_system(
                     Visibility::Visible,
                     InheritedVisibility::default(),
                     ai,
-                    Health::new(HORSE_HP),
+                    Health::new(hp_of(AnimalKind::Horse)),
                     CombatTarget::default(),
                     CombatCooldown::default(),
                     LodLevel::Full,
@@ -2334,7 +2357,7 @@ pub fn animal_reproduction_system(
                     Visibility::Visible,
                     InheritedVisibility::default(),
                     ai,
-                    Health::new(COW_HP),
+                    Health::new(hp_of(AnimalKind::Cow)),
                     CombatTarget::default(),
                     CombatCooldown::default(),
                     LodLevel::Full,
@@ -2356,7 +2379,7 @@ pub fn animal_reproduction_system(
                     Visibility::Visible,
                     InheritedVisibility::default(),
                     ai,
-                    Health::new(RABBIT_HP),
+                    Health::new(hp_of(AnimalKind::Rabbit)),
                     CombatTarget::default(),
                     CombatCooldown::default(),
                     LodLevel::Full,
@@ -2364,6 +2387,7 @@ pub fn animal_reproduction_system(
                     AnimalNeeds::default(),
                     AnimalReproductionCooldown(0),
                     sex,
+                    crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Rabbit),
                 ));
             }
             5 => {
@@ -2374,7 +2398,7 @@ pub fn animal_reproduction_system(
                     Visibility::Visible,
                     InheritedVisibility::default(),
                     ai,
-                    Health::new(PIG_HP),
+                    Health::new(hp_of(AnimalKind::Pig)),
                     CombatTarget::default(),
                     CombatCooldown::default(),
                     LodLevel::Full,
@@ -2393,7 +2417,7 @@ pub fn animal_reproduction_system(
                     Visibility::Visible,
                     InheritedVisibility::default(),
                     ai,
-                    Health::new(FOX_HP),
+                    Health::new(hp_of(AnimalKind::Fox)),
                     CombatTarget::default(),
                     CombatCooldown::default(),
                     LodLevel::Full,
@@ -2401,6 +2425,7 @@ pub fn animal_reproduction_system(
                     AnimalNeeds::default(),
                     AnimalReproductionCooldown(0),
                     sex,
+                    crate::world::spatial::Indexed::new(crate::world::spatial::IndexedKind::Fox),
                 ));
             }
             _ => {
@@ -2411,7 +2436,7 @@ pub fn animal_reproduction_system(
                     Visibility::Visible,
                     InheritedVisibility::default(),
                     ai,
-                    Health::new(CAT_HP),
+                    Health::new(hp_of(AnimalKind::Cat)),
                     CombatTarget::default(),
                     CombatCooldown::default(),
                     LodLevel::Full,
