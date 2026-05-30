@@ -921,6 +921,36 @@ fn compute_settlement_survey_core<F: SurveyFactionView>(
     }
 }
 
+/// Enqueue a settlement brain's full street spine onto the road-carve queue.
+///
+/// Used ONLY by the OnEnter startup passes (kickoff + post-seed resurvey, both
+/// via `survey_one_settlement`). Runtime carving is desire-path /
+/// `settlement_planner_system` driven, so this must NOT be called from the async
+/// survey core (`compute_settlement_survey_core`) or the full spine would
+/// re-queue on every runtime survey. Idempotent at the carve layer
+/// (`road_carve_system`'s `try_write_road` no-ops an already-`Road` tile), so a
+/// re-push of an unchanged segment across the two startup passes is harmless.
+///
+/// Width is tier- and era-aware via `road_width_for`, matching the construction
+/// used by `settlement_planner_system` so startup and runtime carving agree.
+fn enqueue_spine_segments(
+    segments: &[StreetSegment],
+    faction_id: u32,
+    era: Era,
+    road_queue: &mut RoadCarveQueue,
+) {
+    for seg in segments {
+        road_queue
+            .0
+            .push(crate::simulation::construction::RoadCarveJob::Segment {
+                faction_id,
+                from: seg.start,
+                to: seg.end,
+                width: crate::simulation::construction::road_width_for(seg.tier, era),
+            });
+    }
+}
+
 /// Shared synchronous survey apply body. The async scheduler uses
 /// `compute_settlement_survey`; this path is retained for
 /// `kickoff_initial_survey_system` at `OnEnter(GameState::Playing)` so
@@ -929,6 +959,12 @@ fn compute_settlement_survey_core<F: SurveyFactionView>(
 /// the existing one) into `SettlementBrains`, recompute road segments /
 /// parcels / frontier, and enqueue any newly-required desire-path road
 /// extensions.
+///
+/// The startup passes additionally enqueue the brain's full street spine via
+/// `enqueue_spine_segments`: `desire_path_push` is tick-gated and returns
+/// nothing at `tick = 0`, so without this the seed-time spine would be computed
+/// but never carved (only the doormat connectors would paint), leaving houses
+/// joined to dead-end stubs.
 ///
 /// Caller is expected to have already filtered out SOLO / non-settled
 /// factions.
@@ -961,6 +997,15 @@ pub fn survey_one_settlement(
     for road_push in &diff.road_pushes {
         road_queue.0.push(road_push.clone());
     }
+    // Startup-only: enqueue the full spine so the OnEnter `road_carve_system`
+    // drain paints it (desire paths are tick-gated and emit nothing at tick 0).
+    let era = current_era(&faction.techs);
+    enqueue_spine_segments(
+        &diff.brain.road_segments,
+        settlement.owner_faction,
+        era,
+        road_queue,
+    );
     brains.0.insert(diff.settlement_id, diff.brain);
 }
 

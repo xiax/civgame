@@ -20095,6 +20095,180 @@ mod onenter_era_seeding {
         assert_doormats_cardinally_connected(&mut sim, "BronzeAge");
     }
 
+    /// Resolve the player faction's settlement brain centerline + doormats.
+    /// Returns `(spine_centerline_tiles, doormat_tiles)` scoped to the player
+    /// faction — its spawn window is fully pre-generated, so neighbour tiles
+    /// resolve (far AI rivals may sit outside the loaded window).
+    fn player_spine_and_doormats(
+        sim: &mut TestSim,
+    ) -> (Vec<(i32, i32)>, Vec<(i32, i32)>, Vec<(i32, i32)>) {
+        let player_faction_id = sim
+            .app
+            .world()
+            .resource::<crate::simulation::faction::PlayerFaction>()
+            .faction_id;
+        let world = sim.app.world_mut();
+
+        // Spine centerline + widened corridor from the player faction's brains.
+        let settlement_map = world.resource::<crate::simulation::settlement::SettlementMap>();
+        let brains =
+            world.resource::<crate::simulation::organic_settlement::SettlementBrains>();
+        let mut centerline: Vec<(i32, i32)> = Vec::new();
+        let mut corridor: Vec<(i32, i32)> = Vec::new();
+        if let Some(sids) = settlement_map.by_faction.get(&player_faction_id) {
+            for sid in sids {
+                if let Some(brain) = brains.0.get(sid) {
+                    centerline.extend(brain.road_tiles.iter().copied());
+                    corridor.extend(brain.road_corridor_tiles.iter().copied());
+                }
+            }
+        }
+
+        // Doormats — same derivation as `assert_doormats_cardinally_connected`
+        // (component doors + thin-housing edge doors).
+        let mut door_q = world.query::<&Door>();
+        let mut doormats: Vec<(i32, i32)> = door_q
+            .iter(world)
+            .filter(|d| d.faction_id == player_faction_id)
+            .map(|d| d.doormat_tile)
+            .collect();
+        let edge_map = world.resource::<crate::simulation::construction::EdgeStructureMap>();
+        for (key, entry) in edge_map.0.iter() {
+            let Some(door) = entry.door else { continue };
+            if door.faction_id != player_faction_id {
+                continue;
+            }
+            let (a, b) = key.tiles();
+            let (dx, dy) = door.dir.delta();
+            let doormat = if (a.0 + dx, a.1 + dy) == b { b } else { a };
+            doormats.push(doormat);
+        }
+
+        (centerline, corridor, doormats)
+    }
+
+    /// Cardinal connected components of a set of road tiles, largest first.
+    fn cardinal_components(
+        roads: &std::collections::HashSet<(i32, i32)>,
+    ) -> Vec<std::collections::HashSet<(i32, i32)>> {
+        let mut seen: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+        let mut comps: Vec<std::collections::HashSet<(i32, i32)>> = Vec::new();
+        for &t in roads {
+            if seen.contains(&t) {
+                continue;
+            }
+            let mut comp = std::collections::HashSet::new();
+            let mut stack = vec![t];
+            seen.insert(t);
+            comp.insert(t);
+            while let Some((x, y)) = stack.pop() {
+                for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    let n = (x + dx, y + dy);
+                    if roads.contains(&n) && seen.insert(n) {
+                        comp.insert(n);
+                        stack.push(n);
+                    }
+                }
+            }
+            comps.push(comp);
+        }
+        comps.sort_by_key(|c| std::cmp::Reverse(c.len()));
+        comps
+    }
+
+    /// Stronger than the doormat test: the planned street **spine** must
+    /// actually be carved and form a real connected network that the houses
+    /// join — not a scatter of isolated doormat stubs.
+    ///
+    /// Regression for "disconnected startup roads": at tick 0 the spine was
+    /// computed into the brain but never enqueued onto `RoadCarveQueue`
+    /// (`desire_path_push` is tick-gated), so only the short doormat connectors
+    /// carved. Measured contrast on the flat fixture (seed `0xE7A_5EED`):
+    ///
+    /// | | carved Road tiles | largest component | doormats joined |
+    /// |---|---|---|---|
+    /// | pre-fix | 23 | 3 | 1 / 10 |
+    /// | post-fix | 120+ | 45+ | 9 / 10 |
+    ///
+    /// (The network is not a single component — the carve skips segment
+    /// endpoints, so 4-way crossings fragment into arms; that's pre-existing.
+    /// We assert the spine is substantially carved and the bulk of houses join
+    /// one main artery, which cleanly separates pre- from post-fix.)
+    fn assert_startup_spine_carved_and_connected(sim: &mut TestSim, label: &str) {
+        let (_centerline, _corridor, doormats) = player_spine_and_doormats(sim);
+        assert!(!doormats.is_empty(), "{label}: expected at least one doormat");
+
+        // Player home (its spawn window is fully pre-generated).
+        let player_faction_id = sim
+            .app
+            .world()
+            .resource::<crate::simulation::faction::PlayerFaction>()
+            .faction_id;
+        let home = {
+            let world = sim.app.world();
+            let sm = world.resource::<crate::simulation::settlement::SettlementMap>();
+            let br = world.resource::<crate::simulation::organic_settlement::SettlementBrains>();
+            sm.by_faction
+                .get(&player_faction_id)
+                .and_then(|sids| sids.iter().find_map(|sid| br.0.get(sid)))
+                .map(|b| b.home_tile)
+                .expect("player settlement brain")
+        };
+
+        // Every carved Road tile in a generous box around home.
+        let chunk_map = sim.app.world().resource::<crate::world::chunk::ChunkMap>();
+        let mut roads: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+        for y in home.1 - 40..=home.1 + 40 {
+            for x in home.0 - 40..=home.0 + 40 {
+                if chunk_map.tile_kind_at(x, y) == Some(TileKind::Road) {
+                    roads.insert((x, y));
+                }
+            }
+        }
+
+        // Spine carved: far more than the ~23 doormat-stub tiles seen pre-fix.
+        assert!(
+            roads.len() >= 60,
+            "{label}: only {} carved Road tiles — the spine was not carved (pre-fix baseline ~23)",
+            roads.len()
+        );
+
+        let comps = cardinal_components(&roads);
+        let largest = comps.first().expect("at least one road component");
+
+        // The main artery is a real spine, not a 2-3 tile stub.
+        assert!(
+            largest.len() >= 20,
+            "{label}: largest connected road component is only {} tiles (pre-fix ~3) — no real spine",
+            largest.len()
+        );
+
+        // The bulk of houses join that one main artery (pre-fix: 1/10).
+        let joined = doormats.iter().filter(|d| largest.contains(d)).count();
+        assert!(
+            joined * 3 >= doormats.len() * 2,
+            "{label}: only {}/{} doormats join the main road component — houses left on isolated stubs",
+            joined,
+            doormats.len()
+        );
+    }
+
+    #[test]
+    fn neolithic_startup_spine_is_carved_and_connected() {
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::Neolithic);
+        trigger_onenter(&mut sim);
+        assert_startup_spine_carved_and_connected(&mut sim, "Neolithic");
+    }
+
+    #[test]
+    fn bronze_startup_spine_is_carved_and_connected() {
+        let mut sim = fixture_with_flat_world();
+        configure_start(&mut sim, Era::BronzeAge);
+        trigger_onenter(&mut sim);
+        assert_startup_spine_carved_and_connected(&mut sim, "BronzeAge");
+    }
+
     #[test]
     fn bronze_start_seeds_growth_civics_despite_low_founder_population() {
         let mut sim = fixture_with_flat_world();

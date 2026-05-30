@@ -461,7 +461,12 @@ impl Plugin for SimulationPlugin {
                     // road tiles, frontage_edge) exists before the seed
                     // pass picks house anchors. Unified-build-pipeline
                     // step: same `survey_one_settlement` body the
-                    // runtime survey loop uses.
+                    // runtime survey loop uses. The startup pass also
+                    // enqueues the brain's full street spine onto
+                    // `RoadCarveQueue` (`enqueue_spine_segments`) — desire
+                    // paths are tick-gated and emit nothing at tick 0, so
+                    // without this the spine would be planned but never
+                    // carved by the intercalated `road_carve_system` below.
                     organic_settlement::kickoff_initial_survey_system
                         .after(settlement::auto_found_default_settlements_system)
                         .after(technology_adoption::derive_tech_adoption_system)
@@ -480,8 +485,9 @@ impl Plugin for SimulationPlugin {
                     // `PlotIndex.by_faction_hash` is established before any
                     // runtime carve can mismatch + re-tear-down).
                     (
-                        // Drain `RoadCarveQueue` synchronously after the seed
-                        // pushes its doormat / spine / connector entries so
+                        // Drain `RoadCarveQueue` synchronously: the kickoff
+                        // survey queued the spine segments and the seed pass
+                        // queued the doormat connectors, so this paints both so
                         // `resurvey_after_seeding_system` reads the chunk_map
                         // with the actual carved roads. Without this drain,
                         // the resurvey computes parcels against an
