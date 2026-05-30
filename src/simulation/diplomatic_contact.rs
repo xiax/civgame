@@ -25,7 +25,7 @@
 //! Households (`parent_faction.is_some()`) share their village's root
 //! and never carry their own contact book.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 use crate::simulation::diplomacy::{DiplomacyLedger, IncidentKind};

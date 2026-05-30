@@ -6,7 +6,7 @@
 //! validates and applies at most `PerfWorkBudget::settlement_plan_applies_per_tick`
 //! ready results per tick.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
 use std::collections::VecDeque;
@@ -18,7 +18,9 @@ use crate::simulation::organic_settlement::{
     compute_settlement_survey, OrganicStructureMapsParam, SettlementBrains, SettlementParcelIndex,
     SettlementSurveyDiff, SettlementSurveyInput, SurveyFactionSnapshot, SurveyStructureSnapshot,
 };
-use crate::simulation::perf::{micros_u32, BackgroundWorkDiagnostics, PerfWorkBudget};
+use crate::simulation::perf::{
+    micros_u32, BackgroundWorkDiagnostics, DeterministicCompute, PerfWorkBudget,
+};
 use crate::simulation::schedule::SimClock;
 use crate::simulation::settlement::{Settlement, SettlementId};
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
@@ -185,10 +187,19 @@ pub fn schedule_survey_tasks_system(
 pub fn poll_survey_tasks_system(
     mut state: ResMut<SettlementSurveyTaskState>,
     mut perf: ResMut<BackgroundWorkDiagnostics>,
+    deterministic: Option<Res<DeterministicCompute>>,
 ) {
     let ids: Vec<SettlementId> = state.tasks.keys().copied().collect();
     let mut completed = Vec::new();
     for id in ids {
+        if deterministic.is_some() {
+            // Test mode: drain the task to completion so its result lands at a
+            // deterministic tick regardless of compute-pool contention.
+            if let Some(task) = state.tasks.remove(&id) {
+                completed.push((id, block_on(task)));
+            }
+            continue;
+        }
         let Some(task) = state.tasks.get_mut(&id) else {
             continue;
         };

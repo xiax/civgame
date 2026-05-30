@@ -25,7 +25,7 @@
 //! have `caps.posting.is_disabled()` and never emit chief withdraw
 //! requests.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 use crate::economy::resource_catalog::ResourceId;
@@ -159,7 +159,7 @@ where
     GI: IntoIterator<Item = ((i32, i32), ResourceId, u32)>,
     MI: IntoIterator<Item = (&'m FactionMember, &'m crate::economy::agent::EconomicAgent)>,
 {
-    let mut totals: AHashMap<ResourceId, u32> = AHashMap::new();
+    let mut totals: AHashMap<ResourceId, u32> = AHashMap::default();
     let pulls_tile = matches!(
         kind,
         StorageBackendKind::FactionTile | StorageBackendKind::Hybrid

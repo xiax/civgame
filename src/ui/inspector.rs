@@ -834,9 +834,9 @@ pub fn inspector_panel_system(
                                 .show(ui, |ui| {
                                     // Determine which aware-only techs the
                                     // agent has a readable tablet/book for.
-                                    let mut readable: ahash::AHashSet<
+                                    let mut readable: crate::collections::AHashSet<
                                         crate::simulation::technology::TechId,
-                                    > = ahash::AHashSet::new();
+                                    > = crate::collections::AHashSet::default();
                                     for (item, qty) in agent.inventory.iter() {
                                         if *qty == 0 {
                                             continue;

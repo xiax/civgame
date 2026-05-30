@@ -28,7 +28,7 @@
 //! restamp differently, but the bootstrap "this tile is part of a stamped
 //! settlement" claim persists. Sized ~256 tiles × ~20 settlements ≈ 5k.
 
-use ahash::AHashSet;
+use crate::collections::AHashSet;
 use bevy::prelude::*;
 
 use crate::simulation::construction::{RoadCarveQueue, StructureIndex, WellMap};

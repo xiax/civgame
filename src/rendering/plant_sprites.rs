@@ -10,7 +10,7 @@
 //! present; the caller (`entity_sprites::resolve_plant_sprite`) then routes
 //! to legacy ASCII. This file does not own the legacy fallback handles.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 use crate::simulation::plant_catalog::{PlantCatalog, PlantForm, PlantSpeciesId};

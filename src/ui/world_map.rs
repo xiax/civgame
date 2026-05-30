@@ -178,7 +178,7 @@ pub fn world_map_system(
             // contribute, so abstract-faction regions stay uncoloured
             // here (they're rendered by the settled-region outline pass).
             if view.show_territory && !territory.cells.is_empty() {
-                use ahash::AHashMap;
+                use crate::collections::AHashMap;
                 let mut mc_owner: AHashMap<(i32, i32), AHashMap<u32, u32>> =
                     AHashMap::default();
                 for (&tile, cell) in &territory.cells {

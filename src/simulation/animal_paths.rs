@@ -17,7 +17,7 @@
 //! Per project convention: per-agent local nav is A\*, flow fields
 //! reserved for many-agent shared goals.
 
-use ahash::{AHashMap, AHashSet};
+use crate::collections::{AHashMap, AHashSet};
 use bevy::prelude::*;
 
 use crate::pathfinding::astar::{find_path_in, AStarResult};
@@ -164,7 +164,7 @@ pub fn herd_cluster_update_system(
     }
 
     // Aggregate per cluster: count + sum of tile coords.
-    let mut agg: AHashMap<u32, (i64, i64, u32)> = AHashMap::new();
+    let mut agg: AHashMap<u32, (i64, i64, u32)> = AHashMap::default();
     for (hm, transform, lod) in members.iter() {
         if *lod == LodLevel::Dormant {
             continue;
@@ -265,7 +265,7 @@ pub fn herd_threat_detect_system(
     let t_start = std::time::Instant::now();
 
     // (1) Predator snapshot — one cheap pass, all predator tiles.
-    let mut predator_tiles: AHashSet<(i32, i32)> = AHashSet::new();
+    let mut predator_tiles: AHashSet<(i32, i32)> = AHashSet::default();
     for xf in wolf_xf.iter() {
         let tx = (xf.translation.x / TILE_SIZE).floor() as i32;
         let ty = (xf.translation.y / TILE_SIZE).floor() as i32;
@@ -285,7 +285,7 @@ pub fn herd_threat_detect_system(
         x_max: i32,
         y_max: i32,
     }
-    let mut bounds: AHashMap<u32, ClusterBounds> = AHashMap::new();
+    let mut bounds: AHashMap<u32, ClusterBounds> = AHashMap::default();
     for (hm, transform, lod) in members.iter() {
         if *lod == LodLevel::Dormant {
             continue;
@@ -671,7 +671,7 @@ mod tests {
     fn replan_slice_two_ticks_cover_everyone_no_starvation() {
         let ids = [10u32, 20, 30, 40];
         let mut cursor = 0u64;
-        let mut seen: AHashSet<Entity> = AHashSet::new();
+        let mut seen: AHashSet<Entity> = AHashSet::default();
         for _ in 0..2 {
             let mut e = ents(&ids);
             let (slice, next) = select_replan_slice(&mut e, 2, cursor);

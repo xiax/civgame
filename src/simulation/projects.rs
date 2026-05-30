@@ -19,7 +19,7 @@
 //! replaces the flat 50%-per-kind cap in `job_claim_system` (Stage 2).
 //! Stage 3 adds stagnation/cancel logic on top of the same `Project` data.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 use crate::simulation::construction::{Blueprint, BlueprintMap};
@@ -207,7 +207,7 @@ fn blueprint_deposited_total(bp: &Blueprint) -> u32 {
 pub fn blueprint_remaining_inputs(
     bp: &Blueprint,
 ) -> AHashMap<crate::economy::resource_catalog::ResourceId, u32> {
-    let mut out: AHashMap<crate::economy::resource_catalog::ResourceId, u32> = AHashMap::new();
+    let mut out: AHashMap<crate::economy::resource_catalog::ResourceId, u32> = AHashMap::default();
     for i in 0..bp.deposit_count as usize {
         let slot = &bp.deposits[i];
         let remaining = (slot.needed.saturating_sub(slot.deposited)) as u32;

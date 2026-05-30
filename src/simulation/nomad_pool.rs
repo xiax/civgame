@@ -158,7 +158,7 @@ pub fn nomad_band_pool_balance_system(
 
     // Group members by their faction's *root* (so household members of a
     // nomadic village pool with the band, not just within their household).
-    let mut by_faction: ahash::AHashMap<u32, Vec<Entity>> = ahash::AHashMap::new();
+    let mut by_faction: crate::collections::AHashMap<u32, Vec<Entity>> = crate::collections::AHashMap::default();
     for (e, member, _agent, transform, lod) in q.iter() {
         if matches!(lod, Some(LodLevel::Dormant)) {
             continue;
@@ -183,7 +183,7 @@ pub fn nomad_band_pool_balance_system(
 
     // Snapshot-then-writeback pattern. `EconomicAgent: Copy`, so the
     // round-trip is cheap and avoids the `iter_many_mut` reborrow tangle.
-    let mut updates: ahash::AHashMap<Entity, EconomicAgent> = ahash::AHashMap::new();
+    let mut updates: crate::collections::AHashMap<Entity, EconomicAgent> = crate::collections::AHashMap::default();
     for (_root, ents) in by_faction.iter() {
         if ents.len() < 2 {
             continue;

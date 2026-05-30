@@ -1,4 +1,4 @@
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::ecs::component::ComponentId;
 use bevy::ecs::world::DeferredWorld;
 use bevy::prelude::*;

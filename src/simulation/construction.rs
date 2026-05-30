@@ -27,7 +27,7 @@ use crate::world::globe::Globe;
 use crate::world::seasons::{Calendar, Season};
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
 use crate::world::tile::{TileData, TileKind};
-use ahash::{AHashMap, AHashSet};
+use crate::collections::{AHashMap, AHashSet};
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -2658,7 +2658,7 @@ pub fn refresh_construction_poster_pool_system(
 
     // Index every person once so the chief can be resolved by entity id
     // regardless of whether the `FactionChief` marker has been stamped.
-    let mut by_entity: AHashMap<Entity, (FactionTechs, u32, u32, (i32, i32))> = AHashMap::new();
+    let mut by_entity: AHashMap<Entity, (FactionTechs, u32, u32, (i32, i32))> = AHashMap::default();
     let mut architects: Vec<(Entity, u32, FactionTechs, u32, u32, (i32, i32))> = Vec::new();
     for (entity, member, prof, knowledge, skills, xf) in person_q.iter() {
         if member.faction_id == SOLO {
@@ -2675,7 +2675,7 @@ pub fn refresh_construction_poster_pool_system(
     }
 
     // Per-faction accumulated buildable surface (chief ∪ all architects).
-    let mut union_by_faction: AHashMap<u32, FactionTechs> = AHashMap::new();
+    let mut union_by_faction: AHashMap<u32, FactionTechs> = AHashMap::default();
 
     // Chief capability + fallback.
     for (&faction_id, faction) in registry.factions.iter() {
@@ -3209,7 +3209,7 @@ fn plan_reachable_from_home(
     plan: &[PlannedHouseTile],
 ) -> bool {
     use crate::simulation::land::TileEdge as TE;
-    let mut blocked_edges: AHashSet<crate::world::edge::EdgeKey> = AHashSet::new();
+    let mut blocked_edges: AHashSet<crate::world::edge::EdgeKey> = AHashSet::default();
     let mut beds: Vec<(i32, i32)> = Vec::new();
     let mut door_interior: Option<(i32, i32)> = None;
     for entry in plan {
@@ -3689,7 +3689,7 @@ pub fn chief_directive_system(
     // query was replaced with `chief_knowledge_q` (sleepy-dove): we need the
     // chief's `PersonKnowledge.learned` to snapshot into `BlueprintAuthor`.
 
-    let mut faction_bp_count: AHashMap<u32, usize> = AHashMap::new();
+    let mut faction_bp_count: AHashMap<u32, usize> = AHashMap::default();
     for &bp_entity in bp_map.0.values() {
         if let Ok(bp) = bp_query.get(bp_entity) {
             *faction_bp_count.entry(bp.faction_id).or_insert(0) += 1;
@@ -4636,7 +4636,7 @@ fn plan_composite_building(
     if tiles.is_empty() {
         return;
     }
-    let tile_set: ahash::AHashSet<(i32, i32)> = tiles.iter().copied().collect();
+    let tile_set: crate::collections::AHashSet<(i32, i32)> = tiles.iter().copied().collect();
 
     // Door direction: prefer the sourced cardinal (plot frontage); else fall
     // back to the cardinal-toward-home rule used by `plan_building`.
@@ -4703,7 +4703,7 @@ fn plan_composite_building(
     {
         let (ddx, ddy) = door_edge.delta();
         let doormat = (picked_door_tile.0 + ddx, picked_door_tile.1 + ddy);
-        let mut walls: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::new();
+        let mut walls: crate::collections::AHashSet<(i32, i32)> = crate::collections::AHashSet::default();
         let mut beds: Vec<(i32, i32)> = Vec::new();
         for &(tx, ty) in &tiles {
             let pos = (tx, ty);
@@ -5016,7 +5016,7 @@ where
     ];
     // Build a `RoadField` from carved roads only (no planned-spine info
     // available at this layer). Cheap — walks road tiles once.
-    let empty_planned: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::new();
+    let empty_planned: crate::collections::AHashSet<(i32, i32)> = crate::collections::AHashSet::default();
     let road_field = crate::simulation::placement_reachability::road_field_from_home(
         chunk_map,
         &empty_planned,
@@ -5126,8 +5126,8 @@ fn cardinal_path_to_target(
     is_target: &impl Fn((i32, i32)) -> bool,
 ) -> Option<Vec<(i32, i32)>> {
     use std::collections::VecDeque;
-    let mut came_from: ahash::AHashMap<(i32, i32), (i32, i32)> = ahash::AHashMap::new();
-    let mut visited: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::new();
+    let mut came_from: crate::collections::AHashMap<(i32, i32), (i32, i32)> = crate::collections::AHashMap::default();
+    let mut visited: crate::collections::AHashSet<(i32, i32)> = crate::collections::AHashSet::default();
     let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
     visited.insert(doormat);
     queue.push_back(doormat);
@@ -5772,8 +5772,8 @@ pub fn construction_system(
     //   bp_haulers: bp_entity → Vec<(agent, inventory snapshot per deposit slot, claim)>
     //   bp_workers: bp_entity → Vec<agent>
     let mut bp_haulers: AHashMap<Entity, Vec<(Entity, [u32; MAX_BUILD_INPUTS], Option<JobClaim>)>> =
-        AHashMap::new();
-    let mut bp_workers: AHashMap<Entity, Vec<Entity>> = AHashMap::new();
+        AHashMap::default();
+    let mut bp_workers: AHashMap<Entity, Vec<Entity>> = AHashMap::default();
 
     for (entity, mut ai, mut aq, agent, carrier, _skills, slot, lod, claim_opt) in
         agent_query.iter_mut()
@@ -7119,7 +7119,7 @@ pub fn assign_beds_system(
         return;
     }
 
-    let mut claimed_this_pass: AHashSet<Entity> = AHashSet::new();
+    let mut claimed_this_pass: AHashSet<Entity> = AHashSet::default();
 
     // Reverse lookup: bed entity → tile position. BedMap is sparse so the
     // collect is cheap.
@@ -7138,7 +7138,7 @@ pub fn assign_beds_system(
         let plot = plot_q.get(plot_entity).ok()?;
         Some(plot.faction_id)
     };
-    let mut anchors_by_root: AHashMap<u32, Vec<(i32, i32)>> = AHashMap::new();
+    let mut anchors_by_root: AHashMap<u32, Vec<(i32, i32)>> = AHashMap::default();
     for (faction_id, data) in faction_registry.factions.iter() {
         let root = faction_registry.root_faction(*faction_id);
         anchors_by_root.entry(root).or_default().push(data.home_tile);
@@ -7275,7 +7275,7 @@ pub fn assign_beds_system(
     // partner has no bed yet" race in the homeless faction pass — by the
     // time Pass A and the homeless faction pass run, seeded spouses are
     // already paired into adjacent beds inside their dwelling footprint.
-    let mut paired_this_pass: AHashSet<Entity> = AHashSet::new();
+    let mut paired_this_pass: AHashSet<Entity> = AHashSet::default();
     for (person, member, _transform, home_bed_opt, rel_opt, _sex_opt, household_opt, _, _) in
         &person_query
     {
@@ -7635,7 +7635,7 @@ pub fn assign_beds_system(
         partner_bed: Option<(i32, i32)>,
     }
     // Bucket by root_faction so households share the village's bed pool.
-    let mut homeless_by_root: AHashMap<u32, Vec<Homeless>> = AHashMap::new();
+    let mut homeless_by_root: AHashMap<u32, Vec<Homeless>> = AHashMap::default();
     for (person, member, transform, home_bed, rel_opt, sex_opt, _household_opt, _, _) in
         &person_query
     {
@@ -8622,7 +8622,7 @@ pub fn seed_starting_buildings_system(
     // structures are stamped directly through `maps` so they show up in
     // the same maps the next pressure pass reads.
     let empty_bp_map = BlueprintMap::default();
-    let empty_pending: AHashMap<BuildSiteKind, u32> = AHashMap::new();
+    let empty_pending: AHashMap<BuildSiteKind, u32> = AHashMap::default();
     let civic_gate =
         crate::simulation::organic_settlement::CivicGate::Seed(options.maturity);
 
@@ -8632,7 +8632,7 @@ pub fn seed_starting_buildings_system(
         }
         let home = faction.home_tile;
         let members = faction.member_count;
-        let mut used: AHashSet<(i32, i32)> = AHashSet::new();
+        let mut used: AHashSet<(i32, i32)> = AHashSet::default();
         // Reserve the home tile itself — settled factions place their
         // FactionStorageTile here; nomadic factions still want it free of
         // structure overlaps so the camp anchor stays clear.

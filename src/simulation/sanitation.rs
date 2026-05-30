@@ -30,7 +30,7 @@
 //! drink path needs, without yet committing to a settlement-layout
 //! change.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 use crate::world::seasons::TICKS_PER_DAY;

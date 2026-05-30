@@ -109,7 +109,7 @@ fn invalidate_pathing_on_tile_change_system(
     mut hotspots: ResMut<hotspots::HotspotFlowFields>,
     mut perf: ResMut<crate::simulation::perf::BackgroundWorkDiagnostics>,
 ) {
-    let mut chunks: ahash::AHashSet<ChunkCoord> = ahash::AHashSet::new();
+    let mut chunks: crate::collections::AHashSet<ChunkCoord> = crate::collections::AHashSet::default();
     for ev in events.read() {
         let coord = ChunkCoord(
             (ev.tx as i32).div_euclid(CHUNK_SIZE as i32),

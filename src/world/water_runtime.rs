@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use ahash::{AHashMap, AHashSet};
+use crate::collections::{AHashMap, AHashSet};
 use bevy::prelude::*;
 use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
 
@@ -304,9 +304,9 @@ fn dam_impoundment_set(
     bed_at: impl Fn((i32, i32)) -> Option<f32>,
 ) -> AHashSet<(i32, i32)> {
     const NEIGHBOURS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
-    let mut impound: AHashSet<(i32, i32)> = AHashSet::new();
+    let mut impound: AHashSet<(i32, i32)> = AHashSet::default();
     for (&dam, &crest) in dam_crests.iter() {
-        let mut visited: AHashSet<(i32, i32)> = AHashSet::new();
+        let mut visited: AHashSet<(i32, i32)> = AHashSet::default();
         let mut stack: Vec<(i32, i32)> = NEIGHBOURS
             .iter()
             .map(|(dx, dy)| (dam.0 + dx, dam.1 + dy))
@@ -367,7 +367,7 @@ pub fn spawn_water_sim_task_system(
     // reservoir; see `poll`) — gets a small `WATER_CELL_RADIUS` box. A wide
     // box around every runtime cell was the lever the region-blow-up bug
     // pushed on.
-    let mut region: AHashSet<(i32, i32)> = AHashSet::new();
+    let mut region: AHashSet<(i32, i32)> = AHashSet::default();
     let seed_box = |cx: i32, cy: i32, r: i32, region: &mut AHashSet<(i32, i32)>| {
         for ty in (cy - r)..=(cy + r) {
             for tx in (cx - r)..=(cx + r) {
@@ -392,7 +392,7 @@ pub fn spawn_water_sim_task_system(
         let n = sorted.len();
         let start = sim.region_cursor % n;
         let mut window: AHashSet<(i32, i32)> =
-            AHashSet::with_capacity(WATER_SIM_MAX_REGION_TILES);
+            AHashSet::with_capacity_and_hasher(WATER_SIM_MAX_REGION_TILES, crate::collections::FixedState);
         for i in 0..WATER_SIM_MAX_REGION_TILES {
             window.insert(sorted[(start + i) % n]);
         }
@@ -404,7 +404,7 @@ pub fn spawn_water_sim_task_system(
 
     // Raw-tile snapshot — flat `ChunkMap` reads, no math. Lets the classify
     // pass run entirely off-thread against this + the cached `Arc<Globe>`.
-    let mut raw: AHashMap<(i32, i32), RawTile> = AHashMap::with_capacity(region.len());
+    let mut raw: AHashMap<(i32, i32), RawTile> = AHashMap::with_capacity_and_hasher(region.len(), crate::collections::FixedState);
     for &t in &region {
         raw.insert(
             t,
@@ -418,7 +418,7 @@ pub fn spawn_water_sim_task_system(
     }
 
     // Region-restricted runtime-cell snapshot (bounded by region size).
-    let mut runtime_cells: AHashMap<(i32, i32), RuntimeWaterCell> = AHashMap::new();
+    let mut runtime_cells: AHashMap<(i32, i32), RuntimeWaterCell> = AHashMap::default();
     for &t in &region {
         if let Some(rc) = runtime_water.cells.get(&t) {
             runtime_cells.insert(t, *rc);
@@ -499,8 +499,8 @@ fn classify_and_simulate(
         mxx = mxx.max(x);
         mxy = mxy.max(y);
     }
-    let mut inlet: AHashMap<(i32, i32), (f32, f32)> = AHashMap::new(); // (discharge, level)
-    let mut outlet: AHashMap<(i32, i32), f32> = AHashMap::new(); // level
+    let mut inlet: AHashMap<(i32, i32), (f32, f32)> = AHashMap::default(); // (discharge, level)
+    let mut outlet: AHashMap<(i32, i32), f32> = AHashMap::default(); // level
     for c in globe.rivers.edge_crossings_in_bbox((mnx, mny), (mxx, mxy)) {
         match c.kind {
             EdgeCrossingKind::Inlet => {
@@ -689,12 +689,21 @@ pub fn poll_water_sim_task_system(
     mut runtime_water: ResMut<RuntimeWater>,
     mut chunk_map: ResMut<ChunkMap>,
     mut tile_changed: EventWriter<TileChangedEvent>,
+    deterministic: Option<Res<crate::simulation::perf::DeterministicCompute>>,
 ) {
-    let Some(t) = sim.task.as_mut() else {
+    if sim.task.is_none() {
         return;
-    };
-    let Some(result) = block_on(future::poll_once(t)) else {
-        return; // still running
+    }
+    // Test mode: fully drain the task so its result lands this tick regardless
+    // of compute-pool contention. Production keeps the non-blocking `poll_once`.
+    let result = if deterministic.is_some() {
+        block_on(sim.task.take().expect("task present"))
+    } else {
+        let t = sim.task.as_mut().expect("task present");
+        let Some(result) = block_on(future::poll_once(t)) else {
+            return; // still running
+        };
+        result
     };
     sim.task = None;
 
@@ -980,7 +989,7 @@ mod tests {
 
     /// A `WATER_SIM_RADIUS`-style box of tiles around the origin.
     fn box_region(half: i32) -> AHashSet<(i32, i32)> {
-        let mut r = AHashSet::new();
+        let mut r = AHashSet::default();
         for y in -half..=half {
             for x in -half..=half {
                 r.insert((x, y));
@@ -994,7 +1003,7 @@ mod tests {
         // With no dam, every river tile is left out of the impoundment ⇒ the
         // classify loop pins it at hydrology truth (no flooding).
         let region = box_region(5);
-        let crests: AHashMap<(i32, i32), f32> = AHashMap::new();
+        let crests: AHashMap<(i32, i32), f32> = AHashMap::default();
         let impound = dam_impoundment_set(&region, &crests, |_| Some(0.0));
         assert!(impound.is_empty(), "no dam ⇒ nothing free-simulated");
     }
@@ -1004,7 +1013,7 @@ mod tests {
         // A flat channel at bed 0, crest 3. A wall of bed-5 tiles at x=3
         // dams the fill — cells at x>=3 must be excluded.
         let region = box_region(6);
-        let mut crests: AHashMap<(i32, i32), f32> = AHashMap::new();
+        let mut crests: AHashMap<(i32, i32), f32> = AHashMap::default();
         crests.insert((0, 0), 3.0);
         let bed_at = |t: (i32, i32)| -> Option<f32> {
             if t.0 == 3 {
@@ -1033,7 +1042,7 @@ mod tests {
     fn impoundment_is_bounded_by_the_region() {
         // A below-crest cell outside the active region is never pulled in.
         let region = box_region(2);
-        let mut crests: AHashMap<(i32, i32), f32> = AHashMap::new();
+        let mut crests: AHashMap<(i32, i32), f32> = AHashMap::default();
         crests.insert((0, 0), 9.0);
         let impound = dam_impoundment_set(&region, &crests, |_| Some(0.0));
         assert!(impound.contains(&(2, 0)), "in-region below-crest cell");

@@ -1134,9 +1134,11 @@ pub fn spawn_world_system(
     }
 
     let mut total = 0usize;
-    let mut deduped: ahash::AHashSet<ChunkCoord> = ahash::AHashSet::with_capacity(
-        centers.len() * (chunks_x as usize) * (chunks_y as usize),
-    );
+    let mut deduped: crate::collections::AHashSet<ChunkCoord> =
+        crate::collections::AHashSet::with_capacity_and_hasher(
+            centers.len() * (chunks_x as usize) * (chunks_y as usize),
+            crate::collections::FixedState,
+        );
     for (center_cx, center_cy) in &centers {
         let start_cx = center_cx - (chunks_x / 2);
         let start_cy = center_cy - (chunks_y / 2);

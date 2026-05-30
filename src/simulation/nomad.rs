@@ -332,7 +332,7 @@ pub fn nomad_migration_system(world: &mut World) {
 
     // Pick scouts per faction. Lowest combined-need members; skip
     // `Drafted`, skip the chief unless the band only has 1 member.
-    let mut chosen: ahash::AHashMap<u32, Vec<(Entity, u8)>> = ahash::AHashMap::default();
+    let mut chosen: crate::collections::AHashMap<u32, Vec<(Entity, u8)>> = crate::collections::AHashMap::default();
     {
         let mut state: SystemState<(
             Query<
@@ -879,7 +879,7 @@ fn progress_packing_ai_migrations(world: &mut World, now: u32) {
 }
 
 fn stamp_members_for_caravan_travel(world: &mut World, ready: &[AiPackingMigration], now: u32) {
-    let targets: ahash::AHashMap<u32, (i32, i32)> =
+    let targets: crate::collections::AHashMap<u32, (i32, i32)> =
         ready.iter().map(|p| (p.fid, p.target)).collect();
     let mut state: SystemState<(
         Commands,
@@ -916,7 +916,7 @@ fn stamp_members_for_caravan_travel(world: &mut World, ready: &[AiPackingMigrati
 }
 
 fn redirect_owned_pack_animals(world: &mut World, ready: &[AiPackingMigration], now: u32) {
-    let targets: ahash::AHashMap<u32, (i32, i32)> =
+    let targets: crate::collections::AHashMap<u32, (i32, i32)> =
         ready.iter().map(|p| (p.fid, p.target)).collect();
     let mut state: SystemState<(Commands, Query<(Entity, &Tamed, &mut AnimalAI)>)> =
         SystemState::new(world);
@@ -967,7 +967,7 @@ fn progress_traveling_ai_migrations(world: &mut World, now: u32) {
         return;
     }
 
-    let mut caravan_tiles: ahash::AHashMap<u32, (i32, i32)> = ahash::AHashMap::default();
+    let mut caravan_tiles: crate::collections::AHashMap<u32, (i32, i32)> = crate::collections::AHashMap::default();
     let mut arrived: Vec<AiTravelingMigration> = Vec::new();
     for t in traveling.iter() {
         let caravan = caravan_tile_for(world, t.fid, t.old_home);
@@ -1093,7 +1093,7 @@ fn progress_pitching_ai_migrations(world: &mut World, now: u32) {
     }
 
     {
-        let completed_set: ahash::AHashSet<u32> = completed.iter().copied().collect();
+        let completed_set: crate::collections::AHashSet<u32> = completed.iter().copied().collect();
         let mut registry = world.resource_mut::<FactionRegistry>();
         for fid in completed.iter() {
             if let Some(faction) = registry.factions.get_mut(fid) {
@@ -1206,7 +1206,7 @@ fn emit_camp_moved_events(world: &mut World, arrived: &[AiTravelingMigration], n
             Res<FactionRegistry>,
         )> = SystemState::new(world);
         let (q, registry) = state.get(world);
-        let mut actors: ahash::AHashMap<u32, Entity> = ahash::AHashMap::default();
+        let mut actors: crate::collections::AHashMap<u32, Entity> = crate::collections::AHashMap::default();
         for (entity, member) in q.iter() {
             let root = registry.root_faction(member.faction_id);
             actors.entry(root).or_insert(entity);
@@ -1235,7 +1235,7 @@ fn emit_camp_moved_events(world: &mut World, arrived: &[AiTravelingMigration], n
 }
 
 fn unload_pack_animals_at_destination(world: &mut World, pitching: &[AiPitchingMigration]) {
-    let targets: ahash::AHashMap<u32, (i32, i32)> =
+    let targets: crate::collections::AHashMap<u32, (i32, i32)> =
         pitching.iter().map(|p| (p.fid, p.target)).collect();
     if targets.is_empty() {
         return;
@@ -1278,7 +1278,7 @@ fn unload_pack_animals_at_destination(world: &mut World, pitching: &[AiPitchingM
 }
 
 fn dispatch_member_unload_tasks(world: &mut World, pitching: &[AiPitchingMigration]) {
-    let targets: ahash::AHashMap<u32, (i32, i32)> =
+    let targets: crate::collections::AHashMap<u32, (i32, i32)> =
         pitching.iter().map(|p| (p.fid, p.target)).collect();
     if targets.is_empty() {
         return;
@@ -1385,7 +1385,7 @@ fn dispatch_pitch_tasks(world: &mut World, pitching: &[AiPitchingMigration]) {
         anchor: (i32, i32),
     }
 
-    let targets: ahash::AHashMap<u32, (i32, i32)> =
+    let targets: crate::collections::AHashMap<u32, (i32, i32)> =
         pitching.iter().map(|p| (p.fid, p.target)).collect();
     if targets.is_empty() {
         return;
@@ -1411,7 +1411,7 @@ fn dispatch_pitch_tasks(world: &mut World, pitching: &[AiPitchingMigration]) {
         let mut out = Vec::new();
 
         for p in pitching.iter() {
-            let mut used: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::default();
+            let mut used: crate::collections::AHashSet<(i32, i32)> = crate::collections::AHashSet::default();
             for tile in bed_map.0.keys().copied() {
                 if chebyshev(tile, p.target) <= 8 {
                     used.insert(tile);
@@ -1521,7 +1521,7 @@ fn dispatch_pitch_tasks(world: &mut World, pitching: &[AiPitchingMigration]) {
         chunk: crate::world::chunk::ChunkCoord,
         z: i8,
     }
-    let workers_by_faction: ahash::AHashMap<u32, Vec<Worker>> = {
+    let workers_by_faction: crate::collections::AHashMap<u32, Vec<Worker>> = {
         let mut state: SystemState<(
             Query<
                 (
@@ -1536,7 +1536,7 @@ fn dispatch_pitch_tasks(world: &mut World, pitching: &[AiPitchingMigration]) {
             Res<FactionRegistry>,
         )> = SystemState::new(world);
         let (q, registry) = state.get(world);
-        let mut acc: ahash::AHashMap<u32, Vec<Worker>> = ahash::AHashMap::default();
+        let mut acc: crate::collections::AHashMap<u32, Vec<Worker>> = crate::collections::AHashMap::default();
         for (entity, member, transform, ai, aq) in q.iter() {
             let root = registry.root_faction(member.faction_id);
             if !targets.contains_key(&root) {
@@ -1569,7 +1569,7 @@ fn dispatch_pitch_tasks(world: &mut World, pitching: &[AiPitchingMigration]) {
         crate::world::chunk::ChunkCoord,
         i8,
     )> = Vec::new();
-    let mut used_workers: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut used_workers: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
     for req in requests.into_iter() {
         let Some(pool) = workers_by_faction.get(&req.fid) else {
             continue;
@@ -1649,7 +1649,7 @@ fn dispatch_pitch_tasks(world: &mut World, pitching: &[AiPitchingMigration]) {
 fn find_pitch_anchor(
     target: (i32, i32),
     kind: crate::simulation::construction::BuildSiteKind,
-    used: &mut ahash::AHashSet<(i32, i32)>,
+    used: &mut crate::collections::AHashSet<(i32, i32)>,
     chunk_map: &ChunkMap,
 ) -> Option<(i32, i32)> {
     let (min_ring, max_ring): (i32, i32) = match kind {
@@ -1713,7 +1713,7 @@ fn caravan_arrival_threshold_met(world: &mut World, fid: u32, target: (i32, i32)
     total == 0 || arrived.saturating_mul(5) >= total.saturating_mul(4)
 }
 
-fn finish_caravan_member_markers(world: &mut World, completed: &ahash::AHashSet<u32>) {
+fn finish_caravan_member_markers(world: &mut World, completed: &crate::collections::AHashSet<u32>) {
     if completed.is_empty() {
         return;
     }
@@ -1790,7 +1790,7 @@ pub(crate) fn pack_camp_assets_atomic(world: &mut World, packs: &[(u32, (i32, i3
     // band members before the despawn / pack pass runs. Avoids the case
     // where one member at 99% capacity strands the band's only yurt.
     {
-        let migrating: ahash::AHashSet<u32> = packs.iter().map(|(fid, _, _)| *fid).collect();
+        let migrating: crate::collections::AHashSet<u32> = packs.iter().map(|(fid, _, _)| *fid).collect();
         let essentials = crate::simulation::nomad_pool::essentials_for_band();
         let mut state: SystemState<(
             Res<FactionRegistry>,
@@ -1801,8 +1801,8 @@ pub(crate) fn pack_camp_assets_atomic(world: &mut World, packs: &[(u32, (i32, i3
             )>,
         )> = SystemState::new(world);
         let (registry, mut q) = state.get_mut(world);
-        let mut updates: ahash::AHashMap<Entity, crate::economy::agent::EconomicAgent> =
-            ahash::AHashMap::new();
+        let mut updates: crate::collections::AHashMap<Entity, crate::economy::agent::EconomicAgent> =
+            crate::collections::AHashMap::default();
         for &fid in migrating.iter() {
             let mut snapshot: Vec<(Entity, crate::economy::agent::EconomicAgent)> = q
                 .iter()
@@ -1839,7 +1839,7 @@ pub(crate) fn pack_camp_assets_atomic(world: &mut World, packs: &[(u32, (i32, i3
     // (refund-only) are skipped here — the despawn pass below drops
     // their refund.
     {
-        let migrating: ahash::AHashMap<u32, ((i32, i32), i32)> = packs
+        let migrating: crate::collections::AHashMap<u32, ((i32, i32), i32)> = packs
             .iter()
             .map(|(fid, anchor, radius)| (*fid, (*anchor, *radius)))
             .collect();
@@ -1986,7 +1986,7 @@ pub(crate) fn pack_camp_assets_atomic(world: &mut World, packs: &[(u32, (i32, i3
         ) = despawn_state.get_mut(world);
 
         for &(_fid, anchor, radius) in packs.iter() {
-            let mut despawned: ahash::AHashSet<Entity> = ahash::AHashSet::new();
+            let mut despawned: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
 
             let bed_tiles: Vec<(i32, i32)> = bed_map
                 .0
@@ -2455,7 +2455,7 @@ pub fn apply_pitch_camp_command_system(world: &mut World) {
             EventWriter<TileChangedEvent>,
         )> = SystemState::new(world);
         let (mut commands, mut maps, chunk_map, mut tile_changed) = seed_state.get_mut(world);
-        let mut used: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::default();
+        let mut used: crate::collections::AHashSet<(i32, i32)> = crate::collections::AHashSet::default();
         used.insert(r.target);
         seed_nomadic_camp(
             &mut commands,
@@ -2556,7 +2556,7 @@ pub fn apply_pitch_camp_command_system(world: &mut World) {
     // freshly-pitched factions so they herd toward the new camp via
     // `following_band_animal_redirect_system` (survives Dormant LOD).
     {
-        let pitched_fids: ahash::AHashSet<u32> = resolved.iter().map(|r| r.fid).collect();
+        let pitched_fids: crate::collections::AHashSet<u32> = resolved.iter().map(|r| r.fid).collect();
         let mut state: SystemState<(Commands, Query<(Entity, &Tamed)>)> = SystemState::new(world);
         let (mut commands, q) = state.get_mut(world);
         for (e, tamed) in q.iter() {
@@ -2577,7 +2577,7 @@ pub fn apply_pitch_camp_command_system(world: &mut World) {
     // (instead of holding stale GatherFood targets pointed at the old
     // location).
     {
-        let pitched_fids: ahash::AHashSet<u32> = resolved.iter().map(|r| r.fid).collect();
+        let pitched_fids: crate::collections::AHashSet<u32> = resolved.iter().map(|r| r.fid).collect();
         let mut state: SystemState<(
             ResMut<crate::simulation::goals::ForceGoalReevaluate>,
             Query<(Entity, &crate::simulation::faction::FactionMember)>,
@@ -2681,7 +2681,7 @@ fn despawn_old_camp_leftovers(world: &mut World, resolved: &[PitchResolved]) {
     }
     use crate::simulation::construction::seed_nomadic_camp_extent;
 
-    let footprints: ahash::AHashMap<u32, ((i32, i32), i32)> = resolved
+    let footprints: crate::collections::AHashMap<u32, ((i32, i32), i32)> = resolved
         .iter()
         .map(|r| {
             (
@@ -2797,7 +2797,7 @@ fn consume_band_packed_goods_after_pitch(world: &mut World, resolved: &[PitchRes
 
     // Targets per faction match `seed_nomadic_camp`'s emission counts:
     // one bedroll per founder; Neolithic+ yurts at `(members/5).clamp(1, 2)`.
-    let mut targets: ahash::AHashMap<u32, (u32, u32)> = ahash::AHashMap::default();
+    let mut targets: crate::collections::AHashMap<u32, (u32, u32)> = crate::collections::AHashMap::default();
     for r in resolved.iter() {
         let bedrolls = r.members.max(1);
         let yurts = if (r.era as u8) >= (Era::Neolithic as u8) {
@@ -3376,10 +3376,10 @@ pub fn nomad_chief_directive_system(
         }
 
         let mut budget = NOMAD_DIRECTIVE_BP_PER_TICK;
-        let mut used: ahash::AHashSet<(i32, i32)> = bp_map.0.keys().copied().collect();
+        let mut used: crate::collections::AHashSet<(i32, i32)> = bp_map.0.keys().copied().collect();
         // Helper: queue one Single blueprint of `kind` near home.
         let queue_one = |budget: &mut usize,
-                         used: &mut ahash::AHashSet<(i32, i32)>,
+                         used: &mut crate::collections::AHashSet<(i32, i32)>,
                          bp_map: &mut crate::simulation::construction::BlueprintMap,
                          commands: &mut Commands,
                          kind: BuildSiteKind|
@@ -3504,7 +3504,7 @@ pub fn nomad_migration_dispatch_system(
     let now = clock.tick;
     let now_u32 = now as u32;
     // Pass 1: snapshot per-root-faction migrant tiles for centroid reroute.
-    let mut tiles_per_faction: ahash::AHashMap<u32, Vec<(i32, i32)>> = ahash::AHashMap::default();
+    let mut tiles_per_faction: crate::collections::AHashMap<u32, Vec<(i32, i32)>> = crate::collections::AHashMap::default();
     {
         let snap_q = qs.p0();
         for (_t, peer_xform, peer_member) in snap_q.iter() {

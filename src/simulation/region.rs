@@ -11,7 +11,7 @@ use crate::world::chunk::{ChunkMap, CHUNK_SIZE};
 use crate::world::globe::{Globe, MEGACHUNK_SIZE_CHUNKS};
 use crate::world::terrain::{climate_fertility_estimate_at, TILE_SIZE};
 use crate::world::tile::TileKind;
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 /// One focus point for chunk streaming. Chunks within `chunk_radius` of

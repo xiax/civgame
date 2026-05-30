@@ -1,4 +1,4 @@
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 use crate::world::spatial::SpatialIndex;

@@ -396,8 +396,8 @@ pub fn cross_profession_switch_system(
     }
 
     // Pre-pass: per-(faction, profession) headcounts + Crafter mentor pool.
-    let mut counts: ahash::AHashMap<(u32, Profession), usize> = ahash::AHashMap::default();
-    let mut available_mentors: ahash::AHashMap<u32, Vec<Entity>> = ahash::AHashMap::default();
+    let mut counts: crate::collections::AHashMap<(u32, Profession), usize> = crate::collections::AHashMap::default();
+    let mut available_mentors: crate::collections::AHashMap<u32, Vec<Entity>> = crate::collections::AHashMap::default();
     for (entity, prof, member, skills, _peaks, _, _, _, _, _, _) in query.iter() {
         if member.faction_id == crate::simulation::faction::SOLO {
             continue;
@@ -518,8 +518,8 @@ pub fn cross_profession_switch_system(
         return;
     }
 
-    let plan_set: ahash::AHashSet<Entity> = planned.iter().map(|(e, _)| *e).collect();
-    let mut new_prof: ahash::AHashMap<Entity, Profession> = ahash::AHashMap::default();
+    let plan_set: crate::collections::AHashSet<Entity> = planned.iter().map(|(e, _)| *e).collect();
+    let mut new_prof: crate::collections::AHashMap<Entity, Profession> = crate::collections::AHashMap::default();
     for (e, p) in &planned {
         new_prof.insert(*e, *p);
     }

@@ -8,7 +8,7 @@
 //! for every founding resource at startup so hot paths can compare against
 //! an integer rather than re-querying the catalog.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -269,8 +269,8 @@ impl ResourceCatalog {
     pub fn from_defs(mut defs: Vec<ResourceDef>) -> Self {
         defs.sort_by(|a, b| a.key.cmp(&b.key));
 
-        let mut by_key = AHashMap::with_capacity(defs.len());
-        let mut by_tag: AHashMap<ResourceTag, Vec<ResourceId>> = AHashMap::new();
+        let mut by_key = AHashMap::with_capacity_and_hasher(defs.len(), crate::collections::FixedState);
+        let mut by_tag: AHashMap<ResourceTag, Vec<ResourceId>> = AHashMap::default();
 
         for (idx, def) in defs.iter().enumerate() {
             assert!(

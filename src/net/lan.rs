@@ -16,7 +16,7 @@ use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 

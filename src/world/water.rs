@@ -17,7 +17,7 @@
 //! `AHashMap` iteration order. Two identical grids stepped identically are
 //! bit-for-bit equal (`determinism_bitwise` test).
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 
 /// Pipe conductance per unit `dt`. Stability wants `FLOW_K * dt * 4 < 1`
 /// (four neighbours); the wrapper uses small `dt` with several substeps.
@@ -216,20 +216,20 @@ impl WaterGrid {
         }
 
         // --- Per-giver volume clamp (Free givers only) ---
-        let mut gross_out: AHashMap<(i32, i32), f32> = AHashMap::new();
+        let mut gross_out: AHashMap<(i32, i32), f32> = AHashMap::default();
         for &(g, _, a) in &transfers {
             if self.cells.get(&g).map(|c| c.role) == Some(CellRole::Free) {
                 *gross_out.entry(g).or_insert(0.0) += a;
             }
         }
-        let mut scale: AHashMap<(i32, i32), f32> = AHashMap::new();
+        let mut scale: AHashMap<(i32, i32), f32> = AHashMap::default();
         for (&g, &out) in &gross_out {
             let d = self.cells[&g].depth;
             scale.insert(g, if out > d && out > 0.0 { d / out } else { 1.0 });
         }
 
         // --- Apply (deterministic transfer order) ---
-        let mut delta: AHashMap<(i32, i32), f32> = AHashMap::new();
+        let mut delta: AHashMap<(i32, i32), f32> = AHashMap::default();
         for &(g, r, a) in &transfers {
             let s = scale.get(&g).copied().unwrap_or(1.0);
             let m = a * s;

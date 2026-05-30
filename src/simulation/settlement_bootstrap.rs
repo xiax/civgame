@@ -79,8 +79,8 @@ pub fn seed_starting_relationships_system(
 ) {
     // Bucket members by their root faction id (skip households that may
     // have already been formed by other paths — Market preset).
-    use ahash::AHashMap;
-    let mut by_faction: AHashMap<u32, Vec<Entity>> = AHashMap::new();
+    use crate::collections::AHashMap;
+    let mut by_faction: AHashMap<u32, Vec<Entity>> = AHashMap::default();
     for (entity, member, household) in members_q.iter() {
         if household.is_some() {
             continue;
@@ -267,12 +267,12 @@ pub fn relocate_stranded_members_system(
 ) {
     use crate::world::terrain::{tile_to_world, TILE_SIZE};
     use crate::world::tile::TileKind;
-    use ahash::AHashSet;
+    use crate::collections::AHashSet;
 
     // Cache reachable-from-home pools per faction so we don't re-BFS for
     // each stranded member.
-    let mut pools_by_faction: ahash::AHashMap<u32, Vec<(i32, i32)>> = ahash::AHashMap::new();
-    let mut used: AHashSet<(i32, i32)> = AHashSet::new();
+    let mut pools_by_faction: crate::collections::AHashMap<u32, Vec<(i32, i32)>> = crate::collections::AHashMap::default();
+    let mut used: AHashSet<(i32, i32)> = AHashSet::default();
 
     // Seed `used` with every tile any in-place Person already occupies so
     // we don't relocate two strays to the same destination.

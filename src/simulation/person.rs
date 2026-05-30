@@ -1070,8 +1070,8 @@ pub(crate) fn seed_market_households(
     village_home: (i32, i32),
     members: &[Entity],
 ) {
-    use ahash::AHashSet;
-    let mut used: AHashSet<(i32, i32)> = AHashSet::new();
+    use crate::collections::AHashSet;
+    let mut used: AHashSet<(i32, i32)> = AHashSet::default();
     used.insert(village_home);
     // Household plot tiles are drawn from a flood outward from the village
     // home so each FactionStorageTile / home is reachable from the village by

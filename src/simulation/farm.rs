@@ -18,7 +18,7 @@
 //! - `fallow_recovery_system` (Economy, season-edge) — restores nutrients on
 //!   rested tiles up to the per-tile fertility ceiling.
 
-use ahash::{AHashMap, AHashSet};
+use crate::collections::{AHashMap, AHashSet};
 use bevy::prelude::*;
 
 use crate::economy::core_ids;
@@ -1309,7 +1309,7 @@ pub fn drain_farm_retirements_system(
         return;
     }
 
-    let mut touched_plots: ahash::AHashSet<PlotId> = ahash::AHashSet::new();
+    let mut touched_plots: crate::collections::AHashSet<PlotId> = crate::collections::AHashSet::default();
     for (tile, old_plot) in to_finalise.iter().copied() {
         retirements.by_tile.remove(&tile);
         let (tx, ty) = tile;

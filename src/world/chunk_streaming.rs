@@ -1,4 +1,4 @@
-use ahash::{AHashMap, AHashSet};
+use crate::collections::{AHashMap, AHashSet};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use std::time::Instant;

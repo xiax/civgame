@@ -20,7 +20,7 @@
 //! - Pure helpers: `settlement_radius_for`, `camp_radius_for`,
 //!   `score_at`, `cell_winner`. Unit-tested without an `App`.
 
-use ahash::{AHashMap, AHashSet};
+use crate::collections::{AHashMap, AHashSet};
 use bevy::prelude::*;
 
 use crate::simulation::camp::{Camp, CampMap};
@@ -290,7 +290,7 @@ pub fn compute_cells_from_anchors(
         rasterise_anchor(anchor, &mut scratch);
     }
     let mut cells: AHashMap<(i32, i32), TerritoryCell> =
-        AHashMap::with_capacity(scratch.len());
+        AHashMap::with_capacity_and_hasher(scratch.len(), crate::collections::FixedState);
     let mut stats: AHashMap<u32, TerritoryStats> = AHashMap::default();
     for (tile, per_faction) in scratch {
         let cell = cell_winner(&per_faction);

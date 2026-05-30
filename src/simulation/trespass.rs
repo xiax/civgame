@@ -12,7 +12,7 @@
 //! Throttling: per-pair `TrespassCooldown` map prevents one walking
 //! agent from re-firing every tile-step.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 use std::collections::VecDeque;
 

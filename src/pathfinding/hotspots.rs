@@ -1,4 +1,4 @@
-use ahash::{AHashMap, AHashSet};
+use crate::collections::{AHashMap, AHashSet};
 use bevy::prelude::*;
 
 use crate::pathfinding::flow_field::{build_flow_field, FlowField};

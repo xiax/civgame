@@ -1,11 +1,13 @@
-use ahash::{AHashMap, AHashSet};
+use crate::collections::{AHashMap, AHashSet};
 use bevy::prelude::*;
 use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
 use std::collections::VecDeque;
 use std::time::Instant;
 
 use crate::pathfinding::tile_cost::{tile_step_cost, IMPASSABLE};
-use crate::simulation::perf::{micros_u32, BackgroundWorkDiagnostics, PerfWorkBudget};
+use crate::simulation::perf::{
+    micros_u32, BackgroundWorkDiagnostics, DeterministicCompute, PerfWorkBudget,
+};
 use crate::world::chunk::{Chunk, ChunkCoord, ChunkMap, CHUNK_SIZE, Z_MIN};
 use crate::world::chunk_streaming::{ChunkLoadedEvent, ChunkUnloadedEvent, TileChangedEvent};
 
@@ -137,7 +139,7 @@ fn classify_components(
     let csz = CHUNK_SIZE as i32;
 
     // Enumerate every standable cell in this chunk.
-    let mut seeds: AHashSet<(u8, u8, i8)> = AHashSet::new();
+    let mut seeds: AHashSet<(u8, u8, i8)> = AHashSet::default();
     for ly in 0..CHUNK_SIZE {
         for lx in 0..CHUNK_SIZE {
             let tx = coord.0 * csz + lx as i32;
@@ -160,7 +162,7 @@ fn classify_components(
         }
     }
 
-    let mut at: AHashMap<(u8, u8, i8), ComponentId> = AHashMap::new();
+    let mut at: AHashMap<(u8, u8, i8), ComponentId> = AHashMap::default();
     let mut next_id: u8 = 0;
     let mut queue: VecDeque<(u8, u8, i8)> = VecDeque::new();
 
@@ -295,7 +297,7 @@ pub fn take_classify_batch(dirty: &mut AHashSet<ChunkCoord>, limit: usize) -> AH
     let mut coords: Vec<ChunkCoord> = dirty.iter().copied().collect();
     coords.sort_by_key(|c| (c.0, c.1));
     let take = coords.len().min(limit.max(1));
-    let mut batch = AHashSet::with_capacity(take);
+    let mut batch = AHashSet::with_capacity_and_hasher(take, crate::collections::FixedState);
     for coord in coords.into_iter().take(take) {
         dirty.remove(&coord);
         batch.insert(coord);
@@ -362,7 +364,7 @@ pub fn spawn_rebuild_task_system(
     // to currently-loaded chunks. These need their edges re-emitted so they
     // reflect the latest IDs of classify-dirty neighbours and drop edges to
     // unloaded ones.
-    let mut edge_dirty: AHashSet<ChunkCoord> = AHashSet::new();
+    let mut edge_dirty: AHashSet<ChunkCoord> = AHashSet::default();
     for &c in &classify_dirty {
         edge_dirty.insert(c);
         for nb in cardinal_neighbors(c) {
@@ -382,7 +384,7 @@ pub fn spawn_rebuild_task_system(
     // Snapshot tile-data set: edge_dirty ∪ cardinals_of(edge_dirty). Edge
     // scans cross one chunk boundary so we need outer cardinals for tile
     // reads (passable_at on the far side of the border).
-    let mut snapshot_coords: AHashSet<ChunkCoord> = AHashSet::new();
+    let mut snapshot_coords: AHashSet<ChunkCoord> = AHashSet::default();
     for &c in &edge_dirty {
         snapshot_coords.insert(c);
         for nb in cardinal_neighbors(c) {
@@ -393,7 +395,7 @@ pub fn spawn_rebuild_task_system(
     }
 
     let mut snap_map = ChunkMap::default();
-    let mut live_components: AHashMap<ChunkCoord, ChunkComponents> = AHashMap::new();
+    let mut live_components: AHashMap<ChunkCoord, ChunkComponents> = AHashMap::default();
     for coord in &snapshot_coords {
         if let Some(chunk) = chunk_map.0.get(coord) {
             snap_map.0.insert(*coord, chunk.clone());
@@ -425,14 +427,25 @@ pub fn poll_rebuild_task_system(
     mut task: ResMut<GraphRebuildTask>,
     mut graph: ResMut<ChunkGraph>,
     mut perf: ResMut<BackgroundWorkDiagnostics>,
+    deterministic: Option<Res<DeterministicCompute>>,
 ) {
-    let Some(t) = task.0.as_mut() else {
-        return;
+    // Test mode: fully drain the task so its result lands this tick regardless
+    // of compute-pool contention. Production keeps the non-blocking `poll_once`.
+    let result = if deterministic.is_some() {
+        let Some(t) = task.0.take() else {
+            return;
+        };
+        block_on(t)
+    } else {
+        let Some(t) = task.0.as_mut() else {
+            return;
+        };
+        let Some(result) = block_on(future::poll_once(t)) else {
+            return; // still running
+        };
+        task.0 = None;
+        result
     };
-    let Some(result) = block_on(future::poll_once(t)) else {
-        return; // still running
-    };
-    task.0 = None;
 
     let apply_started = Instant::now();
     for coord in &result.unloaded {
@@ -465,7 +478,7 @@ fn rebuild_offthread(snap: RebuildSnapshot) -> RebuildResult {
     // 1. Classify only chunks whose tile state actually changed. Their IDs
     // may shift; cardinal neighbours' edge re-emission below picks up the
     // new IDs.
-    let mut components_delta: AHashMap<ChunkCoord, ChunkComponents> = AHashMap::new();
+    let mut components_delta: AHashMap<ChunkCoord, ChunkComponents> = AHashMap::default();
     for &coord in &snap.classify_dirty {
         if let Some(chunk) = chunk_map.0.get(&coord) {
             components_delta.insert(coord, classify_components(chunk_map, coord, chunk));
@@ -476,7 +489,7 @@ fn rebuild_offthread(snap: RebuildSnapshot) -> RebuildResult {
     // cardinals). Self-components come from `components_delta` for
     // classify_dirty chunks and from `live_components` for cardinals; that
     // way cardinals' IDs stay stable across the rebuild.
-    let mut edges_delta: AHashMap<ChunkCoord, Vec<ChunkEdge>> = AHashMap::new();
+    let mut edges_delta: AHashMap<ChunkCoord, Vec<ChunkEdge>> = AHashMap::default();
     let mut edge_count = 0usize;
 
     for &coord in &snap.edge_dirty {
@@ -538,7 +551,7 @@ fn scan_edges_for_chunk(
 
     // Build a map of (lx, ly) → Vec<z> from this chunk's deltas so we know
     // which underground Z slices to consider for each border tile.
-    let mut deltas_by_xy: AHashMap<(u8, u8), Vec<i8>> = AHashMap::new();
+    let mut deltas_by_xy: AHashMap<(u8, u8), Vec<i8>> = AHashMap::default();
     for &(lx, ly, z_local) in chunk.deltas.keys() {
         let z = (z_local as i32 + Z_MIN) as i8;
         deltas_by_xy.entry((lx, ly)).or_default().push(z);
@@ -557,7 +570,7 @@ fn scan_edges_for_chunk(
             None => classify_components(chunk_map, nb, nb_chunk),
         };
 
-        let mut nb_deltas_by_xy: AHashMap<(u8, u8), Vec<i8>> = AHashMap::new();
+        let mut nb_deltas_by_xy: AHashMap<(u8, u8), Vec<i8>> = AHashMap::default();
         for &(lx, ly, z_local) in nb_chunk.deltas.keys() {
             let z = (z_local as i32 + Z_MIN) as i8;
             nb_deltas_by_xy.entry((lx, ly)).or_default().push(z);
@@ -665,11 +678,11 @@ pub fn rebuild_chunk_graph_sync(chunk_map: &ChunkMap, graph: &mut ChunkGraph) {
     graph.components.clear();
     graph.edges.clear();
 
-    let mut components: AHashMap<ChunkCoord, ChunkComponents> = AHashMap::new();
+    let mut components: AHashMap<ChunkCoord, ChunkComponents> = AHashMap::default();
     for (coord, chunk) in &chunk_map.0 {
         components.insert(*coord, classify_components(chunk_map, *coord, chunk));
     }
-    let empty: AHashMap<ChunkCoord, ChunkComponents> = AHashMap::new();
+    let empty: AHashMap<ChunkCoord, ChunkComponents> = AHashMap::default();
     for (coord, chunk) in &chunk_map.0 {
         let edges = scan_edges_for_chunk(chunk_map, *coord, chunk, &components, &empty);
         graph.edges.insert(*coord, edges);

@@ -9,7 +9,7 @@ use crate::world::seasons::TICKS_PER_SEASON;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
 use crate::world::tile::TileKind;
-use ahash::AHashSet;
+use crate::collections::AHashSet;
 use bevy::prelude::*;
 use std::time::Instant;
 
@@ -2126,7 +2126,7 @@ pub fn animal_reproduction_system(
     // Species codes: 0=wolf 1=deer 2=horse 3=cow 4=rabbit 5=pig 6=fox 7=cat
 
     // Phase 1: collect eligible males (immutable pass)
-    let mut males: [ahash::AHashSet<Entity>; 8] = Default::default();
+    let mut males: [crate::collections::AHashSet<Entity>; 8] = Default::default();
 
     for (
         entity,

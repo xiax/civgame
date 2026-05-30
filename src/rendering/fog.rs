@@ -1,4 +1,4 @@
-use ahash::{AHashMap, AHashSet};
+use crate::collections::{AHashMap, AHashSet};
 use bevy::prelude::*;
 
 use crate::rendering::camera::CameraViewZ;

@@ -262,14 +262,14 @@ pub fn continue_pack_labor_system(world: &mut World) {
 pub fn pack_targets_remaining(
     world: &mut World,
     packs: &[(u32, (i32, i32), i32)],
-) -> ahash::AHashSet<u32> {
+) -> crate::collections::AHashSet<u32> {
     if packs.is_empty() {
-        return ahash::AHashSet::default();
+        return crate::collections::AHashSet::default();
     }
     let mut state: SystemState<Query<&Transform, Or<(With<Deployable>, With<Campfire>)>>> =
         SystemState::new(world);
     let q = state.get(world);
-    let mut remaining: ahash::AHashSet<u32> = ahash::AHashSet::default();
+    let mut remaining: crate::collections::AHashSet<u32> = crate::collections::AHashSet::default();
     for transform in q.iter() {
         let tile = transform_tile(transform);
         for &(fid, home, radius) in packs.iter() {
@@ -322,7 +322,7 @@ pub fn dispatch_unpitch_tasks(world: &mut World, packs: &[(u32, (i32, i32), i32)
         chunk: ChunkCoord,
         z: i8,
     }
-    let workers_by_faction: ahash::AHashMap<u32, Vec<Worker>> = {
+    let workers_by_faction: crate::collections::AHashMap<u32, Vec<Worker>> = {
         let mut state: SystemState<(
             Query<
                 (
@@ -338,7 +338,7 @@ pub fn dispatch_unpitch_tasks(world: &mut World, packs: &[(u32, (i32, i32), i32)
         )> = SystemState::new(world);
         let (q, registry) = state.get(world);
         let csz = CHUNK_SIZE as i32;
-        let mut acc: ahash::AHashMap<u32, Vec<Worker>> = ahash::AHashMap::default();
+        let mut acc: crate::collections::AHashMap<u32, Vec<Worker>> = crate::collections::AHashMap::default();
         for (entity, member, transform, ai, aq) in q.iter() {
             let root = registry.root_faction(member.faction_id);
             if !packs.iter().any(|(fid, _, _)| *fid == root) {
@@ -371,7 +371,7 @@ pub fn dispatch_unpitch_tasks(world: &mut World, packs: &[(u32, (i32, i32), i32)
         structure_tile: (i32, i32),
     }
     let mut assignments: Vec<Assignment> = Vec::new();
-    let mut used_workers: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut used_workers: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
     for s in structures.iter() {
         let Some(pool) = workers_by_faction.get(&s.fid) else {
             continue;

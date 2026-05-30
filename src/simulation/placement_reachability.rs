@@ -22,7 +22,7 @@
 //! `construction::doormat_reaches_home` BFS is folded in here — no parallel
 //! reachability implementation survives.
 
-use ahash::{AHashMap, AHashSet};
+use crate::collections::{AHashMap, AHashSet};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -137,7 +137,7 @@ pub fn path_exists(
 
     // A* over (x, y, z); g = step count, h = chebyshev(xy) to goal.
     let goal_xy = (to.0, to.1);
-    let mut g: AHashMap<(i32, i32, i32), i32> = AHashMap::new();
+    let mut g: AHashMap<(i32, i32, i32), i32> = AHashMap::default();
     let mut open: BinaryHeap<Reverse<(i32, i32, (i32, i32, i32))>> = BinaryHeap::new();
     g.insert(from, 0);
     open.push(Reverse((cheby((from.0, from.1), goal_xy), 0, from)));
@@ -419,7 +419,7 @@ pub fn road_field_from_home(
         return RoadField::default();
     };
     // 8-connected BFS over road-only adjacency.
-    let mut steps: AHashMap<(i32, i32), u16> = AHashMap::new();
+    let mut steps: AHashMap<(i32, i32), u16> = AHashMap::default();
     let mut q: VecDeque<(i32, i32)> = VecDeque::new();
     steps.insert(home_road_tile, 0);
     q.push_back(home_road_tile);
@@ -463,7 +463,7 @@ pub fn nearest_road_cost(
     if field.road_steps_to_home.contains_key(&(from.0, from.1)) {
         return Some((0, (from.0, from.1)));
     }
-    let mut g: AHashMap<(i32, i32, i32), u16> = AHashMap::new();
+    let mut g: AHashMap<(i32, i32, i32), u16> = AHashMap::default();
     let mut open: BinaryHeap<Reverse<(u16, u16, (i32, i32, i32))>> = BinaryHeap::new();
     g.insert(from, 0);
     open.push(Reverse((0, 0, from)));
@@ -597,7 +597,7 @@ pub fn spawn_tiles_from(chunk_map: &ChunkMap, home: (i32, i32), n: usize) -> Vec
     if !chunk_map.passable_at(start.0, start.1, start.2) {
         return out;
     }
-    let mut visited: AHashSet<(i32, i32)> = AHashSet::new();
+    let mut visited: AHashSet<(i32, i32)> = AHashSet::default();
     visited.insert((start.0, start.1));
     let mut q: VecDeque<(i32, i32, i32)> = VecDeque::new();
     q.push_back(start);
@@ -764,7 +764,7 @@ mod tests {
 
     /// 5×5 walled house centred at `c`, west-edge door, one east-interior bed.
     fn house_walls(c: (i32, i32)) -> (AHashSet<(i32, i32)>, (i32, i32), (i32, i32)) {
-        let mut walls = AHashSet::new();
+        let mut walls = AHashSet::default();
         for dy in -2i32..=2 {
             for dx in -2i32..=2 {
                 if dx.abs() == 2 || dy.abs() == 2 {
@@ -798,7 +798,7 @@ mod tests {
     /// with one door gap. The interior bed is reachable through the door; seal
     /// the door edge and it becomes unreachable.
     fn hut_edges(c: (i32, i32)) -> (AHashSet<EdgeKey>, (i32, i32), (i32, i32)) {
-        let mut edges = AHashSet::new();
+        let mut edges = AHashSet::default();
         for dy in -1i32..=1 {
             for dx in -1i32..=1 {
                 if dx.abs() != 1 && dy.abs() != 1 {
@@ -878,7 +878,7 @@ mod tests {
     fn road_field_straight_line() {
         let mut map = flat_map();
         road_h(&mut map, 5, 1, 20);
-        let planned = AHashSet::new();
+        let planned = AHashSet::default();
         let field = road_field_from_home(&map, &planned, (1, 5));
         assert_eq!(field.home_road_tile, Some((1, 5)));
         for x in 1..=20 {
@@ -891,7 +891,7 @@ mod tests {
     #[test]
     fn road_field_planned_only_no_carved() {
         let map = flat_map();
-        let mut planned: AHashSet<(i32, i32)> = AHashSet::new();
+        let mut planned: AHashSet<(i32, i32)> = AHashSet::default();
         for x in 1..=10 {
             planned.insert((x, 5));
         }
@@ -905,7 +905,7 @@ mod tests {
         let mut map = flat_map();
         road_h(&mut map, 5, 1, 5);
         road_h(&mut map, 5, 11, 15);
-        let planned = AHashSet::new();
+        let planned = AHashSet::default();
         let field = road_field_from_home(&map, &planned, (1, 5));
         assert!(field.road_steps_to_home.contains_key(&(5, 5)));
         assert!(!field.road_steps_to_home.contains_key(&(11, 5)));
@@ -916,7 +916,7 @@ mod tests {
     fn nearest_road_cost_adjacent() {
         let mut map = flat_map();
         road_h(&mut map, 5, 1, 10);
-        let planned = AHashSet::new();
+        let planned = AHashSet::default();
         let field = road_field_from_home(&map, &planned, (1, 5));
         let cand = resolve3(&map, (5, 4));
         let (off, road) = nearest_road_cost(&map, &field, cand, 24).expect("reaches road");
@@ -928,7 +928,7 @@ mod tests {
     fn nearest_road_cost_too_far_returns_none() {
         let mut map = flat_map();
         road_h(&mut map, 5, 1, 5);
-        let planned = AHashSet::new();
+        let planned = AHashSet::default();
         let field = road_field_from_home(&map, &planned, (1, 5));
         // Candidate 25 chebyshev east of the road end; max_steps = 24 → None.
         let cand = resolve3(&map, (30, 5));
@@ -939,7 +939,7 @@ mod tests {
     fn path_stats_direct_lot() {
         let mut map = flat_map();
         road_h(&mut map, 5, 1, 20);
-        let planned = AHashSet::new();
+        let planned = AHashSet::default();
         let field = road_field_from_home(&map, &planned, (1, 5));
         // Lot at (10, 4): 1 off-road north of the road, ~9 along road to (1,5).
         let cand = resolve3(&map, (10, 4));
@@ -956,7 +956,7 @@ mod tests {
     #[test]
     fn path_stats_empty_roads_fallback() {
         let map = flat_map();
-        let planned = AHashSet::new();
+        let planned = AHashSet::default();
         let field = road_field_from_home(&map, &planned, (1, 1));
         assert!(field.home_road_tile.is_none());
         let cand = resolve3(&map, (10, 10));

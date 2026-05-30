@@ -2,7 +2,7 @@ use super::core_ids;
 use super::item::Item;
 use super::mode::EconomicMode;
 use super::resource_catalog::ResourceId;
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 /// Bid-driven market — prices reflect what buyers are willing and able
@@ -226,9 +226,9 @@ impl Default for Market {
             (core_ids::book, 8.0),
         ];
 
-        let mut prices = AHashMap::new();
-        let mut price_floor = AHashMap::new();
-        let mut market_stock = AHashMap::new();
+        let mut prices = AHashMap::default();
+        let mut price_floor = AHashMap::default();
+        let mut market_stock = AHashMap::default();
         for &(get_id, base_price) in &seed_prices {
             let id = get_id();
             prices.insert(id, base_price);
@@ -238,9 +238,9 @@ impl Default for Market {
 
         Self {
             prices,
-            bids_cleared: AHashMap::new(),
-            bids_stockout: AHashMap::new(),
-            bids_unaffordable: AHashMap::new(),
+            bids_cleared: AHashMap::default(),
+            bids_stockout: AHashMap::default(),
+            bids_unaffordable: AHashMap::default(),
             price_floor,
             market_stock,
             listings: Vec::new(),

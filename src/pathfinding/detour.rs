@@ -117,10 +117,10 @@ impl<'a> DetourEstimator<'a> {
 mod tests {
     use super::*;
     use crate::pathfinding::chunk_graph::{ChunkComponents, ChunkEdge, ComponentId};
-    use ahash::AHashMap;
+    use crate::collections::AHashMap;
 
     fn comp(coord_tiles: &[(u8, u8)]) -> ChunkComponents {
-        let mut at = AHashMap::new();
+        let mut at = AHashMap::default();
         for &(lx, ly) in coord_tiles {
             at.insert((lx, ly, 0i8), ComponentId(0));
         }

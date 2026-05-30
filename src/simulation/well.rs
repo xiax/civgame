@@ -23,7 +23,7 @@
 //! See `plans/dynamic-wells.md` (superseded) and the mossy-snuggling-puddle
 //! plan for the full design.
 
-use ahash::{AHashMap, AHashSet};
+use crate::collections::{AHashMap, AHashSet};
 use bevy::prelude::*;
 
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_HEIGHT, CHUNK_SIZE, Z_MIN};
@@ -1203,7 +1203,7 @@ mod tests {
 
     #[test]
     fn well_footprint_clear_rejects_used_seed_tile() {
-        use ahash::AHashSet;
+        use crate::collections::AHashSet;
         let well_map = WellMap::default();
         let well_site_map = WellSiteMap::default();
         let structure_index = StructureIndex::default();

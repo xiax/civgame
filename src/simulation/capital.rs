@@ -26,7 +26,7 @@
 //! sentinel that returns `None` today (because the variant doesn't
 //! exist), and will Just Work when the variant lands.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::ecs::component::ComponentId;
 use bevy::ecs::world::DeferredWorld;
 use bevy::prelude::*;

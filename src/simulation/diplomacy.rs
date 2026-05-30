@@ -13,7 +13,7 @@
 //! - `ai_diplomacy_proposal_system` (Economy, TICKS_PER_DAY) generates
 //!   AI-initiated proposals (offset by `faction_id % TICKS_PER_DAY`).
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;

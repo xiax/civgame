@@ -631,7 +631,7 @@ pub fn chief_healer_assignment_system(
     // is restricted to due factions and bails entirely on ticks where none is
     // due — without this gate the full-population injured/Healer census ran
     // every tick (the cadence-gate used to short-circuit the whole system).
-    let due: ahash::AHashSet<u32> = registry
+    let due: crate::collections::AHashSet<u32> = registry
         .factions
         .keys()
         .copied()
@@ -651,15 +651,15 @@ pub fn chief_healer_assignment_system(
 
     // Pass 1: per-faction injured tally + Healer / Apprentice census
     // (restricted to due factions).
-    let mut injured_per_faction: ahash::AHashMap<u32, u32> = ahash::AHashMap::default();
+    let mut injured_per_faction: crate::collections::AHashMap<u32, u32> = crate::collections::AHashMap::default();
     for member in injured_q.iter() {
         if !due.contains(&member.faction_id) {
             continue;
         }
         *injured_per_faction.entry(member.faction_id).or_insert(0) += 1;
     }
-    let mut current_healers: ahash::AHashMap<u32, usize> = ahash::AHashMap::default();
-    let mut available_mentors: ahash::AHashMap<u32, Vec<Entity>> = ahash::AHashMap::default();
+    let mut current_healers: crate::collections::AHashMap<u32, usize> = crate::collections::AHashMap::default();
+    let mut available_mentors: crate::collections::AHashMap<u32, Vec<Entity>> = crate::collections::AHashMap::default();
     for (entity, prof, member, skills, _, _, _, _, _, _) in query.iter() {
         if !due.contains(&member.faction_id) {
             continue;
@@ -692,7 +692,7 @@ pub fn chief_healer_assignment_system(
     }
 
     // Pass 2: build per-faction targets.
-    let mut targets: ahash::AHashMap<u32, usize> = ahash::AHashMap::default();
+    let mut targets: crate::collections::AHashMap<u32, usize> = crate::collections::AHashMap::default();
     for (&fid, faction) in registry.factions.iter() {
         if fid == SOLO {
             continue;
@@ -731,10 +731,10 @@ pub fn chief_healer_assignment_system(
     }
 
     // Pass 3: EV-ranked candidate buckets per faction.
-    let mut by_faction_healers: ahash::AHashMap<u32, Vec<(Entity, f32, u32)>> =
-        ahash::AHashMap::default();
-    let mut by_faction_none: ahash::AHashMap<u32, Vec<(Entity, f32, u32)>> =
-        ahash::AHashMap::default();
+    let mut by_faction_healers: crate::collections::AHashMap<u32, Vec<(Entity, f32, u32)>> =
+        crate::collections::AHashMap::default();
+    let mut by_faction_none: crate::collections::AHashMap<u32, Vec<(Entity, f32, u32)>> =
+        crate::collections::AHashMap::default();
     for (entity, prof, member, skills, agent, carrier, xf, household_opt, _, _) in query.iter() {
         if member.faction_id == SOLO || !targets.contains_key(&member.faction_id) {
             continue;
@@ -777,8 +777,8 @@ pub fn chief_healer_assignment_system(
         }
     }
 
-    let mut promote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
-    let mut demote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut promote: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
+    let mut demote: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
     for (&fid, &want) in &targets {
         let mut healers = by_faction_healers.remove(&fid).unwrap_or_default();
         let mut none = by_faction_none.remove(&fid).unwrap_or_default();

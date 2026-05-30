@@ -13,7 +13,7 @@
 //! installed via `core_plant_ids::install_catalog(catalog)` so hot paths
 //! can pull a process-global ref without a system param.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 use serde::Deserialize;
 
@@ -605,8 +605,8 @@ impl PlantCatalog {
         defs.sort_by(|a, b| a.key.cmp(&b.key));
 
         let mut resolved = Vec::with_capacity(defs.len());
-        let mut by_key = AHashMap::with_capacity(defs.len());
-        let mut by_seed = AHashMap::new();
+        let mut by_key = AHashMap::with_capacity_and_hasher(defs.len(), crate::collections::FixedState);
+        let mut by_seed = AHashMap::default();
 
         for (idx, def) in defs.into_iter().enumerate() {
             assert!(
@@ -709,7 +709,7 @@ impl PlantCatalog {
         let mut native_pools: AHashMap<
             (FloraRealmKind, crate::world::globe::Biome),
             Vec<PlantSpeciesId>,
-        > = AHashMap::new();
+        > = AHashMap::default();
         for d in &resolved {
             for &realm in &d.native_realms {
                 for &biome in &d.spawn.biomes {

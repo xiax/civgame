@@ -24,7 +24,7 @@ use crate::simulation::technology::{
     ActivityKind, ANIMAL_HUSBANDRY, DOG_DOMESTICATION, HORSE_TAMING,
 };
 use crate::world::spatial::SpatialIndex;
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 pub const TICKS_FARMER_PLANT: u8 = 40;

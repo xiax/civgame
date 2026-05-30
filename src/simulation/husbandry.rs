@@ -9,7 +9,7 @@
 //! Stable, FeedTrough, HitchingPost}`); this module owns the finalize-side
 //! component shapes + the runtime queries that depend on them.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 use crate::simulation::animals::{DomesticAnimal, DomesticSpecies, Tamed};
@@ -133,7 +133,7 @@ pub fn assign_preferred_home_system(
     }
     // Count current housed-by-home before scheduling new assignments so we
     // can enforce capacity.
-    let mut housed_count: AHashMap<Entity, u8> = AHashMap::new();
+    let mut housed_count: AHashMap<Entity, u8> = AHashMap::default();
     for (_, _, da, _) in domestic_q.iter() {
         if let Some(home) = da.preferred_home {
             *housed_count.entry(home).or_insert(0) += 1;
@@ -218,8 +218,8 @@ pub fn husbandry_intent_emitter_system(
     // Stable in `assign_preferred_home_system`, but the emitter keeps the two
     // pools separate — a faction that owns horses still needs its own
     // Stable.) Cats have no housing structure, so they're ignored.
-    let mut horses: AHashMap<u32, u32> = AHashMap::new();
-    let mut pen_species: AHashMap<u32, u32> = AHashMap::new();
+    let mut horses: AHashMap<u32, u32> = AHashMap::default();
+    let mut pen_species: AHashMap<u32, u32> = AHashMap::default();
     for (tamed, da) in domestic_q.iter() {
         match da.species {
             DomesticSpecies::Horse => *horses.entry(tamed.owner_faction).or_insert(0) += 1,
@@ -229,8 +229,8 @@ pub fn husbandry_intent_emitter_system(
             DomesticSpecies::Cat => {}
         }
     }
-    let mut pen_cap: AHashMap<u32, u32> = AHashMap::new();
-    let mut stable_cap: AHashMap<u32, u32> = AHashMap::new();
+    let mut pen_cap: AHashMap<u32, u32> = AHashMap::default();
+    let mut stable_cap: AHashMap<u32, u32> = AHashMap::default();
     for p in pens.iter() {
         *pen_cap.entry(p.faction_id).or_insert(0) += p.capacity as u32;
     }

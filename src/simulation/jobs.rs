@@ -1,4 +1,4 @@
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::ecs::entity::Entities;
 use bevy::prelude::*;
 
@@ -1077,14 +1077,14 @@ pub fn faction_wage_signal_system(world: &mut World) {
     let window_start = clock_tick.saturating_sub(WAGE_EMA_WINDOW_TICKS);
 
     // 1. Snapshot per-(faction, key) sums from member earnings.
-    let mut sums: ahash::AHashMap<
+    let mut sums: crate::collections::AHashMap<
         (
             u32,
             JobKind,
             Option<crate::economy::resource_catalog::ResourceId>,
         ),
         (f32, u32),
-    > = ahash::AHashMap::default();
+    > = crate::collections::AHashMap::default();
     let mut q = world.query::<(&Earnings, &crate::simulation::faction::FactionMember)>();
     for (earnings, fm) in q.iter(world) {
         let village_id = {
@@ -1164,7 +1164,7 @@ pub fn faction_wage_signal_system(world: &mut World) {
 /// observed_tick)` — the `observed_tick` lets stale gossip decay.
 #[derive(Component, Clone, Debug, Default)]
 pub struct PerceivedFactionWages {
-    pub by_key: ahash::AHashMap<
+    pub by_key: crate::collections::AHashMap<
         (
             u32,
             JobKind,
@@ -1260,7 +1260,7 @@ pub fn wage_gossip_system(
         f32,
         u32,
     );
-    let mut snapshots: ahash::AHashMap<Entity, Vec<GossipEntry>> = ahash::AHashMap::default();
+    let mut snapshots: crate::collections::AHashMap<Entity, Vec<GossipEntry>> = crate::collections::AHashMap::default();
 
     for (entity, _t, goal, lod, fm, perceived, sec) in q.iter() {
         if !is_social_contact(*goal, *lod, sec, now) {
@@ -1307,7 +1307,7 @@ pub fn wage_gossip_system(
         .iter()
         .position(|e| e.to_bits() >= cursor.next_entity_bits)
         .unwrap_or(0);
-    let slice: ahash::AHashSet<Entity> = (0..cap)
+    let slice: crate::collections::AHashSet<Entity> = (0..cap)
         .map(|offset| social_entities[(pivot + offset) % social_entities.len()])
         .collect();
     if let Some(&last) = (0..cap)
@@ -1830,7 +1830,7 @@ pub fn worker_self_post_stockpile_system(world: &mut World) {
 
     // Phase 2: build per-faction wealth-ranked candidate lists. Skip
     // claim-holders (they're working) and Drafted (combat / lecture).
-    let mut members_by_faction: ahash::AHashMap<u32, Vec<(Entity, f32)>> = ahash::AHashMap::new();
+    let mut members_by_faction: crate::collections::AHashMap<u32, Vec<(Entity, f32)>> = crate::collections::AHashMap::default();
     {
         let mut q = world.query_filtered::<(
             Entity,
@@ -1935,7 +1935,7 @@ pub fn esteem_driven_posting_system(world: &mut World) {
 
     // Functional gate (see craft-demand plan): dedup against any live
     // Luxury-output craft contract already on a faction's board.
-    let mut faction_has_luxury_contract: ahash::AHashSet<u32> = ahash::AHashSet::default();
+    let mut faction_has_luxury_contract: crate::collections::AHashSet<u32> = crate::collections::AHashSet::default();
     {
         let board = world.resource::<JobBoard>();
         let recipes = crate::simulation::crafting::craft_recipes();
@@ -2205,7 +2205,7 @@ pub fn classify_construction_procurement_system(
     // Union of wall-ladder recipe inputs; per-rid `need` is the *largest*
     // single-structure input across the ladder (conservative — a faction with
     // 3 stone still reads short against the 4-stone Cut Stone rung).
-    let mut need_by_rid: AHashMap<ResourceId, u32> = AHashMap::new();
+    let mut need_by_rid: AHashMap<ResourceId, u32> = AHashMap::default();
     for m in WallMaterial::ALL {
         for &(rid, qty) in &recipe_for(BuildSiteKind::Wall(m)).inputs {
             let e = need_by_rid.entry(rid).or_insert(0);
@@ -2342,7 +2342,7 @@ pub fn chief_job_posting_system(
     };
 
     // Group all live, non-personal blueprints by faction.
-    let mut bps_by_faction: AHashMap<u32, Vec<Entity>> = AHashMap::new();
+    let mut bps_by_faction: AHashMap<u32, Vec<Entity>> = AHashMap::default();
     for &bp_entity in bp_map.0.values() {
         let Ok(bp) = bp_query.get(bp_entity) else {
             continue;
@@ -2765,7 +2765,7 @@ pub fn chief_job_posting_system(
             let wood_id = crate::economy::core_ids::wood();
             let stone_id = crate::economy::core_ids::stone();
             let mut co_demand: AHashMap<crate::economy::resource_catalog::ResourceId, u32> =
-                AHashMap::new();
+                AHashMap::default();
             for (_, &order_entity) in &co_map.0 {
                 let Ok(order) = co_query.get(order_entity) else {
                     continue;
@@ -3005,10 +3005,10 @@ pub fn chief_job_posting_system(
                 // Map of plots already covered by an open posting of a
                 // particular phase, so we don't double-post.
                 use crate::simulation::farm::FarmWorkPhase;
-                let mut posted_by_phase: ahash::AHashMap<
+                let mut posted_by_phase: crate::collections::AHashMap<
                     (crate::simulation::land::PlotId, FarmWorkPhase),
                     (),
-                > = ahash::AHashMap::default();
+                > = crate::collections::AHashMap::default();
                 // Seed budget shared across all Plant postings — subtract
                 // remaining commitments on live Plant postings so a new plot
                 // emit cannot overcommit the faction's seed pool. Each plot's
@@ -3283,8 +3283,8 @@ pub fn chief_job_posting_system(
             && matches!(calendar.season, crate::world::seasons::Season::Spring)
         {
             let cur_year = calendar.year as u16;
-            let mut plow_already_posted: ahash::AHashSet<crate::simulation::land::PlotId> =
-                ahash::AHashSet::default();
+            let mut plow_already_posted: crate::collections::AHashSet<crate::simulation::land::PlotId> =
+                crate::collections::AHashSet::default();
             for p in board.faction_postings(faction_id).iter() {
                 if let JobProgress::Plow { plot_id, .. } = p.progress {
                     plow_already_posted.insert(plot_id);
@@ -3395,7 +3395,7 @@ pub fn chief_job_posting_system(
                 let mut blocked_demand: AHashMap<
                     crate::economy::resource_catalog::ResourceId,
                     u32,
-                > = AHashMap::new();
+                > = AHashMap::default();
                 let mut best_blocked_key: (u8, u32) = (0, 0);
                 for (idx, recipe) in crate::simulation::crafting::craft_recipes()
                     .iter()
@@ -3981,9 +3981,9 @@ pub fn chief_loose_stockpile_posting_system(
 
         // Walk anchor neighborhoods, bucketing by resource_id. Deduplicate
         // entities across overlapping anchor discs via a visited set.
-        let mut buckets: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32> =
-            ahash::AHashMap::new();
-        let mut visited: ahash::AHashSet<Entity> = ahash::AHashSet::new();
+        let mut buckets: crate::collections::AHashMap<crate::economy::resource_catalog::ResourceId, u32> =
+            crate::collections::AHashMap::default();
+        let mut visited: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
         for &(ax, ay) in &anchors {
             for dy in -LOOSE_SCAN_RADIUS..=LOOSE_SCAN_RADIUS {
                 for dx in -LOOSE_SCAN_RADIUS..=LOOSE_SCAN_RADIUS {
@@ -4507,7 +4507,7 @@ pub fn job_claim_system(
             Option<crate::simulation::farm::FarmWorkPhase>,
         ),
         u32,
-    > = AHashMap::new();
+    > = AHashMap::default();
     for (faction_id, postings) in board.postings.iter() {
         for p in postings.iter() {
             let (kind, rid, phase) = cap_bucket(p);

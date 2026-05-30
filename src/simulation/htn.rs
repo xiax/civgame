@@ -33,7 +33,7 @@
 //! - `MethodFlags` is a plain `u8` bitmask (no `bitflags` crate per the
 //!   no-new-deps rule). Mirrors `PlanFlags` in `plan/mod.rs`.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 use crate::economy::agent::EconomicAgent;
@@ -10199,7 +10199,7 @@ pub fn htn_deliver_material_to_craft_order_dispatch_system(
         }
 
         // 1. Aggregate per-resource demand across the faction's open orders.
-        let mut still_need: AHashMap<ResourceId, u32> = AHashMap::new();
+        let mut still_need: AHashMap<ResourceId, u32> = AHashMap::default();
         for (_, &order_entity) in &co_map.0 {
             let Ok(order) = co_query.get(order_entity) else {
                 continue;

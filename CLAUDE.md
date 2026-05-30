@@ -61,7 +61,7 @@ ParallelA → ParallelB → Sequential → Economy
 
 - **ECS:** logic in Systems; Components hold data only. No OO inheritance.
 - **UI:** `bevy_egui` for panels (avoid `bevy_ui` except specific overlays).
-- **Hashing/randomness:** `ahash::AHashMap` (not `std::HashMap`). `fastrand` in hot paths, `rand` for init. Never use process-keyed `AHasher::default()` for anything that must be deterministic across runs/reconnects.
+- **Hashing/randomness:** use `crate::collections::{AHashMap, AHashSet}` (deterministic fixed-seed `ahash`, NOT `ahash::AHashMap` or `std::HashMap` — both are process-keyed and make the sim non-reproducible, which flaked the behavioural suite; see `src/collections.rs`). `fastrand` in hot paths, `rand` for init. Never use process-keyed `AHasher::default()` / `ahash::AHashMap::default()` / `std::collections::HashMap` for anything iterated to drive a decision; `ahash::RandomState::with_seeds(..)` stays the primitive for the few hand-seeded sites (`net`, `region`).
 - **No new crates** without explicit permission.
 - **Error handling:** avoid `unwrap()` in core systems; use `match` / `if let`.
 - **Mutable aliasing:** be careful with Bevy query aliasing; test empirically.

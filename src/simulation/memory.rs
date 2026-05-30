@@ -457,8 +457,8 @@ pub fn vision_system(
         }
         eligible.push(entity);
     }
-    let allowed: ahash::AHashSet<Entity> = if eligible.is_empty() {
-        ahash::AHashSet::default()
+    let allowed: crate::collections::AHashSet<Entity> = if eligible.is_empty() {
+        crate::collections::AHashSet::default()
     } else {
         eligible.sort_unstable_by_key(|e| e.to_bits());
         let pivot = eligible
@@ -466,7 +466,7 @@ pub fn vision_system(
             .position(|e| e.to_bits() >= cursor.next_entity_bits)
             .unwrap_or(0);
         let take = cap.min(eligible.len());
-        let slice: ahash::AHashSet<Entity> = (0..take)
+        let slice: crate::collections::AHashSet<Entity> = (0..take)
             .map(|offset| eligible[(pivot + offset) % eligible.len()])
             .collect();
         if let Some(&last) = (0..take)
@@ -799,8 +799,8 @@ pub fn conversation_memory_system(
     // together. `dedicated` = on explicit `AgentGoal::Socialize`; a pair
     // counts as dedicated if *either* end chose to socialize.
     let now = clock.tick as u32;
-    let mut socializers: ahash::AHashSet<Entity> = ahash::AHashSet::default();
-    let mut dedicated: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut socializers: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
+    let mut dedicated: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
     for (e, goal, _, _, lod, sec) in query.iter() {
         if !is_social_contact(*goal, *lod, sec, now) {
             continue;

@@ -198,7 +198,7 @@ pub fn deal_obligation_step_system(
         });
     }
 
-    let mut taken: ahash::AHashSet<Entity> = ahash::AHashSet::new();
+    let mut taken: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
 
     // ── Walk obligations ─────────────────────────────────────────────
     let mut to_despawn: Vec<Entity> = Vec::new();

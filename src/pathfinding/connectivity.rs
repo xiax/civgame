@@ -13,13 +13,13 @@
 //! in O(1) without needing a `&ChunkGraph` borrow at call time, so the
 //! original API survives.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
 use std::time::Instant;
 
 use crate::pathfinding::chunk_graph::{ChunkComponents, ChunkEdge, ChunkGraph, ComponentId};
-use crate::simulation::perf::{micros_u32, BackgroundWorkDiagnostics};
+use crate::simulation::perf::{micros_u32, BackgroundWorkDiagnostics, DeterministicCompute};
 use crate::world::chunk::{ChunkCoord, CHUNK_SIZE};
 
 /// Coarse z-band used by debug visualisations to slice the world for
@@ -216,7 +216,7 @@ pub fn build_connectivity_components(
     graph: &ChunkGraph,
 ) -> AHashMap<(ChunkCoord, ComponentId), u32> {
     let mut nodes: Vec<(ChunkCoord, ComponentId)> = Vec::new();
-    let mut idx: AHashMap<(ChunkCoord, ComponentId), usize> = AHashMap::new();
+    let mut idx: AHashMap<(ChunkCoord, ComponentId), usize> = AHashMap::default();
 
     let intern = |key: (ChunkCoord, ComponentId),
                   nodes: &mut Vec<(ChunkCoord, ComponentId)>,
@@ -260,8 +260,8 @@ pub fn build_connectivity_components(
         }
     }
 
-    let mut out: AHashMap<(ChunkCoord, ComponentId), u32> = AHashMap::with_capacity(n);
-    let mut root_to_id: AHashMap<usize, u32> = AHashMap::new();
+    let mut out: AHashMap<(ChunkCoord, ComponentId), u32> = AHashMap::with_capacity_and_hasher(n, crate::collections::FixedState);
+    let mut root_to_id: AHashMap<usize, u32> = AHashMap::default();
     let mut next_id: u32 = 0;
     for i in 0..n {
         let root = uf_find(&mut parent, i);
@@ -280,10 +280,10 @@ pub fn build_connectivity_components(
 /// out-of-module tests that build their own `ChunkGraph` directly.
 pub fn populate_connectivity_from_graph(graph: &ChunkGraph, conn: &mut ChunkConnectivity) {
     let cc_map = build_connectivity_components(graph);
-    let mut cc_at_z: AHashMap<(ChunkCoord, i8), Vec<u32>> = AHashMap::new();
-    let mut overlay_seen: ahash::AHashSet<(ChunkCoord, ZBand, u32)> = ahash::AHashSet::new();
+    let mut cc_at_z: AHashMap<(ChunkCoord, i8), Vec<u32>> = AHashMap::default();
+    let mut overlay_seen: crate::collections::AHashSet<(ChunkCoord, ZBand, u32)> = crate::collections::AHashSet::default();
     let mut overlay: Vec<(ChunkCoord, ZBand, u32)> = Vec::new();
-    let mut distinct: ahash::AHashSet<u32> = ahash::AHashSet::new();
+    let mut distinct: crate::collections::AHashSet<u32> = crate::collections::AHashSet::default();
     for (coord, components) in &graph.components {
         for (&(_, _, z), &cid) in &components.at {
             let Some(&cc_id) = cc_map.get(&(*coord, cid)) else {
@@ -340,16 +340,25 @@ pub fn poll_connectivity_rebuild_task_system(
     mut conn: ResMut<ChunkConnectivity>,
     mut task: ResMut<ConnectivityRebuildTask>,
     mut perf: ResMut<BackgroundWorkDiagnostics>,
+    deterministic: Option<Res<DeterministicCompute>>,
 ) {
-    let Some(t) = task.0.as_mut() else {
+    if task.0.is_none() {
         perf.connectivity_in_flight = false;
         perf.connectivity_generation = conn.generation;
         return;
-    };
-    let Some(result) = block_on(future::poll_once(t)) else {
-        perf.connectivity_in_flight = true;
-        perf.connectivity_generation = conn.generation;
-        return;
+    }
+    // Test mode: fully drain the task so its result lands this tick regardless
+    // of compute-pool contention. Production keeps the non-blocking `poll_once`.
+    let result = if deterministic.is_some() {
+        block_on(task.0.take().expect("task present"))
+    } else {
+        let t = task.0.as_mut().expect("task present");
+        let Some(result) = block_on(future::poll_once(t)) else {
+            perf.connectivity_in_flight = true;
+            perf.connectivity_generation = conn.generation;
+            return;
+        };
+        result
     };
     task.0 = None;
     perf.connectivity_in_flight = false;
@@ -401,7 +410,7 @@ mod tests {
     use crate::pathfinding::chunk_graph::{ChunkComponents, ChunkEdge, ChunkGraph};
 
     fn comp_at_z(coord: ChunkCoord, z: i8, count: u8) -> ChunkComponents {
-        let mut at = AHashMap::new();
+        let mut at = AHashMap::default();
         for c in 0..count {
             at.insert((c, 0, z), ComponentId(c));
         }
@@ -423,8 +432,8 @@ mod tests {
 
     fn rebuild(graph: &ChunkGraph) -> ChunkConnectivity {
         let cc_map = build_connectivity_components(graph);
-        let mut cc_at_z: AHashMap<(ChunkCoord, i8), Vec<u32>> = AHashMap::new();
-        let mut distinct: ahash::AHashSet<u32> = ahash::AHashSet::new();
+        let mut cc_at_z: AHashMap<(ChunkCoord, i8), Vec<u32>> = AHashMap::default();
+        let mut distinct: crate::collections::AHashSet<u32> = crate::collections::AHashSet::default();
         for (coord, components) in &graph.components {
             for (&(_, _, z), &cid) in &components.at {
                 if let Some(&cc_id) = cc_map.get(&(*coord, cid)) {
@@ -485,9 +494,9 @@ mod tests {
         // by a stair-step edge. The legacy `(chunk, z)` check between
         // B@z=0 fails (no component there), but exact tile reachability
         // between (A tile, z=0) and (B tile, z=1) succeeds.
-        let mut a = AHashMap::new();
+        let mut a = AHashMap::default();
         a.insert((0u8, 0u8, 0i8), ComponentId(0));
-        let mut b = AHashMap::new();
+        let mut b = AHashMap::default();
         b.insert((0u8, 0u8, 1i8), ComponentId(0));
         let mut graph = ChunkGraph::default();
         graph
@@ -526,10 +535,10 @@ mod tests {
         // Component 0 at z=0, component 1 at z=-5 (disconnected). Surface
         // travels across to chunk (1,0), cave doesn't. Asking
         // is_reachable((0,0)@0, (1,0)@-5) must be false.
-        let mut a = AHashMap::new();
+        let mut a = AHashMap::default();
         a.insert((0u8, 0u8, 0i8), ComponentId(0));
         a.insert((1u8, 0u8, -5i8), ComponentId(1));
-        let mut b = AHashMap::new();
+        let mut b = AHashMap::default();
         b.insert((0u8, 0u8, 0i8), ComponentId(0));
         b.insert((1u8, 0u8, -5i8), ComponentId(1));
         let mut graph = ChunkGraph::default();

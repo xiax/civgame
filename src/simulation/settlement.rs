@@ -12,7 +12,7 @@
 //! is the *layout* of buildings around a hearth and is keyed per-faction;
 //! `Settlement` (below) is the economic unit and has its own ID space.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 use crate::economy::market::SettlementMarket;

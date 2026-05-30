@@ -126,21 +126,21 @@ impl BeliefState {
 pub struct PersonKnowledge {
     pub aware: KnowledgeBits,
     pub learned: KnowledgeBits,
-    pub learned_at: ahash::AHashMap<TechId, u32>,
+    pub learned_at: crate::collections::AHashMap<TechId, u32>,
     /// Sparse map TechId → progress ticks accumulated toward Learned. Cleared
     /// on successful learn or eviction. Used by Phase-2 reading/lecture/teach
     /// systems; the original passive `tech_teaching_system` and
     /// `try_discover_from_action` paths bypass it (they roll directly).
-    pub study_progress: ahash::AHashMap<TechId, u32>,
+    pub study_progress: crate::collections::AHashMap<TechId, u32>,
     /// Per-skill mastery level (0..=`MASTERY_MAX`). Sparse — absent ids read
     /// as 0. Only meaningful for `KnowledgeKind::PracticalSkill` /
     /// `PracticalTechnique` entries; reading mastery for a `Belief` is
     /// undefined (always 0).
-    pub mastery: ahash::AHashMap<TechId, u8>,
+    pub mastery: crate::collections::AHashMap<TechId, u8>,
     /// Per-group belief state. Sparse — absent groups read as "no belief held
     /// in this group". `KnowledgeKind::Belief` entries are the only ones that
     /// populate this.
-    pub belief: ahash::AHashMap<
+    pub belief: crate::collections::AHashMap<
         crate::simulation::knowledge_catalog::BeliefGroupId,
         BeliefState,
     >,
@@ -624,9 +624,9 @@ pub fn select_promotion_slice(
     officials: &mut Vec<Entity>,
     cap: usize,
     cursor_bits: u64,
-) -> (ahash::AHashSet<Entity>, u64) {
+) -> (crate::collections::AHashSet<Entity>, u64) {
     if officials.is_empty() {
-        return (ahash::AHashSet::default(), cursor_bits);
+        return (crate::collections::AHashSet::default(), cursor_bits);
     }
     officials.sort_unstable_by_key(|e| e.to_bits());
     let pivot = officials
@@ -634,7 +634,7 @@ pub fn select_promotion_slice(
         .position(|e| e.to_bits() >= cursor_bits)
         .unwrap_or(0);
     let take = cap.max(1).min(officials.len());
-    let slice: ahash::AHashSet<Entity> = (0..take)
+    let slice: crate::collections::AHashSet<Entity> = (0..take)
         .map(|off| officials[(pivot + off) % officials.len()])
         .collect();
     let last = officials[(pivot + take - 1) % officials.len()];
@@ -681,7 +681,7 @@ pub fn awareness_gossip_system(
     // AND visited settlements (Pluralist Economy R8 follow-on). Both
     // OR-merge between adjacent socializing agents; gossip is free,
     // teaching (Learned) is the bottleneck via tech_teaching_system.
-    let snapshots: ahash::AHashMap<
+    let snapshots: crate::collections::AHashMap<
         Entity,
         (
             KnowledgeBits,
@@ -713,7 +713,7 @@ pub fn awareness_gossip_system(
         .iter()
         .position(|e| e.to_bits() >= cursor.next_entity_bits)
         .unwrap_or(0);
-    let slice: ahash::AHashSet<Entity> = (0..cap)
+    let slice: crate::collections::AHashSet<Entity> = (0..cap)
         .map(|offset| social_entities[(pivot + offset) % social_entities.len()])
         .collect();
     // Advance cursor past the last entity in the slice.
@@ -734,8 +734,8 @@ pub fn awareness_gossip_system(
         let tx = (transform.translation.x / TILE_SIZE_LOCAL).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE_LOCAL).floor() as i32;
         let mut aware_received = KnowledgeBits::EMPTY;
-        let mut settlements_received: ahash::AHashSet<crate::simulation::settlement::SettlementId> =
-            ahash::AHashSet::default();
+        let mut settlements_received: crate::collections::AHashSet<crate::simulation::settlement::SettlementId> =
+            crate::collections::AHashSet::default();
         for dy in -3i32..=3 {
             for dx in -3i32..=3 {
                 for &other in spatial.get(tx + dx, ty + dy) {
@@ -847,7 +847,7 @@ pub fn cluster_tier_promotion_system(
 
     // O(1) entity → snap-index map so the 7×7 neighbour scan below is
     // O(officials × 49) instead of O(officials × 49 × snaps).
-    let snap_index: ahash::AHashMap<Entity, usize> = snaps
+    let snap_index: crate::collections::AHashMap<Entity, usize> = snaps
         .iter()
         .enumerate()
         .map(|(i, s)| (s.entity, i))
@@ -872,14 +872,14 @@ pub fn cluster_tier_promotion_system(
     // (mirrors `SettlementMap::first_for_faction` semantics elsewhere in
     // the codebase). A household's root faction (walking parent chain) is
     // what we match against the bureaucrat's faction.
-    let mut household_to_settlement: ahash::AHashSet<(
+    let mut household_to_settlement: crate::collections::AHashSet<(
         u32,
         crate::simulation::settlement::SettlementId,
-    )> = ahash::AHashSet::default();
-    let mut settlement_to_faction: ahash::AHashSet<(
+    )> = crate::collections::AHashSet::default();
+    let mut settlement_to_faction: crate::collections::AHashSet<(
         crate::simulation::settlement::SettlementId,
         u32,
-    )> = ahash::AHashSet::default();
+    )> = crate::collections::AHashSet::default();
     for s in &snaps {
         if !(s.is_bureaucrat || s.is_chief) {
             continue;
@@ -1017,7 +1017,7 @@ pub fn tech_teaching_system(
     // `social_contact::SecondarySocial` / `is_social_contact` here — casual
     // work chatter must not become accidental instruction (awareness/wage
     // gossip is free and does go ambient; *teaching* does not).
-    let snapshots: ahash::AHashMap<Entity, KnowledgeBits> = q
+    let snapshots: crate::collections::AHashMap<Entity, KnowledgeBits> = q
         .iter()
         .filter(|(_, _, goal, _, lod, _, _)| {
             matches!(goal, AgentGoal::Socialize) && **lod != LodLevel::Dormant

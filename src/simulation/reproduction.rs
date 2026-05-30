@@ -295,7 +295,7 @@ pub fn wake_up_conception_system(
         sex: BiologicalSex,
         faction_id: u32,
     }
-    let male_snapshot: ahash::AHashMap<Entity, MaleSnapshot> = {
+    let male_snapshot: crate::collections::AHashMap<Entity, MaleSnapshot> = {
         let q = params.p3();
         q.iter()
             .map(|(e, stats, cd, sex, fm, knowledge)| {
@@ -605,10 +605,10 @@ pub fn pregnancy_system(
                     crate::simulation::knowledge::PersonKnowledge {
                         aware: inherited_aware,
                         learned: crate::simulation::knowledge_bits::KnowledgeBits::EMPTY,
-                        learned_at: ahash::AHashMap::new(),
-                        study_progress: ahash::AHashMap::new(),
-                        mastery: ahash::AHashMap::new(),
-                        belief: ahash::AHashMap::new(),
+                        learned_at: crate::collections::AHashMap::default(),
+                        study_progress: crate::collections::AHashMap::default(),
+                        mastery: crate::collections::AHashMap::default(),
+                        belief: crate::collections::AHashMap::default(),
                     },
                     crate::simulation::typed_task::ActionQueue::idle(),
                     crate::simulation::goal_scorers::AgentDecisionState::default(),
@@ -694,7 +694,7 @@ pub fn household_formation_system(
     // represent the same household. Track `seen` so we only emit
     // one spawn intent per pair.
     let mut spawn_intents: Vec<(Entity, Entity, u32, (i32, i32))> = Vec::new();
-    let mut seen: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut seen: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
     for (entity, tracker, member) in candidates.iter() {
         if tracker.bond_strength < HOUSEHOLD_BOND_THRESHOLD {
             continue;

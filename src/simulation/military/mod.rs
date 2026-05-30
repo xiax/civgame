@@ -5,7 +5,7 @@ pub use formation::{
     MilitaryFormationSlot, PendingFormationSlots,
 };
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 use crate::pathfinding::chunk_graph::ChunkGraph;

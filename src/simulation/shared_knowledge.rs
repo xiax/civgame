@@ -20,7 +20,7 @@
 use crate::simulation::memory::MemoryKind;
 use crate::simulation::settlement::SettlementId;
 use crate::world::chunk::{ChunkCoord, CHUNK_SIZE};
-use ahash::{AHashMap, AHashSet};
+use crate::collections::{AHashMap, AHashSet};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 

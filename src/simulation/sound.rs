@@ -1,4 +1,4 @@
-use ahash::AHashSet;
+use crate::collections::AHashSet;
 use bevy::prelude::*;
 use std::collections::VecDeque;
 
@@ -29,7 +29,7 @@ pub fn audible_tiles(
     z: i8,
     max_dist: u8,
 ) -> AHashSet<(i32, i32)> {
-    let mut visited: AHashSet<(i32, i32)> = AHashSet::new();
+    let mut visited: AHashSet<(i32, i32)> = AHashSet::default();
     let mut frontier: VecDeque<((i32, i32), u8)> = VecDeque::new();
     visited.insert(origin);
     frontier.push_back((origin, 0));

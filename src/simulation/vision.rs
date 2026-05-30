@@ -31,7 +31,7 @@
 //! Combat / sound / projectile LOS keep using `simulation::line_of_sight::has_los`
 //! (own walls must defend); only fog and memory use `has_vision_los`.
 
-use ahash::AHashSet;
+use crate::collections::AHashSet;
 use bevy::prelude::*;
 
 use crate::simulation::camp::Camp;

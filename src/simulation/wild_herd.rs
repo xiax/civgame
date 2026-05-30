@@ -15,7 +15,7 @@
 //! lifecycle: they're owned by the [`WildHerd::members`] vec and despawn on
 //! collapse instead of persisting forever.
 
-use ahash::AHashSet;
+use crate::collections::AHashSet;
 use bevy::prelude::*;
 
 use crate::simulation::animals::{AnimalAI, AnimalNeeds, AnimalReproductionCooldown, Cow, Horse};
@@ -114,7 +114,7 @@ pub struct WildHerd {
 
 #[derive(Resource, Default, Debug)]
 pub struct WildHerdRegistry {
-    pub herds: ahash::AHashMap<u32, WildHerd>,
+    pub herds: crate::collections::AHashMap<u32, WildHerd>,
     pub next_id: u32,
 }
 
@@ -505,7 +505,7 @@ fn spawn_herd_members(
     use crate::simulation::animals::HerdMember;
     use crate::world::tile::TileKind;
     let mut placed: Vec<Entity> = Vec::with_capacity(count as usize);
-    let mut used: AHashSet<(i32, i32)> = AHashSet::new();
+    let mut used: AHashSet<(i32, i32)> = AHashSet::default();
 
     for i in 0..count {
         let mut tile_opt: Option<(i32, i32)> = None;

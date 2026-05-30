@@ -11,7 +11,7 @@
 //! bincode-serialised alongside the rest of the globe. `GLOBE_FILE_VERSION`
 //! bumped to 11 to invalidate older caches.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::simulation::plant_catalog::FloraRealmKind;
@@ -272,7 +272,7 @@ pub fn build_flora_regions(globe: &Globe) -> FloraRegionMap {
             visited[sidx] = true;
             // Group cells by (lat_band, biome_bucket) so a single huge
             // continent splits naturally between climate zones.
-            let mut groups: AHashMap<(LatBand, BiomeKey), Vec<(i32, i32)>> = AHashMap::new();
+            let mut groups: AHashMap<(LatBand, BiomeKey), Vec<(i32, i32)>> = AHashMap::default();
             while let Some((cx, cy)) = queue.pop_front() {
                 let cidx = (cy * GLOBE_WIDTH + cx) as usize;
                 let cell = &globe.cells[cidx];

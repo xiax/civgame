@@ -6,7 +6,7 @@
 //! pressures into build intents, and lets `construction::chief_directive_system`
 //! execute the selected intent through the normal construction backend.
 
-use ahash::{AHashMap, AHashSet};
+use crate::collections::{AHashMap, AHashSet};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use serde::Deserialize;

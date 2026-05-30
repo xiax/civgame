@@ -9,7 +9,7 @@
 //! Lifecycle: the `Door` `on_remove` component hook frees the doormat entry
 //! so demolished or evicted buildings release their reservation.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 use crate::simulation::land::TileEdge;

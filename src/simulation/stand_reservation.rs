@@ -24,7 +24,7 @@
 //! that capture this as `Res<StandTileReservations>` can mutate without a
 //! `ResMut` exclusive borrow. Critical sections are a single hashmap op each.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use std::sync::Mutex;

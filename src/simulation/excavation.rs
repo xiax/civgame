@@ -5,7 +5,7 @@
 //!
 //! See `plans/incremental-mining.md`.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 use crate::economy::core_ids;

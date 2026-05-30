@@ -183,7 +183,7 @@ pub fn land_policy_for(preset: crate::game_state::EconomyPreset) -> LandPolicy {
 ///   alongside via `FarmWorkScorer`.
 /// - `Market`: insert `capitalist()` for every catalog resource.
 pub fn apply_preset(
-    map: &mut ahash::AHashMap<ResourceId, ResourceControlPolicy>,
+    map: &mut crate::collections::AHashMap<ResourceId, ResourceControlPolicy>,
     preset: crate::game_state::EconomyPreset,
     catalog: &crate::economy::resource_catalog::ResourceCatalog,
 ) {
@@ -266,7 +266,7 @@ mod tests {
         // skipped these resources entirely.)
         let catalog = crate::economy::resource_catalog::load_resource_catalog();
         crate::economy::core_ids::install_catalog(catalog.clone());
-        let mut map = ahash::AHashMap::new();
+        let mut map = crate::collections::AHashMap::default();
         apply_preset(&mut map, crate::game_state::EconomyPreset::Mixed, &catalog);
         let grain = crate::economy::core_ids::grain();
         let wood = crate::economy::core_ids::wood();

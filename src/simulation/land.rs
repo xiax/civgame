@@ -9,7 +9,7 @@
 //! See `~/.claude/plans/i-want-to-add-starry-conway.md` for the full
 //! plan.
 
-use ahash::{AHashMap, AHashSet};
+use crate::collections::{AHashMap, AHashSet};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
@@ -852,7 +852,7 @@ pub fn carve_plots_system(
     // carve loop to keep running through a multi-tick drain so hard-
     // conflict subtraction can re-evaluate as crops clear).
     let factions_with_live_retirements: AHashSet<u32> = {
-        let mut set: AHashSet<u32> = AHashSet::new();
+        let mut set: AHashSet<u32> = AHashSet::default();
         for retire in retirements.by_tile.values() {
             if let Some(&ent) = plot_index.by_id.get(&retire.old_plot) {
                 if let Ok(plot) = plot_q.get(ent) {
@@ -885,8 +885,8 @@ pub fn carve_plots_system(
         //    flatten to a tile set, with any tile also covered by a non-Ag
         //    canonical rect subtracted (hard-conflict subtraction). The
         //    raw Ag zone rects survive for the fresh-plot hull pass.
-        let mut non_ag_canonicals: AHashSet<(ZoneKind, TileRect)> = AHashSet::new();
-        let mut non_ag_tile_set: AHashSet<(i32, i32)> = AHashSet::new();
+        let mut non_ag_canonicals: AHashSet<(ZoneKind, TileRect)> = AHashSet::default();
+        let mut non_ag_tile_set: AHashSet<(i32, i32)> = AHashSet::default();
         let mut ag_zone_rects: Vec<TileRect> = Vec::new();
         for (kind, rect) in &zones {
             if *kind == ZoneKind::Agricultural {
@@ -906,7 +906,7 @@ pub fn carve_plots_system(
                 }
             }
         }
-        let mut desired_ag_tile_set: AHashSet<(i32, i32)> = AHashSet::new();
+        let mut desired_ag_tile_set: AHashSet<(i32, i32)> = AHashSet::default();
         for rect in &ag_zone_rects {
             for ty in rect.y0..rect.y0 + rect.h as i32 {
                 for tx in rect.x0..rect.x0 + rect.w as i32 {
@@ -1169,9 +1169,9 @@ pub fn land_listing_system(
     // Snapshot existing listings so we don't double-list. Count is per-
     // (faction, zone_kind) and per-plot — a plot already publishing under
     // multiple kinds (Sale + Lease + Sharecrop) only consumes one slot.
-    let mut listed: AHashSet<PlotId> = AHashSet::new();
-    let mut count_by_faction_zone: AHashMap<(u32, ZoneKind), usize> = AHashMap::new();
-    let mut counted_plots: AHashSet<PlotId> = AHashSet::new();
+    let mut listed: AHashSet<PlotId> = AHashSet::default();
+    let mut count_by_faction_zone: AHashMap<(u32, ZoneKind), usize> = AHashMap::default();
+    let mut counted_plots: AHashSet<PlotId> = AHashSet::default();
     for l in listings.for_sale.iter().chain(listings.for_lease.iter()) {
         listed.insert(l.plot_id);
         if counted_plots.insert(l.plot_id) {
@@ -1340,7 +1340,7 @@ pub fn household_land_acquisition_system(
     // Snapshot which households already hold a plot of each zone kind.
     // Pre-farm-planner this was a single-plot cap; now per-zone so a
     // household with housing can still acquire cropland.
-    let mut households_zones: AHashMap<u32, AHashSet<ZoneKind>> = AHashMap::new();
+    let mut households_zones: AHashMap<u32, AHashSet<ZoneKind>> = AHashMap::default();
     for (_, &entity) in plot_index.by_id.iter() {
         if let Ok(plot) = plot_q.get(entity) {
             if let TenureHolder::Household { faction_id } = plot.holder {
@@ -1356,7 +1356,7 @@ pub fn household_land_acquisition_system(
     // farmer household acquiring an agricultural plot gets its own tile
     // spawned (so private harvest/withdrawal stays out of village storage)
     // — but only once per household.
-    let mut households_with_storage: AHashSet<u32> = AHashSet::new();
+    let mut households_with_storage: AHashSet<u32> = AHashSet::default();
     for st in storage_q.iter() {
         households_with_storage.insert(st.faction_id);
     }
@@ -1396,7 +1396,7 @@ pub fn household_land_acquisition_system(
     }
 
     let now = clock.tick;
-    let mut consumed: AHashSet<PlotId> = AHashSet::new();
+    let mut consumed: AHashSet<PlotId> = AHashSet::default();
 
     // Spawns a household-private FactionStorageTile the first time a
     // household lands an Agricultural plot, so private harvest/withdrawal

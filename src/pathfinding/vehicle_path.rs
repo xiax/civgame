@@ -15,7 +15,7 @@
 //! cargo-haul task — until then this module is exercised only by its tests.
 #![allow(dead_code)]
 
-use ahash::{AHashMap, AHashSet};
+use crate::collections::{AHashMap, AHashSet};
 use bevy::math::IVec2;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;

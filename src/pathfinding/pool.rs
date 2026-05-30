@@ -1,4 +1,4 @@
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;

@@ -263,7 +263,7 @@ pub fn compute_interest_chunks(
     factions: &FactionRegistry,
     radius: i32,
 ) -> Vec<(i32, i32)> {
-    let mut out: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::new();
+    let mut out: crate::collections::AHashSet<(i32, i32)> = crate::collections::AHashSet::default();
     for &fid in controlled {
         let Some(faction) = factions.factions.get(&fid) else {
             continue;

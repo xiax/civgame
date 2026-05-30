@@ -84,6 +84,20 @@ impl Default for PerfWorkBudget {
     }
 }
 
+/// Test-only marker: when present, the async-compute poll systems fully drain
+/// (block on) their in-flight task instead of doing a non-blocking `poll_once`,
+/// so a task spawned on tick N always applies by tick N+1 regardless of how the
+/// process-wide `AsyncComputeTaskPool` is scheduled under parallel-test load.
+/// Inserted by `TestSim::new`; a real game never inserts it, so production keeps
+/// its async (off-tick-thread) behaviour.
+///
+/// This complements the deterministic hashing in [`crate::collections`]: hashing
+/// makes the sim reproducible *given* identical apply-ticks; this makes the
+/// apply-ticks themselves deterministic for the few survey-/world-sim-paced
+/// behavioural tests whose setups tick while a result is mid-flight.
+#[derive(Resource, Default, Debug)]
+pub struct DeterministicCompute;
+
 /// Frame-local and rolling counters for background/budgeted work. The debug
 /// panel reads this directly; systems update only the fields they own.
 #[derive(Resource, Default, Debug)]

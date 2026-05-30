@@ -9,7 +9,7 @@
 //! Scope is the bug fix only: no persistent squad types, no formation pickers,
 //! and no changes to `MilitaryAttack`.
 
-use ahash::{AHashMap, AHashSet};
+use crate::collections::{AHashMap, AHashSet};
 use bevy::prelude::*;
 
 use crate::simulation::doormat::DoormatReservations;
@@ -212,7 +212,7 @@ pub fn expand_military_move_system(
 
         // Selected actors' own tiles are treated as passable so a tight
         // group can reshuffle without self-blocking.
-        let mut own_tiles: AHashSet<(i32, i32)> = AHashSet::new();
+        let mut own_tiles: AHashSet<(i32, i32)> = AHashSet::default();
         for (t, _) in &actors {
             own_tiles.insert(*t);
         }
@@ -371,7 +371,7 @@ mod tests {
             assert!(a.is_some());
         }
         // Distinct slots.
-        let mut taken: AHashSet<usize> = AHashSet::new();
+        let mut taken: AHashSet<usize> = AHashSet::default();
         for a in &assigns {
             assert!(taken.insert(a.unwrap()));
         }

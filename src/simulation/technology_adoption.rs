@@ -18,7 +18,7 @@
 //! O(members) member pass per faction + 44 stage evals using cached
 //! aggregates. Phase 4 will add stage-downgrade (decay).
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 use std::collections::VecDeque;
 
@@ -454,7 +454,7 @@ pub fn derive_tech_adoption_system(
     let now = clock.tick as u32;
 
     let mut per_faction: AHashMap<u32, (FactionMemberAggregate, [PerTechCounts; TECH_COUNT])> =
-        AHashMap::new();
+        AHashMap::default();
     for (fm, knowledge) in members_q.iter() {
         let entry = per_faction.entry(fm.faction_id).or_insert_with(|| {
             (

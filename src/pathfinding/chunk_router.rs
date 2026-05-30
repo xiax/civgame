@@ -1,4 +1,4 @@
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
@@ -292,8 +292,8 @@ fn build_tree(graph: &ChunkGraph, goal: RouterNode) -> Option<ShortestPathTree> 
     if !graph.components.contains_key(&goal.0) {
         return None;
     }
-    let mut dist: AHashMap<RouterNode, u32> = AHashMap::new();
-    let mut next_hop: AHashMap<RouterNode, NextHop> = AHashMap::new();
+    let mut dist: AHashMap<RouterNode, u32> = AHashMap::default();
+    let mut next_hop: AHashMap<RouterNode, NextHop> = AHashMap::default();
     // ChunkCoord doesn't impl Ord, so we put the coord/component inline
     // in the heap key.
     let mut heap: BinaryHeap<Reverse<(u32, i32, i32, u8)>> = BinaryHeap::new();
@@ -361,7 +361,7 @@ mod tests {
     use crate::pathfinding::chunk_graph::{ChunkComponents, ChunkEdge, ChunkGraph};
 
     fn comp_one(coord: ChunkCoord, count: u8) -> ChunkComponents {
-        let mut at = AHashMap::new();
+        let mut at = AHashMap::default();
         // Just put a single sentinel cell at (0,0,0) — tests use compute_route
         // which doesn't read individual cells, only the edge list.
         for c in 0..count {

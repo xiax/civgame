@@ -266,6 +266,7 @@ Per-call-site composition (each row lists the primitives required at the cancel 
 Headless `App` harness for AI assertions without rendering/UI/globe gen. `TestSim::new(seed)`, `flat_world(radius, z, kind)`, `spawn_person(faction, tile, |b| b.hunger(...).add_inventory(...))`, then `tick()` / `tick_n(n)`.
 
 - Time deterministic via `TimeUpdateStrategy::ManualDuration` — one fixed-tick per `app.update()`.
+- **Determinism (parallel-test flakiness fix).** Two sources made the suite flake a different subset each run: (1) process-random `ahash` iteration order — fixed crate-wide by `crate::collections::{AHashMap, AHashSet}` (fixed-seed, see root CLAUDE.md → Constraints); (2) async-compute apply latency under shared-`AsyncComputeTaskPool` contention — fixed by `TestSim::new` inserting `perf::DeterministicCompute`, which makes the survey / world-sim / chunk-graph / connectivity / water poll systems fully drain (block on) their task each tick so results land at a fixed tick. Production never inserts the resource (keeps async off the tick thread). Together the headless sim is reproducible from its seed.
 - State stays in `SpawnSelect`; FixedUpdate sim runs regardless.
 - Camera at origin so LOD doesn't drop test agents to Dormant.
 - Currency-invariant helpers: `set_currency`, `assert_total_currency_invariant(app, baseline, eps)`. Snapshot sums `EconomicAgent.currency + FactionData.treasury + Settlement.treasury + JobEscrow.amount`.

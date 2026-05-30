@@ -17,7 +17,7 @@ use crate::economy::policy::{LandPolicy, ResourceControlPolicy};
 use crate::economy::resource_catalog::{ResourceCatalog, ResourceId};
 use crate::game_state::EconomyPreset;
 use crate::simulation::faction::Lifestyle;
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::Resource;
 use serde::Deserialize;
 
@@ -204,7 +204,7 @@ impl Default for FactionCapabilities {
                 carves_plots: true,
                 eviction_policy: EvictionPolicy::LeaveStructures,
             },
-            economic_policy: AHashMap::new(),
+            economic_policy: AHashMap::default(),
             income: IncomeFlow::default(),
             inheritance: InheritanceSpec::default(),
         }
@@ -254,7 +254,7 @@ pub fn derive_from_legacy(
         ),
     };
 
-    let mut economic_policy = AHashMap::new();
+    let mut economic_policy = AHashMap::default();
     crate::economy::policy::apply_preset(&mut economic_policy, preset, catalog);
 
     let land = LandModalities {
@@ -411,7 +411,7 @@ pub fn load_archetype_registry(catalog: &ResourceCatalog) -> FactionArchetypeReg
     });
 
     let mut reg = FactionArchetypeRegistry::default();
-    let mut seen: AHashMap<String, std::path::PathBuf> = AHashMap::new();
+    let mut seen: AHashMap<String, std::path::PathBuf> = AHashMap::default();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("ron") {

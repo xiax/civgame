@@ -27,7 +27,7 @@ use crate::pathfinding::worker::PathfindingDiagnostics;
 use crate::world::chunk::ChunkMap;
 use crate::world::spatial::{Indexed, SpatialIndex};
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
-use ahash::AHashSet;
+use crate::collections::AHashSet;
 use bevy::prelude::*;
 use rand::Rng;
 

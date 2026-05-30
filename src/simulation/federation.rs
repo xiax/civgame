@@ -27,7 +27,7 @@
 //! `FederationCharter::trade_propagation_pct` of the original value
 //! (cap 5 members ⇒ ≤8 pair-writes per trade).
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -246,7 +246,7 @@ pub fn federation_alliance_sync_system(
     // is bounded by the 5-member cap and small federation count, so this
     // is left as a single daily pass.
     let now = clock.tick;
-    let mut live_pairs: ahash::AHashSet<(u32, u32)> = ahash::AHashSet::new();
+    let mut live_pairs: crate::collections::AHashSet<(u32, u32)> = crate::collections::AHashSet::default();
     for fed in map.by_id.values() {
         for i in 0..fed.members.len() {
             for j in (i + 1)..fed.members.len() {
@@ -293,7 +293,7 @@ pub fn federation_alliance_sync_system(
 /// teardown time. Resource because it lives across sync ticks.
 #[derive(Resource, Default)]
 pub struct RememberedFederationAlliance {
-    pub pairs: ahash::AHashSet<(u32, u32)>,
+    pub pairs: crate::collections::AHashSet<(u32, u32)>,
 }
 
 /// Daily GC for expired invites.

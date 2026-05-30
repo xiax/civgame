@@ -237,7 +237,7 @@ pub fn ambient_social_pairing_system(
     let now = clock.tick as u32;
 
     let mut snaps: Vec<Snap> = Vec::new();
-    let mut index: ahash::AHashMap<Entity, usize> = ahash::AHashMap::default();
+    let mut index: crate::collections::AHashMap<Entity, usize> = crate::collections::AHashMap::default();
     for (e, t, goal, lod, fm, sec, (drafted, combat, rescue, migrate, packing)) in q.iter() {
         let tile = (
             (t.translation.x / TILE_SIZE).floor() as i32,
@@ -273,7 +273,7 @@ pub fn ambient_social_pairing_system(
     // Only entities whose `SecondarySocial` state actually changes are
     // recorded — the apply pass touches nobody else (zero needless writes,
     // never an archetype move).
-    let mut decisions: ahash::AHashMap<Entity, SecondarySocial> = ahash::AHashMap::default();
+    let mut decisions: crate::collections::AHashMap<Entity, SecondarySocial> = crate::collections::AHashMap::default();
 
     let partner_still_ok = |s: &Snap, partner: Entity| -> bool {
         index

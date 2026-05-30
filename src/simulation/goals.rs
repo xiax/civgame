@@ -437,7 +437,7 @@ impl GoalCooldown {
 /// `AHashSet` for fast contains/insert/remove; populated and drained
 /// each tick the system fires.
 #[derive(Resource, Default)]
-pub struct ForceGoalReevaluate(pub ahash::AHashSet<Entity>);
+pub struct ForceGoalReevaluate(pub crate::collections::AHashSet<Entity>);
 
 /// Pluralist Economy R8 follow-on: Maslow's hierarchy of needs as a
 /// 5-tier comparator. Each agent's `next_unmet_tier` is the
@@ -659,7 +659,7 @@ pub fn goal_update_system(
     // Goal-contract: live per-tile `Person` count for the
     // `has_social_partner` gate. Built fresh from current `Transform`s so
     // the gate sees no `SpatialIndex` one-tick lag.
-    let mut person_count: ahash::AHashMap<(i32, i32), u16> = ahash::AHashMap::default();
+    let mut person_count: crate::collections::AHashMap<(i32, i32), u16> = crate::collections::AHashMap::default();
     for tf in scorer_inputs.person_pos_q.iter() {
         let tx = (tf.translation.x / TILE_SIZE).floor() as i32;
         let ty = (tf.translation.y / TILE_SIZE).floor() as i32;
@@ -670,7 +670,7 @@ pub fn goal_update_system(
     // household adult — not only `Profession::Farmer` — can nominate
     // `AgentGoal::Farm`. Rebuilt every tick (one O(plots) walk, no tile
     // scan).
-    let mut households_with_ag_plot: ahash::AHashSet<u32> = ahash::AHashSet::default();
+    let mut households_with_ag_plot: crate::collections::AHashSet<u32> = crate::collections::AHashSet::default();
     for plot in scorer_inputs.plot_q.iter() {
         if plot.zone_kind != crate::simulation::settlement::ZoneKind::Agricultural {
             continue;
@@ -687,7 +687,7 @@ pub fn goal_update_system(
     // seasonal work when the household or its parent village actually
     // holds grain seed).
     let farm_season = scorer_inputs.farm_work_index.farm_season;
-    let mut households_with_seasonal_work_set: ahash::AHashSet<u32> = ahash::AHashSet::default();
+    let mut households_with_seasonal_work_set: crate::collections::AHashSet<u32> = crate::collections::AHashSet::default();
     if farm_season != crate::simulation::farm::FarmSeasonPhase::WinterDormant {
         let _span = info_span!("farm_precompute").entered();
         let seed_id = crate::economy::core_ids::grain_seed();
@@ -726,7 +726,7 @@ pub fn goal_update_system(
             }
         }
     }
-    let households_with_seasonal_work: &ahash::AHashSet<u32> = &households_with_seasonal_work_set;
+    let households_with_seasonal_work: &crate::collections::AHashSet<u32> = &households_with_seasonal_work_set;
     for (
         entity,
         mut goal,

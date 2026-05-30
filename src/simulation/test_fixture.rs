@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
 use bevy::time::{TimePlugin, TimeUpdateStrategy};
@@ -71,6 +71,14 @@ impl TestSim {
         bevy::tasks::AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
 
         let mut app = App::new();
+
+        // Determinism: the global compute pool is shared across all parallel
+        // tests, so async task-completion latency varies under load and a few
+        // survey-/world-sim-paced behavioural assertions flake. With this
+        // resource present the poll systems fully drain their task each tick so
+        // results land at a fixed tick. Production never inserts it. (Hashing
+        // determinism lives separately in `crate::collections`.)
+        app.insert_resource(crate::simulation::perf::DeterministicCompute);
 
         // Time + states. We deliberately skip ScheduleRunnerPlugin /
         // FrameCountPlugin / TaskPoolPlugin — `MinimalPlugins` is a
@@ -163,6 +171,28 @@ impl TestSim {
         app.add_plugins(crate::pathfinding::PathfindingPlugin);
         app.add_plugins(crate::economy::EconomyPlugin);
         app.add_plugins(crate::simulation::SimulationPlugin);
+
+        // Determinism: run every schedule single-threaded. The sim has ~73
+        // global `fastrand::` call sites (combat rolls, reproduction, plant
+        // sprouting, knowledge discovery, …). Under Bevy's multi-threaded
+        // executor those systems run on shared `ComputeTaskPool` worker threads
+        // whose `fastrand` thread-local is NOT seeded by `fastrand::seed(seed)`
+        // (that seeds only this test's main thread) — so under parallel `cargo
+        // test` the worker threads interleave across tests and the rolls become
+        // non-deterministic, flaking a different subset each run. Forcing the
+        // single-threaded executor runs every system on this seeded test thread,
+        // so all `fastrand` draws are deterministic. (Combined with
+        // `crate::collections` fixed-seed hashing and the `DeterministicCompute`
+        // async drain, the headless sim is fully reproducible from its seed.)
+        {
+            use bevy::ecs::schedule::ExecutorKind;
+            let mut schedules = app
+                .world_mut()
+                .resource_mut::<bevy::ecs::schedule::Schedules>();
+            for (_label, schedule) in schedules.iter_mut() {
+                schedule.set_executor_kind(ExecutorKind::SingleThreaded);
+            }
+        }
 
         // Spawn a camera at world origin. Without it,
         // `update_lod_levels_system` reports every agent as Dormant
@@ -699,7 +729,7 @@ pub fn person_inventory(
         .world()
         .get::<EconomicAgent>(entity)
         .expect("EconomicAgent missing");
-    let mut out = AHashMap::new();
+    let mut out = AHashMap::default();
     for (item, qty) in econ.inventory.iter() {
         if *qty > 0 {
             *out.entry(item.resource_id).or_insert(0) += *qty;
@@ -9683,7 +9713,7 @@ mod smoke {
             }
         }
         // Households must be unique per member.
-        let unique: ahash::AHashSet<u32> = household_ids.iter().copied().collect();
+        let unique: crate::collections::AHashSet<u32> = household_ids.iter().copied().collect();
         assert_eq!(
             unique.len(),
             members.len(),
@@ -9693,7 +9723,7 @@ mod smoke {
         // Each household needs its own `FactionStorageTile` entity so
         // private deposits land separately from the village storage.
         let mut tile_q = world.query::<&FactionStorageTile>();
-        let mut household_tile_count: ahash::AHashMap<u32, u32> = ahash::AHashMap::new();
+        let mut household_tile_count: crate::collections::AHashMap<u32, u32> = crate::collections::AHashMap::default();
         for tile in tile_q.iter(world) {
             *household_tile_count.entry(tile.faction_id).or_insert(0) += 1;
         }
@@ -19122,7 +19152,7 @@ mod military_formation {
     use crate::simulation::player_command::{
         CommandFailure, CommandStatus, Commanded, PlayerCommand, PlayerCommandEvent,
     };
-    use ahash::AHashSet;
+    use crate::collections::AHashSet;
 
     fn spawn_drafted_at(sim: &mut TestSim, tile: (i32, i32)) -> Entity {
         let person = sim.spawn_person(sim.player_faction_id, tile, |b| {
@@ -19168,9 +19198,9 @@ mod military_formation {
         // and stamps the formation slot.
         sim.tick_n(2);
 
-        let mut dests: AHashSet<(i32, i32)> = AHashSet::new();
-        let mut groups: AHashSet<u32> = AHashSet::new();
-        let mut slot_indices: AHashSet<u8> = AHashSet::new();
+        let mut dests: AHashSet<(i32, i32)> = AHashSet::default();
+        let mut groups: AHashSet<u32> = AHashSet::default();
+        let mut slot_indices: AHashSet<u8> = AHashSet::default();
         for &u in &units {
             let dest = agent_dest_tile(&sim.app, u);
             assert!(dests.insert(dest), "two units share dest_tile {:?}", dest);
@@ -19323,7 +19353,7 @@ mod military_formation {
         });
         sim.tick_n(2);
 
-        let mut new_groups: AHashSet<u32> = AHashSet::new();
+        let mut new_groups: AHashSet<u32> = AHashSet::default();
         for &u in &units {
             let slot = sim
                 .app
@@ -19673,8 +19703,8 @@ mod onenter_era_seeding {
             // Group plots by faction, then find a faction with both an
             // Agricultural plot and any other plot to use as the durability
             // evidence target.
-            let mut by_faction: ahash::AHashMap<u32, Vec<(u32, Entity, TileRect, ZoneKind)>> =
-                ahash::AHashMap::new();
+            let mut by_faction: crate::collections::AHashMap<u32, Vec<(u32, Entity, TileRect, ZoneKind)>> =
+                crate::collections::AHashMap::default();
             {
                 let world = sim.app.world();
                 let plot_index = world.resource::<PlotIndex>();
@@ -19807,8 +19837,8 @@ mod onenter_era_seeding {
         //    tiles); only previously-unowned tiles would attach to the
         //    shifted plot. The invariant we care about is that no tile
         //    inside any current Ag plan rect is orphaned.
-        let settlement_ag_plots: ahash::AHashSet<u32> = {
-            let mut s: ahash::AHashSet<u32> = ahash::AHashSet::new();
+        let settlement_ag_plots: crate::collections::AHashSet<u32> = {
+            let mut s: crate::collections::AHashSet<u32> = crate::collections::AHashSet::default();
             for (&pid, &entity) in plot_index.by_id.iter() {
                 let Some(p) = world.get::<Plot>(entity) else {
                     continue;
@@ -21502,8 +21532,8 @@ mod onenter_era_seeding {
         assert_eq!(members.len(), 6);
         // Group founders by household and verify each multi-adult household
         // carries an opposite-sex spouse pair.
-        use ahash::AHashMap;
-        let mut by_hh: AHashMap<u32, Vec<Entity>> = AHashMap::new();
+        use crate::collections::AHashMap;
+        let mut by_hh: AHashMap<u32, Vec<Entity>> = AHashMap::default();
         for &e in &members {
             if let Some(h) = household_id_of(&sim, e) {
                 by_hh.entry(h).or_default().push(e);
@@ -21581,7 +21611,7 @@ mod onenter_era_seeding {
         // Find each member's HomeBed tile by walking BedMap reverse lookup.
         let world = sim.app.world();
         let bed_map = world.resource::<BedMap>();
-        let bed_pos: ahash::AHashMap<Entity, (i32, i32)> =
+        let bed_pos: crate::collections::AHashMap<Entity, (i32, i32)> =
             bed_map.0.iter().map(|(&pos, &e)| (e, pos)).collect();
 
         let mut tiles: Vec<(i32, i32)> = Vec::new();

@@ -17,7 +17,7 @@
 //! Phase 3 lifecycle events will move/destroy Camps on
 //! `Migrate`/`Abandon`/`SwitchArchetype` directly.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 use crate::economy::market::SettlementMarket;

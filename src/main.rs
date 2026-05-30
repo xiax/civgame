@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 
+mod collections;
 mod economy;
 mod game_state;
 mod net;

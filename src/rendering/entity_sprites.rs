@@ -695,7 +695,7 @@ fn vehicle_sprite_plan_internal(
 
     // Pre-compute each weapon module's anchor cell so we can skip the
     // non-anchor members and emit one composite at the anchor.
-    let module_anchors: ahash::AHashMap<crate::simulation::vehicle::VehicleModuleId, bevy::math::IVec3> =
+    let module_anchors: crate::collections::AHashMap<crate::simulation::vehicle::VehicleModuleId, bevy::math::IVec3> =
         design
             .grid
             .modules
@@ -853,7 +853,7 @@ fn push_connector_overlays<F: Fn(f32, f32, f32) -> Vec3>(
     heading: u8,
     view: crate::rendering::vehicle_part_sprites::VehicleSpriteView,
     project: F,
-    module_anchors: &ahash::AHashMap<
+    module_anchors: &crate::collections::AHashMap<
         crate::simulation::vehicle::VehicleModuleId,
         bevy::math::IVec3,
     >,
@@ -873,7 +873,7 @@ fn push_connector_overlays<F: Fn(f32, f32, f32) -> Vec3>(
         IVec3::new(0, 0, -1),
     ];
 
-    let kind_at: ahash::AHashMap<IVec3, VehiclePartKind> = design
+    let kind_at: crate::collections::AHashMap<IVec3, VehiclePartKind> = design
         .grid
         .cells
         .iter()

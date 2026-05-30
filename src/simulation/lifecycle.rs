@@ -307,7 +307,7 @@ fn reseed_nomadic_camp_for(world: &mut World, faction_id: u32, tile: (i32, i32))
         EventWriter<TileChangedEvent>,
     )> = SystemState::new(world);
     let (mut commands, mut maps, chunk_map, mut tile_changed) = state.get_mut(world);
-    let mut used: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::new();
+    let mut used: crate::collections::AHashSet<(i32, i32)> = crate::collections::AHashSet::default();
     used.insert(tile);
     seed_nomadic_camp(
         &mut commands,
@@ -354,7 +354,7 @@ fn despawn_camp_structures_at(world: &mut World, tile: (i32, i32)) {
     let (mut commands, mut bed_map, mut campfire_map, deployable_q, tent_q, mut camp_map, camp_q) =
         state.get_mut(world);
 
-    let mut despawned: ahash::AHashSet<Entity> = ahash::AHashSet::new();
+    let mut despawned: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
 
     let bed_tiles: Vec<(i32, i32)> = bed_map
         .0

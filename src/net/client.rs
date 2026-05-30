@@ -672,11 +672,11 @@ pub enum ReplicatedEntityKind {
 /// `apply_overlay_delta`'s `AddPlant` branch and torn down by
 /// `RemovePlant`.
 #[derive(bevy::prelude::Resource, Default, Debug)]
-pub struct ReplicatedPlantMap(pub ahash::AHashMap<(i32, i32), bevy::prelude::Entity>);
+pub struct ReplicatedPlantMap(pub crate::collections::AHashMap<(i32, i32), bevy::prelude::Entity>);
 
 /// Client-side tile→`Entity` index for replicated structures.
 #[derive(bevy::prelude::Resource, Default, Debug)]
-pub struct ReplicatedStructureMap(pub ahash::AHashMap<(i32, i32), bevy::prelude::Entity>);
+pub struct ReplicatedStructureMap(pub crate::collections::AHashMap<(i32, i32), bevy::prelude::Entity>);
 
 /// Replicated-entity bookkeeping carried on every stub. Stores the latest
 /// server tick that touched the stub so a future LOD-aware draw can age

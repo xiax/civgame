@@ -1,4 +1,4 @@
-use ahash::AHashSet;
+use crate::collections::AHashSet;
 use bevy::prelude::*;
 use std::collections::VecDeque;
 

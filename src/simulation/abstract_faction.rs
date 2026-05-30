@@ -8,7 +8,7 @@
 //! `false` — until the player travels near their home region and a later phase
 //! materialises them.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 use crate::simulation::faction::FactionRegistry;

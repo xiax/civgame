@@ -49,7 +49,7 @@ pub fn same_bank_bfs(chunk_map: &ChunkMap, start: (i32, i32), target: (i32, i32)
     if start == target {
         return true;
     }
-    let mut visited: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::with_capacity(BFS_NODE_CAP);
+    let mut visited: crate::collections::AHashSet<(i32, i32)> = crate::collections::AHashSet::with_capacity_and_hasher(BFS_NODE_CAP, crate::collections::FixedState);
     let mut queue: std::collections::VecDeque<(i32, i32)> = std::collections::VecDeque::new();
     queue.push_back(start);
     visited.insert(start);

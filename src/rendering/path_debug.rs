@@ -1,4 +1,4 @@
-use ahash::AHashSet;
+use crate::collections::AHashSet;
 use bevy::prelude::*;
 
 use crate::pathfinding::chunk_graph::ChunkGraph;
@@ -208,7 +208,7 @@ pub fn chunk_graph_gizmo_system(
     let node_color = Color::srgba(1.0, 0.65, 0.15, 0.85);
     let edge_color = Color::srgba(1.0, 0.65, 0.15, 0.45);
 
-    let mut drawn: AHashSet<(ChunkCoord, ChunkCoord)> = AHashSet::new();
+    let mut drawn: AHashSet<(ChunkCoord, ChunkCoord)> = AHashSet::default();
     for (&coord, edges) in &graph.edges {
         let a = projector.project(chunk_center(coord));
         gizmos.circle_2d(a, 3.0, node_color);

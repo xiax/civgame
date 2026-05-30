@@ -1,5 +1,5 @@
 use crate::rendering::pixel_art::{ascii_to_image, WARM_PALETTE};
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 // ============================================================

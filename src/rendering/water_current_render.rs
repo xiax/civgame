@@ -7,7 +7,7 @@
 //! robust to the spawn-area chunks that pre-load without a
 //! `ChunkLoadedEvent`.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 use crate::rendering::projection::{ProjectedAnchor, ProjectionState};

@@ -10,7 +10,7 @@
 //! in `ui/debug_panel.rs`; reddens when the rolling average exceeds the
 //! current preset's CPU budget.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::input::ButtonInput;
 use bevy::prelude::*;
 use bevy_egui::EguiContexts;

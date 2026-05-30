@@ -13,7 +13,7 @@
 //! static terrain, so there is no `SharedKnowledge` cluster bookkeeping.
 //! Claims reuse `GatherClaims` keyed on `(spot_tile, Resource(fish))`.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
@@ -144,7 +144,7 @@ fn tile_supports_fishery(chunk_map: &ChunkMap, tile: (i32, i32)) -> bool {
     if !is_water(tile) {
         return false;
     }
-    let mut visited: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::default();
+    let mut visited: crate::collections::AHashSet<(i32, i32)> = crate::collections::AHashSet::default();
     let mut frontier: Vec<(i32, i32)> = Vec::with_capacity(MIN_FISHABLE_WATER_TILES * 2);
     visited.insert(tile);
     frontier.push(tile);

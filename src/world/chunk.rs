@@ -1,6 +1,6 @@
 use super::edge::{ChunkEdgeBits, EdgeAxis, EdgeKey, EdgeState};
 use super::tile::{TileData, TileKind};
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 pub const CHUNK_SIZE: usize = 32;
@@ -140,7 +140,7 @@ impl Chunk {
         surface_reservoir_id: Box<[[u32; CHUNK_SIZE]; CHUNK_SIZE]>,
     ) -> Self {
         Self {
-            deltas: AHashMap::new(),
+            deltas: AHashMap::default(),
             surface_z,
             surface_kind,
             surface_fertility,

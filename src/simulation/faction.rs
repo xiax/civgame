@@ -25,7 +25,7 @@ use crate::world::chunk::ChunkMap;
 use crate::world::seasons::TICKS_PER_DAY;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::{tile_to_world, TILE_SIZE};
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -399,8 +399,8 @@ pub fn faction_hunter_assignment_system(
         }
     }
 
-    let mut promote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
-    let mut demote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut promote: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
+    let mut demote: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
     for (&fid, target) in &targets {
         let mut hunters = by_faction_hunters.remove(&fid).unwrap_or_default();
         let mut none = by_faction_none.remove(&fid).unwrap_or_default();
@@ -598,8 +598,8 @@ pub fn chief_bureaucrat_appointment_system(
         }
     }
 
-    let mut promote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
-    let mut demote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut promote: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
+    let mut demote: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
     for (&fid, &want) in &targets {
         let mut bureaucrats = by_faction_bureaucrats.remove(&fid).unwrap_or_default();
         let mut none = by_faction_none.remove(&fid).unwrap_or_default();
@@ -712,7 +712,7 @@ pub fn chief_architect_appointment_system(
     // architects) from "not due this tick" (preserve architects untouched).
     let mut chief_gap: AHashMap<u32, Vec<crate::simulation::technology::TechId>> =
         AHashMap::default();
-    let mut evaluated_fids: ahash::AHashSet<u32> = ahash::AHashSet::default();
+    let mut evaluated_fids: crate::collections::AHashSet<u32> = crate::collections::AHashSet::default();
     for (&fid, faction) in registry.factions.iter() {
         if fid == SOLO || faction.member_count == 0 {
             continue;
@@ -828,12 +828,12 @@ pub fn chief_architect_appointment_system(
         }
     }
 
-    let mut promote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
-    let mut demote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut promote: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
+    let mut demote: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
 
     // Every settlement that has demand (gap non-empty) targets exactly 1.
-    let mut settlement_keys: ahash::AHashSet<(u32, crate::simulation::settlement::SettlementId)> =
-        ahash::AHashSet::default();
+    let mut settlement_keys: crate::collections::AHashSet<(u32, crate::simulation::settlement::SettlementId)> =
+        crate::collections::AHashSet::default();
     for k in architects.keys() {
         settlement_keys.insert(*k);
     }
@@ -949,7 +949,7 @@ pub fn chief_craft_assignment_system(
     // Which factions fire this tick? Compute once (cheap registry walk) so the
     // population census below can skip non-due factions, and bail entirely on
     // ticks where no faction is due.
-    let due: ahash::AHashSet<u32> = registry
+    let due: crate::collections::AHashSet<u32> = registry
         .factions
         .keys()
         .copied()
@@ -1099,8 +1099,8 @@ pub fn chief_craft_assignment_system(
         }
     }
 
-    let mut promote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
-    let mut demote: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut promote: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
+    let mut demote: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
     for (&fid, &want) in &targets {
         let mut crafters = by_faction_crafters.remove(&fid).unwrap_or_default();
         let mut none = by_faction_none.remove(&fid).unwrap_or_default();
@@ -1865,7 +1865,7 @@ pub fn faction_profession_system(
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then(b.2.cmp(&a.2))
             });
-            let promote: ahash::AHashSet<Entity> = none_set
+            let promote: crate::collections::AHashSet<Entity> = none_set
                 .into_iter()
                 .take(to_assign)
                 .map(|(e, _, _)| e)
@@ -1883,7 +1883,7 @@ pub fn faction_profession_system(
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then(a.2.cmp(&b.2))
             });
-            let demote: ahash::AHashSet<Entity> = current_farmer_set
+            let demote: crate::collections::AHashSet<Entity> = current_farmer_set
                 .into_iter()
                 .take(to_unassign)
                 .map(|(e, _, _)| e)
@@ -2583,10 +2583,10 @@ pub const MAX_CANDIDATE_SITES: usize = 16;
 /// site. Cleared on `MigrationPhase` returning to `Idle`.
 #[derive(Clone, Debug, Default)]
 pub struct CampCargoManifest {
-    pub required: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
-    pub loaded: ahash::AHashMap<(Entity, crate::economy::resource_catalog::ResourceId), u32>,
+    pub required: crate::collections::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
+    pub loaded: crate::collections::AHashMap<(Entity, crate::economy::resource_catalog::ResourceId), u32>,
     pub abandoned: Vec<(crate::economy::resource_catalog::ResourceId, u32)>,
-    pub deployed: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
+    pub deployed: crate::collections::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
     pub pitching_started_tick: Option<u32>,
     pub repair_unlocked: bool,
 }
@@ -2646,7 +2646,7 @@ pub struct FactionData {
     /// Sparse ring buffer of recent successful uses per tech. Populated
     /// by craft / hunt / build executors; consumed by `derive_stage` for
     /// the "≥N successful uses in last K days" Adopted threshold.
-    pub recent_tech_use: ahash::AHashMap<
+    pub recent_tech_use: crate::collections::AHashMap<
         crate::simulation::technology::TechId,
         crate::simulation::technology_adoption::RecentTechUse,
     >,
@@ -2654,15 +2654,15 @@ pub struct FactionData {
     /// Phase 2d: keyed on `ResourceId` so consumers (recipe pipelines,
     /// HTN methods) can look up by catalog id without reverse-resolving
     /// to a legacy `Good` enum variant.
-    pub resource_supply: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
-    pub resource_demand: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
+    pub resource_supply: crate::collections::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
+    pub resource_demand: crate::collections::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
     /// Functional craft demand: per crafted-output `ResourceId`, the netted
     /// deficit (consumers lacking the good minus spare supply). Computed by
     /// `resource_demand_system` via `jobs::compute_craft_demand`; read by the
     /// chief Craft posting branch. Distinct from `resource_demand` (which holds
     /// only gatherable blueprint + food demand) — crafted goods are produced,
     /// not foraged, so they must not feed `opportunity.rs`'s MaterialDeficit.
-    pub craft_demand: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
+    pub craft_demand: crate::collections::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
     /// The current tribal chief of this faction, if one has been designated.
     pub chief_entity: Option<Entity>,
     /// **Phase H** — chief's accepted disease-causation belief, cached for
@@ -2693,7 +2693,7 @@ pub struct FactionData {
     /// surfaced via `material_deficit_ema_of` for diagnostics — the chief
     /// no longer reads it now that construction routes through the organic
     /// `pressure_to_intent` path. Range 0..=255. Keyed on `ResourceId`.
-    pub material_deficit_ema: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u8>,
+    pub material_deficit_ema: crate::collections::AHashMap<crate::economy::resource_catalog::ResourceId, u8>,
     /// Anticipatory stockpile reserves: target storage levels per resource
     /// that the chief asks workers to maintain even before any blueprint
     /// demands them. Computed each chief tick from member count, culture
@@ -2702,7 +2702,7 @@ pub struct FactionData {
     /// fallback gather goal for unclaimed workers. Range 0..=u32::MAX.
     /// Phase 2-residual: keyed on `ResourceId`; legacy callers go through
     /// `material_target_of(good)`.
-    pub material_targets: ahash::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
+    pub material_targets: crate::collections::AHashMap<crate::economy::resource_catalog::ResourceId, u32>,
     /// Active hunting directive (`Hunt` or `Scout`) issued by the chief.
     /// Refreshed by `chief_hunt_order_system` once per game-day, with a
     /// mid-day invalidation sweep that clears spent / empty targets.
@@ -2723,7 +2723,7 @@ pub struct FactionData {
     /// `ResourceId` to the `HaulSource` Phase 3c should stamp on its Haul
     /// posting: `Market { max_unit_price }` when the resource is scarce-but-
     /// affordably-procurable (absent / `Storage` = legacy withdraw-from-storage).
-    pub procurement_plan: ahash::AHashMap<
+    pub procurement_plan: crate::collections::AHashMap<
         crate::economy::resource_catalog::ResourceId,
         crate::simulation::jobs::HaulSource,
     >,
@@ -2750,7 +2750,7 @@ pub struct FactionData {
     /// `ResourceControlPolicy::default()` — the all-communist preset
     /// matching today's behaviour. So an empty map is observationally
     /// identical to a pre-R4 faction.
-    pub economic_policy: ahash::AHashMap<
+    pub economic_policy: crate::collections::AHashMap<
         crate::economy::resource_catalog::ResourceId,
         crate::economy::policy::ResourceControlPolicy,
     >,
@@ -2869,7 +2869,7 @@ pub struct FactionData {
     /// member-side `Earnings` rings. Phase 4's EV-driven profession
     /// choice reads this to score `expected_wage(profession)`.
     /// `target_rid = None` covers Build / Calories postings.
-    pub wage_signal: ahash::AHashMap<
+    pub wage_signal: crate::collections::AHashMap<
         (
             crate::simulation::jobs::JobKind,
             Option<crate::economy::resource_catalog::ResourceId>,
@@ -3002,11 +3002,11 @@ impl FactionRegistry {
                 tech_adoption: [crate::simulation::technology_adoption::AdoptionStage::Unknown;
                     crate::simulation::technology::TECH_COUNT],
                 stage_changed_at_tick: [0; crate::simulation::technology::TECH_COUNT],
-                recent_tech_use: ahash::AHashMap::default(),
+                recent_tech_use: crate::collections::AHashMap::default(),
                 activity_log: ActivityLog::default(),
-                resource_supply: ahash::AHashMap::default(),
-                resource_demand: ahash::AHashMap::default(),
-                craft_demand: ahash::AHashMap::default(),
+                resource_supply: crate::collections::AHashMap::default(),
+                resource_demand: crate::collections::AHashMap::default(),
+                craft_demand: crate::collections::AHashMap::default(),
                 chief_entity: None,
                 chief_disease_belief: None,
                 chief_cosmology_belief: None,
@@ -3014,15 +3014,15 @@ impl FactionRegistry {
                 lineage,
                 active_upgrade: None,
                 workforce_budget: crate::simulation::projects::WorkforceBudget::default(),
-                material_deficit_ema: ahash::AHashMap::default(),
-                material_targets: ahash::AHashMap::default(),
+                material_deficit_ema: crate::collections::AHashMap::default(),
+                material_targets: crate::collections::AHashMap::default(),
                 hunt_order: None,
                 nearby_prey_count: 0,
                 treasury: 0.0,
-                procurement_plan: ahash::AHashMap::default(),
+                procurement_plan: crate::collections::AHashMap::default(),
                 procurement_market: None,
                 material_view: crate::simulation::construction::MaterialAvailabilityView::default(),
-                economic_policy: ahash::AHashMap::default(),
+                economic_policy: crate::collections::AHashMap::default(),
                 land_policy: crate::economy::policy::LandPolicy::default(),
                 parent_faction: None,
                 household_head: None,
@@ -3052,7 +3052,7 @@ impl FactionRegistry {
                 // bonding-formed factions) keep the default until
                 // they apply their own preset/lifestyle.
                 caps: crate::simulation::archetype::FactionCapabilities::default(),
-                wage_signal: ahash::AHashMap::default(),
+                wage_signal: crate::collections::AHashMap::default(),
                 raid_phase: RaidPhase::default(),
                 food_deficit_streak_tick: 0,
                 hunger_crisis_streak_tick: 0,
@@ -3461,12 +3461,12 @@ pub fn drop_items_at_destination_system(
         // worker holds. Generalises the legacy wood/stone-only hand credit
         // and food calorie credit to every eligible class (seeds, hides,
         // cloth, crafted goods, recovered wood, …).
-        use ahash::AHashMap;
+        use crate::collections::AHashMap;
         let wood_id = crate::economy::core_ids::wood();
         let mut deposited_by_rid: AHashMap<
             crate::economy::resource_catalog::ResourceId,
             u32,
-        > = AHashMap::new();
+        > = AHashMap::default();
 
         // 1. Dump everything in hands. Hauling loads (Wood, Stone, Iron, ...) are
         //    exactly what storage wants; food/tools that ended up in hands also
@@ -3698,7 +3698,7 @@ pub fn update_storage_tile_map_system(
         return;
     }
     // Snapshot the previous tile set so we can diff hotspot registrations.
-    let prev: ahash::AHashSet<(i32, i32)> = map.tiles.keys().copied().collect();
+    let prev: crate::collections::AHashSet<(i32, i32)> = map.tiles.keys().copied().collect();
 
     map.tiles.clear();
     map.by_faction.clear();
@@ -3738,11 +3738,11 @@ pub fn update_storage_tile_map_system(
 pub fn sync_faction_center_hotspots_system(
     mut hotspots: ResMut<HotspotFlowFields>,
     chunk_map: Res<ChunkMap>,
-    mut last_seen: Local<ahash::AHashMap<Entity, (i32, i32, i8)>>,
+    mut last_seen: Local<crate::collections::AHashMap<Entity, (i32, i32, i8)>>,
     mut removed: RemovedComponents<FactionCenter>,
     centers: Query<(Entity, &Transform), With<FactionCenter>>,
 ) {
-    let mut current: ahash::AHashMap<Entity, (i32, i32, i8)> = ahash::AHashMap::new();
+    let mut current: crate::collections::AHashMap<Entity, (i32, i32, i8)> = crate::collections::AHashMap::default();
     for (entity, transform) in centers.iter() {
         let tx = (transform.translation.x / TILE_SIZE).floor() as i32;
         let ty = (transform.translation.y / TILE_SIZE).floor() as i32;
@@ -4115,7 +4115,7 @@ pub fn resource_demand_system(
     // ── In-flight craft tally — units already being crafted, keyed
     // (faction, output ResourceId). Live Craft postings + live CraftOrders.
     let recipes = crate::simulation::crafting::craft_recipes();
-    let mut in_flight: ahash::AHashMap<(u32, ResourceId), u32> = ahash::AHashMap::default();
+    let mut in_flight: crate::collections::AHashMap<(u32, ResourceId), u32> = crate::collections::AHashMap::default();
     for (&fid, postings) in board.postings.iter() {
         for p in postings.iter() {
             if let crate::simulation::jobs::JobProgress::Crafting {
@@ -4152,16 +4152,16 @@ pub fn resource_demand_system(
     let is_armor = |rid: ResourceId| rid.class() == Some(ResourceClass::Armor);
     let is_shield = |rid: ResourceId| rid.class() == Some(ResourceClass::Shield);
     let is_cloth = |rid: ResourceId| rid.class() == Some(ResourceClass::Cloth);
-    let mut unarmed: ahash::AHashMap<u32, u32> = ahash::AHashMap::default();
-    let mut unarmored: ahash::AHashMap<u32, u32> = ahash::AHashMap::default();
-    let mut unshielded: ahash::AHashMap<u32, u32> = ahash::AHashMap::default();
-    let mut unclothed: ahash::AHashMap<u32, u32> = ahash::AHashMap::default();
+    let mut unarmed: crate::collections::AHashMap<u32, u32> = crate::collections::AHashMap::default();
+    let mut unarmored: crate::collections::AHashMap<u32, u32> = crate::collections::AHashMap::default();
+    let mut unshielded: crate::collections::AHashMap<u32, u32> = crate::collections::AHashMap::default();
+    let mut unclothed: crate::collections::AHashMap<u32, u32> = crate::collections::AHashMap::default();
     // Realistic Tool Overhaul: per-faction per-form tool tally (member kits +
     // hands + inventory). Feeds `compute_faction_tool_deficits`.
-    let mut tool_have: ahash::AHashMap<
+    let mut tool_have: crate::collections::AHashMap<
         u32,
-        ahash::AHashMap<crate::simulation::tools::ToolForm, u32>,
-    > = ahash::AHashMap::default();
+        crate::collections::AHashMap<crate::simulation::tools::ToolForm, u32>,
+    > = crate::collections::AHashMap::default();
     for (entity, member, agent, profession, equipment, carrier, toolkit) in agent_query.iter() {
         if member.faction_id == SOLO {
             continue;
@@ -4436,7 +4436,7 @@ pub fn chief_selection_system(
     }
 
     // Build faction_id → member entities map from the current world state.
-    let mut faction_members: AHashMap<u32, Vec<Entity>> = AHashMap::new();
+    let mut faction_members: AHashMap<u32, Vec<Entity>> = AHashMap::default();
     for (entity, member) in member_query.iter() {
         if member.faction_id != SOLO {
             faction_members

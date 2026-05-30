@@ -58,7 +58,7 @@ use crate::net::bootstrap::tile_to_chunk_coord;
 /// whose `sender_faction_id` doesn't match.
 #[derive(Resource, Default, Debug, Clone)]
 pub struct ServerConnections {
-    pub by_client: ahash::AHashMap<ClientId, ConnectionState>,
+    pub by_client: crate::collections::AHashMap<ClientId, ConnectionState>,
 }
 
 /// LOD-style classifier for one chunk within a client's interest frame.
@@ -108,7 +108,7 @@ pub struct ConnectionState {
     /// `INTEREST_REBUILD_INTERVAL_UPDATES`. Per-tick replicators (tile +
     /// entity) gate per-chunk sends on membership here; chunks no one is
     /// interested in skip the wire entirely.
-    pub interest_chunks: ahash::AHashMap<(i32, i32), InterestTier>,
+    pub interest_chunks: crate::collections::AHashMap<(i32, i32), InterestTier>,
     /// Last chunk this client reported its camera was focused on (via
     /// `ClientCameraFocus`). `compute_interest_system` folds this in as
     /// an additional `Owned`-tier anchor so scouting expeditions outside
@@ -313,7 +313,7 @@ fn allocate_free_faction(
     factions: &FactionRegistry,
     controlled: &ControlledFactions,
 ) -> Option<u32> {
-    let already_assigned: ahash::AHashSet<u32> = conns
+    let already_assigned: crate::collections::AHashSet<u32> = conns
         .by_client
         .values()
         .map(|s| s.assigned_faction)
@@ -386,7 +386,7 @@ pub const RECONNECT_GRACE_TICKS: u64 = 1200;
 /// expired by `expire_pending_reconnects_system`.
 #[derive(Resource, Default, Debug)]
 pub struct PendingReconnect {
-    pub by_name: ahash::AHashMap<String, ReconnectEntry>,
+    pub by_name: crate::collections::AHashMap<String, ReconnectEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -533,8 +533,8 @@ pub fn replicate_tile_overlays_system(
     overlay: TileOverlayParams,
 ) {
     // Group ops by chunk to keep ChunkOverlayDelta tight.
-    let mut by_chunk: ahash::AHashMap<(i32, i32), Vec<TileOverlayOp>> = ahash::AHashMap::new();
-    let mut seen_tiles: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::new();
+    let mut by_chunk: crate::collections::AHashMap<(i32, i32), Vec<TileOverlayOp>> = crate::collections::AHashMap::default();
+    let mut seen_tiles: crate::collections::AHashSet<(i32, i32)> = crate::collections::AHashSet::default();
 
     for ev in changes.read() {
         let tile = (ev.tx, ev.ty);
@@ -901,7 +901,7 @@ pub const INTEREST_REBUILD_INTERVAL_UPDATES: u32 = 30;
 /// gating as state deltas. NetIds that despawn before they were ever
 /// replicated stay absent — the remove falls back to broadcast.
 #[derive(Resource, Default, Debug)]
-pub struct LastKnownChunkMap(pub ahash::AHashMap<crate::net_id::NetId, (i32, i32)>);
+pub struct LastKnownChunkMap(pub crate::collections::AHashMap<crate::net_id::NetId, (i32, i32)>);
 
 /// Per-channel bandwidth + send-rate counters for the replication
 /// pipeline (Phase 3g). Follows the project's existing diagnostic-resource
@@ -1034,8 +1034,8 @@ pub fn replicate_entity_state_system(
     // sends (~7 years at 50ms cadence — fine).
     *send_index = send_index.wrapping_add(1);
 
-    let mut by_chunk: ahash::AHashMap<(i32, i32), Vec<EntityStateEntry>> =
-        ahash::AHashMap::new();
+    let mut by_chunk: crate::collections::AHashMap<(i32, i32), Vec<EntityStateEntry>> =
+        crate::collections::AHashMap::default();
 
     for (n, t, ai, facing, health, member) in person_q.iter() {
         let entry = build_entry(
@@ -1176,7 +1176,7 @@ type AnimalRow<'a> = (
 );
 
 fn push_animal<'a, I>(
-    by_chunk: &mut ahash::AHashMap<(i32, i32), Vec<EntityStateEntry>>,
+    by_chunk: &mut crate::collections::AHashMap<(i32, i32), Vec<EntityStateEntry>>,
     iter: I,
     species: AnimalSpeciesWire,
 ) where
@@ -1300,7 +1300,7 @@ pub fn compute_interest_system(
         // inflate around each anchor by ±1; `Neighbour` extends to
         // NEIGHBOUR_TIER_RADIUS; the rest of the INTEREST_RADIUS_CHUNKS
         // frame is `Far`.
-        let mut anchors: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::new();
+        let mut anchors: crate::collections::AHashSet<(i32, i32)> = crate::collections::AHashSet::default();
         if let Some(faction) = factions.factions.get(&state.assigned_faction) {
             anchors.insert(tile_to_chunk_coord(faction.home_tile));
         }
@@ -1327,10 +1327,10 @@ pub fn compute_interest_system(
         // bounded (raid ≤ RAID_MAX_PARTY_ABS, hunt ≤ target_party_size,
         // defenders by `Drafted` insertion sites), so the per-rebuild
         // iteration cost stays trivial.
-        let mut military_anchors: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::new();
+        let mut military_anchors: crate::collections::AHashSet<(i32, i32)> = crate::collections::AHashSet::default();
         if let Some(faction) = factions.factions.get(&state.assigned_faction) {
             let push_entity_chunk =
-                |anchors: &mut ahash::AHashSet<(i32, i32)>, entity: bevy::prelude::Entity| {
+                |anchors: &mut crate::collections::AHashSet<(i32, i32)>, entity: bevy::prelude::Entity| {
                     let Ok(tf) = transform_q.get(entity) else {
                         return;
                     };
@@ -1364,7 +1364,7 @@ pub fn compute_interest_system(
             military_anchors.insert(tile_to_chunk_coord(tile));
         }
 
-        let mut tiered: ahash::AHashMap<(i32, i32), InterestTier> = ahash::AHashMap::new();
+        let mut tiered: crate::collections::AHashMap<(i32, i32), InterestTier> = crate::collections::AHashMap::default();
         // Seed `Owned` (±1 of each settled anchor) and `Neighbour`
         // (±NEIGHBOUR_TIER_RADIUS) first so `Far` only fills cells the
         // tighter tiers didn't already claim. Military anchors only
@@ -1428,8 +1428,8 @@ pub fn replicate_entity_removals_system(
 
     // Group ids by recipient set so a single message goes to each
     // interested client.
-    let mut by_recipients: ahash::AHashMap<Vec<ClientId>, Vec<crate::net_id::NetId>> =
-        ahash::AHashMap::new();
+    let mut by_recipients: crate::collections::AHashMap<Vec<ClientId>, Vec<crate::net_id::NetId>> =
+        crate::collections::AHashMap::default();
     let mut unknown_chunk: Vec<crate::net_id::NetId> = Vec::new();
     for id in ids {
         match last_chunks.0.remove(&id) {

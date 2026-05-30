@@ -772,7 +772,7 @@ pub fn validate_grid(
 
     // Occupancy set — O(1) membership for the connectivity / module passes
     // (the grid's own `get`/`contains` are linear).
-    let occupied: ahash::AHashSet<IVec3> = grid.cells.iter().map(|(p, _)| *p).collect();
+    let occupied: crate::collections::AHashSet<IVec3> = grid.cells.iter().map(|(p, _)| *p).collect();
 
     // Bounds.
     for (p, _) in &grid.cells {
@@ -789,7 +789,7 @@ pub fn validate_grid(
 
     // Connectivity — flood fill over 6-neighbours from the first cell.
     {
-        let mut seen: ahash::AHashSet<IVec3> = ahash::AHashSet::default();
+        let mut seen: crate::collections::AHashSet<IVec3> = crate::collections::AHashSet::default();
         let mut stack: Vec<IVec3> = vec![grid.cells[0].0];
         while let Some(p) = stack.pop() {
             if !seen.insert(p) {
@@ -2106,7 +2106,7 @@ pub struct VehicleYard {
 
 /// Tile → `VehicleYard` entity index.
 #[derive(Resource, Default)]
-pub struct VehicleYardMap(pub ahash::AHashMap<(i32, i32), Entity>);
+pub struct VehicleYardMap(pub crate::collections::AHashMap<(i32, i32), Entity>);
 
 pub fn on_vehicle_yard_add(
     mut world: bevy::ecs::world::DeferredWorld<'_>,
@@ -2688,7 +2688,7 @@ pub fn vehicle_assembly_system(
 /// `vehicle_occupancy_sync_system`; the clearance-aware pathfinder treats an
 /// entry as a hard block.
 #[derive(Resource, Default)]
-pub struct VehicleOccupancyIndex(pub ahash::AHashMap<(i32, i32), Entity>);
+pub struct VehicleOccupancyIndex(pub crate::collections::AHashMap<(i32, i32), Entity>);
 
 /// Outward-spiral search for a passable tile a rider can disembark onto.
 /// Skips the vehicle's own footprint, tiles claimed by a different vehicle
@@ -2698,8 +2698,8 @@ pub struct VehicleOccupancyIndex(pub ahash::AHashMap<(i32, i32), Entity>);
 pub fn find_disembark_landing(
     anchor: (i32, i32),
     z: i8,
-    footprint: &ahash::AHashSet<(i32, i32)>,
-    used: &ahash::AHashSet<(i32, i32)>,
+    footprint: &crate::collections::AHashSet<(i32, i32)>,
+    used: &crate::collections::AHashSet<(i32, i32)>,
     chunk_map: &ChunkMap,
     occupancy: &VehicleOccupancyIndex,
 ) -> Option<(i32, i32)> {
@@ -2877,7 +2877,7 @@ pub fn design_is_cargo_capable(design: &VehicleDesign, data: &VehicleData) -> bo
 fn pick_idle_draft_animal(
     faction_id: u32,
     animals_q: &Query<(Entity, &DomesticAnimal, &Tamed), Without<AnimalWorkClaim>>,
-    taken: &ahash::AHashSet<Entity>,
+    taken: &crate::collections::AHashSet<Entity>,
 ) -> Option<Entity> {
     for (e, da, tamed) in animals_q.iter() {
         if tamed.owner_faction != faction_id || taken.contains(&e) {
@@ -3064,7 +3064,7 @@ pub fn htn_vehicle_haul_dispatch_system(
 ) {
     let now = clock.tick;
     let now_u32 = now as u32;
-    let mut claimed_this_pass: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut claimed_this_pass: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
 
     for (worker, mut ai, mut aq, goal, fm, tr, lod, slot, claim) in workers.iter_mut() {
         let actor = worker;
@@ -3819,7 +3819,7 @@ pub fn vehicle_yard_intent_emitter_system(
     if clock.tick % (TICKS_PER_DAY as u64) != 0 {
         return;
     }
-    let mut have_yard: ahash::AHashSet<u32> = ahash::AHashSet::default();
+    let mut have_yard: crate::collections::AHashSet<u32> = crate::collections::AHashSet::default();
     for y in yards.iter() {
         have_yard.insert(y.faction_id);
     }
@@ -3904,7 +3904,7 @@ pub fn vehicle_ai_queue_system(
     let Some(handcart) = registry.by_name("Handcart").map(|d| d.id) else {
         return;
     };
-    let mut yard_factions: ahash::AHashSet<u32> = ahash::AHashSet::default();
+    let mut yard_factions: crate::collections::AHashSet<u32> = crate::collections::AHashSet::default();
     for y in yards.iter() {
         yard_factions.insert(y.faction_id);
     }
@@ -3948,7 +3948,7 @@ pub fn vehicle_ai_design_proposal_system(
     };
     // Factions that already own an authored design (proposal or player
     // custom) — one proposal each.
-    let mut authored: ahash::AHashSet<u32> = ahash::AHashSet::default();
+    let mut authored: crate::collections::AHashSet<u32> = crate::collections::AHashSet::default();
     for d in designs.iter() {
         if let Some(f) = d.author_faction {
             authored.insert(f);
@@ -4119,8 +4119,8 @@ pub fn vehicle_player_command_system(
         return;
     }
     let now = clock.tick as u32;
-    let mut claimed_this_pass: ahash::AHashSet<Entity> = ahash::AHashSet::default();
-    let mut crew_claimed: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut claimed_this_pass: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
+    let mut crew_claimed: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
 
     for (vehicle_e, kind) in std::mem::take(&mut pending.ops) {
         let Ok((mut v, mut inv, mut crew, mut draft)) = vehicles_q.get_mut(vehicle_e) else {
@@ -4292,12 +4292,12 @@ pub fn vehicle_player_command_system(
                     .chain(crew.gunners.iter().copied())
                     .chain(crew.passengers.iter().copied())
                     .collect();
-                let footprint: ahash::AHashSet<(i32, i32)> =
+                let footprint: crate::collections::AHashSet<(i32, i32)> =
                     footprint_tiles(&design, anchor, v.heading)
                         .into_iter()
                         .collect();
-                let mut used: ahash::AHashSet<(i32, i32)> = ahash::AHashSet::default();
-                let mut still_boarded: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+                let mut used: crate::collections::AHashSet<(i32, i32)> = crate::collections::AHashSet::default();
+                let mut still_boarded: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
                 for rider in riders {
                     if let Some(tile) = find_disembark_landing(
                         anchor,
@@ -4567,7 +4567,7 @@ pub fn vehicle_combat_system(
     )>,
 ) {
     // Vehicles wrecked / despawned earlier this pass — skip further hits.
-    let mut wrecked: ahash::AHashSet<Entity> = ahash::AHashSet::default();
+    let mut wrecked: crate::collections::AHashSet<Entity> = crate::collections::AHashSet::default();
 
     for (target, tf, lod, mut cd, stats, eq) in attackers.iter_mut() {
         if *lod == LodLevel::Dormant {
@@ -4865,8 +4865,8 @@ pub fn vehicle_turret_fire_system(
     )>,
     person_q: Query<(&Transform, &FactionMember), With<Person>>,
     target_vehicle_q: Query<(&Vehicle, &VehicleHealth), Without<Person>>,
-    mut cell_cooldowns: Local<ahash::AHashMap<(Entity, IVec3), u64>>,
-    mut module_cooldowns: Local<ahash::AHashMap<(Entity, VehicleModuleId), u64>>,
+    mut cell_cooldowns: Local<crate::collections::AHashMap<(Entity, IVec3), u64>>,
+    mut module_cooldowns: Local<crate::collections::AHashMap<(Entity, VehicleModuleId), u64>>,
     mut projectile: EventWriter<ProjectileFired>,
 ) {
     let now = clock.tick;
@@ -5072,7 +5072,7 @@ pub fn vehicle_siege_system(
         Option<&VehiclePathFollow>,
     )>,
     mut wall_q: Query<(&mut Health, &Wall)>,
-    mut cooldowns: Local<ahash::AHashMap<Entity, u64>>,
+    mut cooldowns: Local<crate::collections::AHashMap<Entity, u64>>,
     mut scratch: Local<VehiclePathScratch>,
 ) {
     let now = clock.tick;

@@ -19,7 +19,7 @@
 //! intent, tile, settlements, calendar)` is pure-fn and consulted by
 //! `trespass_detection_system`.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 

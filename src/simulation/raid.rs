@@ -21,7 +21,7 @@ use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::seasons::TICKS_PER_DAY;
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::TILE_SIZE;
-use ahash::{AHashMap, AHashSet};
+use crate::collections::{AHashMap, AHashSet};
 use bevy::prelude::*;
 
 // ── Raid tuning constants ──────────────────────────────────────────────────

@@ -820,7 +820,7 @@ mod tests {
     #[test]
     fn faction_tool_deficit_nets_against_holdings() {
         use crate::simulation::jobs::compute_faction_tool_deficits;
-        let mut have: ahash::AHashMap<ToolForm, u32> = ahash::AHashMap::default();
+        let mut have: crate::collections::AHashMap<ToolForm, u32> = crate::collections::AHashMap::default();
         // 8 Paleolithic members want max(8/2,2)=4 knives/axes, 1 pick/hammer.
         // Stock 4 knives → no knife deficit; 0 axes → axe deficit 4.
         have.insert(ToolForm::Knife, 4);

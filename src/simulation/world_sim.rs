@@ -1,10 +1,12 @@
-use ahash::AHashSet;
+use crate::collections::AHashSet;
 use bevy::prelude::*;
 use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use crate::simulation::perf::{micros_u32, BackgroundWorkDiagnostics, PerfWorkBudget};
+use crate::simulation::perf::{
+    micros_u32, BackgroundWorkDiagnostics, DeterministicCompute, PerfWorkBudget,
+};
 use crate::simulation::person::Person;
 use crate::world::chunk::{ChunkMap, CHUNK_SIZE};
 use crate::world::globe::{Biome, Globe, GLOBE_HEIGHT, GLOBE_WIDTH};
@@ -90,6 +92,7 @@ pub fn world_sim_system(
     mut state: ResMut<WorldSimTaskState>,
     budget: Res<PerfWorkBudget>,
     mut perf: ResMut<BackgroundWorkDiagnostics>,
+    deterministic: Option<Res<DeterministicCompute>>,
 ) {
     let season_mult: f32 = match calendar.season {
         Season::Spring => 0.8,
@@ -98,20 +101,31 @@ pub fn world_sim_system(
         Season::Winter => 0.2,
     };
 
-    if let Some(task) = state.task.as_mut() {
-        if let Some(result) = block_on(future::poll_once(task)) {
-            state.task = None;
-            perf.world_sim_in_flight = false;
-            perf.world_sim_compute_us = micros_u32(result.elapsed);
-            perf.world_sim_snapshot_cells = result.snapshot_cells.min(u32::MAX as usize) as u32;
-            if !queue_world_sim_result_if_current(&mut state, result, cursor.generation) {
-                perf.world_sim_dropped_stale = perf.world_sim_dropped_stale.saturating_add(1);
+    // Test mode (`deterministic`): fully drain the in-flight task so its result
+    // lands this tick regardless of compute-pool contention. Production keeps
+    // the non-blocking `poll_once` so heavy world-sim stays off the tick thread.
+    let polled = if deterministic.is_some() {
+        state.task.take().map(block_on)
+    } else if let Some(task) = state.task.as_mut() {
+        match block_on(future::poll_once(task)) {
+            Some(result) => {
+                state.task = None;
+                Some(result)
             }
-        } else {
-            perf.world_sim_in_flight = true;
+            None => None,
         }
     } else {
+        None
+    };
+    if let Some(result) = polled {
         perf.world_sim_in_flight = false;
+        perf.world_sim_compute_us = micros_u32(result.elapsed);
+        perf.world_sim_snapshot_cells = result.snapshot_cells.min(u32::MAX as usize) as u32;
+        if !queue_world_sim_result_if_current(&mut state, result, cursor.generation) {
+            perf.world_sim_dropped_stale = perf.world_sim_dropped_stale.saturating_add(1);
+        }
+    } else {
+        perf.world_sim_in_flight = state.task.is_some();
     }
 
     let apply_started = Instant::now();

@@ -15,7 +15,7 @@
 
 use crate::simulation::memory::MemoryKind;
 use crate::simulation::SimClock;
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 use std::sync::Mutex;
 

@@ -17,7 +17,7 @@ use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
 use crate::world::spatial::SpatialIndex;
 use crate::world::terrain::TILE_SIZE;
 use crate::world::tile::TileKind;
-use ahash::AHashSet;
+use crate::collections::AHashSet;
 use bevy::prelude::*;
 
 /// Represents the current active task an agent is performing.

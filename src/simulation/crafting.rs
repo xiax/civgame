@@ -16,7 +16,7 @@ use crate::simulation::skills::{SkillKind, Skills};
 use crate::simulation::tasks::TaskKind;
 use crate::simulation::technology::TechId;
 use crate::world::terrain::tile_to_world;
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 use std::sync::OnceLock;
 
@@ -949,7 +949,7 @@ pub fn faction_craft_order_system(
 
         // Count currently-live orders for this faction (and per-recipe).
         let mut live_total: u32 = 0;
-        let mut live_recipes: AHashMap<u8, u32> = AHashMap::new();
+        let mut live_recipes: AHashMap<u8, u32> = AHashMap::default();
         for order in order_query.iter() {
             if order.faction_id == faction_id {
                 live_total += 1;
@@ -963,7 +963,7 @@ pub fn faction_craft_order_system(
         // Sum faction inventory across living members. Phase 2d:
         // ResourceId-keyed to match `storage.totals` so the union check
         // below can drop its reverse-resolve.
-        let mut faction_inv: AHashMap<ResourceId, u32> = AHashMap::new();
+        let mut faction_inv: AHashMap<ResourceId, u32> = AHashMap::default();
         for (member, agent, lod) in agent_query.iter() {
             if *lod == LodLevel::Dormant || member.faction_id != faction_id {
                 continue;
@@ -1150,10 +1150,10 @@ pub fn craft_order_system(
     mut ground_item_q: Query<&mut crate::simulation::items::GroundItem>,
 ) {
     let mut order_haulers: AHashMap<Entity, Vec<(Entity, [u32; MAX_CRAFT_INPUTS])>> =
-        AHashMap::new();
+        AHashMap::default();
     // Realistic Tool Overhaul: each worker carries a per-tick work-speed
     // multiplier derived from the tier of the tools they hold.
-    let mut order_workers: AHashMap<Entity, Vec<(Entity, f32)>> = AHashMap::new();
+    let mut order_workers: AHashMap<Entity, Vec<(Entity, f32)>> = AHashMap::default();
 
     for (
         entity,

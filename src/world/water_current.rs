@@ -12,7 +12,7 @@
 //! marsh / dam pools — near-zero). Runtime water-surface-gradient flow
 //! (`RuntimeFlow`) and current-aware pathfinding cost are deferred.
 
-use ahash::AHashMap;
+use crate::collections::AHashMap;
 use bevy::prelude::*;
 
 use crate::world::chunk::{ChunkCoord, ChunkMap, CHUNK_SIZE};
@@ -63,7 +63,7 @@ pub struct WaterCurrentField {
     by_chunk: AHashMap<ChunkCoord, Vec<(i32, i32)>>,
     /// Chunks (re)built since the renderer last consumed the field —
     /// drained by `take_dirty` so the streak renderer re-spawns them.
-    dirty: ahash::AHashSet<ChunkCoord>,
+    dirty: crate::collections::AHashSet<ChunkCoord>,
 }
 
 impl WaterCurrentField {

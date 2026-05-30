@@ -26,7 +26,7 @@
 //! **Hard guardrail intact:** zero diff in `tasks.rs` /
 //! `typed_task.rs` / executor framework.
 
-use ahash::AHashSet;
+use crate::collections::AHashSet;
 use bevy::prelude::*;
 
 use crate::economy::agent::EconomicAgent;
